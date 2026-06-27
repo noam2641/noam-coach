@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import coach_bot
+import user_model
 
 
 async def _db_with_user(tmp_path: Path, monkeypatch) -> coach_bot.Database:
@@ -55,3 +56,23 @@ async def test_profile_readiness_lists_missing_facts(tmp_path, monkeypatch) -> N
     # The threshold is explained and missing items are surfaced.
     assert "כל נתוני החובה" in text
     assert "חסר:" in text
+
+
+@pytest.mark.asyncio
+async def test_profile_formats_structured_values_without_raw_dicts(tmp_path, monkeypatch) -> None:
+    db = await _db_with_user(tmp_path, monkeypatch)
+    await user_model.set_fact(
+        db,
+        1,
+        "weekly_availability",
+        [{"weekday": 0, "start": "18:00", "minutes": 45, "available": True}],
+        source=user_model.SOURCE_USER,
+        confirmed=True,
+    )
+
+    text = await coach_bot.build_profile_text(1)
+
+    assert "ראשון 18:00 45 דקות" in text
+    assert "{'weekday'" not in text
+    assert '"weekday"' not in text
+    assert "available" not in text

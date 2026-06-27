@@ -177,11 +177,16 @@ def build_telegram_app() -> Application:
         .rate_limiter(AIORateLimiter())
         # Large health ZIPs need long read/write windows and a bigger pool so
         # downloading a file doesn't starve the polling connection.
-        .read_timeout(120)
-        .write_timeout(120)
-        .connect_timeout(30)
-        .pool_timeout(30)
-        .connection_pool_size(16)
+        .read_timeout(SETTINGS.telegram_read_timeout)
+        .write_timeout(SETTINGS.telegram_write_timeout)
+        .connect_timeout(SETTINGS.telegram_connect_timeout)
+        .pool_timeout(SETTINGS.telegram_pool_timeout)
+        .connection_pool_size(SETTINGS.telegram_connection_pool_size)
+        .get_updates_read_timeout(SETTINGS.telegram_get_updates_read_timeout)
+        .get_updates_write_timeout(SETTINGS.telegram_get_updates_write_timeout)
+        .get_updates_connect_timeout(SETTINGS.telegram_get_updates_connect_timeout)
+        .get_updates_pool_timeout(SETTINGS.telegram_get_updates_pool_timeout)
+        .get_updates_connection_pool_size(SETTINGS.telegram_get_updates_connection_pool_size)
     )
     # When a Local Bot API Server is configured we can receive files far larger
     # than the 50MB cloud limit (needed for the Apple Health ZIP).
@@ -226,6 +231,30 @@ async def verify_bot_identity(application: Application) -> None:
         )
 
 
+async def _stop_telegram_application(application: Application) -> None:
+    updater = application.updater
+    if updater is not None and getattr(updater, "running", False):
+        with suppress(Exception):
+            await updater.stop()
+    if getattr(application, "running", False):
+        with suppress(Exception):
+            await application.stop()
+
+
+async def _stop_api_server(server: uvicorn.Server) -> None:
+    server.should_exit = True
+    if getattr(server, "started", False):
+        await asyncio.sleep(0)
+
+
+async def _cancel_task(task: asyncio.Task[Any] | None) -> None:
+    if task is None or task.done():
+        return
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+
+
 @runtime_bound(RUNTIME_NAMES)
 async def run() -> None:
     SETTINGS.validate_runtime()
@@ -254,23 +283,27 @@ async def run() -> None:
     )
     cleaner = asyncio.create_task(cleanup_photos())
 
+    RUNTIME_STATE.shutting_down = False
     try:
         async with telegram:
-            await telegram.start()
-            # Fail fast if the token belongs to the wrong bot (identity guard).
-            await verify_bot_identity(telegram)
-            if telegram.updater is None:
-                raise RuntimeError("Telegram updater לא זמין")
-            await telegram.updater.start_polling(drop_pending_updates=False)
-            RUNTIME_STATE.telegram_ready = True
-            LOGGER.info("Telegram bot and API are running")
-            await server.serve()
-            RUNTIME_STATE.telegram_ready = False
-            await telegram.updater.stop()
-            await telegram.stop()
+            try:
+                await telegram.start()
+                # Fail fast if the token belongs to the wrong bot (identity guard).
+                await verify_bot_identity(telegram)
+                if telegram.updater is None:
+                    raise RuntimeError("Telegram updater is not available")
+                await telegram.updater.start_polling(drop_pending_updates=False)
+                RUNTIME_STATE.telegram_ready = True
+                LOGGER.info("Telegram bot and API are running")
+                await server.serve()
+            finally:
+                RUNTIME_STATE.shutting_down = True
+                RUNTIME_STATE.telegram_ready = False
+                await _stop_api_server(server)
+                await _stop_telegram_application(telegram)
     finally:
+        RUNTIME_STATE.shutting_down = True
         RUNTIME_STATE.telegram_ready = False
         RUNTIME_STATE.db_ready = False
-        cleaner.cancel()
-        with suppress(asyncio.CancelledError):
-            await cleaner
+        await _cancel_task(cleaner)
+        RUNTIME_STATE.shutting_down = False

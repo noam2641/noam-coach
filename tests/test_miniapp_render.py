@@ -30,6 +30,7 @@ def test_static_files_exist_and_have_no_python_braces() -> None:
     # The f-string escaping ({{ }}) must be gone now that JS lives in a file.
     assert "{{" not in js and "}}" not in js
     assert "saveProfile" in js and "loadDashboard" in js
+    assert "loadTodayMeals" in js and "mealCard" in js
     assert "onclick=" not in js
     assert "escapeHtml" in js
     assert ".card" in css
@@ -39,6 +40,7 @@ def test_template_has_no_inline_event_handlers() -> None:
     html = (miniapp.TEMPLATES_DIR / "index.html").read_text(encoding="utf-8")
     assert "onclick=" not in html
     assert 'script-src \'self\'' in html
+    assert 'id="todayMealsBox"' in html
 
 
 def test_static_route_serves_js_with_correct_type() -> None:

@@ -32,6 +32,16 @@ class Settings(BaseSettings):
     # Apple Health ZIPs can be sent in chat). Leave empty to use Telegram cloud.
     telegram_base_url: str = ""
     telegram_base_file_url: str = ""
+    telegram_read_timeout: float = 120.0
+    telegram_write_timeout: float = 120.0
+    telegram_connect_timeout: float = 30.0
+    telegram_pool_timeout: float = 30.0
+    telegram_connection_pool_size: int = 16
+    telegram_get_updates_read_timeout: float = 45.0
+    telegram_get_updates_write_timeout: float = 30.0
+    telegram_get_updates_connect_timeout: float = 15.0
+    telegram_get_updates_pool_timeout: float = 15.0
+    telegram_get_updates_connection_pool_size: int = 4
 
     openai_api_key: str = ""
     openai_model: str = "gpt-4.1-mini"
@@ -124,6 +134,19 @@ class Settings(BaseSettings):
             raise RuntimeError("API_MAX_BODY_BYTES קטן מדי")
         if self.api_rate_limit_requests_per_minute <= 0:
             raise RuntimeError("API_RATE_LIMIT_REQUESTS_PER_MINUTE חייב להיות חיובי")
+        if min(
+            self.telegram_read_timeout,
+            self.telegram_write_timeout,
+            self.telegram_connect_timeout,
+            self.telegram_pool_timeout,
+            self.telegram_get_updates_read_timeout,
+            self.telegram_get_updates_write_timeout,
+            self.telegram_get_updates_connect_timeout,
+            self.telegram_get_updates_pool_timeout,
+        ) <= 0:
+            raise RuntimeError("הגדרות timeout של Telegram חייבות להיות חיוביות")
+        if self.telegram_connection_pool_size < 1 or self.telegram_get_updates_connection_pool_size < 1:
+            raise RuntimeError("גודל connection pool של Telegram חייב להיות חיובי")
         if self.proactive_daily_limit < 0 or self.proactive_max_attempts < 1:
             raise RuntimeError("הגדרות ההתראות אינן תקינות")
         if (
@@ -228,6 +251,7 @@ for _handler in logging.getLogger().handlers:
 class RuntimeState:
     db_ready: bool = False
     telegram_ready: bool = False
+    shutting_down: bool = False
     startup_error: str | None = None
 
 

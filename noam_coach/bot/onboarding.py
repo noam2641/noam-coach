@@ -320,6 +320,87 @@ PENDING_QUESTION: dict[int, str] = {}
 CONFIRM_PENDING: dict[int, dict[str, Any]] = {}
 
 
+PLAN_COMPLETION_FLOW = "plan_completion"
+PLAN_COMPLETION_PROFILES = ("workout", "nutrition", "safety")
+
+
+async def set_flow_state(user_id: int, flow: str, step: str, payload: dict[str, Any]) -> None:
+    from noam_coach.services.core import set_flow_state as _set_flow_state
+
+    await _set_flow_state(user_id, flow, step, payload)
+
+
+async def get_flow_state(user_id: int, flow: str) -> dict[str, Any] | None:
+    from noam_coach.services.core import get_flow_state as _get_flow_state
+
+    return await _get_flow_state(user_id, flow)
+
+
+async def clear_flow_state(user_id: int, flow: str) -> None:
+    from noam_coach.services.core import clear_flow_state as _clear_flow_state
+
+    await _clear_flow_state(user_id, flow)
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def first_missing_plan_question(user_id: int) -> questions.Question | None:
+    """Return the next missing profile question for the plan-completion flow."""
+    readiness = await user_model.compute_all_readiness(DB, user_id)
+    seen: set[str] = set()
+    for profile_name in PLAN_COMPLETION_PROFILES:
+        for key in readiness.get(profile_name, {}).get("missing", []):
+            if key in seen:
+                continue
+            seen.add(key)
+            question = questions.question_by_fact_key(key)
+            if question is not None:
+                return question
+    return None
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def ask_next_plan_completion_question(target: Any, user_id: int) -> bool:
+    """Ask the next missing plan detail and keep the user inside plan setup."""
+    from noam_coach.bot.ui import button, safe_edit
+
+    question = await first_missing_plan_question(user_id)
+    if question is None:
+        await clear_flow_state(user_id, PLAN_COMPLETION_FLOW)
+        await render_smart_plan_hub(target, user_id)
+        return False
+    await set_flow_state(
+        user_id,
+        PLAN_COMPLETION_FLOW,
+        question.id,
+        {"return_to": "menu:smartplan"},
+    )
+    await set_pending(user_id, question.id)
+    rows = []
+    if question.options:
+        rows = [
+            [button(label, f"qa:{question.id}:{index}")]
+            for index, (label, _value) in enumerate(question.options)
+        ]
+    rows.append([button("⬅️ חזור לתוכנית", "menu:smartplan")])
+    keyboard = InlineKeyboardMarkup(rows) if rows else None
+    text = f"<b>שאלה להשלמת התוכנית</b>\n\n{question.text}"
+    if hasattr(target, "edit_message_text"):
+        await safe_edit(target, text, keyboard)
+    else:
+        await target.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+    return True
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def continue_after_plan_completion_answer(target: Any, user_id: int) -> bool:
+    """Continue plan-completion questions; return True when this flow owned it."""
+    if not await get_flow_state(user_id, PLAN_COMPLETION_FLOW):
+        return False
+    if await ask_next_plan_completion_question(target, user_id):
+        return True
+    return True
+
+
 @runtime_bound(RUNTIME_NAMES)
 async def set_confirm_pending(user_id: int, payload: dict[str, Any]) -> None:
     CONFIRM_PENDING[user_id] = payload
@@ -545,6 +626,8 @@ async def handle_onboarding_callback(query: Any, user_id: int, data: str) -> Non
             source="onboarding",
             properties={"restriction_type": restriction_type, "food_item": food_item},
         )
+        if await continue_after_plan_completion_answer(query, user_id):
+            return
         if not await ask_next_question(query, user_id):
             await finish_onboarding(query, user_id)
         return
@@ -564,6 +647,8 @@ async def handle_onboarding_callback(query: Any, user_id: int, data: str) -> Non
                     source="onboarding",
                 )
             await clear_pending(user_id)
+            if await continue_after_plan_completion_answer(query, user_id):
+                return
             if not await ask_next_question(query, user_id):
                 await finish_onboarding(query, user_id)
             return
@@ -614,6 +699,8 @@ async def handle_onboarding_callback(query: Any, user_id: int, data: str) -> Non
                 # do NOT clear it or advance; wait for the user's reply.
                 return
         await clear_pending(user_id)
+        if await continue_after_plan_completion_answer(query, user_id):
+            return
         # If we're in a deferred-plan flow, continue asking or build the plan.
         deferred = await get_flow_state(user_id, "deferred_plan")
         if deferred:
@@ -928,15 +1015,12 @@ def _format_fact_value(key: str, value: Any) -> str:
             if start and end:
                 return f"{start}–{end}"
             return f"{start}{end}" if (start or end) else "לא צוין"
-        # Generic dict: format as readable key-value, not Python repr
-        readable = []
-        for k, v in value.items():
-            if v is not None and k not in ("type", "source", "status"):
-                readable.append(str(v))
-        return ", ".join(readable) if readable else "לא צוין"
+        return _format_structured_profile_item(key, value)
 
     if isinstance(value, (list, tuple)):
-        return ", ".join(str(v) for v in value) if value else "לא צוין"
+        readable = [_format_structured_profile_item(key, item) for item in value]
+        readable = [item for item in readable if item and item != "לא צוין"]
+        return ", ".join(readable) if readable else "לא צוין"
 
     def _as_float() -> float | None:
         try:
@@ -969,6 +1053,48 @@ def _format_fact_value(key: str, value: Any) -> str:
     if "_" in s and s.replace("_", "").isalpha():
         return s.replace("_", " ")
     return s
+
+
+def _format_structured_profile_item(key: str, value: Any) -> str:
+    if not isinstance(value, dict):
+        return str(value).replace("_", " ")
+    if key == "weekly_availability" or "weekday" in value:
+        weekday = _weekday_label(value.get("weekday"))
+        start = str(value.get("start") or value.get("time") or "").strip()
+        minutes = value.get("minutes")
+        parts = [part for part in (weekday, start) if part]
+        if minutes:
+            parts.append(f"{minutes} דקות")
+        return " ".join(parts) if parts else "לא צוין"
+    if "value" in value:
+        return _format_structured_profile_item(key, value["value"])
+    readable = []
+    for item_key, item_value in value.items():
+        if item_value is None or item_key in {"type", "source", "status", "confidence"}:
+            continue
+        if isinstance(item_value, (dict, list, tuple)):
+            nested = _format_fact_value(item_key, item_value)
+            if nested != "לא צוין":
+                readable.append(nested)
+        else:
+            readable.append(str(item_value).replace("_", " "))
+    return ", ".join(readable) if readable else "לא צוין"
+
+
+def _weekday_label(value: Any) -> str:
+    names = {
+        0: "ראשון",
+        1: "שני",
+        2: "שלישי",
+        3: "רביעי",
+        4: "חמישי",
+        5: "שישי",
+        6: "שבת",
+    }
+    try:
+        return names.get(int(value), "")
+    except (TypeError, ValueError):
+        return str(value or "").replace("_", " ")
 
 
 @runtime_bound(RUNTIME_NAMES)
@@ -1109,6 +1235,8 @@ def _format_candidate(candidate: dict[str, Any], index: int | None = None) -> st
 
 @runtime_bound(RUNTIME_NAMES)
 async def render_smart_plan_hub(target: Any, user_id: int) -> None:
+    from noam_coach.bot.ui import button, safe_edit
+
     readiness = await user_model.compute_all_readiness(DB, user_id)
     nutrition = await planning.get_active_plan(DB, user_id, "nutrition")
     workout = await planning.get_active_plan(DB, user_id, "workout")
@@ -1360,7 +1488,7 @@ async def ask_deferred_for_plan(target: Any, user_id: int, frequency: int) -> bo
     Returns True if a question was asked (caller should wait for the answer),
     False if all deferred questions are already answered and the plan can proceed.
     """
-    for key, why in questions.DEFERRED_GAP_KEYS.items():
+    for key, _why in questions.DEFERRED_GAP_KEYS.items():
         fact = await user_model.get_fact(DB, user_id, key)
         if fact is not None:
             continue
@@ -1586,6 +1714,8 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
         )
         await clear_pending(user_id)
         await message.reply_text(f"רשמתי כאב ב{text}. אסיר או אחליף תרגילים שמעמיסים על האזור הזה.")
+        if await continue_after_plan_completion_answer(message, user_id):
+            return True
         if not await ask_next_question(message, user_id):
             await finish_onboarding(message, user_id)
         return True
@@ -1599,6 +1729,8 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
         )
         await clear_pending(user_id)
         await message.reply_text("נרשם, אתאים את התוכנית בהתאם.")
+        if await continue_after_plan_completion_answer(message, user_id):
+            return True
         if not await ask_next_question(message, user_id):
             await finish_onboarding(message, user_id)
         return True
@@ -1611,6 +1743,8 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
         )
         await clear_pending(user_id)
         await message.reply_text(f"רשמתי: {text}. אתחשב בזה בתכנון התזונה.")
+        if await continue_after_plan_completion_answer(message, user_id):
+            return True
         if not await ask_next_question(message, user_id):
             await finish_onboarding(message, user_id)
         return True
@@ -1623,6 +1757,8 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
         )
         await clear_pending(user_id)
         await message.reply_text(f"רשמתי: {text}. אבחר תרגילים בהתאם.")
+        if await continue_after_plan_completion_answer(message, user_id):
+            return True
         if not await ask_next_question(message, user_id):
             await finish_onboarding(message, user_id)
         return True
@@ -1659,6 +1795,8 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
             "תודה, התיקון נשמר והפרופיל עודכן ✅",
             parse_mode=ParseMode.HTML,
         )
+        if await continue_after_plan_completion_answer(message, user_id):
+            return True
         if not await ask_next_question(message, user_id):
             await finish_onboarding(message, user_id)
         return True
@@ -1735,6 +1873,47 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
             # No items parsed but text was provided — store as-is
             value = text
 
+        if question.fact_key in {"weekly_availability", "workout_window", "session_minutes"}:
+            from noam_coach.services.availability import parse_hebrew_availability_answer
+
+            parsed_availability = parse_hebrew_availability_answer(text)
+            if question.fact_key == "weekly_availability" and parsed_availability.weekly_availability:
+                value = parsed_availability.weekly_availability
+                if parsed_availability.training_days_per_week:
+                    await user_model.set_fact(
+                        DB,
+                        user_id,
+                        "training_days_per_week",
+                        parsed_availability.training_days_per_week,
+                        kind=user_model.KIND_FACT,
+                        source=user_model.SOURCE_USER,
+                        confirmed=True,
+                    )
+            if parsed_availability.workout_window:
+                if question.fact_key == "workout_window":
+                    value = parsed_availability.workout_window
+                await user_model.set_fact(
+                    DB,
+                    user_id,
+                    "workout_window",
+                    parsed_availability.workout_window,
+                    kind=user_model.KIND_FACT,
+                    source=user_model.SOURCE_USER,
+                    confirmed=True,
+                )
+            if parsed_availability.session_minutes:
+                if question.fact_key == "session_minutes":
+                    value = parsed_availability.session_minutes
+                await user_model.set_fact(
+                    DB,
+                    user_id,
+                    "session_minutes",
+                    parsed_availability.session_minutes,
+                    kind=user_model.KIND_FACT,
+                    source=user_model.SOURCE_USER,
+                    confirmed=True,
+                )
+
         try:
             await questions.record_answer(DB, user_id, question, value)
         except Exception:  # noqa: BLE001
@@ -1756,6 +1935,8 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
             )
             return True
         await clear_pending(user_id)
+        if await continue_after_plan_completion_answer(message, user_id):
+            return True
         if not await ask_next_question(message, user_id):
             await finish_onboarding(message, user_id)
         return True

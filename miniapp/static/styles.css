@@ -11,6 +11,9 @@ h1,h2 { margin-top:0; }
 .upload-status.success { color:#27ae60; }
 .action-btn { padding:10px 14px; margin:4px; border:0; border-radius:10px; background:#2481cc; color:white; cursor:pointer; }
 .action-btn.secondary { background:#eef3f7; color:#222; }
+.action-row { display:flex; flex-wrap:wrap; gap:4px; margin-top:8px; }
+.meal-row { border-bottom:1px solid #edf0f2; padding:8px 0; }
+.meal-row small { display:block; color:#666; margin-top:2px; }
 .candidate { border:1px solid #e3e7eb; border-radius:12px; padding:12px; margin:10px 0; }
 .candidate small { color:#666; }
 .error { color:#b42318; }

@@ -3,8 +3,9 @@
 Date: 2026-06-27
 
 Scope: independent repository audit, completion of the current `REC-PROGRAM-04`
-batch, adversarial review, verification, and release inspection. `REC-NEXT-MEAL-05`
-was not started.
+batch, adversarial review, verification, and release inspection. At the time of
+this audit, `REC-NEXT-MEAL-05` had not started; it is now covered by
+`docs/CODEX_AUDIT_REC_NEXT_MEAL_05.md`.
 
 ## Repository State Found
 
@@ -21,7 +22,7 @@ was not started.
 |---|---|---|
 | Full test suite passes | PROVEN | `557 passed, 3 warnings in 30.61s`, exit code 0. |
 | Startup works | PROVEN | Bounded startup reached Telegram application start, scheduler start, bot identity, FastAPI startup, Uvicorn running; no traceback. |
-| Dietary firewall integration | PARTIALLY_PROVEN | Production meal rendering and nutrition candidate generation use canonical restrictions. Older AI recommendation paths still need the future `REC-NEXT-MEAL-05` central service. |
+| Dietary firewall integration | PROVEN_AFTER_REC_NEXT_MEAL_05 | Production meal rendering, nutrition candidate generation, and the new next-meal service use canonical restrictions. |
 | Availability resolver integration | PROVEN | Used by workout candidate generation, Telegram profile/program views, and Mini App API/display. |
 | Body-fat normalization | PROVEN | Apple Health sync and profile display use centralized source-aware normalizer; tests cover fraction, percent, Apple Health, NaN/Inf, ambiguous values. |
 | Delta meal correction | PROVEN | Text correction route applies deterministic remove/replace patches before AI fallback; tests prove unrelated items and oil are preserved. |
@@ -41,7 +42,7 @@ was not started.
 | 04-03 Plan activation remediation | PARTIALLY_PROVEN | Existing blockers preserve typed missing data and plan callbacks are versioned; no new broad remediation flow was added in this pass. |
 | 04-04 Explainable proposal compatibility | PROVEN | Telegram candidate formatting no longer shows arbitrary precise percentages; rationale/tradeoffs/assumptions are shown. |
 | 04-05 Canonical dietary restrictions | PROVEN | Typed `DietaryRestriction` model distinguishes allergy, sensitivity, intolerance, avoidance, preference, unavailable, and unknown. |
-| 04-06 Restriction firewall | PARTIALLY_PROVEN | Meal display and nutrition plans are validated; older recommendation surfaces are documented as pending centralization under REC-NEXT-MEAL-05. |
+| 04-06 Restriction firewall | PROVEN_AFTER_REC_NEXT_MEAL_05 | Meal display, nutrition plans, and next-meal options are validated through the canonical restriction service. |
 | 04-07 Natural-language updates | PARTIALLY_PROVEN | Existing REC-PLAN-MEAL-03 parsing routes many updates; full repeated NL restriction update idempotency across all contexts is not fully replayed. |
 | 04-08 Profile/body-fat presentation | PROVEN | Raw dicts are suppressed; body-fat normalization is source-aware; Hebrew output tests pass. |
 | 04-09 Completeness service | PARTIALLY_PROVEN | Existing readiness service is shared by plan/profile flows; the richer status taxonomy is not fully centralized beyond current readiness fields. |
@@ -87,4 +88,5 @@ was not started.
 
 - Full production Telegram/OpenAI behavior still depends on real external services and credentials.
 - Extracted release full Telegram startup was not run because `.env` is intentionally excluded from the release artifact.
-- `REC-NEXT-MEAL-05` remains intentionally unimplemented.
+- The historical `REC-NEXT-MEAL-05` gap is now implemented and documented in
+  `docs/CODEX_AUDIT_REC_NEXT_MEAL_05.md`.

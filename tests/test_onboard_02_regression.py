@@ -69,6 +69,34 @@ class TestHealthImportOutcomeFields:
         assert outcome.import_started == "2025-01-01T00:00:00Z"
         assert outcome.import_completed == "2025-01-01T00:01:00Z"
 
+    @pytest.mark.asyncio
+    async def test_followup_summary_lists_missing_and_approval_without_raw_keys(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        from noam_coach.services import health_jobs
+
+        db = await _make_db(tmp_path)
+        monkeypatch.setattr(health_jobs, "DB", db)
+        await user_model.set_fact(
+            db,
+            1,
+            "sleep_schedule",
+            {"typical_bedtime": "23:00", "typical_wake_time": "07:00"},
+            kind=user_model.KIND_ESTIMATE,
+            source=user_model.SOURCE_DERIVED,
+            confirmed=False,
+        )
+
+        text = await health_jobs._health_import_followup_text(1)
+
+        assert "דורש אישור" in text
+        assert "עדיין חסר" in text
+        assert "sleep_schedule" not in text
+        assert "active_pain" not in text
+        assert "{" not in text
+
 
 # ── REC-ONBOARD-02-02: Health export freshness ──────────────────────────
 

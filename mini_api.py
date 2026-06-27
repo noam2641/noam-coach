@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Cookie, Depends, HTTPException, UploadFile
+from fastapi import APIRouter, Body, Cookie, Depends, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 import coach_intelligence
@@ -27,6 +27,12 @@ from db import DB
 from helpers import _safe_html_block, friendly_error, today_bounds_utc
 from models import MiniProfileUpdate
 from noam_coach.services.availability import resolve_availability
+from noam_coach.services.next_meal import (
+    format_next_meal_recommendation,
+    generate_next_meal_recommendation,
+    save_next_meal_workout_status,
+    workout_clarification_actions,
+)
 
 router = APIRouter()
 
@@ -88,6 +94,50 @@ async def mini_dashboard(user_id: int = Depends(mini_session_user)) -> JSONRespo
             "availability": availability.__dict__,
         }
     )
+
+
+@router.get("/mini/api/next-meal", include_in_schema=False)
+async def mini_next_meal(user_id: int = Depends(mini_session_user)) -> JSONResponse:
+    recommendation = await generate_next_meal_recommendation(DB, user_id)
+    return JSONResponse(_next_meal_payload(recommendation))
+
+
+@router.post("/mini/api/next-meal/workout-status", include_in_schema=False)
+async def mini_next_meal_workout_status(
+    payload: dict[str, Any] = Body(default_factory=dict),
+    user_id: int = Depends(mini_session_user),
+) -> JSONResponse:
+    status = str(payload.get("status") or "").strip()
+    if status not in {"later", "during", "completed", "cancelled"}:
+        raise HTTPException(status_code=400, detail="Invalid workout status")
+    await save_next_meal_workout_status(DB, user_id, status)
+    recommendation = await generate_next_meal_recommendation(DB, user_id)
+    return JSONResponse(_next_meal_payload(recommendation))
+
+
+def _next_meal_payload(recommendation: Any) -> dict[str, Any]:
+    status_map = {
+        "later": "later",
+        "during": "during",
+        "done": "completed",
+        "cancel": "cancelled",
+    }
+    action_rows = []
+    for row in workout_clarification_actions(recommendation):
+        action_rows.append(
+            [
+                {
+                    "label": label,
+                    "status": status_map.get(callback_data.rsplit(":", 1)[-1], ""),
+                }
+                for label, callback_data in row
+            ]
+        )
+    return {
+        "recommendation": recommendation.to_dict(),
+        "text": format_next_meal_recommendation(recommendation),
+        "actions": action_rows,
+    }
 
 
 @router.get("/mini/api/profile", include_in_schema=False)

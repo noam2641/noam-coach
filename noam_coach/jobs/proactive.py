@@ -124,6 +124,26 @@ JOB_PRIORITY_HIGH = 80
 JOB_PRIORITY_URGENT = 100
 
 
+NUTRITION_GOAL_QUALITY_KEYS = frozenset(
+    {
+        "morning_menu",
+        "evening",
+        "weekly_summary",
+        "overpace_alert",
+        "intraday_nudge",
+    }
+)
+
+
+NUTRITION_DAY_QUALITY_KEYS = frozenset(
+    {
+        "evening",
+        "overpace_alert",
+        "intraday_nudge",
+    }
+)
+
+
 @dataclass(frozen=True)
 class JobDeliveryClaim:
     user_id: int
@@ -422,16 +442,15 @@ async def deliver_proactive_message(
     retry_callback: Callable[[CallbackContext], Awaitable[None]] | None = None,
 ) -> bool:
     user_id = SETTINGS.telegram_allowed_user_id
-    nutrition_sensitive = any(
-        token in key
-        for token in ("calorie", "meal", "evening", "morning", "weekly_summary")
-    )
+    goal_quality_sensitive = key in NUTRITION_GOAL_QUALITY_KEYS
+    nutrition_sensitive = key in NUTRITION_DAY_QUALITY_KEYS
     start_utc = end_utc = None
     if nutrition_sensitive:
         start_utc, end_utc = today_bounds_utc()
     allowed, reason = await data_quality.can_send_proactive(
         DB,
         user_id,
+        require_goal_quality=goal_quality_sensitive,
         require_nutrition_quality=nutrition_sensitive,
         start_utc=start_utc,
         end_utc=end_utc,

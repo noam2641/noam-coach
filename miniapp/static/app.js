@@ -49,6 +49,63 @@ async function loadDashboard() {
   } catch (err) { box.innerHTML = errorHtml(err); }
 }
 
+async function loadNextMeal() {
+  const box = document.getElementById('nextMealBox');
+  if (!box) return;
+  box.textContent = 'טוען המלצה...';
+  try {
+    const data = await apiCall('/mini/api/next-meal');
+    renderNextMeal(data);
+  } catch (err) { box.innerHTML = errorHtml(err); }
+}
+
+function renderNextMeal(data) {
+  const box = document.getElementById('nextMealBox');
+  const text = String(data.text || '').replaceAll('\n', '<br>');
+  const actionRows = (data.actions || [])
+    .map(row => `<div class="action-row">${row.map(action =>
+      `<button class="action-btn secondary next-meal-status-btn" type="button" data-status="${escapeHtml(action.status)}">${escapeHtml(action.label)}</button>`
+    ).join('')}</div>`)
+    .join('');
+  box.innerHTML = text + actionRows;
+}
+
+async function setNextMealWorkoutStatus(status) {
+  const box = document.getElementById('nextMealBox');
+  try {
+    box.textContent = 'מעדכן המלצה...';
+    const data = await apiCall('/mini/api/next-meal/workout-status', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status }),
+    });
+    renderNextMeal(data);
+  } catch (err) { box.innerHTML = errorHtml(err); }
+}
+
+function mealCard(meal) {
+  const calories = Math.round(Number(meal.calories) || 0);
+  const protein = Math.round(Number(meal.protein) || 0);
+  const when = meal.eaten_at ? new Date(meal.eaten_at).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' }) : '';
+  return `<div class="meal-row"><b>${escapeHtml(meal.name || 'ארוחה')}</b>` +
+    `<small>${escapeHtml(when)} · כ-${calories} קל׳ · כ-${protein} גרם חלבון</small></div>`;
+}
+
+async function loadTodayMeals() {
+  const box = document.getElementById('todayMealsBox');
+  if (!box) return;
+  box.textContent = 'טוען ארוחות...';
+  try {
+    const data = await apiCall('/mini/api/meals/today');
+    const meals = data.meals || [];
+    const quality = data.quality || {};
+    const summary = `<div class="muted">אמינות דיווח: ${escapeHtml(quality.confidence_label || 'לא ידוע')}</div>`;
+    box.innerHTML = meals.length
+      ? summary + meals.map(mealCard).join('')
+      : summary + '<div class="muted">עוד לא נרשמו ארוחות היום.</div>';
+  } catch (err) { box.innerHTML = errorHtml(err); }
+}
+
 async function generatePlans(type) {
   const box = document.getElementById('planCandidates');
   box.textContent = 'בונה ובודק שלוש חלופות...';
@@ -169,8 +226,17 @@ async function saveProfile() {
 
 loadDashboard();
 loadProfile();
+loadNextMeal();
+loadTodayMeals();
 
 document.getElementById('saveProfileBtn').addEventListener('click', saveProfile);
+document.getElementById('refreshNextMealBtn').addEventListener('click', loadNextMeal);
+document.getElementById('refreshMealsBtn').addEventListener('click', loadTodayMeals);
+document.getElementById('nextMealBox').addEventListener('click', event => {
+  const buttonEl = event.target.closest('.next-meal-status-btn');
+  if (!buttonEl) return;
+  setNextMealWorkoutStatus(buttonEl.dataset.status);
+});
 document.getElementById('generateNutritionBtn').addEventListener('click', () => generatePlans('nutrition'));
 document.getElementById('generateWorkoutBtn').addEventListener('click', () => generatePlans('workout'));
 document.getElementById('buildUnifiedBtn').addEventListener('click', buildUnified);

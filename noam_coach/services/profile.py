@@ -257,6 +257,7 @@ async def reanalyze_meal_with_text_and_image(
     image_path: str,
     correction_text: str,
     locked_corrections: list[str] | None = None,
+    nutrition_context: dict[str, Any] | None = None,
 ) -> MealAnalysis:
     """Re-analyse a meal image with a user text correction.
 
@@ -309,6 +310,16 @@ async def reanalyze_meal_with_text_and_image(
                     "rejected identification. If the drink is genuinely a non-caloric "
                     "beverage, return it with its real (possibly zero) values and a clear name."
                     + locked_block
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Structured nutrition context for this user and day:\n"
+                    f"{json.dumps(nutrition_context or {}, ensure_ascii=False)}\n\n"
+                    "Use this only for relevant safety context such as allergies, dietary rules, "
+                    "fasting/medication flags, and whether today's food logging is incomplete. "
+                    "Do not count planned meals as eaten."
                 ),
             },
             {

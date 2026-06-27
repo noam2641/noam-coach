@@ -18,6 +18,7 @@ No Telegram imports — fully testable in isolation.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -55,6 +56,28 @@ WEEKDAY_NAMES: dict[int, str] = {
 _DEFAULT_DAYS_PER_WEEK = 3
 _DEFAULT_PREFERRED_DAYS: list[int] = [0, 2, 4]
 _DEFAULT_SESSION_MINUTES = 45
+_DAY_ALIASES: dict[int, tuple[str, ...]] = {
+    0: ("ראשון", "יום ראשון", "בראשון", "א׳", "א'"),
+    1: ("שני", "יום שני", "בשני", "ב׳", "ב'"),
+    2: ("שלישי", "יום שלישי", "בשלישי", "ג׳", "ג'"),
+    3: ("רביעי", "יום רביעי", "ברביעי", "ד׳", "ד'"),
+    4: ("חמישי", "יום חמישי", "בחמישי", "ה׳", "ה'"),
+    5: ("שישי", "יום שישי", "בשישי", "ו׳", "ו'"),
+    6: ("שבת", "יום שבת", "בשבת"),
+}
+_HEBREW_HOURS: dict[str, int] = {
+    "אחת": 1,
+    "שתיים": 2,
+    "שניים": 2,
+    "שלוש": 3,
+    "ארבע": 4,
+    "חמש": 5,
+    "שש": 6,
+    "שבע": 7,
+    "שמונה": 8,
+    "תשע": 9,
+    "עשר": 10,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +95,17 @@ class TrainingAvailability:
     source: str                        # one of SOURCE_PRIORITY
     confidence: float
     confirmed: bool
+
+
+@dataclass(frozen=True)
+class ParsedAvailabilityAnswer:
+    weekly_availability: list[dict[str, Any]]
+    workout_window: str | None
+    session_minutes: int | None
+
+    @property
+    def training_days_per_week(self) -> int | None:
+        return len(self.weekly_availability) or None
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +187,182 @@ def _parse_workout_pattern(value: Any) -> dict[str, Any]:
         except (json.JSONDecodeError, ValueError):
             pass
     return {}
+
+
+def parse_hebrew_availability_answer(text: str) -> ParsedAvailabilityAnswer:
+    """Parse common Hebrew free-text availability into structured facts.
+
+    Each day keeps its OWN time. The input is split into per-day segments so
+    "ראשון 19:00, שני 19, שלישי 18:30 45 דקות" stores Sunday 19:00, Monday
+    19:00, Tuesday 18:30 (not the first time for everyone). A segment may list
+    several days that share one explicit time. A global/representative time is
+    used ONLY for a day whose own segment carries no time; the system clock is
+    never used.
+    """
+    normalized = f" {text.strip()} "
+    session_minutes = _parse_hebrew_duration_minutes(normalized)
+    minutes = session_minutes or _DEFAULT_SESSION_MINUTES
+
+    segments = _segment_availability_by_day(normalized)
+    if not segments:
+        # No day mentioned: nothing to schedule per-day, but still surface a
+        # global time/duration if the user gave one (e.g. "בערב, 45 דקות").
+        return ParsedAvailabilityAnswer(
+            weekly_availability=[],
+            workout_window=_parse_hebrew_time(normalized),
+            session_minutes=session_minutes,
+        )
+
+    # Representative window: first segment that actually carries a time, else a
+    # global parse over the whole text (handles "ראשון ורביעי בערב").
+    global_time = next(
+        (seg_time for _days, seg_time in segments if seg_time is not None),
+        None,
+    ) or _parse_hebrew_time(normalized)
+
+    slots: dict[int, dict[str, Any]] = {}
+    for seg_days, seg_time in segments:
+        start = seg_time if seg_time is not None else global_time
+        for day in seg_days:
+            slots[day] = {
+                "weekday": day,
+                "start": start,
+                "minutes": minutes,
+                "available": True,
+            }
+
+    weekly_availability = [slots[day] for day in sorted(slots)]
+    return ParsedAvailabilityAnswer(
+        weekly_availability=weekly_availability,
+        workout_window=global_time,
+        session_minutes=session_minutes,
+    )
+
+
+def _segment_availability_by_day(text: str) -> list[tuple[list[int], str | None]]:
+    """Split free text into per-day segments anchored on day-name tokens.
+
+    Returns a list of (weekdays, time) where *weekdays* are the day indices that
+    appear together before the next day's text, and *time* is the explicit time
+    found inside that segment (or None). Consecutive days with no time in
+    between are grouped so a single shared time still applies to all of them,
+    e.g. "שני וחמישי ב-19:30".
+    """
+    matches = _find_day_tokens(text)
+    if not matches:
+        return []
+
+    segments: list[tuple[list[int], str | None]] = []
+    pending_days: list[int] = []
+    for position, (start_idx, end_idx, day) in enumerate(matches):
+        # Text from just after this day token up to the next day token.
+        next_start = matches[position + 1][0] if position + 1 < len(matches) else len(text)
+        between = text[end_idx:next_start]
+        seg_time = _parse_segment_time(between)
+        pending_days.append(day)
+        if seg_time is not None:
+            segments.append((pending_days, seg_time))
+            pending_days = []
+    if pending_days:
+        # Trailing days with no explicit time fall back to the global window.
+        segments.append((pending_days, None))
+    return segments
+
+
+def _find_day_tokens(text: str) -> list[tuple[int, int, int]]:
+    """Locate day-name tokens with positions, longest-alias-first, no overlaps.
+
+    Returns (start, end, weekday) sorted by position. Longer aliases (e.g.
+    "יום ראשון") win over shorter ones ("ראשון") so a day is counted once.
+    """
+    candidates: list[tuple[int, int, int]] = []
+    aliases: list[tuple[str, int]] = [
+        (alias, day) for day, names in _DAY_ALIASES.items() for alias in names
+    ]
+    # Longest aliases first so we prefer the most specific match at a position.
+    aliases.sort(key=lambda pair: len(pair[0]), reverse=True)
+    occupied: list[tuple[int, int]] = []
+    for alias, day in aliases:
+        search_from = 0
+        while True:
+            idx = text.find(alias, search_from)
+            if idx == -1:
+                break
+            end = idx + len(alias)
+            if not any(idx < occ_end and end > occ_start for occ_start, occ_end in occupied):
+                candidates.append((idx, end, day))
+                occupied.append((idx, end))
+            search_from = idx + 1
+    candidates.sort(key=lambda item: item[0])
+    return candidates
+
+
+def _parse_hebrew_days(text: str) -> list[int]:
+    found: list[int] = []
+    for day, aliases in _DAY_ALIASES.items():
+        if any(alias in text for alias in aliases):
+            found.append(day)
+    return sorted(set(found))
+
+
+def _parse_segment_time(segment: str) -> str | None:
+    """Parse a time inside a single day's segment, allowing a bare hour.
+
+    Within a day's own text "שני 19" should mean 19:00. A bare hour is accepted
+    only when it is NOT immediately followed by a duration word (so "45 דקות"
+    is never read as an hour). Falls back to the shared Hebrew time parser for
+    everything else (explicit HH:MM, word hours, parts of day).
+    """
+    padded = f" {segment.strip()} "
+    explicit = _parse_hebrew_time(padded)
+    if explicit is not None:
+        return explicit
+    # Bare hour like "19" or "9" not attached to a duration ("45 דקות") and not
+    # part of a longer number.
+    bare = re.search(r"(?<!\d)([01]?\d|2[0-3])(?!\d)(?!\s*(?:דקות|דקה|דק))", padded)
+    if bare:
+        hour = int(bare.group(1))
+        if ("ערב" in padded or "לילה" in padded) and hour < 12:
+            hour += 12
+        return f"{hour:02d}:00"
+    return None
+
+
+def _parse_hebrew_time(text: str) -> str | None:
+    explicit = re.search(r"(?<!\d)([01]?\d|2[0-3])[:.](\d{2})(?!\d)", text)
+    if explicit:
+        return f"{int(explicit.group(1)):02d}:{int(explicit.group(2)):02d}"
+    word_hour = next((hour for word, hour in _HEBREW_HOURS.items() if word in text), None)
+    if word_hour is not None:
+        if "ערב" in text or "לילה" in text:
+            word_hour = word_hour + 12 if word_hour < 12 else word_hour
+        return f"{word_hour:02d}:00"
+    hour_match = re.search(r"(?:בשעה|ב־|ב-)\s*([01]?\d|2[0-3])(?!\d)", text)
+    if hour_match:
+        hour = int(hour_match.group(1))
+        if ("ערב" in text or "לילה" in text) and hour < 12:
+            hour += 12
+        return f"{hour:02d}:00"
+    if "בוקר" in text:
+        return "07:00"
+    if "צהריים" in text or "צהרים" in text:
+        return "12:00"
+    if "ערב" in text:
+        return "18:00"
+    return None
+
+
+def _parse_hebrew_duration_minutes(text: str) -> int | None:
+    match = re.search(r"(?<!\d)(\d{2,3})\s*(?:דקות|דקה|דק)", text)
+    if match:
+        minutes = int(match.group(1))
+        if 10 <= minutes <= 300:
+            return minutes
+    if "שעה וחצי" in text:
+        return 90
+    if "שעה" in text:
+        return 60
+    return None
 
 
 # ---------------------------------------------------------------------------

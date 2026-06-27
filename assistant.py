@@ -28,6 +28,7 @@ Action = Literal[
     "build_plan",  # "תבנה לי תוכנית" / "3 אימונים בשבוע"
     "start_workout",  # "בוא נתאמן" / "אימון"
     "set_goal",  # "אני רוצה לרדת ל-85"
+    "set_calorie_goal",  # "יעד 2100" / "תשנה לי ל-2100 קלוריות" (REC re7 P0-4)
     "set_dietary_pref",  # "אני לא שותה אלכוהול" / "אני צמחוני" / "אלרגי לבוטנים"
     "morning_flag",  # "לקחתי ריטלין" / "היום צום"
     "report_pain",  # "כואבת לי הברך"
@@ -61,7 +62,10 @@ SYSTEM_PROMPT = (
     "- build_plan: wants a workout program built; slot 'frequency' if a number "
     "of workouts/week is mentioned.\n"
     "- start_workout: wants to start/open a workout now.\n"
-    "- set_goal: states a target (e.g. goal weight); slot 'goal_weight'.\n"
+    "- set_goal: states a target body weight; slot 'goal_weight'.\n"
+    "- set_calorie_goal: wants to set/change the DAILY CALORIE target. Examples: "
+    "'יעד 2100', 'תשנה לי ל-2100 קלוריות', 'אני רוצה לאכול 2100 ביום', 'היעד שלי "
+    "2100', 'בעצם 2000'. Slot 'calories' = the number (typically 800-6000).\n"
     "- set_dietary_pref: states a STANDING dietary preference, restriction or "
     "allergy that is NOT a report of food eaten now. Examples: 'אני לא שותה "
     "אלכוהול', 'אני לא אוכל בשר', 'אני צמחוני', 'אלרגי לבוטנים', 'בלי גלוטן'. "
@@ -216,6 +220,15 @@ def keyword_fallback(text: str) -> Intent:
         num = _looks_numeric(t)
         if num and 100 <= num <= 250:
             return Intent(action="update_measurement", slots={"height_cm": num}, confidence=0.7)
+    # Daily calorie-goal change (REC re7 P0-4) — must come BEFORE goal weight so
+    # "יעד 2100" is read as 2100 calories, not an impossible 2100 kg body weight.
+    if (
+        has("קלוריות", "קלוריה", "יעד", "תשנה", "לשנות", "בעצם")
+        or (has("לאכול") and has("ביום"))
+    ):
+        num = _looks_numeric(t)
+        if num and 800 <= num <= 6000:
+            return Intent(action="set_calorie_goal", slots={"calories": int(num)}, confidence=0.7)
     if has("רדת", "להוריד", "יעד", "להגיע ל"):
         num = _looks_numeric(t)
         if num and 30 <= num <= 400:
@@ -228,6 +241,18 @@ def keyword_fallback(text: str) -> Intent:
             action="set_dietary_pref",
             slots={"kind": "allergy", "polarity": "avoid", "item": t, "note": t},
             confidence=0.7,
+        )
+    if has("לא אוהב", "לא אוהבת", "לא מתחבר", "לא מתחברת", "לא בא לי"):
+        return Intent(
+            action="set_dietary_pref",
+            slots={"kind": "preference", "polarity": "avoid", "item": t, "note": t},
+            confidence=0.72,
+        )
+    if has("מעדיף", "מעדיפה"):
+        return Intent(
+            action="set_dietary_pref",
+            slots={"kind": "preference", "polarity": "prefer", "item": t, "note": t},
+            confidence=0.68,
         )
     pref = _dietary_negation(t)
     if pref is not None:

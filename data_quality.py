@@ -174,6 +174,7 @@ async def can_send_proactive(
     db: Any,
     user_id: int,
     *,
+    require_goal_quality: bool = False,
     require_nutrition_quality: bool = False,
     start_utc: str | None = None,
     end_utc: str | None = None,
@@ -183,7 +184,7 @@ async def can_send_proactive(
         (user_id,),
     )
     if flow and flow.get("flow") not in {None, "", "idle"}:
-        return False, "קיים תהליך שיחה פעיל"
+        return False, "active_flow"
 
     recent = await db.fetch_one(
         """
@@ -199,15 +200,17 @@ async def can_send_proactive(
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
             if (datetime.now(timezone.utc) - ts).total_seconds() < 10 * 60:
-                return False, "המשתמש פעיל כרגע"
+                return False, "user_recently_active"
         except (ValueError, TypeError):
             pass
 
+    if require_goal_quality or require_nutrition_quality:
+        goal = await active_goal_quality(db, user_id)
+        if goal.score < 0.6:
+            return False, "goal_quality_insufficient"
+
     if require_nutrition_quality and start_utc and end_utc:
         day = await assess_day(db, user_id, start_utc, end_utc)
-        goal = await active_goal_quality(db, user_id)
         if not day.usable:
-            return False, "איכות דיווח האוכל אינה מספקת"
-        if goal.score < 0.6:
-            return False, "היעד אינו מספיק אמין"
+            return False, "nutrition_quality_insufficient"
     return True, "ok"

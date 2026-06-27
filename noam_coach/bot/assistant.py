@@ -265,9 +265,36 @@ async def _handle_redundant_question_challenge(ctx: FreeTextContext) -> bool:
 
 @runtime_bound(RUNTIME_NAMES)
 async def _handle_status_text_action(ctx: FreeTextContext) -> bool:
+    if ctx.action == "next_meal":
+        from noam_coach.services.next_meal import (
+            format_next_meal_recommendation,
+            generate_next_meal_recommendation,
+            next_meal_action_rows,
+            record_next_meal_served,
+            remember_active_recommendation,
+        )
+
+        await ctx.message.chat.send_action("typing")
+        recommendation = await generate_next_meal_recommendation(DB, ctx.user_id)
+        keyboard_rows = [
+            [button(label, callback_data) for label, callback_data in row]
+            for row in next_meal_action_rows(recommendation)
+        ]
+        keyboard_rows.append([button("⬅️ חזרה למצב היום", "menu:status"), button("🏠 תפריט", "menu:home")])
+        sent = await ctx.message.reply_text(
+            format_next_meal_recommendation(recommendation),
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+            parse_mode=ParseMode.HTML,
+        )
+        await record_next_meal_served(DB, ctx.user_id, recommendation)
+        await remember_active_recommendation(
+            DB, ctx.user_id, recommendation,
+            message_id=getattr(sent, "message_id", None),
+        )
+        return True
+
     builders = {
         "today_menu": build_morning_menu_text,
-        "next_meal": build_next_meal_text,
         "evening_summary": build_evening_summary_text,
         "request_progress": build_progress_text,
         "show_profile": build_profile_text,
@@ -346,10 +373,62 @@ async def _handle_goal_text_action(ctx: FreeTextContext) -> bool:
             await ctx.send("מה היעד? כתוב לי משקל יעד (למשל 85).", None)
         return True
 
+    if ctx.action == "set_calorie_goal":
+        await _handle_calorie_goal_change(ctx)
+        return True
+
     if ctx.action == "set_dietary_pref":
         await record_dietary_preference(ctx.user_id, ctx.slots, ctx.text, ctx.send)
         return True
     return False
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def _handle_calorie_goal_change(ctx: FreeTextContext) -> None:
+    """REC re7 P0-4: a free-text daily-calorie change -> explicit confirm flow.
+
+    Shows previous vs new target and asks for confirmation. The activation
+    itself runs through the existing confirm:goal_cal callback, which versions
+    the goal, supersedes the old one, and refreshes the daily snapshot.
+    """
+    calories = ctx.slots.get("calories")
+    try:
+        new_cal = int(float(calories))
+    except (TypeError, ValueError):
+        new_cal = 0
+    if not (800 <= new_cal <= 6000):
+        await ctx.send(
+            "מה יעד הקלוריות היומי שתרצה? כתוב מספר (למשל \"יעד 2100\").",
+            None,
+        )
+        return
+
+    current = await fetch_goal(ctx.user_id)
+    prev_cal = int(current.get("calories") or 0)
+    prev_label = "יעד זמני" if current.get("provisional") else "יעד נוכחי"
+    await event_log.append_event(
+        DB,
+        ctx.user_id,
+        "goal_change_requested",
+        entity="goal",
+        source="user_text",
+        properties={"previous": prev_cal, "requested": new_cal},
+    )
+    await set_confirm_pending(ctx.user_id, {"value": float(new_cal), "text": ctx.text})
+    await ctx.send(
+        (
+            "<b>שינוי יעד קלוריות</b>\n\n"
+            f"{prev_label}: <b>{prev_cal:,}</b> קלוריות\n"
+            f"יעד מבוקש: <b>{new_cal:,}</b> קלוריות\n\n"
+            "אחרי אישור זה יהפוך ליעד הפעיל היחיד, ומצב היום והחישובים יתעדכנו מיד."
+        ),
+        InlineKeyboardMarkup(
+            [
+                [button("✅ אישור יעד", f"confirm:goal_cal:{new_cal}")],
+                [button("✏️ עריכה", "confirm:cancel:0"), button("❌ ביטול", "confirm:cancel:0")],
+            ]
+        ),
+    )
 
 
 @runtime_bound(RUNTIME_NAMES)
@@ -593,38 +672,36 @@ async def record_dietary_preference(
     (string, comma-separated, deduped) and tells the user exactly what changed,
     including the source so it is clear the bot inferred this from their text.
     """
-    kind = str(slots.get("kind") or "restriction")
     item = _clean_pref_item(str(slots.get("item") or slots.get("note") or text))
     if not item:
         await send("לא הצלחתי להבין איזו העדפה לרשום. נסה למשל: \"אני לא שותה אלכוהול\".", None)
         return
 
-    fact_key = "allergies" if kind == "allergy" else "diet_restrictions"
-    existing = await user_model.get_value(DB, user_id, fact_key)
-    parts = [p.strip() for p in str(existing).split(",") if p.strip()] if existing else []
-    already = any(item == p or item in p for p in parts)
-    if not already:
-        parts.append(item)
-    new_value = ", ".join(dict.fromkeys(parts))
-
-    await user_model.set_fact(
-        DB,
-        user_id,
-        fact_key,
-        new_value,
-        kind=user_model.KIND_FACT,
-        source=user_model.SOURCE_USER,
-        confirmed=True,
+    from noam_coach.services.food_preferences import (
+        DISLIKE_FACT,
+        PREFERENCE_FACT,
+        record_food_preference_from_slots,
     )
 
-    label = "אלרגיה" if kind == "allergy" else "מגבלה/העדפה תזונתית"
-    if already:
+    update = await record_food_preference_from_slots(DB, user_id, slots, text)
+    item = update.item
+    new_value = update.new_value
+
+    labels = {
+        "allergies": "אלרגיה",
+        "diet_restrictions": "מגבלה תזונתית",
+        DISLIKE_FACT: "מאכל שלא מתאים לך",
+        PREFERENCE_FACT: "העדפת אוכל",
+    }
+    label = labels.get(update.fact_key, "העדפה תזונתית")
+    contradiction_note = "\nניקיתי גם סתירה קודמת ברשימת ההעדפות." if update.removed_from else ""
+    if update.already_present:
         body = f"כבר רשום אצלי ש{label} כוללת: <b>{esc(item)}</b>. לא שיניתי דבר."
     else:
         body = (
             f"עדכנתי {label}: <b>{esc(item)}</b> ✅\n"
             f"זו לא ארוחה — שמרתי את זה כהעדפה קבועה (מקור: דיווח שלך).\n"
-            f"כל הרשימה כעת: {esc(new_value)}"
+            f"כל הרשימה כעת: {esc(new_value)}{contradiction_note}"
         )
     await send(
         body,

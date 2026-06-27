@@ -1,0 +1,1579 @@
+"""Deterministic next-meal recommendation service.
+
+REC-NEXT-MEAL-05 centralises "what should I eat now?" so Telegram, proactive
+jobs, and the Mini App all read the same workout-aware nutrition context.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import re
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, time, timedelta, timezone
+from enum import Enum
+from typing import Any
+
+import planning
+import user_model
+from config import SETTINGS, TZ
+from helpers import esc, today_bounds_utc, utc_now
+from noam_coach.services.dietary_restrictions import (
+    DietaryRestriction,
+    load_restrictions_from_facts,
+    validate_meal_restrictions,
+)
+from noam_coach.services.food_preferences import (
+    merge_with_preference_restrictions,
+    preference_restrictions_from_facts,
+    record_food_preference_from_slots,
+)
+
+
+class WorkoutPhase(str, Enum):
+    REST_DAY = "rest_day"
+    PRE_WORKOUT_EARLY = "pre_workout_early"
+    PRE_WORKOUT_NEAR = "pre_workout_near"
+    PRE_WORKOUT_IMMEDIATE = "pre_workout_immediate"
+    DURING_WORKOUT = "during_workout"
+    POST_WORKOUT_IMMEDIATE = "post_workout_immediate"
+    POST_WORKOUT_LATER = "post_workout_later"
+    WORKOUT_COMPLETED_EARLIER = "workout_completed_earlier"
+    WORKOUT_CANCELLED = "workout_cancelled"
+    WORKOUT_PLANNED_TIME_PASSED = "workout_planned_time_passed"
+    WORKOUT_STATUS_UNKNOWN = "workout_status_unknown"
+
+
+@dataclass
+class NutritionTotals:
+    target_calories: int | None
+    target_protein: int | None
+    consumed_calories: int
+    consumed_protein: int
+    calorie_balance: int | None
+    protein_balance: int | None
+    calorie_overage: int
+    protein_overage: int
+    goal_status: str
+    goal_source: str
+
+
+@dataclass
+class WorkoutNutritionContext:
+    user_id: int
+    local_now: str
+    local_day: str
+    nutrition: NutritionTotals
+    workout_phase: WorkoutPhase
+    workout_source: str
+    workout_label: str
+    planned_workout_start: str | None = None
+    planned_workout_end: str | None = None
+    actual_workout_start: str | None = None
+    actual_workout_end: str | None = None
+    minutes_until_workout: int | None = None
+    minutes_since_workout: int | None = None
+    hours_until_bedtime: float | None = None
+    meals_remaining_estimate: int = 1
+    recent_meal_minutes_ago: int | None = None
+    recent_meal_name: str | None = None
+    fasting: bool = False
+    medications_today: list[str] = field(default_factory=list)
+    restrictions: list[str] = field(default_factory=list)
+    assumptions: list[str] = field(default_factory=list)
+
+
+@dataclass
+class MealBudget:
+    calories_min: int
+    calories_max: int
+    protein_min: int
+    protein_max: int
+    meal_size: str
+    rationale: str
+    # re7 P0-2: the remaining daily calories the budget MUST respect, the policy
+    # mode used to build it, and whether the budget deliberately exceeds the
+    # remaining balance (only with an explicit, surfaced justification).
+    policy: str = "normal"
+    remaining_calories: int | None = None
+    allows_overage: bool = False
+    overage_reason: str | None = None
+
+
+@dataclass
+class MealOption:
+    title: str
+    ingredients: list[str]
+    calories: int
+    protein: int
+    rationale: str
+    substitutions: list[str] = field(default_factory=list)
+    restriction_validated: bool = True
+
+
+@dataclass
+class NextMealRecommendation:
+    context: WorkoutNutritionContext
+    budget: MealBudget
+    options: list[MealOption]
+    needs_workout_clarification: bool = False
+    notices: list[str] = field(default_factory=list)
+    validation_events: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        out = asdict(self)
+        out["context"]["workout_phase"] = self.context.workout_phase.value
+        return out
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _clamp_int(value: float, low: int, high: int) -> int:
+    return int(max(low, min(high, round(value))))
+
+
+def _parse_dt(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(TZ)
+
+
+def _parse_hhmm(value: Any) -> time | None:
+    if not value:
+        return None
+    text = str(value).strip()[:5]
+    try:
+        hour, minute = text.split(":", 1)
+        return time(int(hour), int(minute))
+    except (TypeError, ValueError):
+        return None
+
+
+def _sunday_index(local_dt: datetime) -> int:
+    return (local_dt.weekday() + 1) % 7
+
+
+async def _daily_flags(db: Any, user_id: int, local_day: str) -> dict[str, Any]:
+    row = await db.fetch_one(
+        "SELECT flags FROM daily_flags WHERE user_id=? AND day=?",
+        (user_id, local_day),
+    )
+    if not row:
+        return {}
+    try:
+        data = json.loads(row["flags"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+async def save_next_meal_workout_status(
+    db: Any,
+    user_id: int,
+    status: str,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Persist today's explicit workout clarification from a Telegram button."""
+    local_now = (now or datetime.now(TZ)).astimezone(TZ)
+    local_day = local_now.date().isoformat()
+    flags = await _daily_flags(db, user_id, local_day)
+    flags["next_meal_workout_status"] = status
+    flags["next_meal_workout_status_at"] = utc_now()
+    await _save_daily_flags(db, user_id, local_day, flags)
+
+
+async def _save_daily_flags(db: Any, user_id: int, local_day: str, flags: dict[str, Any]) -> None:
+    await db.execute(
+        """
+        INSERT INTO daily_flags(user_id, day, flags, created_at)
+        VALUES(?, ?, ?, ?)
+        ON CONFLICT(user_id, day) DO UPDATE SET flags=excluded.flags
+        """,
+        (user_id, local_day, json.dumps(flags, ensure_ascii=False), utc_now()),
+    )
+
+
+async def _today_meals(db: Any, user_id: int) -> list[dict[str, Any]]:
+    start_utc, end_utc = today_bounds_utc()
+    return await db.fetch_all(
+        """
+        SELECT name, calories, protein, eaten_at
+        FROM meals
+        WHERE user_id=? AND eaten_at>=? AND eaten_at<?
+        ORDER BY eaten_at DESC
+        """,
+        (user_id, start_utc, end_utc),
+    )
+
+
+async def _nutrition_totals(db: Any, user_id: int) -> tuple[NutritionTotals, dict[str, Any] | None]:
+    goal = await planning.active_goal(db, user_id)
+    target_calories = None
+    target_protein = None
+    goal_status = "unavailable"
+    goal_source = "none"
+    if goal:
+        cal = _safe_float(goal.get("calories"))
+        protein = _safe_float(goal.get("protein"))
+        if cal and cal > 0:
+            target_calories = int(round(cal))
+        if protein and protein > 0:
+            target_protein = int(round(protein))
+        goal_status = str(goal.get("status") or "active")
+        goal_source = str(goal.get("source") or "goal_versions")
+    else:
+        target_calories = int(getattr(SETTINGS, "default_calories", 2000) or 2000)
+        target_protein = int(getattr(SETTINGS, "default_protein", 140) or 140)
+        goal_status = "default"
+        goal_source = "settings_default"
+
+    consumed_calories = 0
+    consumed_protein = 0
+    for row in await _today_meals(db, user_id):
+        calories = _safe_float(row.get("calories"))
+        protein = _safe_float(row.get("protein"))
+        if calories is not None and calories > 0:
+            consumed_calories += int(round(calories))
+        if protein is not None and protein > 0:
+            consumed_protein += int(round(protein))
+
+    calorie_balance = None if target_calories is None else target_calories - consumed_calories
+    protein_balance = None if target_protein is None else target_protein - consumed_protein
+    return (
+        NutritionTotals(
+            target_calories=target_calories,
+            target_protein=target_protein,
+            consumed_calories=consumed_calories,
+            consumed_protein=consumed_protein,
+            calorie_balance=calorie_balance,
+            protein_balance=protein_balance,
+            calorie_overage=max(0, -int(calorie_balance or 0)),
+            protein_overage=max(0, -int(protein_balance or 0)),
+            goal_status=goal_status,
+            goal_source=goal_source,
+        ),
+        goal,
+    )
+
+
+async def _recent_meal(db: Any, user_id: int, now: datetime) -> tuple[str | None, int | None]:
+    rows = await _today_meals(db, user_id)
+    if not rows:
+        return None, None
+    row = rows[0]
+    eaten_at = _parse_dt(row.get("eaten_at"))
+    if not eaten_at:
+        return str(row.get("name") or ""), None
+    minutes = max(0, int((now - eaten_at).total_seconds() // 60))
+    return str(row.get("name") or ""), minutes
+
+
+async def _restrictions(db: Any, user_id: int) -> list[DietaryRestriction]:
+    diet = await user_model.get_value(db, user_id, "diet_restrictions")
+    allergies = await user_model.get_value(db, user_id, "allergies")
+    base = load_restrictions_from_facts(
+        str(diet) if diet not in (None, "", "none") else None,
+        str(allergies) if allergies not in (None, "", "none") else None,
+    )
+    preferences = await preference_restrictions_from_facts(db, user_id)
+    return merge_with_preference_restrictions(base, preferences)
+
+
+async def _bedtime_hours(db: Any, user_id: int, now: datetime) -> float | None:
+    sleep_fact = await user_model.get_value(db, user_id, "sleep_schedule")
+    bedtime = None
+    if isinstance(sleep_fact, dict):
+        bedtime = sleep_fact.get("bedtime") or sleep_fact.get("typical_bedtime")
+    if not bedtime:
+        row = await db.fetch_one("SELECT profile FROM routine_profile WHERE user_id=?", (user_id,))
+        if row:
+            try:
+                profile = json.loads(row["profile"] or "{}")
+                bedtime = (profile.get("sleep") or {}).get("typical_bedtime")
+            except (TypeError, json.JSONDecodeError):
+                bedtime = None
+    parsed = _parse_hhmm(bedtime) or time(23, 0)
+    bed_dt = datetime.combine(now.date(), parsed, tzinfo=TZ)
+    if bed_dt <= now:
+        bed_dt += timedelta(days=1)
+    return round((bed_dt - now).total_seconds() / 3600, 1)
+
+
+async def _active_session(db: Any, user_id: int) -> dict[str, Any] | None:
+    return await db.fetch_one(
+        """
+        SELECT *
+        FROM sessions
+        WHERE user_id=? AND status='active'
+        ORDER BY started_at DESC, id DESC
+        LIMIT 1
+        """,
+        (user_id,),
+    )
+
+
+async def _latest_closed_session_today(db: Any, user_id: int) -> dict[str, Any] | None:
+    start_utc, end_utc = today_bounds_utc()
+    return await db.fetch_one(
+        """
+        SELECT *
+        FROM sessions
+        WHERE user_id=?
+          AND ended_at>=?
+          AND ended_at<?
+          AND status IN ('completed', 'partial', 'cancelled')
+        ORDER BY ended_at DESC, id DESC
+        LIMIT 1
+        """,
+        (user_id, start_utc, end_utc),
+    )
+
+
+def _planned_session_for_today(workout_plan: dict[str, Any] | None, now: datetime) -> dict[str, Any] | None:
+    if not workout_plan:
+        return None
+    sessions = (workout_plan.get("payload") or {}).get("sessions") or []
+    today = _sunday_index(now)
+    candidates = [session for session in sessions if int(session.get("weekday", -1)) == today]
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda item: str(item.get("time") or "23:59"))[0]
+
+
+def _phase_from_times(now: datetime, start: datetime, end: datetime) -> tuple[WorkoutPhase, int | None, int | None]:
+    if now < start:
+        minutes_until = int((start - now).total_seconds() // 60)
+        if minutes_until <= 30:
+            return WorkoutPhase.PRE_WORKOUT_IMMEDIATE, minutes_until, None
+        if minutes_until <= 120:
+            return WorkoutPhase.PRE_WORKOUT_NEAR, minutes_until, None
+        return WorkoutPhase.PRE_WORKOUT_EARLY, minutes_until, None
+    if start <= now <= end:
+        return WorkoutPhase.WORKOUT_STATUS_UNKNOWN, None, None
+    return WorkoutPhase.WORKOUT_PLANNED_TIME_PASSED, None, int((now - end).total_seconds() // 60)
+
+
+async def _workout_state(
+    db: Any,
+    user_id: int,
+    now: datetime,
+    flags: dict[str, Any],
+) -> dict[str, Any]:
+    explicit = str(flags.get("next_meal_workout_status") or "").strip()
+    if explicit == "during":
+        return {
+            "phase": WorkoutPhase.DURING_WORKOUT,
+            "source": "user_clarification",
+            "label": "האימון מתבצע עכשיו לפי הדיווח שלך.",
+        }
+    if explicit == "completed":
+        return {
+            "phase": WorkoutPhase.POST_WORKOUT_IMMEDIATE,
+            "source": "user_clarification",
+            "label": "דיווחת שהאימון הושלם.",
+            "minutes_since": 0,
+        }
+    if explicit == "cancelled":
+        return {
+            "phase": WorkoutPhase.WORKOUT_CANCELLED,
+            "source": "user_clarification",
+            "label": "דיווחת שהאימון בוטל היום.",
+        }
+
+    active = await _active_session(db, user_id)
+    if active:
+        return {
+            "phase": WorkoutPhase.DURING_WORKOUT,
+            "source": "active_session",
+            "label": "יש אימון פעיל כרגע.",
+            "actual_start": _parse_dt(active.get("started_at")),
+        }
+
+    closed = await _latest_closed_session_today(db, user_id)
+    if closed:
+        ended = _parse_dt(closed.get("ended_at"))
+        if str(closed.get("status")) == "cancelled":
+            return {
+                "phase": WorkoutPhase.WORKOUT_CANCELLED,
+                "source": "session_status",
+                "label": "האימון סומן כמבוטל היום.",
+                "actual_end": ended,
+            }
+        minutes_since = int((now - ended).total_seconds() // 60) if ended else None
+        if minutes_since is not None and minutes_since <= 90:
+            phase = WorkoutPhase.POST_WORKOUT_IMMEDIATE
+        elif minutes_since is not None and minutes_since <= 360:
+            phase = WorkoutPhase.POST_WORKOUT_LATER
+        else:
+            phase = WorkoutPhase.WORKOUT_COMPLETED_EARLIER
+        return {
+            "phase": phase,
+            "source": "completed_session",
+            "label": "האימון היום כבר הושלם.",
+            "actual_start": _parse_dt(closed.get("started_at")),
+            "actual_end": ended,
+            "minutes_since": minutes_since,
+        }
+
+    workout_plan = await planning.get_active_plan(db, user_id, "workout")
+    planned = _planned_session_for_today(workout_plan, now)
+    if planned:
+        start_time = _parse_hhmm(planned.get("time")) or time(18, 0)
+        minutes = int(planned.get("minutes") or 60)
+        start = datetime.combine(now.date(), start_time, tzinfo=TZ)
+        end = start + timedelta(minutes=minutes)
+        phase, minutes_until, minutes_since = _phase_from_times(now, start, end)
+        if explicit == "later" and phase in {
+            WorkoutPhase.WORKOUT_STATUS_UNKNOWN,
+            WorkoutPhase.WORKOUT_PLANNED_TIME_PASSED,
+        }:
+            phase = WorkoutPhase.PRE_WORKOUT_NEAR
+            minutes_until = None
+        return {
+            "phase": phase,
+            "source": "active_workout_plan",
+            "label": "יש אימון מתוכנן היום לפי התוכנית.",
+            "planned_start": start,
+            "planned_end": end,
+            "minutes_until": minutes_until,
+            "minutes_since": minutes_since,
+        }
+
+    routine_pattern = await db.fetch_one("SELECT profile FROM routine_profile WHERE user_id=?", (user_id,))
+    if routine_pattern:
+        try:
+            profile = json.loads(routine_pattern["profile"] or "{}")
+            weekdays = ((profile.get("workout") or {}).get("common_weekdays") or [])
+            if now.weekday() in [int(day) for day in weekdays]:
+                return {
+                    "phase": WorkoutPhase.WORKOUT_STATUS_UNKNOWN,
+                    "source": "routine_pattern",
+                    "label": "יש דפוס אימונים היסטורי היום, אבל אין ראיה שאימון נקבע או בוצע.",
+                }
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+
+    return {
+        "phase": WorkoutPhase.REST_DAY,
+        "source": "no_workout_evidence",
+        "label": "לא נמצא אימון מתוכנן או פעיל היום.",
+    }
+
+
+def _meals_remaining(hours_until_bedtime: float | None, recent_minutes: int | None, flags: dict[str, Any]) -> int:
+    assumption = str(flags.get("next_meal_count_assumption") or "").strip()
+    if assumption in {"1", "last", "one"}:
+        return 1
+    if assumption in {"2", "two"}:
+        return 2
+    if assumption in {"3", "three"}:
+        return 3
+    if hours_until_bedtime is None:
+        estimate = 2
+    elif hours_until_bedtime <= 3:
+        estimate = 1
+    elif hours_until_bedtime <= 7:
+        estimate = 2
+    else:
+        estimate = 3
+    if recent_minutes is not None and recent_minutes < 75:
+        estimate = min(estimate, 1)
+    return max(1, min(3, estimate))
+
+
+async def build_workout_nutrition_context(
+    db: Any,
+    user_id: int,
+    *,
+    now: datetime | None = None,
+) -> WorkoutNutritionContext:
+    local_now = (now or datetime.now(TZ)).astimezone(TZ)
+    local_day = local_now.date().isoformat()
+    flags = await _daily_flags(db, user_id, local_day)
+    nutrition, _goal = await _nutrition_totals(db, user_id)
+    workout = await _workout_state(db, user_id, local_now, flags)
+    recent_name, recent_minutes = await _recent_meal(db, user_id, local_now)
+    hours_until_bedtime = await _bedtime_hours(db, user_id, local_now)
+    restrictions = await _restrictions(db, user_id)
+    assumptions: list[str] = []
+    if nutrition.goal_status in {"default", "unavailable"}:
+        assumptions.append("אין יעד פעיל מאושר, לכן נעשה שימוש בערכי ברירת מחדל זהירים.")
+    elif nutrition.goal_status == "active_provisional":
+        assumptions.append("היעד זמני, לכן ההמלצה נשארת שמרנית.")
+    if workout["source"] == "routine_pattern":
+        assumptions.append("דפוס אימונים היסטורי אינו הוכחה שאימון מתקיים היום.")
+
+    return WorkoutNutritionContext(
+        user_id=user_id,
+        local_now=local_now.isoformat(),
+        local_day=local_day,
+        nutrition=nutrition,
+        workout_phase=workout["phase"],
+        workout_source=str(workout["source"]),
+        workout_label=str(workout["label"]),
+        planned_workout_start=workout.get("planned_start").isoformat() if workout.get("planned_start") else None,
+        planned_workout_end=workout.get("planned_end").isoformat() if workout.get("planned_end") else None,
+        actual_workout_start=workout.get("actual_start").isoformat() if workout.get("actual_start") else None,
+        actual_workout_end=workout.get("actual_end").isoformat() if workout.get("actual_end") else None,
+        minutes_until_workout=workout.get("minutes_until"),
+        minutes_since_workout=workout.get("minutes_since"),
+        hours_until_bedtime=hours_until_bedtime,
+        meals_remaining_estimate=_meals_remaining(hours_until_bedtime, recent_minutes, flags),
+        recent_meal_minutes_ago=recent_minutes,
+        recent_meal_name=recent_name,
+        fasting=bool(flags.get("fasting")),
+        medications_today=[
+            str(item)
+            for item in (flags.get("medications") or [])
+            if str(item).strip()
+        ],
+        restrictions=[restriction.canonical_id for restriction in restrictions],
+        assumptions=assumptions,
+    )
+
+
+# re7 P0-2: a near-workout meal may justifiably exceed the plain remaining
+# balance, but only by a bounded amount and always with a surfaced reason.
+_WORKOUT_OVERAGE_PHASES = {
+    WorkoutPhase.PRE_WORKOUT_IMMEDIATE,
+    WorkoutPhase.PRE_WORKOUT_NEAR,
+    WorkoutPhase.POST_WORKOUT_IMMEDIATE,
+    WorkoutPhase.POST_WORKOUT_LATER,
+    WorkoutPhase.DURING_WORKOUT,
+}
+# Below this many remaining calories we treat the day as "low remaining" and
+# build a protein-dense, balance-fitting budget instead of a normal meal.
+_LOW_REMAINING_THRESHOLD = 350
+# A budget cap is never allowed to fall below this floor unless there is a real
+# positive remaining balance smaller than it (then the balance is the cap).
+_MIN_MEAL_FLOOR = 120
+
+
+def allocate_next_meal_budget(
+    context: WorkoutNutritionContext,
+    *,
+    allow_overage: bool = False,
+) -> MealBudget:
+    """Build a meal budget that treats remaining calories as a binding cap.
+
+    The maximum calories never exceed the remaining daily balance, except:
+      * a bounded, explicitly-explained overage near a workout, or
+      * an overage the user explicitly asked for (``allow_overage``).
+    When the day is at/over target, no "full meal that meets the goal" is built;
+    instead a light-recovery or explicit-overage budget is returned.
+    """
+    nutrition = context.nutrition
+    balance = nutrition.calorie_balance
+    remaining_cal = int(balance) if balance is not None else None
+    remaining_protein = max(0, int(nutrition.protein_balance or 0))
+    meals_left = max(1, context.meals_remaining_estimate)
+    base_protein = remaining_protein / meals_left if remaining_protein else 22
+    phase = context.workout_phase
+
+    def _cap(value: int, *, allow: bool, reason: str | None) -> int:
+        """Clamp a desired calorie ceiling to the remaining balance."""
+        if remaining_cal is None:
+            return value  # unknown balance: no numeric cap to enforce
+        if allow:
+            # Bounded overage: at most +35% of remaining (min +250) over balance.
+            ceiling = max(remaining_cal, 0) + max(250, int(max(remaining_cal, 0) * 0.35))
+            return min(value, ceiling)
+        return min(value, max(remaining_cal, 0))
+
+    # ---- At / over target, or no usable positive balance -------------------
+    if remaining_cal is not None and remaining_cal <= 0:
+        if allow_overage:
+            target = max(250, int(max(0, -remaining_cal) and 300 or 350))
+            return MealBudget(
+                calories_min=150,
+                calories_max=target,
+                protein_min=_clamp_int(base_protein, 18, 35),
+                protein_max=_clamp_int(base_protein + 12, 25, 45),
+                meal_size="explicit_overage",
+                rationale="אישרת חריגה מבוקרת — זו תוספת קטנה מעבר ליעד, עם דגש על חלבון.",
+                policy="explicit_overage",
+                remaining_calories=remaining_cal,
+                allows_overage=True,
+                overage_reason="המשתמש ביקש חריגה מבוקרת",
+            )
+        return MealBudget(
+            calories_min=0,
+            calories_max=max(0, min(150, remaining_cal if remaining_cal > 0 else 150)) if remaining_cal > 0 else 120,
+            protein_min=_clamp_int(base_protein, 12, 30),
+            protein_max=_clamp_int(base_protein + 10, 20, 40),
+            meal_size="at_or_over_target",
+            rationale="הגעת ליעד הקלוריות היומי. עדיף נשנוש קל מאוד או משקה דל קלוריות.",
+            policy="at_or_over_target",
+            remaining_calories=remaining_cal,
+            allows_overage=False,
+        )
+
+    # ---- Workout-justified overage ----------------------------------------
+    workout_overage = phase in _WORKOUT_OVERAGE_PHASES and remaining_cal is not None and remaining_cal < 350
+
+    # ---- Low remaining balance: fit tightly, favour protein ----------------
+    if remaining_cal is not None and 0 < remaining_cal <= _LOW_REMAINING_THRESHOLD and not workout_overage:
+        return MealBudget(
+            calories_min=max(0, min(120, remaining_cal - 40)),
+            calories_max=remaining_cal,
+            protein_min=_clamp_int(max(base_protein, 18), 15, 40),
+            protein_max=_clamp_int(max(base_protein, 18) + 12, 22, 55),
+            meal_size="low_remaining_protein_dense",
+            rationale="נשארו מעט קלוריות להיום, אז האפשרויות נבנו כדי להיכנס ליתרה עם דגש על חלבון.",
+            policy="low_remaining",
+            remaining_calories=remaining_cal,
+            allows_overage=False,
+        )
+
+    # ---- Normal / workout phases ------------------------------------------
+    base_cal = (remaining_cal / meals_left) if (remaining_cal and remaining_cal > 0) else 350
+
+    if phase in {WorkoutPhase.PRE_WORKOUT_IMMEDIATE, WorkoutPhase.DURING_WORKOUT}:
+        desired_max = _clamp_int(min(base_cal, 320), 180, 340)
+        return MealBudget(
+            calories_min=min(120, desired_max),
+            calories_max=_cap(desired_max, allow=workout_overage or allow_overage, reason="סמוך לאימון"),
+            protein_min=8,
+            protein_max=25,
+            meal_size="quick_pre_workout",
+            rationale="קרוב לאימון עדיף משהו קל לעיכול, בלי ארוחה כבדה ושומנית.",
+            policy="workout" if workout_overage else "normal",
+            remaining_calories=remaining_cal,
+            allows_overage=workout_overage or allow_overage,
+            overage_reason="ארוחה סמוכה לאימון" if workout_overage else None,
+        )
+    if phase == WorkoutPhase.PRE_WORKOUT_NEAR:
+        desired_max = _clamp_int(base_cal + 120, 360, 650)
+        return MealBudget(
+            calories_min=min(_clamp_int(base_cal - 120, 200, 450), desired_max),
+            calories_max=_cap(desired_max, allow=workout_overage or allow_overage, reason="לפני אימון"),
+            protein_min=_clamp_int(base_protein, 20, 35),
+            protein_max=_clamp_int(base_protein + 18, 30, 55),
+            meal_size="pre_workout_meal",
+            rationale="יש זמן לארוחה אמיתית לפני האימון, עם פחמימה נוחה וחלבון מתון.",
+            policy="workout" if workout_overage else "normal",
+            remaining_calories=remaining_cal,
+            allows_overage=workout_overage or allow_overage,
+            overage_reason="ארוחה לפני אימון" if workout_overage else None,
+        )
+    if phase in {WorkoutPhase.POST_WORKOUT_IMMEDIATE, WorkoutPhase.POST_WORKOUT_LATER}:
+        desired_max = _clamp_int(base_cal + 160, 480, 780)
+        return MealBudget(
+            calories_min=min(_clamp_int(base_cal - 80, 250, 520), desired_max),
+            calories_max=_cap(desired_max, allow=workout_overage or allow_overage, reason="אחרי אימון"),
+            protein_min=_clamp_int(base_protein + 8, 30, 45),
+            protein_max=_clamp_int(base_protein + 25, 40, 65),
+            meal_size="post_workout_meal",
+            rationale="אחרי אימון כדאי לתת עדיפות לחלבון ולארוחה משביעה.",
+            policy="workout" if workout_overage else "normal",
+            remaining_calories=remaining_cal,
+            allows_overage=workout_overage or allow_overage,
+            overage_reason="ארוחה אחרי אימון" if workout_overage else None,
+        )
+
+    if context.fasting:
+        desired_max = 480
+        return MealBudget(
+            calories_min=min(220, _cap(desired_max, allow=allow_overage, reason=None)),
+            calories_max=_cap(desired_max, allow=allow_overage, reason=None),
+            protein_min=_clamp_int(base_protein, 18, 35),
+            protein_max=_clamp_int(base_protein + 15, 28, 50),
+            meal_size="fast_break",
+            rationale="אתה מסומן בצום היום, לכן ההמלצה מניחה ארוחה עדינה לשבירת צום.",
+            policy="fasting",
+            remaining_calories=remaining_cal,
+            allows_overage=allow_overage,
+        )
+
+    desired_max = _clamp_int(base_cal + 120, 380, 750)
+    return MealBudget(
+        calories_min=min(_clamp_int(base_cal - 100, 200, 520), desired_max),
+        calories_max=_cap(desired_max, allow=allow_overage, reason=None),
+        protein_min=_clamp_int(base_protein, 20, 40),
+        protein_max=_clamp_int(base_protein + 18, 30, 60),
+        meal_size="balanced_meal",
+        rationale="חלוקה מאוזנת של מה שנשאר להיום לפי מספר הארוחות המשוער.",
+        policy="normal",
+        remaining_calories=remaining_cal,
+        allows_overage=allow_overage,
+    )
+
+
+def _low_remaining_templates(budget: MealBudget) -> list[MealOption]:
+    """Protein-dense, low-calorie options for when little budget remains."""
+    cap = max(budget.calories_max, 60)
+    return [
+        MealOption(
+            "קוטג׳ 5% עם ירקות",
+            ["קוטג׳ 5% 150 גרם", "מלפפון", "עגבנייה"],
+            min(cap, 245),
+            min(max(budget.protein_min, 18), budget.protein_max + 5),
+            "צפיפות חלבון גבוהה בקלוריות נמוכות, נכנס ביתרה.",
+            ["אם יש מגבלת חלב: 150 גרם טונה במים במקום."],
+        ),
+        MealOption(
+            "יוגורט חלבון 0% עם פרי קטן",
+            ["יוגורט חלבון 0% 200 גרם", "תפוח קטן"],
+            min(cap, 230),
+            min(max(budget.protein_min, 18), budget.protein_max + 5),
+            "חלבון גבוה, מתוק וקל, ונשאר בתוך היתרה.",
+            ["בלי חלב: פודינג חלבון על בסיס סויה."],
+        ),
+        MealOption(
+            "חביתת חלבונים עם ירק",
+            ["3 חלבוני ביצה", "ירקות מוקפצים", "כף שמן זית קטנה"],
+            min(cap, 210),
+            min(max(budget.protein_min, 16), budget.protein_max + 4),
+            "ארוחה חמה דלת קלוריות עם חלבון איכותי.",
+            ["בלי ביצים: 120 גרם גבינה לבנה 5%."],
+        ),
+    ]
+
+
+def _candidate_templates(phase: WorkoutPhase, budget: MealBudget) -> list[MealOption]:
+    if budget.policy in {"low_remaining", "at_or_over_target"}:
+        return _low_remaining_templates(budget)
+    if phase in {WorkoutPhase.PRE_WORKOUT_IMMEDIATE, WorkoutPhase.DURING_WORKOUT}:
+        return [
+            MealOption(
+                "בננה ושייק חלבון קל",
+                ["בננה", "אבקת חלבון", "מים"],
+                min(budget.calories_max, 260),
+                min(max(budget.protein_min, 20), budget.protein_max),
+                "קל לעיכול ונותן אנרגיה זמינה.",
+                ["אם אין שייק: יוגורט חלבון מתאים רק אם אין מגבלת חלב."],
+            ),
+            MealOption(
+                "פריכיות אורז עם חזה הודו",
+                ["פריכיות אורז", "חזה הודו", "מלפפון"],
+                min(budget.calories_max, 300),
+                min(max(budget.protein_min, 18), budget.protein_max),
+                "קטן, מלוח, ולא כבד לפני תנועה.",
+                ["אפשר להחליף לעוף קר או טונה אם מתאים למגבלות."],
+            ),
+        ]
+    if phase in {WorkoutPhase.POST_WORKOUT_IMMEDIATE, WorkoutPhase.POST_WORKOUT_LATER}:
+        return [
+            MealOption(
+                "קערת אורז ועוף",
+                ["אורז", "חזה עוף", "ירקות", "שמן זית"],
+                _clamp_int((budget.calories_min + budget.calories_max) / 2, budget.calories_min, budget.calories_max),
+                _clamp_int((budget.protein_min + budget.protein_max) / 2, budget.protein_min, budget.protein_max),
+                "ארוחה פשוטה עם חלבון גבוה ופחמימה נוחה אחרי אימון.",
+                ["אפשר להחליף אורז לתפוח אדמה או קינואה."],
+            ),
+            MealOption(
+                "קערת עדשים וקינואה",
+                ["עדשים", "קינואה", "ירקות", "טחינה"],
+                min(budget.calories_max, max(budget.calories_min, 520)),
+                max(budget.protein_min, min(budget.protein_max, 34)),
+                "אפשרות צמחית ומשביעה בלי להישען על מוצרי חלב.",
+                ["אם יש מגבלת שומשום, להחליף טחינה באבוקדו קטן."],
+            ),
+        ]
+    return [
+        MealOption(
+            "צלחת עוף, תפוח אדמה וסלט",
+            ["חזה עוף", "תפוח אדמה", "סלט ירקות", "שמן זית"],
+            _clamp_int((budget.calories_min + budget.calories_max) / 2, budget.calories_min, budget.calories_max),
+            _clamp_int((budget.protein_min + budget.protein_max) / 2, budget.protein_min, budget.protein_max),
+            "מאוזן, משביע, ומכסה חלבון בלי להעמיס.",
+            ["אפשר להחליף עוף בטופו רק אם אין מגבלת סויה."],
+        ),
+        MealOption(
+            "טורטייה חלבון",
+            ["טורטייה חיטה", "חזה הודו", "ירקות", "טחינה"],
+            min(budget.calories_max, max(budget.calories_min, 480)),
+            max(budget.protein_min, min(budget.protein_max, 35)),
+            "מתאים כשצריך משהו מהיר ולא ארוחה כבדה.",
+            ["ללא גלוטן: להחליף לטורטייה תירס או קערת אורז."],
+        ),
+        MealOption(
+            "קערת עדשים ואורז",
+            ["עדשים", "אורז", "ירקות", "שמן זית"],
+            min(budget.calories_max, max(budget.calories_min, 500)),
+            max(budget.protein_min, min(budget.protein_max, 28)),
+            "אפשרות פשוטה בלי חלב, ביצים, דגים או אגוזים.",
+            ["אפשר להוסיף עוף אם אין העדפה צמחית."],
+        ),
+    ]
+
+
+def _filter_options(
+    options: list[MealOption],
+    restrictions: list[DietaryRestriction],
+    recent_titles: list[str] | None = None,
+    budget: MealBudget | None = None,
+) -> list[MealOption]:
+    if not restrictions:
+        return _prioritize_fresh_options(options, recent_titles)
+    safe: list[MealOption] = []
+    for option in options:
+        items = [{"item_name": ingredient} for ingredient in option.ingredients]
+        violations = validate_meal_restrictions(items, restrictions)
+        preference_hit = _matches_free_text_preference([option.title, *option.ingredients], restrictions)
+        if not violations and not preference_hit:
+            safe.append(option)
+    if len(safe) >= 2:
+        return _prioritize_fresh_options(safe, recent_titles)
+    # Budget-aware allergen-light fallback (never a hardcoded calorie count that
+    # could exceed the remaining balance — it is fitted later by the validator).
+    fallback_cal = budget.calories_max if budget else 450
+    fallback = MealOption(
+        "קערת אורז ועדשים פשוטה",
+        ["אורז", "עדשים", "ירקות", "שמן זית"],
+        max(120, int(fallback_cal)),
+        26,
+        "ברירת מחדל שממעטת באלרגנים נפוצים ומספקת בסיס מאוזן.",
+        ["אם אחת מהרכיבים לא מתאימה לך, עדכן מגבלה בפרופיל לפני בחירה."],
+    )
+    if not validate_meal_restrictions([{"item_name": item} for item in fallback.ingredients], restrictions):
+        safe.append(fallback)
+    return _prioritize_fresh_options(safe, recent_titles) or options[:1]
+
+
+def _prioritize_fresh_options(
+    options: list[MealOption],
+    recent_titles: list[str] | None,
+) -> list[MealOption]:
+    if not recent_titles:
+        return options
+    recent_keys = {_free_text_preference_key(title) for title in recent_titles if str(title).strip()}
+    fresh = [
+        option
+        for option in options
+        if _free_text_preference_key(option.title) not in recent_keys
+    ]
+    stale = [
+        option
+        for option in options
+        if _free_text_preference_key(option.title) in recent_keys
+    ]
+    return [*fresh, *stale] if fresh else options
+
+
+def _matches_free_text_preference(
+    ingredients: list[str],
+    restrictions: list[DietaryRestriction],
+) -> bool:
+    disliked = [
+        _free_text_preference_key(restriction.canonical_id or restriction.user_label)
+        for restriction in restrictions
+        if restriction.restriction_type == "preference"
+    ]
+    if not disliked:
+        return False
+    ingredient_keys = [*(_free_text_preference_key(ingredient) for ingredient in ingredients)]
+    for dislike in disliked:
+        if not dislike:
+            continue
+        if any(dislike in ingredient or ingredient in dislike for ingredient in ingredient_keys):
+            return True
+    return False
+
+
+def _free_text_preference_key(value: str) -> str:
+    return " ".join(
+        "".join(
+            char if char.isalnum() or char.isspace() else " "
+            for char in str(value).lower()
+        ).split()
+    )
+
+
+def option_fingerprint(option: MealOption) -> str:
+    """Canonical identity of a meal option for rejection / anti-repetition.
+
+    Two options with the same normalised title or the same core ingredient set
+    share a fingerprint so a "different" alternative is genuinely different
+    (re7 P1-8), not the same dish under a slightly different name.
+    """
+    title_key = _free_text_preference_key(option.title)
+    core = sorted(
+        {
+            _free_text_preference_key(_strip_quantity(ingredient))
+            for ingredient in option.ingredients
+            if str(ingredient).strip()
+        }
+    )
+    return f"{title_key}|{'+'.join(core)}"
+
+
+def _strip_quantity(text: str) -> str:
+    """Drop quantities/units so '150 גרם קוטג׳' and 'קוטג׳' match."""
+    cleaned = re.sub(r"\d+(?:[.,]\d+)?\s*(?:גרם|ג|מ\"ל|מל|כף|כפית|יחידה|יח׳)?", " ", str(text))
+    return " ".join(cleaned.split())
+
+
+def validate_meal_option(
+    option: MealOption,
+    budget: MealBudget,
+    restrictions: list[DietaryRestriction],
+) -> list[str]:
+    """Deterministic post-generation validation. Returns a list of problems."""
+    problems: list[str] = []
+    if option.calories < 0 or option.protein < 0:
+        problems.append("negative_values")
+    if not option.ingredients:
+        problems.append("missing_ingredients")
+    # Budget cap: never exceed calories_max unless the budget explicitly allows
+    # an acknowledged overage. A small rounding tolerance is permitted.
+    tolerance = max(15, int(budget.calories_max * 0.05))
+    if not budget.allows_overage and option.calories > budget.calories_max + tolerance:
+        problems.append("over_budget")
+    # Restrictions / allergies / dislikes.
+    items = [{"item_name": ingredient} for ingredient in option.ingredients]
+    if validate_meal_restrictions(items, restrictions):
+        problems.append("restriction_violation")
+    if _matches_free_text_preference([option.title, *option.ingredients], restrictions):
+        problems.append("disliked_food")
+    return problems
+
+
+def _repair_option_to_budget(option: MealOption, budget: MealBudget) -> MealOption:
+    """Scale an option's calories/protein down to fit the budget cap."""
+    if budget.allows_overage or option.calories <= budget.calories_max or option.calories <= 0:
+        return option
+    target = max(budget.calories_min or 0, min(option.calories, budget.calories_max))
+    if target <= 0:
+        target = budget.calories_max
+    scale = target / option.calories
+    return MealOption(
+        title=option.title,
+        ingredients=option.ingredients,
+        calories=int(round(option.calories * scale)),
+        protein=int(round(option.protein * scale)) if option.protein else option.protein,
+        rationale=option.rationale,
+        substitutions=option.substitutions,
+        restriction_validated=option.restriction_validated,
+    )
+
+
+def _fit_and_validate_options(
+    options: list[MealOption],
+    budget: MealBudget,
+    restrictions: list[DietaryRestriction],
+    *,
+    excluded_fingerprints: set[str] | None = None,
+) -> tuple[list[MealOption], list[str]]:
+    """Repair-or-drop options so a broken / over-budget option is never shown.
+
+    Returns (valid_options, validation_events) where events feed observability.
+    """
+    excluded = excluded_fingerprints or set()
+    valid: list[MealOption] = []
+    events: list[str] = []
+    for option in options:
+        if option_fingerprint(option) in excluded:
+            continue
+        problems = validate_meal_option(option, budget, restrictions)
+        if "over_budget" in problems and not budget.allows_overage:
+            events.append("next_meal_validation_failed")
+            option = _repair_option_to_budget(option, budget)
+            problems = validate_meal_option(option, budget, restrictions)
+            if not problems:
+                events.append("next_meal_regenerated")
+        if problems:
+            continue  # unrepairable -> never displayed
+        valid.append(option)
+    return valid, events
+
+
+async def generate_next_meal_recommendation(
+    db: Any,
+    user_id: int,
+    *,
+    now: datetime | None = None,
+    excluded_fingerprints: set[str] | None = None,
+    allow_overage: bool = False,
+) -> NextMealRecommendation:
+    context = await build_workout_nutrition_context(db, user_id, now=now)
+    budget = allocate_next_meal_budget(context, allow_overage=allow_overage)
+    restrictions = await _restrictions(db, user_id)
+    flags = await _daily_flags(db, user_id, context.local_day)
+    recent_titles = [
+        str(title)
+        for title in (flags.get("next_meal_recent_titles") or [])
+        if str(title).strip()
+    ]
+    # Persisted temporary rejections (re7 P1-7): exclude rejected fingerprints
+    # for this context without recording a permanent dislike.
+    stored_rejections = _active_rejections(flags, now=now)
+    excluded = set(excluded_fingerprints or set()) | stored_rejections
+
+    candidates = _candidate_templates(context.workout_phase, budget)
+    filtered = _filter_options(candidates, restrictions, recent_titles, budget)
+    options, validation_events = _fit_and_validate_options(
+        filtered, budget, restrictions, excluded_fingerprints=excluded
+    )
+    if len(options) < 2:
+        # Top up from the full candidate pool (still validated & de-duplicated).
+        extra, extra_events = _fit_and_validate_options(
+            _candidate_templates(context.workout_phase, budget),
+            budget,
+            restrictions,
+            excluded_fingerprints=excluded | {option_fingerprint(o) for o in options},
+        )
+        validation_events += extra_events
+        for option in extra:
+            if option_fingerprint(option) not in {option_fingerprint(o) for o in options}:
+                options.append(option)
+            if len(options) >= 2:
+                break
+    options = options[:3] if budget.policy in {"low_remaining", "at_or_over_target"} else options[:2]
+
+    notices: list[str] = []
+    if budget.policy == "low_remaining":
+        notices.append("האפשרויות נבנו כדי להיכנס ליתרת הקלוריות שנותרה להיום.")
+    if budget.policy == "at_or_over_target":
+        notices.append(
+            "הגעת ליעד הקלוריות היומי. אם אתה עדיין רעב, אפשר לבקש חריגה מבוקרת."
+        )
+    if budget.allows_overage and budget.overage_reason:
+        notices.append(
+            f"ההמלצה חורגת מעט מהיתרה מסיבה ברורה: {budget.overage_reason}. "
+            "שים לב להשפעה על סוף היום."
+        )
+    if context.recent_meal_minutes_ago is not None and context.recent_meal_minutes_ago < 75:
+        notices.append(f"אכלת לאחרונה את {context.recent_meal_name}; אם אין רעב, אפשר לבחור גרסה קטנה.")
+    if context.fasting:
+        notices.append(
+            "דיווחת שאתה בצום היום. אם כבר אינך בצום, כתוב ״אני לא בצום״."
+        )
+    needs_clarification = context.workout_phase in {
+        WorkoutPhase.WORKOUT_STATUS_UNKNOWN,
+        WorkoutPhase.WORKOUT_PLANNED_TIME_PASSED,
+    }
+    return NextMealRecommendation(
+        context=context,
+        budget=budget,
+        options=options,
+        needs_workout_clarification=needs_clarification,
+        notices=notices,
+        validation_events=validation_events,
+    )
+
+
+def _active_rejections(flags: dict[str, Any], *, now: datetime | None = None) -> set[str]:
+    """Return non-expired temporary option rejections from daily flags."""
+    raw = flags.get("next_meal_rejections") or []
+    if not isinstance(raw, list):
+        return set()
+    current = (now or datetime.now(TZ)).astimezone(TZ)
+    active: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        fingerprint = str(entry.get("fingerprint") or "")
+        if not fingerprint:
+            continue
+        expiry = _parse_dt(entry.get("expiry"))
+        if expiry is not None and expiry < current:
+            continue
+        active.add(fingerprint)
+    return active
+
+
+async def record_next_meal_served(
+    db: Any,
+    user_id: int,
+    recommendation: NextMealRecommendation,
+) -> None:
+    local_day = recommendation.context.local_day
+    flags = await _daily_flags(db, user_id, local_day)
+    recent = [
+        str(title)
+        for title in (flags.get("next_meal_recent_titles") or [])
+        if str(title).strip()
+    ]
+    for option in recommendation.options:
+        recent = [title for title in recent if _free_text_preference_key(title) != _free_text_preference_key(option.title)]
+        recent.append(option.title)
+    flags["next_meal_recent_titles"] = recent[-6:]
+    flags["next_meal_recent_titles_at"] = utc_now()
+    await _save_daily_flags(db, user_id, local_day, flags)
+
+
+_REJECTION_TTL_HOURS = 12
+
+
+async def save_next_meal_option_feedback(
+    db: Any,
+    user_id: int,
+    option_number: int,
+    *,
+    now: datetime | None = None,
+) -> tuple[str, NextMealRecommendation]:
+    """"לא מתאים לי N": a TEMPORARY rejection of this option in this context.
+
+    re7 P1-7: this is NOT a permanent dislike. We record the option's
+    fingerprint with an expiry, exclude it (and near-identical options) from the
+    next generation, and return a genuinely different alternative. The user's
+    standing preferences are untouched.
+    """
+    recommendation = await generate_next_meal_recommendation(db, user_id, now=now)
+    if option_number < 1 or option_number > len(recommendation.options):
+        raise ValueError("Unknown next-meal option")
+    option = recommendation.options[option_number - 1]
+    fingerprint = option_fingerprint(option)
+
+    await _record_temporary_rejection(
+        db, user_id, recommendation, fingerprint, now=now, reason="not_suitable_now"
+    )
+    # Regenerate excluding the rejected fingerprint -> a truly different option.
+    refreshed = await generate_next_meal_recommendation(
+        db, user_id, now=now, excluded_fingerprints={fingerprint}
+    )
+    return option.title, refreshed
+
+
+async def _record_temporary_rejection(
+    db: Any,
+    user_id: int,
+    recommendation: NextMealRecommendation,
+    fingerprint: str,
+    *,
+    now: datetime | None = None,
+    reason: str = "not_suitable_now",
+) -> None:
+    local_day = recommendation.context.local_day
+    current = (now or datetime.now(TZ)).astimezone(TZ)
+    expiry = (current + timedelta(hours=_REJECTION_TTL_HOURS)).isoformat()
+    flags = await _daily_flags(db, user_id, local_day)
+    rejections = [r for r in (flags.get("next_meal_rejections") or []) if isinstance(r, dict)]
+    rejections = [r for r in rejections if str(r.get("fingerprint")) != fingerprint]
+    rejections.append(
+        {
+            "fingerprint": fingerprint,
+            "rejected_at": current.isoformat(),
+            "reason": reason,
+            "expiry": expiry,
+        }
+    )
+    flags["next_meal_rejections"] = rejections[-20:]
+    await _save_daily_flags(db, user_id, local_day, flags)
+
+
+async def save_next_meal_unavailable_item(
+    db: Any,
+    user_id: int,
+    option_number: int,
+    *,
+    now: datetime | None = None,
+) -> tuple[str, NextMealRecommendation]:
+    """"אין לי בבית": temporary stock shortage, not a standing dislike.
+
+    Treated like a temporary rejection of the option so a different one is shown.
+    """
+    return await save_next_meal_option_feedback(db, user_id, option_number, now=now)
+
+
+async def regenerate_with_size(
+    db: Any,
+    user_id: int,
+    option_number: int,
+    *,
+    smaller: bool,
+    now: datetime | None = None,
+) -> NextMealRecommendation:
+    """"קטן יותר"/"גדול יותר": rebuild with a size hint, respecting the budget cap."""
+    flags = await _daily_flags(db, user_id, (now or datetime.now(TZ)).astimezone(TZ).date().isoformat())
+    # A "bigger" request may justify an explicit overage; "smaller" never does.
+    allow_overage = not smaller and bool(flags.get("next_meal_size_pref") == "bigger")
+    flags["next_meal_size_pref"] = "smaller" if smaller else "bigger"
+    await _save_daily_flags(db, user_id, (now or datetime.now(TZ)).astimezone(TZ).date().isoformat(), flags)
+    return await generate_next_meal_recommendation(db, user_id, now=now, allow_overage=allow_overage)
+
+
+def workout_clarification_actions(recommendation: NextMealRecommendation) -> list[list[tuple[str, str]]]:
+    if not recommendation.needs_workout_clarification:
+        return []
+    return [
+        [("אדחה את האימון", "nextmeal:wkt:later"), ("אני באימון", "nextmeal:wkt:during")],
+        [("סיימתי אימון", "nextmeal:wkt:done"), ("ביטלתי היום", "nextmeal:wkt:cancel")],
+    ]
+
+
+def option_feedback_actions(recommendation: NextMealRecommendation) -> list[list[tuple[str, str]]]:
+    return [
+        [(f"לא מתאים לי {index}", f"nextmeal:dislike:{index}")]
+        for index, _option in enumerate(recommendation.options, 1)
+    ]
+
+
+def next_meal_action_rows(recommendation: NextMealRecommendation) -> list[list[tuple[str, str]]]:
+    """Full re7 P1-11 action set: per-option actions + global actions.
+
+    Each option gets choose / replace / smaller / bigger / edit-quantities /
+    unavailable / dislike-ingredient. Global: why-it-fits. Workout clarification
+    buttons are prepended when needed. Returns (label, callback_data) rows.
+    """
+    rows: list[list[tuple[str, str]]] = []
+    rows.extend(workout_clarification_actions(recommendation))
+    allow_bigger = (
+        recommendation.budget.policy not in {"at_or_over_target"}
+    )
+    for index, _option in enumerate(recommendation.options, 1):
+        rows.append([(f"✅ אבחר ב-{index}", f"nextmeal:choose:{index}")])
+        size_row = [("🔁 החלף", f"nextmeal:dislike:{index}"), ("➖ קטן יותר", f"nextmeal:smaller:{index}")]
+        if allow_bigger:
+            size_row.append(("➕ גדול יותר", f"nextmeal:bigger:{index}"))
+        rows.append(size_row)
+        rows.append([
+            ("✏️ עריכת כמויות", f"nextmeal:editqty:{index}"),
+            ("🏠 אין לי בבית", f"nextmeal:nostock:{index}"),
+            ("🚫 לא אוהב מרכיב", f"nextmeal:dislikeitem:{index}"),
+        ])
+    rows.append([("ℹ️ למה זה מתאים", "nextmeal:why")])
+    return rows
+
+
+def _signed_balance_line(label: str, target: int | None, consumed: int, balance: int | None, unit: str) -> list[str]:
+    lines = [f"• יעד {label}: {target if target is not None else 'לא ידוע'} {unit}"]
+    lines.append(f"• נאכל עד עכשיו: {consumed} {unit}")
+    if balance is None:
+        lines.append("• נותר להיום: לא ידוע")
+    elif balance >= 0:
+        lines.append(f"• נותר להיום: {balance} {unit}")
+    else:
+        lines.append(f"• חריגה מהיעד: {abs(balance)} {unit}")
+    return lines
+
+
+def _remaining_headline(nutrition: NutritionTotals) -> str:
+    cal = nutrition.calorie_balance
+    prot = nutrition.protein_balance
+    if cal is None:
+        return "<b>מה לאכול עכשיו</b>"
+    cal_part = (
+        f"נשארו לך היום <b>{cal}</b> קלוריות"
+        if cal >= 0
+        else f"היום כבר יש חריגה של <b>{abs(cal)}</b> קלוריות"
+    )
+    if prot is not None and prot > 0:
+        return f"{cal_part} ו-<b>{prot}</b> גרם חלבון."
+    return f"{cal_part}."
+
+
+def format_next_meal_recommendation(recommendation: NextMealRecommendation) -> str:
+    """Answer-first message (re7 P1-10): remaining + options first, short note,
+    and the long explanation only via the 'why it fits' detail view."""
+    context = recommendation.context
+    nutrition = context.nutrition
+    goal_note = ""
+    if nutrition.goal_status == "active_provisional":
+        goal_note = " (יעד זמני)"
+    elif nutrition.goal_status == "default":
+        goal_note = " (ברירת מחדל עד לאישור יעד)"
+
+    lines = [_remaining_headline(nutrition) + goal_note, ""]
+    for index, option in enumerate(recommendation.options, 1):
+        lines += [
+            f"<b>אפשרות {index}: {esc(option.title)}</b>",
+            f"{esc(', '.join(option.ingredients))}",
+            f"כ-{option.calories} קל׳ | כ-{option.protein} גרם חלבון",
+            "",
+        ]
+    if recommendation.options:
+        if nutrition.calorie_balance is not None and nutrition.calorie_balance >= 0 and not recommendation.budget.allows_overage:
+            lines.append("שתיהן מתאימות ליתרה שלך כרגע.")
+        elif recommendation.budget.allows_overage and recommendation.budget.overage_reason:
+            lines.append(f"שים לב: ההצעה חורגת מעט מהיתרה ({esc(recommendation.budget.overage_reason)}).")
+    if recommendation.needs_workout_clarification:
+        lines.append("לא אניח שהאימון קרה בלי דיווח — אפשר לעדכן בכפתורים.")
+    return "\n".join(lines).strip()
+
+
+def format_next_meal_explanation(recommendation: NextMealRecommendation) -> str:
+    """The 'why it fits' detail screen (re7 P1-10): full calculation & context."""
+    context = recommendation.context
+    nutrition = context.nutrition
+    budget = recommendation.budget
+    lines = [
+        "<b>למה זה מתאים</b>",
+        "",
+        "<b>מצב היום</b>",
+        *_signed_balance_line("קלוריות", nutrition.target_calories, nutrition.consumed_calories, nutrition.calorie_balance, "קל׳"),
+        *_signed_balance_line("חלבון", nutrition.target_protein, nutrition.consumed_protein, nutrition.protein_balance, "גרם"),
+        "",
+        "<b>אימון</b>",
+        f"• {esc(context.workout_label)}",
+    ]
+    if context.minutes_until_workout is not None:
+        lines.append(f"• זמן עד אימון: כ-{context.minutes_until_workout} דקות")
+    if context.minutes_since_workout is not None:
+        lines.append(f"• זמן מאז אימון: כ-{context.minutes_since_workout} דקות")
+    lines += [
+        "",
+        "<b>תקציב הארוחה</b>",
+        f"• כ-{budget.calories_min}-{budget.calories_max} קלוריות",
+        f"• כ-{budget.protein_min}-{budget.protein_max} גרם חלבון",
+        f"• {esc(budget.rationale)}",
+    ]
+    if context.meals_remaining_estimate:
+        lines.append(f"• הערכת ארוחות שנותרו היום: {context.meals_remaining_estimate}")
+    for notice in recommendation.notices:
+        lines.append(f"• {esc(notice)}")
+    if context.assumptions:
+        lines += ["", "<i>" + esc(" ".join(context.assumptions)) + "</i>"]
+    return "\n".join(lines)
+
+
+ACTIVE_RECOMMENDATION_FLOW = "next_meal_recommendation"
+_RECOMMENDATION_TTL_HOURS = 6
+
+
+async def remember_active_recommendation(
+    db: Any,
+    user_id: int,
+    recommendation: NextMealRecommendation,
+    *,
+    message_id: int | None = None,
+    now: datetime | None = None,
+) -> None:
+    """Persist the active next-meal recommendation so a later free-text
+    correction ("זה גדול מדי", "אבל נשאר לי 269") can be understood against it,
+    and survive a restart for a reasonable window (re7 P1-15)."""
+    from noam_coach.services import core as core_services
+
+    current = (now or datetime.now(TZ)).astimezone(TZ)
+    payload = {
+        "options": [option_fingerprint(o) for o in recommendation.options],
+        "option_titles": [o.title for o in recommendation.options],
+        "remaining_calories": recommendation.context.nutrition.calorie_balance,
+        "budget_policy": recommendation.budget.policy,
+        "message_id": message_id,
+        "created_at": current.isoformat(),
+        "expiry": (current + timedelta(hours=_RECOMMENDATION_TTL_HOURS)).isoformat(),
+    }
+    await core_services.set_flow_state(user_id, ACTIVE_RECOMMENDATION_FLOW, "active", payload)
+
+
+async def get_active_recommendation_state(
+    db: Any,
+    user_id: int,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    from noam_coach.services import core as core_services
+
+    state = await core_services.get_flow_state(user_id, ACTIVE_RECOMMENDATION_FLOW)
+    if not state:
+        return None
+    payload = state.get("payload") or {}
+    expiry = _parse_dt(payload.get("expiry"))
+    current = (now or datetime.now(TZ)).astimezone(TZ)
+    if expiry is not None and expiry < current:
+        await core_services.clear_flow_state(user_id, ACTIVE_RECOMMENDATION_FLOW)
+        return None
+    return payload
+
+
+async def clear_active_recommendation(db: Any, user_id: int) -> None:
+    from noam_coach.services import core as core_services
+
+    await core_services.clear_flow_state(user_id, ACTIVE_RECOMMENDATION_FLOW)
+
+
+def classify_recommendation_correction(text: str) -> dict[str, Any]:
+    """Interpret a free-text message relative to an active recommendation.
+
+    Returns {"kind": ...} where kind is one of:
+      budget_correction (with 'calories'), smaller, bigger, pre_workout,
+      short_time (with 'minutes'), unavailable_item (with 'item'),
+      dislike_item (with 'item'), or none.
+    """
+    t = f" {text.strip()} "
+
+    # A stated remaining-calories number ("אבל נשאר לי 269 קלוריות").
+    if any(word in t for word in ("נשאר", "נשארו", "נותר", "נותרו")):
+        match = re.search(r"(?<!\d)(\d{2,4})(?!\d)", t)
+        if match:
+            value = int(match.group(1))
+            if 0 <= value <= 6000:
+                return {"kind": "budget_correction", "calories": value}
+
+    if any(word in t for word in ("גדול מדי", "יותר מדי", "כבד מדי", "משהו קטן", "קטן יותר", "פחות")):
+        return {"kind": "smaller"}
+    if any(word in t for word in ("ממש רעב", "רעב מאוד", "גדול יותר", "יותר אוכל", "משהו גדול")):
+        return {"kind": "bigger"}
+    if any(word in t for word in ("לפני אימון", "לפני האימון", "הולך להתאמן", "מתאמן עוד")):
+        return {"kind": "pre_workout"}
+
+    minutes_match = re.search(r"(?:רק\s*)?(\d{1,3})\s*דקות", t)
+    if minutes_match and ("יש לי" in t or "רק" in t or "זמן" in t):
+        return {"kind": "short_time", "minutes": int(minutes_match.group(1))}
+
+    if any(word in t for word in ("אין לי", "נגמר", "נגמרו", "אזל")):
+        return {"kind": "unavailable_item", "item": text.strip()}
+    if any(word in t for word in ("לא אוהב", "לא אוהבת", "שונא", "לא מתחבר")):
+        return {"kind": "dislike_item", "item": text.strip()}
+
+    return {"kind": "none"}
+
+
+async def handle_recommendation_correction(
+    db: Any,
+    user_id: int,
+    text: str,
+    *,
+    now: datetime | None = None,
+) -> tuple[str, NextMealRecommendation] | None:
+    """Apply a free-text correction to the active recommendation (re7 P1-13/14).
+
+    Returns (prefix_message, refreshed_recommendation) when the text was a
+    recommendation correction, else None so the caller falls through to generic
+    routing. Records observability events. Does NOT count anything as eaten.
+    """
+    from noam_coach.services import core as core_services
+
+    state = await get_active_recommendation_state(db, user_id, now=now)
+    if not state:
+        return None
+    correction = classify_recommendation_correction(text)
+    kind = correction["kind"]
+    if kind == "none":
+        return None
+    del core_services  # imported for symmetry; state already loaded above
+
+    prefix = ""
+    allow_overage = False
+
+    if kind == "budget_correction":
+        snapshot = await build_workout_nutrition_context(db, user_id, now=now)
+        actual_remaining = snapshot.nutrition.calorie_balance
+        stated = int(correction["calories"])
+        await _log_event(db, user_id, "next_meal_user_budget_correction",
+                         {"stated": stated, "actual": actual_remaining})
+        if actual_remaining is not None and abs(actual_remaining - stated) > 30:
+            await _log_event(db, user_id, "nutrition_context_mismatch",
+                             {"stated": stated, "actual": actual_remaining})
+            prefix = (
+                f"לפי מה שרשום אצלי נשארו לך {actual_remaining} קלוריות (ולא {stated}). "
+                "הנה אפשרויות שמתאימות לחישוב הזה:"
+            )
+        else:
+            prefix = (
+                f"צודק — נשארו לך כ-{actual_remaining if actual_remaining is not None else stated} "
+                "קלוריות. חישבתי מחדש, והנה אפשרויות שמתאימות ליתרה:"
+            )
+    elif kind == "smaller":
+        prefix = "הקטנתי את ההצעה כך שתתאים טוב יותר ליתרה ולרעב שלך."
+    elif kind == "bigger":
+        allow_overage = True
+        prefix = "הגדלתי מעט את ההצעה. שים לב להשפעה על סוף היום."
+    elif kind == "pre_workout":
+        await save_next_meal_workout_status(db, user_id, "later", now=now)
+        prefix = "התאמתי את ההצעה לארוחה לפני אימון."
+    elif kind == "short_time":
+        prefix = "התאמתי לאפשרויות מהירות להכנה."
+    elif kind == "unavailable_item":
+        prefix = "סימנתי שחסר לך מרכיב כרגע (זמני) והחלפתי את ההצעה."
+    elif kind == "dislike_item":
+        # A standing dislike -> persist via the canonical preferences service.
+        await record_food_preference_from_slots(
+            db, user_id,
+            {"kind": "preference", "polarity": "avoid", "item": text.strip(), "note": text.strip()},
+            text.strip(),
+        )
+        prefix = "שמרתי את ההעדפה הקבועה והחלפתי את ההצעה."
+
+    refreshed = await generate_next_meal_recommendation(
+        db, user_id, now=now, allow_overage=allow_overage
+    )
+    await remember_active_recommendation(db, user_id, refreshed, now=now)
+    await _log_event(db, user_id, "next_meal_option_replaced", {"correction": kind})
+    return prefix, refreshed
+
+
+async def _log_event(db: Any, user_id: int, name: str, properties: dict[str, Any]) -> None:
+    import event_log
+
+    try:
+        await event_log.append_event(
+            db, user_id, name, entity="next_meal", source="user_text", properties=properties
+        )
+    except Exception:  # observability must never break the flow  # noqa: BLE001
+        pass
+
+
+async def save_chosen_meal(
+    db: Any,
+    user_id: int,
+    option: MealOption,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Persist a chosen next-meal option as an eaten meal (re7 task 11/5).
+
+    Only this function counts a recommendation as consumed — choosing/viewing
+    never does. A short-lived per-fingerprint guard makes a fast double-tap
+    idempotent. Returns False when the same option was just saved.
+    """
+    current = (now or datetime.now(TZ)).astimezone(TZ)
+    fingerprint = option_fingerprint(option)
+    local_day = current.date().isoformat()
+    flags = await _daily_flags(db, user_id, local_day)
+    saved = flags.get("next_meal_saved") or {}
+    last_at = _parse_dt(saved.get(fingerprint)) if isinstance(saved, dict) else None
+    if last_at is not None and (current - last_at).total_seconds() < 120:
+        return False  # double-tap within 2 minutes -> no duplicate row
+
+    iso_now = current.astimezone(timezone.utc).isoformat()
+    await db.execute(
+        """
+        INSERT INTO meals(user_id, name, calories, protein, carbs, fat,
+                          confidence, eaten_at, created_at)
+        VALUES(?, ?, ?, ?, 0, 0, ?, ?, ?)
+        """,
+        (user_id, option.title, int(option.calories), int(option.protein), 0.6, iso_now, iso_now),
+    )
+    if not isinstance(saved, dict):
+        saved = {}
+    saved[fingerprint] = current.isoformat()
+    flags["next_meal_saved"] = saved
+    await _save_daily_flags(db, user_id, local_day, flags)
+    await _log_event(db, user_id, "next_meal_saved_as_meal", {"title": option.title, "calories": option.calories})
+    return True
+
+
+async def invalidate_daily_nutrition_cache(
+    db: Any,
+    user_id: int,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Drop per-day next-meal cache state after a goal/snapshot change (re7 P0-5).
+
+    The budget is always recomputed live from the active goal, but stale recent
+    titles / size preference could bias the next recommendation, so clear them.
+    """
+    local_day = (now or datetime.now(TZ)).astimezone(TZ).date().isoformat()
+    flags = await _daily_flags(db, user_id, local_day)
+    for key in ("next_meal_recent_titles", "next_meal_recent_titles_at", "next_meal_size_pref"):
+        flags.pop(key, None)
+    await _save_daily_flags(db, user_id, local_day, flags)
+
+
+async def build_next_meal_response_text(db: Any, user_id: int) -> str:
+    recommendation = await generate_next_meal_recommendation(db, user_id)
+    await record_next_meal_served(db, user_id, recommendation)
+    return format_next_meal_recommendation(recommendation)

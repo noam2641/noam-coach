@@ -36,6 +36,9 @@ HealthKit.zip
 *.health_export
 export*.zip
 
+# Source-dump / recording archives must never be committed
+*.zip
+
 # Temporary files
 pytest_full.log
 PROJECT_STATE.md

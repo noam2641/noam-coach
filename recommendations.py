@@ -17,6 +17,7 @@ so the bot still works without an API key.
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 from typing import Any
@@ -150,6 +151,7 @@ async def morning_menu(
     goal: dict[str, Any],
     today_has_workout: bool,
     daily_flags: dict[str, Any] | None = None,
+    nutrition_context: dict[str, Any] | None = None,
 ) -> MorningMenu:
     flags = daily_flags or {}
     if not _client_ready(client):
@@ -220,6 +222,13 @@ async def morning_menu(
                         "בנה תפריט מגוון להיום."
                     ),
                 },
+                {
+                    "role": "user",
+                    "content": (
+                        "Structured nutrition context:\n"
+                        f"{json.dumps(nutrition_context or {}, ensure_ascii=False)}"
+                    ),
+                },
             ],
             text_format=MorningMenu,
         )
@@ -228,7 +237,15 @@ async def morning_menu(
         return response.output_parsed
     except Exception:  # noqa: BLE001
         LOGGER.exception("morning_menu AI call failed, using deterministic fallback")
-        return await morning_menu(None, model, profile, goal, today_has_workout, daily_flags)
+        return await morning_menu(
+            None,
+            model,
+            profile,
+            goal,
+            today_has_workout,
+            daily_flags,
+            nutrition_context,
+        )
 
 
 async def intraday_next_meals(
@@ -319,6 +336,7 @@ async def evening_summary(
     consumed_protein: float,
     meals: list[dict[str, Any]],
     daily_flags: dict[str, Any] | None = None,
+    nutrition_context: dict[str, Any] | None = None,
 ) -> EveningSummary:
     flags = daily_flags or {}
     # Pre-compute objective food flags so the model has hard signals to cite.
@@ -375,6 +393,13 @@ async def evening_summary(
                         f"אינדיקציות בוקר: {flags or 'אין'}."
                     ),
                 },
+                {
+                    "role": "user",
+                    "content": (
+                        "Structured nutrition context:\n"
+                        f"{json.dumps(nutrition_context or {}, ensure_ascii=False)}"
+                    ),
+                },
             ],
             text_format=EveningSummary,
         )
@@ -385,6 +410,7 @@ async def evening_summary(
         LOGGER.exception("evening_summary AI call failed, using deterministic fallback")
         return await evening_summary(
             None, model, profile, goal, consumed_calories, consumed_protein, meals, daily_flags,
+            nutrition_context,
         )
 
 

@@ -111,6 +111,10 @@ from noam_coach.services.local_health_path import (
     looks_like_local_health_path,
     resolve_local_health_export,
 )
+from noam_coach.services.nutrition_context import (
+    build_nutrition_ai_request,
+    build_nutrition_context,
+)
 
 RUNTIME_NAMES = ('Any', 'CallbackContext', 'ContextTypes', 'DB', 'Exception', 'InlineKeyboardButton', 'InlineKeyboardMarkup', 'JOB_PRIORITY_COACHING', 'JOB_PRIORITY_HIGH', 'JOB_PRIORITY_LOW', 'JOB_PRIORITY_SCHEDULED', 'LOGGER', 'OPENAI_CLIENT', 'ParseMode', 'Path', 'RuntimeError', 'SETTINGS', 'TZ', 'Update', 'ValueError', '_ctx_has_workout', '_data_quality_disclaimer', 'abs', 'action', 'actual_bytes', 'any', 'asyncio', 'at', 'bool', 'build_daily_context', 'build_evening_summary_text', 'build_morning_menu_text', 'build_next_meal_text', 'button', 'context', 'conversation', 'ctx', 'current_flow', 'datetime', 'deliver_proactive_message', 'document', 'duplicates', 'ensure_user', 'enumerate', 'esc', 'exc', 'extract_dir', 'fasting_negated', 'flags', 'float', 'folder', 'format_evening_summary', 'format_morning_menu', 'format_next_meals', 'fraction_used', 'friendly_error', 'get_daily_flags', 'health_import', 'hh', 'hhmm', 'hint', 'hour', 'idx', 'inserted', 'insights', 'int', 'is_allowed', 'items', 'job_calorie_watch', 'job_evening', 'job_morning', 'job_motivation', 'keyboard', 'known_medications', 'learned', 'learned_block', 'lines', 'list', 'load_routine_profile', 'local_day_str', 'lowered', 'max_bytes', 'med', 'meds', 'menu', 'message', 'mm', 'moment', 'morning_checkin_keyboard', 'name', 'near', 'notify_admin', 'now', 'onboarding', 'parse_to_rows', 'profile', 'progress', 'random', 're', 'recommendations', 'reconcile', 'resumed', 'ritalin_negated', 'route_decision', 'rows', 'run_post_import_reconciliation', 'save_routine_profile', 'saved_path', 'secrets', 'send_checkin', 'send_menu', 'send_motivation', 'send_nudge', 'send_overpace', 'send_summary', 'send_to_user', 'sent', 'set_daily_flags', 'show_onboarding_basics', 'shutil', 'sleep', 'snack_hours', 'str', 'suffix', 'suggestion', 'summary', 'suppress', 'sync_health_measurements_to_facts', 'target', 'target_cal', 'telegram_file', 'text', 'today_meal_items', 'top', 'track_event', 'tuple', 'update', 'upsert_health_rows', 'user_id', 'user_model', 'value', 'weekly', 'window', 'workout', 'workout_hour', 'write_audit', 'x', 'xml_path')
 
@@ -182,6 +186,50 @@ def _health_import_success_text(outcome: HealthImportOutcome) -> str:
             "שגרה ברורה — נמשיך ונלמד תוך כדי."
         )
 
+    return "\n".join(lines)
+
+
+async def _health_import_followup_text(user_id: int) -> str:
+    readiness = await user_model.compute_all_readiness(DB, user_id)
+    missing_labels: list[str] = []
+    for profile_name in ("safety", "workout", "nutrition"):
+        for label in readiness.get(profile_name, {}).get("missing_labels", []):
+            if label not in missing_labels:
+                missing_labels.append(label)
+
+    rows = await DB.fetch_all(
+        """
+        SELECT key, source
+        FROM user_facts
+        WHERE user_id=?
+          AND valid=1
+          AND confirmed=0
+          AND kind!='gap'
+        ORDER BY updated_at DESC
+        LIMIT 6
+        """,
+        (user_id,),
+    )
+    approval_labels = []
+    for row in rows:
+        label = user_model.display_label(str(row["key"]))
+        source = user_model.SOURCE_LABELS.get(row.get("source"), row.get("source") or "")
+        approval_labels.append(f"{label} ({source})" if source else label)
+
+    lines = ["", "<b>מה עדיין צריך כדי להשלים תמונה מלאה?</b>"]
+    if approval_labels:
+        lines.append("<b>דורש אישור:</b>")
+        lines.extend(f"• {esc(label)}" for label in approval_labels)
+    else:
+        lines.append("• אין כרגע נתונים מיובאים שממתינים לאישור.")
+
+    if missing_labels:
+        lines.append("<b>עדיין חסר:</b>")
+        lines.extend(f"• {esc(label)}" for label in missing_labels[:8])
+        if len(missing_labels) > 8:
+            lines.append(f"• ועוד {len(missing_labels) - 8} פריטים")
+    else:
+        lines.append("• אין פריטי חובה חסרים כרגע.")
     return "\n".join(lines)
 
 
@@ -428,7 +476,9 @@ async def try_handle_local_health_path(
             else ""
         )
         await progress.edit_text(
-            _health_import_success_text(outcome) + selected_note,
+            _health_import_success_text(outcome)
+            + await _health_import_followup_text(user_id)
+            + selected_note,
             parse_mode=ParseMode.HTML,
         )
         await event_log.append_event(
@@ -527,7 +577,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             audit_source="telegram_document",
         )
         await progress.edit_text(
-            _health_import_success_text(outcome),
+            _health_import_success_text(outcome)
+            + await _health_import_followup_text(user_id),
             parse_mode=ParseMode.HTML,
         )
         await track_event(
@@ -846,6 +897,16 @@ def _data_quality_disclaimer(ctx: "DailyContext") -> str:
 async def build_morning_menu_text(user_id: int, ctx: "DailyContext | None" = None) -> str:
     if ctx is None:
         ctx = await build_daily_context(user_id)
+    nutrition_context = await build_nutrition_context(
+        DB,
+        user_id,
+        "morning_menu",
+        daily_ctx=ctx,
+    )
+    nutrition_request = build_nutrition_ai_request(
+        nutrition_context,
+        "Build today's nutrition menu",
+    )
     menu = await recommendations.morning_menu(
         OPENAI_CLIENT,
         SETTINGS.openai_model,
@@ -853,6 +914,7 @@ async def build_morning_menu_text(user_id: int, ctx: "DailyContext | None" = Non
         ctx.goal,
         _ctx_has_workout(ctx),
         ctx.flags,
+        nutrition_request["context"],
     )
     text = format_morning_menu(menu)
     if not ctx.flags:
@@ -863,25 +925,26 @@ async def build_morning_menu_text(user_id: int, ctx: "DailyContext | None" = Non
 
 @runtime_bound(RUNTIME_NAMES)
 async def build_next_meal_text(user_id: int, ctx: "DailyContext | None" = None) -> str:
-    if ctx is None:
-        ctx = await build_daily_context(user_id)
-    suggestion = await recommendations.intraday_next_meals(
-        OPENAI_CLIENT,
-        SETTINGS.openai_model,
-        ctx.profile,
-        ctx.calories_remaining,
-        ctx.protein_remaining,
-        ctx.hours_left,
-        _ctx_has_workout(ctx),
-        ctx.flags,
-    )
-    return format_next_meals(suggestion) + _data_quality_disclaimer(ctx)
+    del ctx
+    from noam_coach.services.next_meal import build_next_meal_response_text
+
+    return await build_next_meal_response_text(DB, user_id)
 
 
 @runtime_bound(RUNTIME_NAMES)
 async def build_evening_summary_text(user_id: int, ctx: "DailyContext | None" = None) -> str:
     if ctx is None:
         ctx = await build_daily_context(user_id)
+    nutrition_context = await build_nutrition_context(
+        DB,
+        user_id,
+        "evening_summary",
+        daily_ctx=ctx,
+    )
+    nutrition_request = build_nutrition_ai_request(
+        nutrition_context,
+        "Summarize today's nutrition",
+    )
     items = await today_meal_items(user_id)
     summary = await recommendations.evening_summary(
         OPENAI_CLIENT,
@@ -892,5 +955,6 @@ async def build_evening_summary_text(user_id: int, ctx: "DailyContext | None" = 
         ctx.protein_consumed,
         items,
         ctx.flags,
+        nutrition_request["context"],
     )
     return format_evening_summary(summary) + _data_quality_disclaimer(ctx)

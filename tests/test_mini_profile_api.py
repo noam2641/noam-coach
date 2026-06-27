@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 import coach_bot
 import mini_api
 import user_model
+from config import TZ
 from db import Database
 from helpers import utc_now
 from models import MiniProfileUpdate
@@ -81,3 +83,33 @@ async def test_mini_profile_returns_resolved_availability(
     data = json.loads(response.body)
     assert data["availability"]["max_days_per_week"] == 4
     assert data["availability"]["source"] == "user_corrected"
+
+
+@pytest.mark.asyncio
+async def test_mini_today_meals_returns_meals_logged_in_db(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = Database(str(tmp_path / "mini-meals.db"))
+    await db.init()
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(1,'A',NULL,?)",
+        (utc_now(),),
+    )
+    eaten_at = datetime.now(TZ).replace(hour=12, minute=30, second=0, microsecond=0).isoformat()
+    await db.execute(
+        """
+        INSERT INTO meals(user_id, name, calories, protein, carbs, fat, confidence, eaten_at, created_at)
+        VALUES(1, 'Chicken bowl', 620, 45, 50, 18, 0.9, ?, ?)
+        """,
+        (eaten_at, utc_now()),
+    )
+    monkeypatch.setattr(coach_bot, "DB", db)
+    monkeypatch.setattr(mini_api, "DB", db)
+
+    response = await mini_api.mini_today_meals(user_id=1)
+    data = json.loads(response.body)
+
+    assert data["meals"][0]["name"] == "Chicken bowl"
+    assert data["meals"][0]["calories"] == 620
+    assert "quality" in data

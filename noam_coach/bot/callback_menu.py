@@ -140,6 +140,14 @@ async def handle_goal_callback(query: Any, user_id: int, data: str) -> bool:
             await activate_goal_version_provisional(user_id, gv_id)
             missing = await planning.missing_goal_inputs(DB, user_id)
             await decide_approval(approval_id, "approved")
+            await write_audit(user_id, "approve_provisional", "goal", gv_id, **payload)
+            # A provisional goal is a real active goal for planning purposes
+            # (planning.active_goal includes 'active_provisional'), so a request
+            # that was blocked on "no active goal" can continue automatically.
+            from noam_coach.bot.callback_plans import resume_pending_plan_action
+
+            if await resume_pending_plan_action(query, user_id):
+                return True
             await safe_edit(
                 query,
                 "סימנתי יעד <b>זמני</b> ⏳ אשתמש בו בזהירות ולא אתבסס עליו "
@@ -153,7 +161,6 @@ async def handle_goal_callback(query: Any, user_id: int, data: str) -> bool:
                     ]
                 ),
             )
-            await write_audit(user_id, "approve_provisional", "goal", gv_id, **payload)
             return True
         try:
             await planning.activate_goal(DB, user_id, gv_id)
@@ -186,6 +193,10 @@ async def handle_goal_callback(query: Any, user_id: int, data: str) -> bool:
             source="user",
             properties={k: payload[k] for k in ("calories", "protein", "steps", "phase")},
         )
+        from noam_coach.bot.callback_plans import resume_pending_plan_action
+
+        if await resume_pending_plan_action(query, user_id):
+            return True
         await safe_edit(query, "היעד נשמר כיעד הפעיל היחיד ✅", home_keyboard())
         return True
 
@@ -195,6 +206,44 @@ async def handle_goal_callback(query: Any, user_id: int, data: str) -> bool:
         await safe_edit(query, "היעד לא שונה.", home_keyboard())
         return True
     return False
+
+
+async def _invalidate_nutrition_snapshot(user_id: int) -> None:
+    """Clear per-day next-meal cache so a new goal recomputes everything."""
+    from noam_coach.services.next_meal import invalidate_daily_nutrition_cache
+
+    await invalidate_daily_nutrition_cache(DB, user_id)
+
+
+async def _render_next_meal_screen(
+    query: Any,
+    user_id: int,
+    *,
+    prefix: str = "",
+    recommendation: Any | None = None,
+) -> None:
+    from noam_coach.services.next_meal import (
+        format_next_meal_recommendation,
+        generate_next_meal_recommendation,
+        next_meal_action_rows,
+        record_next_meal_served,
+        remember_active_recommendation,
+    )
+
+    recommendation = recommendation or await generate_next_meal_recommendation(DB, user_id)
+    keyboard_rows = [
+        [button(label, callback_data) for label, callback_data in row]
+        for row in next_meal_action_rows(recommendation)
+    ]
+    keyboard_rows.append([button("⬅️ חזרה למצב היום", "menu:status"), button("🏠 תפריט", "menu:home")])
+    text = format_next_meal_recommendation(recommendation)
+    if prefix:
+        text = f"{prefix}\n\n{text}"
+    await safe_edit(query, text, InlineKeyboardMarkup(keyboard_rows))
+    await record_next_meal_served(DB, user_id, recommendation)
+    message_id = getattr(getattr(query, "message", None), "message_id", None)
+    await remember_active_recommendation(DB, user_id, recommendation, message_id=message_id)
+
 
 @runtime_bound(RUNTIME_NAMES)
 async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
@@ -217,6 +266,174 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
                     [button("⬅️ תפריט", "menu:home")],
                 ]
             ),
+        )
+        return True
+
+    if data.startswith("nextmeal:wkt:"):
+        from noam_coach.services.next_meal import save_next_meal_workout_status
+
+        status = data.rsplit(":", 1)[1]
+        status_map = {
+            "later": "later",
+            "during": "during",
+            "done": "completed",
+            "cancel": "cancelled",
+        }
+        if status not in status_map:
+            return True
+        await save_next_meal_workout_status(DB, user_id, status_map[status])
+        await _render_next_meal_screen(query, user_id, prefix="עדכנתי את מצב האימון ורעננתי את ההמלצה.")
+        return True
+
+    if data.startswith("nextmeal:dislike:"):
+        from noam_coach.services.next_meal import save_next_meal_option_feedback
+
+        try:
+            option_number = int(data.rsplit(":", 1)[1])
+            disliked_item, recommendation = await save_next_meal_option_feedback(DB, user_id, option_number)
+        except (TypeError, ValueError):
+            await _render_next_meal_screen(query, user_id, prefix="לא מצאתי את האפשרות הזו, אז רעננתי את ההמלצה.")
+            return True
+        await _render_next_meal_screen(
+            query,
+            user_id,
+            prefix=(
+                f"רשמתי שלא מתאים לך עכשיו {esc(disliked_item)} (דחייה זמנית, לא העדפה קבועה) "
+                "ורעננתי את ההמלצה."
+            ),
+            recommendation=recommendation,
+        )
+        return True
+
+    if data.startswith(("nextmeal:smaller:", "nextmeal:bigger:")):
+        from noam_coach.services.next_meal import regenerate_with_size
+
+        smaller = data.startswith("nextmeal:smaller:")
+        try:
+            option_number = int(data.rsplit(":", 1)[1])
+        except (TypeError, ValueError):
+            option_number = 1
+        recommendation = await regenerate_with_size(DB, user_id, option_number, smaller=smaller)
+        prefix = "הקטנתי את ההצעה." if smaller else "הגדלתי מעט את ההצעה — שים לב להשפעה על סוף היום."
+        await _render_next_meal_screen(query, user_id, prefix=prefix, recommendation=recommendation)
+        return True
+
+    if data.startswith("nextmeal:nostock:"):
+        from noam_coach.services.next_meal import save_next_meal_unavailable_item
+
+        try:
+            option_number = int(data.rsplit(":", 1)[1])
+            item, recommendation = await save_next_meal_unavailable_item(DB, user_id, option_number)
+        except (TypeError, ValueError):
+            await _render_next_meal_screen(query, user_id, prefix="רעננתי את ההמלצה.")
+            return True
+        await _render_next_meal_screen(
+            query, user_id,
+            prefix=f"סימנתי שחסר לך כרגע {esc(item)} (זמני) והחלפתי את ההצעה.",
+            recommendation=recommendation,
+        )
+        return True
+
+    if data.startswith("nextmeal:dislikeitem:"):
+        from noam_coach.services.food_preferences import record_food_preference_from_slots
+        from noam_coach.services.next_meal import generate_next_meal_recommendation
+
+        try:
+            option_number = int(data.rsplit(":", 1)[1])
+            current = await generate_next_meal_recommendation(DB, user_id)
+            title = current.options[option_number - 1].title if 0 < option_number <= len(current.options) else ""
+        except (TypeError, ValueError, IndexError):
+            title = ""
+        if title:
+            await record_food_preference_from_slots(
+                DB, user_id,
+                {"kind": "preference", "polarity": "avoid", "item": title, "note": title},
+                title,
+            )
+        await _render_next_meal_screen(
+            query, user_id,
+            prefix="שמרתי את ההעדפה הקבועה והחלפתי את ההצעה." if title else "רעננתי את ההמלצה.",
+        )
+        return True
+
+    if data.startswith("nextmeal:choose:"):
+        from noam_coach.services.next_meal import generate_next_meal_recommendation
+
+        try:
+            option_number = int(data.rsplit(":", 1)[1])
+            recommendation = await generate_next_meal_recommendation(DB, user_id)
+            option = recommendation.options[option_number - 1]
+        except (TypeError, ValueError, IndexError):
+            await _render_next_meal_screen(query, user_id, prefix="לא מצאתי את האפשרות. הנה שוב ההמלצה.")
+            return True
+        # Choosing does NOT log the meal as eaten — only "save as meal" does.
+        nutrition = recommendation.context.nutrition
+        after_cal = (nutrition.calorie_balance - option.calories) if nutrition.calorie_balance is not None else None
+        impact = (
+            f"\nאחרי הארוחה יישארו לך כ-{after_cal} קלוריות להיום." if after_cal is not None else ""
+        )
+        await safe_edit(
+            query,
+            (
+                f"<b>{esc(option.title)}</b>\n"
+                f"{esc(', '.join(option.ingredients))}\n"
+                f"כ-{option.calories} קל׳ | כ-{option.protein} גרם חלבון{impact}\n\n"
+                "רוצה שאשמור את זה כארוחה שאכלת?"
+            ),
+            InlineKeyboardMarkup([
+                [button("💾 שמור כארוחה", f"nextmeal:save:{option_number}")],
+                [button("⬅️ חזרה להמלצה", "menu:nextmeal")],
+            ]),
+        )
+        return True
+
+    if data.startswith("nextmeal:save:"):
+        from noam_coach.services.next_meal import (
+            clear_active_recommendation,
+            generate_next_meal_recommendation,
+            save_chosen_meal,
+        )
+
+        try:
+            option_number = int(data.rsplit(":", 1)[1])
+            recommendation = await generate_next_meal_recommendation(DB, user_id)
+            option = recommendation.options[option_number - 1]
+        except (TypeError, ValueError, IndexError):
+            await safe_edit(query, "לא מצאתי את האפשרות לשמירה.", home_keyboard())
+            return True
+        saved = await save_chosen_meal(DB, user_id, option)
+        await clear_active_recommendation(DB, user_id)
+        if not saved:
+            await safe_edit(query, "כבר שמרתי את הארוחה הזו — לא כפלתי אותה.", home_keyboard())
+            return True
+        await safe_edit(
+            query,
+            f"שמרתי את {esc(option.title)} כארוחה ✅\nמצב היום עודכן.",
+            InlineKeyboardMarkup([[button("📊 מצב היום", "menu:status"), button("🏠 תפריט", "menu:home")]]),
+        )
+        return True
+
+    if data == "nextmeal:why":
+        from noam_coach.services.next_meal import (
+            format_next_meal_explanation,
+            generate_next_meal_recommendation,
+        )
+
+        recommendation = await generate_next_meal_recommendation(DB, user_id)
+        await safe_edit(
+            query,
+            format_next_meal_explanation(recommendation),
+            InlineKeyboardMarkup([[button("⬅️ חזרה להמלצה", "menu:nextmeal")]]),
+        )
+        return True
+
+    if data.startswith("nextmeal:editqty:"):
+        # Quantity editing reuses the existing per-item editor entry point.
+        await safe_edit(
+            query,
+            "כדי לכוונן כמויות מדויקות, בחר ״שמור כארוחה״ ואז ניתן לערוך פריטים, "
+            "או כתוב לי למשל ״תוסיף 50 גרם אורז״.",
+            InlineKeyboardMarkup([[button("⬅️ חזרה להמלצה", "menu:nextmeal")]]),
         )
         return True
 
@@ -278,8 +495,20 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
                 "GOAL_MANUALLY_CHANGED",
                 entity="goal",
                 entity_id=goal_id,
-                payload={"calories": int(value)},
+                properties={"calories": int(value)},
                 source="user",
+            )
+            # re7 P0-5: a new active goal invalidates any per-day nutrition
+            # snapshot/cache so every screen recomputes from the new target.
+            await event_log.append_event(
+                DB, user_id, "goal_change_confirmed",
+                entity="goal", entity_id=goal_id, source="user",
+                properties={"calories": int(value), "previous": int(current.get("calories") or 0)},
+            )
+            await _invalidate_nutrition_snapshot(user_id)
+            await event_log.append_event(
+                DB, user_id, "goal_snapshot_invalidated",
+                entity="goal", entity_id=goal_id, source="system",
             )
             await safe_edit(
                 query,
@@ -353,7 +582,8 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
             if data == "menu:morning":
                 text = await build_morning_menu_text(user_id)
             elif data == "menu:nextmeal":
-                text = await build_next_meal_text(user_id)
+                await _render_next_meal_screen(query, user_id)
+                return True
             else:
                 text = await build_evening_summary_text(user_id)
         except Exception as exc:  # noqa: BLE001

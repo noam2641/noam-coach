@@ -105,6 +105,10 @@ from retention import (
 # ---------------------------------------------------------------------------
 
 from noam_coach.runtime_bind import runtime_bound
+from noam_coach.services.nutrition_context import (
+    build_nutrition_ai_request,
+    build_nutrition_context,
+)
 
 RUNTIME_NAMES = ('ContextTypes', 'DB', 'Exception', 'InlineKeyboardMarkup', 'LOGGER', 'MealAnalysis', 'RuntimeError', 'Update', '_CANCEL_WORDS', '_handle_meal_correction_text', 'approval_id', 'button', 'candidate_ids', 'clear_meal_fix', 'conversation', 'corrected_analysis', 'correction_text', 'count', 'decision', 'ensure_user', 'event_log', 'exc', 'fetch_approval', 'flow', 'friendly_error', 'get_meal_fix', 'handle_onboarding_text', 'home_keyboard', 'image_path', 'index', 'int', 'is_allowed', 'json', 'len', 'list', 'original_analysis', 'pc', 'planning', 'prior_locked', 'progress', 'rc', 'reanalyze_meal_with_text_and_image', 'refine_count', 'removal_corrections', 'render_meal', 'route_free_text', 'row', 'selected', 'set_meal_fix', 'str', 'suppress', 'text', 'track_event', 'update', 'user_id', 'write_audit')
 
@@ -193,10 +197,17 @@ async def _handle_meal_correction_text(
                 raise RuntimeError("לא נמצאה תמונת מקור לניתוח חוזר")
             await progress.edit_text("מנתח מחדש את התמונה לפי מה שכתבת…")
             prior_locked: list[str] = list(row["data"].get("locked_corrections") or [])
+            nutrition_payload: dict[str, Any] | None = None
+            with suppress(Exception):
+                nutrition_payload = build_nutrition_ai_request(
+                    await build_nutrition_context(DB, user_id, "meal_correction"),
+                    "Re-analyze meal correction",
+                )["context"]
             corrected_analysis = await reanalyze_meal_with_text_and_image(
                 image_path=image_path,
                 correction_text=correction_text,
                 locked_corrections=prior_locked,
+                nutrition_context=nutrition_payload,
             )
 
         corrected_analysis.notes = (
@@ -336,6 +347,37 @@ async def handle_text_message(
             entity="plan_selection", source="router",
             properties={"text_preview": text[:60]},
         )
+
+    # re7 P1-13/14: when a next-meal recommendation is active, interpret a
+    # correction ("אבל נשאר לי 269", "זה גדול מדי", "אין לי ביצים") against it
+    # FIRST, before generic intent routing.
+    from noam_coach.services.next_meal import (
+        format_next_meal_recommendation,
+        handle_recommendation_correction,
+        next_meal_action_rows,
+        remember_active_recommendation,
+    )
+
+    correction = await handle_recommendation_correction(DB, user_id, text)
+    if correction is not None:
+        prefix, recommendation = correction
+        keyboard_rows = [
+            [button(label, cb) for label, cb in row]
+            for row in next_meal_action_rows(recommendation)
+        ]
+        keyboard_rows.append([button("⬅️ חזרה למצב היום", "menu:status"), button("🏠 תפריט", "menu:home")])
+        body = format_next_meal_recommendation(recommendation)
+        if prefix:
+            body = f"{prefix}\n\n{body}"
+        sent = await update.effective_message.reply_text(
+            body,
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+            parse_mode=ParseMode.HTML,
+        )
+        await remember_active_recommendation(
+            DB, user_id, recommendation, message_id=getattr(sent, "message_id", None)
+        )
+        return
 
     # Workout text and ordinary free text both go through the natural-language
     # intent router, but only after the conversation engine assigned ownership.

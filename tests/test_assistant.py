@@ -148,6 +148,20 @@ def test_habitual_negation_is_restriction() -> None:
     assert intent2.action == "set_dietary_pref"
 
 
+def test_food_dislike_is_preference_not_generic_restriction() -> None:
+    intent = assistant.keyword_fallback("אני לא אוהב טורטייה")
+    assert intent.action == "set_dietary_pref"
+    assert intent.slots.get("kind") == "preference"
+    assert intent.slots.get("polarity") == "avoid"
+
+
+def test_food_preference_is_positive_preference() -> None:
+    intent = assistant.keyword_fallback("אני מעדיף אורז")
+    assert intent.action == "set_dietary_pref"
+    assert intent.slots.get("kind") == "preference"
+    assert intent.slots.get("polarity") == "prefer"
+
+
 def test_allergy_is_restriction() -> None:
     intent = assistant.keyword_fallback("אני אלרגי לבוטנים")
     assert intent.action == "set_dietary_pref"

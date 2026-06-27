@@ -560,6 +560,7 @@ SCHEMA_MIGRATIONS: tuple[tuple[int, str], ...] = (
     (6, "planning_and_event_tables"),
     (7, "active_flow_expiry"),
     (8, "meal_origin"),
+    (9, "single_active_goal_version"),
 )
 
 FK_MIGRATION_TABLES: tuple[str, ...] = (
@@ -1109,6 +1110,42 @@ async def _migration_meal_origin(db: Database) -> None:
         await _record_migration(connection, 8, "meal_origin")
 
 
+async def _migration_single_active_goal_version(db: Database) -> None:
+    """Migration 9: enforce one current goal version per user."""
+    async with db.transaction() as connection:
+        now = utc_now()
+        await connection.execute(
+            """
+            WITH ranked AS (
+                SELECT
+                    id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY user_id
+                        ORDER BY
+                            CASE status WHEN 'active' THEN 0 ELSE 1 END,
+                            COALESCE(decided_at, created_at) DESC,
+                            id DESC
+                    ) AS rn
+                FROM goal_versions
+                WHERE status IN ('active', 'active_provisional')
+            )
+            UPDATE goal_versions
+            SET status='superseded',
+                decided_at=COALESCE(decided_at, ?)
+            WHERE id IN (SELECT id FROM ranked WHERE rn > 1)
+            """,
+            (now,),
+        )
+        await connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_goal_versions_single_current
+            ON goal_versions(user_id)
+            WHERE status IN ('active', 'active_provisional')
+            """
+        )
+        await _record_migration(connection, 9, "single_active_goal_version")
+
+
 async def run_migrations(
     db: Database,
     *,
@@ -1143,6 +1180,8 @@ async def run_migrations(
             await _migration_active_flow_expiry(db)
         elif version == 8:
             await _migration_meal_origin(db)
+        elif version == 9:
+            await _migration_single_active_goal_version(db)
         else:
             raise RuntimeError(f"Unknown schema migration {version}")
         LOGGER.info("Applied schema migration %s: %s", version, name)

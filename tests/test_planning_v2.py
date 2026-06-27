@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import coach_bot
 import planning
 import user_model
 from db import Database
@@ -64,6 +65,7 @@ async def test_three_nutrition_and_workout_candidates_are_generated(tmp_path: Pa
         for session in workout[1].payload["sessions"]
         for exercise in session["exercises"]
     )
+    assert all(not planning.workout_quality_issues(item.payload) for item in workout)
 
 
 @pytest.mark.asyncio
@@ -77,6 +79,113 @@ async def test_plan_activation_is_versioned_and_single_active(tmp_path: Path) ->
     assert active and active["id"] == candidates[1].id
     old = await db.fetch_one("SELECT status FROM plan_versions WHERE id=?", (candidates[0].id,))
     assert old and old["status"] == "superseded"
+
+
+@pytest.mark.asyncio
+async def test_workout_activation_blocks_duplicate_exercise_payload(tmp_path: Path) -> None:
+    db = await _ready_db(tmp_path)
+    payload = {
+        "frequency": 1,
+        "sessions": [
+            {
+                "weekday": 0,
+                "time": "18:00",
+                "minutes": 45,
+                "exercises": [
+                    {"id": "bench", "name": "Bench", "sets": 3, "rmin": 8, "rmax": 10},
+                    {"id": "bench", "name": "Bench duplicate", "sets": 3, "rmin": 8, "rmax": 10},
+                ],
+            }
+        ],
+    }
+    plan_id = await db.execute(
+        """
+        INSERT INTO plan_versions(
+            user_id, plan_type, title, strategy, fit_score, status, payload,
+            rationale, tradeoffs, assumptions, based_on, created_at
+        ) VALUES(1, 'workout', 'Bad Workout', 'bad', 0.1, 'candidate', ?, '[]', '[]', '[]', '{}', ?)
+        """,
+        (planning.json.dumps(payload, ensure_ascii=False), utc_now()),
+    )
+
+    with pytest.raises(planning.PlanningBlockedError) as exc:
+        await planning.activate_plan(db, 1, plan_id)
+
+    assert any("duplicate_exercise" in item for item in exc.value.missing)
+
+
+def test_repair_workout_payload_drops_duplicate_and_fixes_params() -> None:
+    """L-NEW-2: a safe repair removes duplicate exercises and fixes bad params."""
+    payload = {
+        "frequency": 1,
+        "sessions": [
+            {
+                "weekday": 0,
+                "time": "",          # missing time -> defaulted
+                "minutes": 5,         # invalid -> clamped
+                "exercises": [
+                    {"id": "bench", "name": "Bench", "sets": 99, "rmin": 8, "rmax": 10},
+                    {"id": "bench", "name": "Bench dup", "sets": 3, "rmin": 8, "rmax": 10},
+                ],
+            }
+        ],
+    }
+    repaired = planning.repair_workout_payload(payload)
+    session = repaired["sessions"][0]
+    assert session["time"]                          # time filled in
+    assert 20 <= session["minutes"] <= 150          # duration clamped
+    ids = [ex["id"] for ex in session["exercises"]]
+    assert ids == ["bench"]                          # duplicate dropped
+    assert session["exercises"][0]["sets"] <= 6      # sets clamped
+    assert not planning.workout_quality_issues(repaired)
+    # Original payload was not mutated.
+    assert len(payload["sessions"][0]["exercises"]) == 2
+
+
+def test_repair_workout_candidates_never_emits_broken_candidate() -> None:
+    """A candidate with a duplicate exercise must not survive to the renderer."""
+    broken = planning.PlanCandidate(
+        plan_type="workout",
+        title="broken",
+        strategy="bad",
+        score=0.9,
+        rationale=[],
+        tradeoffs=[],
+        assumptions=[],
+        payload={
+            "frequency": 1,
+            "sessions": [
+                {
+                    "weekday": 0,
+                    "time": "18:00",
+                    "minutes": 45,
+                    "exercises": [
+                        {"id": "squat", "name": "Squat", "sets": 3, "rmin": 5, "rmax": 8},
+                        {"id": "squat", "name": "Squat dup", "sets": 3, "rmin": 5, "rmax": 8},
+                    ],
+                }
+            ],
+        },
+    )
+    result = planning._repair_workout_candidates([broken])
+    assert len(result) == 1
+    # No duplicate exercise reaches the output.
+    assert not planning.workout_quality_issues(result[0].payload)
+
+
+def test_repair_workout_candidates_drops_unrepairable() -> None:
+    """A candidate with no exercises at all cannot be repaired -> dropped."""
+    empty = planning.PlanCandidate(
+        plan_type="workout",
+        title="empty",
+        strategy="bad",
+        score=0.9,
+        rationale=[],
+        tradeoffs=[],
+        assumptions=[],
+        payload={"frequency": 1, "sessions": [{"weekday": 0, "time": "18:00", "minutes": 45, "exercises": []}]},
+    )
+    assert planning._repair_workout_candidates([empty]) == []
 
 
 @pytest.mark.asyncio
@@ -114,6 +223,68 @@ async def test_manual_goal_activates_without_full_data(tmp_path: Path) -> None:
         (utc_now(),),
     )
     assert await planning.activate_goal(db, 1, int(goal_id)) is True
+
+
+@pytest.mark.asyncio
+async def test_activate_goal_supersedes_active_provisional_goal(tmp_path: Path) -> None:
+    db = Database(str(tmp_path / "active_provisional_goal.db"))
+    await db.init()
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(1,'T',NULL,?)",
+        (utc_now(),),
+    )
+    provisional_id = await db.execute(
+        "INSERT INTO goal_versions(user_id, calories, protein, steps, phase, status, source, "
+        "explanation, created_at) VALUES(1, 2100, 140, 8000, 'maintain', 'active_provisional', 'computed', '', ?)",
+        (utc_now(),),
+    )
+    goal_id = await db.execute(
+        "INSERT INTO goal_versions(user_id, calories, protein, steps, phase, status, source, "
+        "explanation, created_at) VALUES(1, 2000, 150, 9000, 'maintain', 'proposed', 'manual', '', ?)",
+        (utc_now(),),
+    )
+
+    assert await planning.activate_goal(db, 1, int(goal_id)) is True
+
+    old = await db.fetch_one("SELECT status FROM goal_versions WHERE id=?", (provisional_id,))
+    new = await db.fetch_one("SELECT status FROM goal_versions WHERE id=?", (goal_id,))
+    assert old and old["status"] == "superseded"
+    assert new and new["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_fetch_goal_prefers_goal_versions_over_legacy_goals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = Database(str(tmp_path / "single_goal_source.db"))
+    await db.init()
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(1,'T',NULL,?)",
+        (utc_now(),),
+    )
+    await db.execute(
+        """
+        INSERT INTO goal_versions(user_id, calories, protein, steps, phase, status, source, created_at)
+        VALUES(1, 1900, 155, 9000, 'fat_loss_muscle_retention', 'active', 'computed', ?)
+        """,
+        (utc_now(),),
+    )
+    await db.execute(
+        """
+        INSERT INTO goals(user_id, calories, protein, steps, phase, updated_at)
+        VALUES(1, 3000, 90, 4000, 'legacy', ?)
+        """,
+        (utc_now(),),
+    )
+    monkeypatch.setattr(coach_bot, "DB", db)
+
+    goal = await coach_bot.fetch_goal(1)
+
+    assert goal["calories"] == 1900
+    assert goal["protein"] == 155
+    assert goal["steps"] == 9000
+    assert goal["phase"] == "fat_loss_muscle_retention"
 
 
 @pytest.mark.asyncio

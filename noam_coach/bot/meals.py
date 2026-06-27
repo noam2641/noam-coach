@@ -105,6 +105,10 @@ from retention import (
 # ---------------------------------------------------------------------------
 
 from noam_coach.runtime_bind import runtime_bound
+from noam_coach.services.nutrition_context import (
+    build_nutrition_ai_request,
+    build_nutrition_context,
+)
 from noam_coach.services.dietary_restrictions import (
     load_restrictions_from_facts,
     validate_meal_restrictions,
@@ -177,9 +181,16 @@ async def analyze_duplicate_candidate(
     image_bytes = await asyncio.to_thread(Path(image_path).read_bytes)
     caption = str(payload.get("caption") or "").strip()
     if caption:
+        nutrition_payload: dict[str, Any] | None = None
+        with suppress(Exception):
+            nutrition_payload = build_nutrition_ai_request(
+                await build_nutrition_context(DB, user_id, "meal_photo_caption"),
+                "Analyze duplicate meal photo with user caption",
+            )["context"]
         analysis = await reanalyze_meal_with_text_and_image(
             image_path=image_path,
             correction_text=caption,
+            nutrition_context=nutrition_payload,
         )
     else:
         analysis = await analyze_meal_image(image_bytes)
@@ -282,8 +293,16 @@ async def handle_photo(
             return
 
         if caption:
+            nutrition_payload: dict[str, Any] | None = None
+            with suppress(Exception):
+                nutrition_payload = build_nutrition_ai_request(
+                    await build_nutrition_context(DB, user_id, "meal_photo_caption"),
+                    "Analyze meal photo with user caption",
+                )["context"]
             analysis = await reanalyze_meal_with_text_and_image(
-                image_path=str(path), correction_text=caption
+                image_path=str(path),
+                correction_text=caption,
+                nutrition_context=nutrition_payload,
             )
             analysis.notes = (analysis.notes + [f"תיאור מהמשתמש: {caption}"])[-10:]
         else:

@@ -245,7 +245,7 @@ async def activate_goal(db: Any, user_id: int, goal_id: int) -> bool:
         now = utc_now()
         await conn.execute(
             "UPDATE goal_versions SET status='superseded', decided_at=? "
-            "WHERE user_id=? AND status='active' AND id!=?",
+            "WHERE user_id=? AND status IN ('active', 'active_provisional') AND id!=?",
             (now, user_id, goal_id),
         )
         await conn.execute(
@@ -565,6 +565,140 @@ def _schedule_sessions(
     return sessions, assumed
 
 
+def workout_quality_issues(payload: dict[str, Any]) -> list[str]:
+    sessions = payload.get("sessions") or []
+    issues: list[str] = []
+    if not sessions:
+        return ["missing_sessions"]
+    seen_weekdays: set[int] = set()
+    weekly_sets = 0
+    for session_index, session in enumerate(sessions, 1):
+        try:
+            weekday = int(session.get("weekday"))
+        except (TypeError, ValueError):
+            issues.append(f"session_{session_index}_invalid_weekday")
+            weekday = -1
+        if weekday in seen_weekdays:
+            issues.append(f"session_{session_index}_duplicate_weekday")
+        seen_weekdays.add(weekday)
+        try:
+            minutes = int(session.get("minutes") or 0)
+        except (TypeError, ValueError):
+            minutes = 0
+        if minutes < 20 or minutes > 150:
+            issues.append(f"session_{session_index}_invalid_duration")
+        if not session.get("time"):
+            issues.append(f"session_{session_index}_missing_time")
+        exercises = session.get("exercises") or []
+        if not exercises:
+            issues.append(f"session_{session_index}_missing_exercises")
+            continue
+        seen_exercises: set[str] = set()
+        session_sets = 0
+        for exercise_index, exercise in enumerate(exercises, 1):
+            exercise_id = str(exercise.get("id") or "").strip()
+            if not exercise_id:
+                issues.append(f"session_{session_index}_exercise_{exercise_index}_missing_id")
+            elif exercise_id in seen_exercises:
+                issues.append(f"session_{session_index}_duplicate_exercise_{exercise_id}")
+            seen_exercises.add(exercise_id)
+            if not str(exercise.get("name") or "").strip():
+                issues.append(f"session_{session_index}_exercise_{exercise_index}_missing_name")
+            try:
+                sets = int(exercise.get("sets") or 0)
+                rmin = int(exercise.get("rmin") or 0)
+                rmax = int(exercise.get("rmax") or 0)
+            except (TypeError, ValueError):
+                issues.append(f"session_{session_index}_exercise_{exercise_index}_invalid_prescription")
+                continue
+            if sets < 1 or sets > 6 or rmin < 1 or rmax < rmin or rmax > 30:
+                issues.append(f"session_{session_index}_exercise_{exercise_index}_invalid_prescription")
+            session_sets += max(0, sets)
+        if session_sets > 32:
+            issues.append(f"session_{session_index}_excessive_volume")
+        weekly_sets += session_sets
+    if weekly_sets > 120:
+        issues.append("weekly_excessive_volume")
+    return sorted(set(issues))
+
+
+def repair_workout_payload(payload: dict[str, Any], *, default_minutes: int = 45) -> dict[str, Any]:
+    """Deterministically repair common workout-candidate defects in place-safe copy.
+
+    Fixes the issues `workout_quality_issues` detects where a safe automatic
+    correction exists: duplicate exercises within a session (drop later repeats),
+    missing/invalid session time (default to 18:00), out-of-range duration
+    (clamp), and out-of-range set/rep prescriptions (clamp). Defects with no safe
+    auto-fix (e.g. duplicate weekdays, missing exercises entirely) are left for
+    the caller to reject. Returns a new payload; the input is not mutated.
+    """
+    repaired = copy.deepcopy(payload)
+    sessions = repaired.get("sessions") or []
+    for session in sessions:
+        # Session time / duration.
+        if not session.get("time"):
+            session["time"] = "18:00"
+        try:
+            minutes = int(session.get("minutes") or 0)
+        except (TypeError, ValueError):
+            minutes = 0
+        if minutes < 20 or minutes > 150:
+            session["minutes"] = max(20, min(150, minutes or default_minutes))
+
+        # Drop duplicate exercises (by id), keeping the first occurrence.
+        seen: set[str] = set()
+        deduped: list[dict[str, Any]] = []
+        for exercise in session.get("exercises") or []:
+            exercise_id = str(exercise.get("id") or "").strip()
+            if exercise_id and exercise_id in seen:
+                continue
+            if exercise_id:
+                seen.add(exercise_id)
+            # Clamp obviously invalid prescriptions.
+            try:
+                sets = int(exercise.get("sets") or 0)
+                rmin = int(exercise.get("rmin") or 0)
+                rmax = int(exercise.get("rmax") or 0)
+            except (TypeError, ValueError):
+                sets, rmin, rmax = 0, 0, 0
+            if sets:
+                exercise["sets"] = max(1, min(6, sets))
+            if rmin:
+                exercise["rmin"] = max(1, min(30, rmin))
+            if rmax:
+                exercise["rmax"] = max(int(exercise.get("rmin") or 1), min(30, rmax))
+            deduped.append(exercise)
+        session["exercises"] = deduped
+    return repaired
+
+
+def _repair_workout_candidates(candidates: list["PlanCandidate"]) -> list["PlanCandidate"]:
+    """Repair-or-drop workout candidates so a broken one is never displayed.
+
+    Each candidate is repaired deterministically; if it still has quality issues
+    after repair it is dropped. Score penalty for repaired candidates is removed
+    once they pass validation so a clean repaired plan competes fairly.
+    """
+    healthy: list[PlanCandidate] = []
+    for candidate in candidates:
+        if candidate.plan_type != "workout":
+            healthy.append(candidate)
+            continue
+        if not workout_quality_issues(candidate.payload):
+            healthy.append(candidate)
+            continue
+        candidate.payload = repair_workout_payload(candidate.payload)
+        if workout_quality_issues(candidate.payload):
+            continue  # unrepairable -> never shown
+        # Repaired successfully: drop the quality penalty and note the repair.
+        candidate.score = round(min(1.0, candidate.score + 0.12), 2)
+        note = "התוכנית תוקנה אוטומטית לפני הצגה (הוסרו כפילויות/תוקנו פרמטרים)"
+        if note not in candidate.assumptions:
+            candidate.assumptions.append(note)
+        healthy.append(candidate)
+    return healthy
+
+
 def _workout_candidate(
     title: str,
     strategy: str,
@@ -621,25 +755,30 @@ def _workout_candidate(
         ]
     if adaptation_audit:
         assumptions.append("התוכנית הותאמה לציוד, לניסיון ולמגבלות שדווחו")
+    payload = {
+        "frequency": frequency,
+        "sessions": sessions,
+        "progression": {
+            "method": "double_progression_rir",
+            "target_rir": 2,
+            "deload_trigger": "2-3 אימונים רצופים עם ירידה בביצועים או עייפות גבוהה",
+        },
+        "days_source": "default" if assumed else "confirmed_availability",
+        "adaptation_audit": adaptation_audit,
+    }
+    quality_issues = workout_quality_issues(payload)
+    quality_penalty = 0.12 if quality_issues else 0.0
+    if quality_issues:
+        assumptions.append("נמצאו בעיות איכות במועמד האימון ונדרש תיקון לפני הפעלה")
     return PlanCandidate(
         plan_type="workout",
         title=title,
         strategy=strategy,
-        score=round(max(0.0, min(1.0, score - (0.08 if assumed else 0.0))), 2),
+        score=round(max(0.0, min(1.0, score - (0.08 if assumed else 0.0) - quality_penalty)), 2),
         rationale=rationale,
         tradeoffs=tradeoffs,
         assumptions=assumptions,
-        payload={
-            "frequency": frequency,
-            "sessions": sessions,
-            "progression": {
-                "method": "double_progression_rir",
-                "target_rir": 2,
-                "deload_trigger": "2-3 אימונים רצופים עם ירידה בביצועים או עייפות גבוהה",
-            },
-            "days_source": "default" if assumed else "confirmed_availability",
-            "adaptation_audit": adaptation_audit,
-        },
+        payload=payload,
     )
 
 
@@ -780,6 +919,16 @@ async def generate_candidates(db: Any, user_id: int, plan_type: PlanType) -> lis
                 if note not in candidate.assumptions:
                     candidate.assumptions.append(note)
 
+    # L-NEW-2: never display a broken workout candidate. Repair where safe, drop
+    # the unrepairable, and block clearly if nothing usable remains.
+    if plan_type == "workout":
+        candidates = _repair_workout_candidates(candidates)
+        if not candidates:
+            raise PlanningBlockedError(
+                "לא הצלחתי לבנות תוכנית אימון תקינה. בוא נשלים פרטים ונבנה מחדש.",
+                missing=["workout_plan_quality"],
+            )
+
     return await save_candidates(db, user_id, candidates)
 
 
@@ -829,6 +978,12 @@ async def _validate_plan_for_activation(
             )
         if any(not session.get("exercises") for session in sessions):
             raise PlanningBlockedError("לפחות אימון אחד נשאר ללא תרגילים מתאימים")
+        quality_issues = workout_quality_issues(payload)
+        if quality_issues:
+            raise PlanningBlockedError(
+                "תוכנית האימונים צריכה תיקון איכות לפני הפעלה",
+                missing=quality_issues[:5],
+            )
     elif plan_type == "nutrition":
         if await active_goal(db, user_id) is None:
             raise PlanningBlockedError("אין יעד פעיל לתוכנית התזונה")
