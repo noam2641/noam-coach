@@ -47,3 +47,9 @@
 - `.venv`, `.git`, `.claude` ו־caches.
 - storage, תמונות וקובצי Health של משתמשים.
 - logs, bytecode וארכיוני עבודה.
+## REC-PROGRAM-04 release manifest note — 2026-06-27
+
+- Release artifact verified: `dist\noam_coach_2.0.0-rc5.zip`.
+- File count: 169.
+- SHA-256: `48ffab080da0b07fda606c9a108cfd5777481b177670057dc9e91ba4fd4d9fe6`.
+- Forbidden-entry count: 0.

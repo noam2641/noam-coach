@@ -105,6 +105,10 @@ from retention import (
 # ---------------------------------------------------------------------------
 
 from noam_coach.runtime_bind import runtime_bound
+from noam_coach.services.dietary_restrictions import (
+    load_restrictions_from_facts,
+    validate_meal_restrictions,
+)
 
 RUNTIME_NAMES = ('Any', 'ContextTypes', 'DB', 'Exception', 'FoodItem', 'InlineKeyboardButton', 'InlineKeyboardMarkup', 'LOGGER', 'MealAnalysis', 'ParseMode', 'Path', 'SETTINGS', 'Update', 'ValueError', '_AlreadyDecided', '_dt', '_item_line', 'abs', 'allergies_val', 'analysis', 'analyze_meal_image', 'any', 'approval', 'approval_id', 'asyncio', 'auto_save_meal', 'bool', 'button', 'bytes', 'cal', 'caption', 'clear_meal_fix', 'conn', 'conversation', 'count', 'create_approval', 'cur', 'cursor', 'cutoff', 'data_quality', 'datetime', 'decide_approval', 'dict', 'diet_restrictions', 'diff', 'duplicate_approval_id', 'duplicate_id', 'edit_meal_id', 'edited_existing', 'ensure_user', 'enumerate', 'esc', 'event_log', 'exc', 'fetch_approval', 'file_unique_id', 'float', 'folder', 'friendly_error', 'handed_off', 'hasattr', 'high', 'home_keyboard', 'i', 'image_bytes', 'image_path', 'index', 'int', 'is_allowed', 'item', 'item_count', 'item_index', 'item_name_lower', 'items', 'json', 'keyboard', 'line', 'list', 'low', 'macro_cal', 'macro_diff', 'max', 'meal', 'meal_id', 'meal_intelligence', 'message', 'now', 'option', 'option_rows', 'path', 'payload', 'pending_dup', 'persist_meal', 'photo_obj', 'progress', 'query', 'range', 'reanalyze_meal_with_text_and_image', 'recent', 'refine_count', 'refine_hint', 'render_meal', 'report', 'restriction', 'restriction_block', 'restriction_lower', 'restriction_warnings', 'restricted_items', 'row', 'rows', 'safe_edit', 'saved_dup', 'secrets', 'set_meal_fix', 'should_auto_approve', 'str', 'suppress', 'target', 'telegram_file', 'telegram_file_unique_id', 'text', 'timedelta', 'timezone', 'totals', 'update', 'user_id', 'user_model', 'utc_now', 'write_audit')
 
@@ -584,25 +588,33 @@ async def render_meal(target: Any, user_id: int, approval_id: str, refine_count:
     analysis = MealAnalysis.model_validate(row["data"]["analysis"])
     totals = analysis.totals()
 
-    # REC-PLAN-MEAL-03-13: Check for dietary restriction contradictions
+    # REC-PROGRAM-04-06: Allergy-safe recommendation firewall
     restriction_warnings = []
     diet_restrictions = await user_model.get_value(DB, user_id, "diet_restrictions")
     allergies_val = await user_model.get_value(DB, user_id, "allergies")
-    restricted_items = []
-    if diet_restrictions and diet_restrictions != "none":
-        restricted_items.extend(p.strip() for p in str(diet_restrictions).split(",") if p.strip())
-    if allergies_val and allergies_val != "none":
-        restricted_items.extend(p.strip() for p in str(allergies_val).split(",") if p.strip())
-    if restricted_items:
-        for item in analysis.items:
-            item_name_lower = item.name.lower()
-            for restriction in restricted_items:
-                restriction_lower = restriction.lower()
-                if restriction_lower in item_name_lower or item_name_lower in restriction_lower:
-                    restriction_warnings.append(
-                        f"⚠️ <b>{esc(item.name)}</b> — "
-                        f"רשום אצלך כהימנעות: {esc(restriction)}"
-                    )
+    active_restrictions = load_restrictions_from_facts(diet_restrictions, allergies_val)
+    if active_restrictions:
+        item_dicts = [{"item_name": item.name} for item in analysis.items]
+        violations = validate_meal_restrictions(item_dicts, active_restrictions)
+        for violation in violations:
+            item_name = violation["item_name"]
+            restr = violation["restriction"]
+            action = violation["action"]
+            if action == "block":
+                restriction_warnings.append(
+                    f"⛔ <b>{esc(item_name)}</b> — "
+                    f"אלרגיה/רגישות: {esc(restr.user_label or restr.canonical_id)}"
+                )
+            elif action == "warn":
+                restriction_warnings.append(
+                    f"⚠️ <b>{esc(item_name)}</b> — "
+                    f"רשום אצלך כהימנעות: {esc(restr.user_label or restr.canonical_id)}"
+                )
+            elif action == "substitute":
+                restriction_warnings.append(
+                    f"🔄 <b>{esc(item_name)}</b> — "
+                    f"מרכיב לא זמין: {esc(restr.user_label or restr.canonical_id)}"
+                )
 
     def _item_line(index: int, item: "FoodItem") -> str:
         line = (

@@ -290,18 +290,50 @@ def _normalize_restrictions(value: Any) -> set[str]:
     return {part.strip().casefold() for part in text.replace("/", ",").split(",") if part.strip()}
 
 
-def _protein_options(restrictions: set[str]) -> list[str]:
+def _protein_options(restrictions: set[str], canonical_ids: set[str] | None = None) -> list[str]:
+    """Return protein source suggestions respecting dietary restrictions.
+
+    *canonical_ids* (if provided) is a set of canonical restriction IDs
+    from the dietary-restriction service (e.g. ``{"dairy", "eggs"}``).
+    When supplied, individual options are filtered against those IDs so
+    the nutrition plan never recommends a restricted protein source.
+    """
     vegan = any("טבע" in x or "vegan" in x for x in restrictions)
     vegetarian = vegan or any("צמח" in x or "vegetarian" in x for x in restrictions)
     if vegan:
-        return ["טופו/טמפה", "עדשים וקטניות", "סייטן", "יוגורט סויה עתיר חלבון"]
-    if vegetarian:
-        return ["ביצים", "גבינה/יוגורט עתיר חלבון", "טופו", "קטניות"]
-    return ["עוף/הודו", "דג", "ביצים", "יוגורט/גבינה", "טופו"]
+        base = ["טופו/טמפה", "עדשים וקטניות", "סייטן", "יוגורט סויה עתיר חלבון"]
+    elif vegetarian:
+        base = ["ביצים", "גבינה/יוגורט עתיר חלבון", "טופו", "קטניות"]
+    else:
+        base = ["עוף/הודו", "דג", "ביצים", "יוגורט/גבינה", "טופו"]
+
+    # REC-PROGRAM-04-10: Filter options against canonical restriction IDs
+    if canonical_ids:
+        _OPTION_CANONICAL: dict[str, set[str]] = {
+            "ביצים": {"eggs"},
+            "גבינה/יוגורט עתיר חלבון": {"dairy"},
+            "יוגורט/גבינה": {"dairy"},
+            "יוגורט סויה עתיר חלבון": {"soy"},
+            "טופו/טמפה": {"soy"},
+            "טופו": {"soy"},
+            "דג": {"fish"},
+        }
+        filtered = [opt for opt in base if not (_OPTION_CANONICAL.get(opt, set()) & canonical_ids)]
+        # Always keep at least one option
+        if not filtered:
+            filtered = ["קטניות ועדשים"]
+        base = filtered
+    return base
 
 
-def _meal_slots(calories: int, protein: int, strategy: str, restrictions: set[str]) -> list[dict[str, Any]]:
-    proteins = _protein_options(restrictions)
+def _meal_slots(
+    calories: int,
+    protein: int,
+    strategy: str,
+    restrictions: set[str],
+    canonical_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    proteins = _protein_options(restrictions, canonical_ids)
     if strategy == "structured":
         ratios = [("ארוחת בוקר", 0.22), ("ארוחת צהריים", 0.34), ("ארוחת ביניים", 0.12), ("ארוחת ערב", 0.32)]
     elif strategy == "flexible":
@@ -354,11 +386,12 @@ def _nutrition_candidate(
     protein: int,
     facts: dict[str, dict[str, Any]],
     restrictions: set[str],
+    canonical_ids: set[str] | None = None,
     rationale: list[str],
     tradeoffs: list[str],
     assumptions: list[str],
 ) -> PlanCandidate:
-    slots = _meal_slots(calories, protein, strategy, restrictions)
+    slots = _meal_slots(calories, protein, strategy, restrictions, canonical_ids)
     times = _workday_meal_times(facts, len(slots))
     for slot, time_text in zip(slots, times, strict=False):
         slot["time"] = time_text
@@ -416,6 +449,17 @@ async def build_nutrition_candidates(db: Any, user_id: int) -> list[PlanCandidat
     facts = await collect_facts(db, user_id)
     restrictions = _normalize_restrictions(_fact_value(facts, "diet_restrictions"))
     restrictions |= _normalize_restrictions(_fact_value(facts, "allergies"))
+
+    # REC-PROGRAM-04-10: Build canonical restriction IDs for constraint-safe filtering
+    from noam_coach.services.dietary_restrictions import load_restrictions_from_facts
+    diet_raw = _fact_value(facts, "diet_restrictions")
+    allergy_raw = _fact_value(facts, "allergies")
+    typed_restrictions = load_restrictions_from_facts(
+        str(diet_raw) if diet_raw else None,
+        str(allergy_raw) if allergy_raw else None,
+    )
+    canonical_ids = {r.canonical_id for r in typed_restrictions}
+
     cooking = str(_fact_value(facts, "cooking_capacity", "unknown"))
     has_breaks = _fact_value(facts, "meal_break_info") is not None
     assumptions: list[str] = []
@@ -429,6 +473,7 @@ async def build_nutrition_candidates(db: Any, user_id: int) -> list[PlanCandidat
         "protein": int(goal["protein"]),
         "facts": facts,
         "restrictions": restrictions,
+        "canonical_ids": canonical_ids,
         "assumptions": assumptions,
     }
     candidates = [
@@ -529,9 +574,15 @@ def _workout_candidate(
     score: float,
     rationale: list[str],
     tradeoffs: list[str],
+    resolved_session_minutes: int | None = None,
+    resolved_preferred_days: list[int] | None = None,
 ) -> PlanCandidate:
-    minutes = int(_fact_value(facts, "session_minutes", 50) or 50)
+    # REC-PROGRAM-04-01: Use resolved availability when provided
+    minutes = resolved_session_minutes or int(_fact_value(facts, "session_minutes", 50) or 50)
     availability = _parse_availability(_fact_value(facts, "weekly_availability"))
+    if resolved_preferred_days and not availability:
+        # Synthesize availability slots from resolved preferred days
+        availability = [{"weekday": d, "available": True, "minutes": minutes} for d in resolved_preferred_days]
     sessions, assumed = _schedule_sessions(frequency, availability, default_minutes=minutes)
     equipment_value = _fact_value(facts, "equipment")
     location = _fact_value(facts, "training_location")
@@ -596,13 +647,21 @@ async def build_workout_candidates(db: Any, user_id: int) -> list[PlanCandidate]
     await _require_readiness(db, user_id, "workout")
     await _require_readiness(db, user_id, "safety")
     facts = await collect_facts(db, user_id)
-    desired = int(_fact_value(facts, "training_days_per_week", 3) or 3)
-    desired = max(MIN_FREQUENCY, min(MAX_FREQUENCY, desired))
+
+    # REC-PROGRAM-04-01: Use resolved availability as the authoritative source
+    from noam_coach.services.availability import resolve_availability
+    avail = await resolve_availability(db, user_id)
+    desired = max(MIN_FREQUENCY, min(MAX_FREQUENCY, avail.max_days_per_week))
     experience = str(_fact_value(facts, "strength_experience", "beginner"))
     consistency_freq = max(1, min(3, desired - 1 if desired > 2 else desired))
     performance_freq = min(MAX_FREQUENCY, desired + 1)
     if experience in {"beginner", "מתחיל", "none", "unknown"}:
         performance_freq = desired
+    # REC-PROGRAM-04-01: Pass resolved availability to candidates
+    _avail_kwargs = {
+        "resolved_session_minutes": avail.session_minutes,
+        "resolved_preferred_days": avail.preferred_days,
+    }
     return [
         _workout_candidate(
             "מקסימום עקביות",
@@ -612,6 +671,7 @@ async def build_workout_candidates(db: Any, user_id: int) -> list[PlanCandidate]
             score=0.9,
             rationale=["פחות אימונים", "גרסאות קצרות מובנות", "סיכוי גבוה להתמדה"],
             tradeoffs=["נפח שבועי מתון יותר", "פחות התמחות בכל קבוצת שריר"],
+            **_avail_kwargs,
         ),
         _workout_candidate(
             "מאוזנת",
@@ -621,6 +681,7 @@ async def build_workout_candidates(db: Any, user_id: int) -> list[PlanCandidate]
             score=0.92,
             rationale=["תואמת את התדירות שביקשת", "איזון בין נפח להתאוששות", "שומרת חלופות למכשיר תפוס"],
             tradeoffs=["דורשת לעמוד ברוב חלונות האימון"],
+            **_avail_kwargs,
         ),
         _workout_candidate(
             "ביצועים",
@@ -630,6 +691,7 @@ async def build_workout_candidates(db: Any, user_id: int) -> list[PlanCandidate]
             score=0.82 if performance_freq > desired else 0.86,
             rationale=["יותר הזדמנויות לתרגול ולהתקדמות", "נפח גבוה יותר למשתמש מתאים"],
             tradeoffs=["דורשת יותר זמן והתאוששות", "פחות מתאימה לשבוע עמוס"],
+            **_avail_kwargs,
         ),
     ]
 

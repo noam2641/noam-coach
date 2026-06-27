@@ -25,12 +25,17 @@ class APIBodyLimitMiddleware:
         ):
             await self.app(scope, receive, send)
             return
+        limit_bytes = (
+            SETTINGS.health_import_max_upload_mb * 1024 * 1024
+            if path == "/mini/upload"
+            else SETTINGS.api_max_body_bytes
+        )
 
         headers = {key.lower(): value for key, value in scope.get("headers", [])}
         raw_length = headers.get(b"content-length")
         if raw_length:
             try:
-                if int(raw_length.decode("ascii")) > SETTINGS.api_max_body_bytes:
+                if int(raw_length.decode("ascii")) > limit_bytes:
                     await JSONResponse(
                         status_code=413,
                         content={"detail": "Request body too large"},
@@ -50,7 +55,7 @@ class APIBodyLimitMiddleware:
             buffered.append(message)
             if message.get("type") == "http.request":
                 total += len(message.get("body", b""))
-                if total > SETTINGS.api_max_body_bytes:
+                if total > limit_bytes:
                     await JSONResponse(
                         status_code=413,
                         content={"detail": "Request body too large"},

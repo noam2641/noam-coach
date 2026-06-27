@@ -99,3 +99,12 @@
 - עומס וריבוי משתמשים production.
 
 אלו דורשים credentials, מחשב Windows פעיל, רשת או תשתית שאינם חלק מה־ZIP.
+## REC-PROGRAM-04 validation — 2026-06-27
+
+- `C:\Users\user\anaconda3\python.exe -m compileall -q coach_bot.py noam_coach`: exit code 0.
+- `C:\Users\user\anaconda3\python.exe -m ruff check .`: exit code 0.
+- `C:\Users\user\anaconda3\python.exe -m pytest --maxfail=0 -ra`: exit code 0; `557 passed, 3 warnings in 30.61s`; skipped 0; xfailed 0.
+- `C:\Users\user\anaconda3\python.exe scripts\run_evaluations.py`: exit code 0; 33/33 passed.
+- `C:\Users\user\anaconda3\python.exe scripts\preflight.py --skip-runtime-secrets`: exit code 0.
+- Bounded startup smoke: reached Telegram app start, scheduler start, bot identity, FastAPI/Uvicorn startup; no traceback.
+- Release build: `dist\noam_coach_2.0.0-rc5.zip`, 169 files, 0 forbidden entries, SHA-256 `48ffab080da0b07fda606c9a108cfd5777481b177670057dc9e91ba4fd4d9fe6`.

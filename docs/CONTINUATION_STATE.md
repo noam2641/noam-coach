@@ -27,3 +27,11 @@
 - Telegram token ו־OpenAI key אמיתיים.
 - Mini App בטלפון דורש HTTPS ציבורי; לפיתוח ניתן להשתמש ב־Quick Tunnel.
 - נתיב מקומי עובד רק כשהבוט רץ על אותו מחשב שמכיל את הקובץ.
+## REC-PROGRAM-04 checkpoint — 2026-06-27
+
+- Current batch completed/reviewed; `REC-NEXT-MEAL-05` was not started.
+- Audit: `docs/CODEX_AUDIT_REC_PROGRAM_04.md`.
+- Test matrix: `docs/TEST_MATRIX.md`.
+- Verified gates: compileall passed, Ruff passed, pytest `557 passed, 3 warnings`, evaluations `33/33`, preflight passed, bounded startup smoke passed.
+- Release ZIP: `dist\noam_coach_2.0.0-rc5.zip`, 169 files, 0 forbidden entries, SHA-256 `48ffab080da0b07fda606c9a108cfd5777481b177670057dc9e91ba4fd4d9fe6`.
+- Remaining external limitations: full live Telegram/OpenAI behavior depends on external credentials/services; extracted release full startup needs a private `.env` that is intentionally excluded.

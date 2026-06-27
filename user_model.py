@@ -451,8 +451,21 @@ def display_label(key: str) -> str:
 
 
 def display_value(key: str, value: Any) -> str:
-    """Return a user-friendly Hebrew string for a fact value."""
+    """Return a user-friendly Hebrew string for a fact value.
+
+    REC-PROGRAM-04-08: Never display raw dicts, JSON, snake_case keys,
+    or internal metadata.  Body-fat values are normalized by source unit
+    (fraction vs percentage).
+    """
     if value is None:
+        return "לא צוין"
+    # REC-PROGRAM-04-08: Intercept raw gap/internal dicts before they leak.
+    if isinstance(value, dict):
+        if value.get("missing"):
+            return "לא צוין"
+        # Internal dict with structured data — show only the meaningful part
+        if "value" in value:
+            return display_value(key, value["value"])
         return "לא צוין"
     # Check display labels for enum-like values
     str_val = str(value)
@@ -466,7 +479,10 @@ def display_value(key: str, value: Any) -> str:
         if key == "height_cm":
             return f'{num:.0f} ס"מ'
         if key == "body_fat_pct":
-            return f"{num:.1f}%"
+            # REC-PROGRAM-04-08: Delegate to centralized normalizer.
+            from noam_coach.services.body_fat import display_body_fat, normalize_body_fat
+            result = normalize_body_fat(num)
+            return display_body_fat(result)
         if key == "avg_steps":
             return f"{round(num):,} צעדים"
         if key == "resting_hr":

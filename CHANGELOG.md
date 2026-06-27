@@ -187,3 +187,14 @@
 - Ruff/compile/preflight clean.
 - clean-environment dependency validation, including `python-multipart` for Mini App uploads.
 - no `.env`, DB, images, backups, `.venv` or `.git` in release archive.
+## REC-PROGRAM-04 — 2026-06-27
+
+- Completed and audited REC-PROGRAM-04 production integration.
+- Added canonical training availability into workout planning, Telegram profile/program views, and Mini App profile/dashboard data.
+- Hardened dietary restriction matching for `nut`, `nutmeg`, `coconut milk`, plant milk, and explicit negation phrases.
+- Wired canonical dietary IDs into nutrition plan protein-option filtering.
+- Added source-aware body-fat normalization for Apple Health and profile display.
+- Added deterministic replacement meal corrections before AI fallback.
+- Hardened Mini App CSP/XSS posture by removing inline event handlers and escaping server text.
+- Fixed Mini App upload body limit handling for Apple Health imports.
+- Verified release ZIP: 169 files, 0 forbidden entries.

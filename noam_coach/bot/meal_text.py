@@ -175,6 +175,15 @@ async def _handle_meal_correction_text(
                 )
                 used_deterministic = True
 
+        replace_corrections = [c for c in corrections if c.kind == "replace"]
+
+        if replace_corrections:
+            for rc in replace_corrections:
+                corrected_analysis = meal_intelligence.apply_item_replacement_correction(
+                    corrected_analysis, rc,
+                )
+            used_deterministic = True
+
         if not used_deterministic:
             # Fall back to AI reanalysis only when deterministic parser
             # did not recognize the correction.

@@ -128,7 +128,6 @@ async def sync_health_measurements_to_facts(user_id: int) -> None:
 
     mapping = [
         ("weight", "weight_kg"),
-        ("body_fat", "body_fat_pct"),
         ("resting_heart_rate", "resting_hr"),
     ]
     for stype, key in mapping:
@@ -137,6 +136,22 @@ async def sync_health_measurements_to_facts(user_id: int) -> None:
             await user_model.set_fact(
                 _current_db(), user_id, key,
                 round(float(row["value"]), 2),
+                kind=user_model.KIND_FACT,
+                source=user_model.SOURCE_APPLE_HEALTH,
+            )
+
+    # REC-PROGRAM-04-08: Body-fat sync uses the centralized normalizer
+    bf_row = await latest("body_fat")
+    if bf_row:
+        from noam_coach.services.body_fat import normalize_body_fat
+        bf_result = normalize_body_fat(
+            bf_row["value"],
+            source_type="apple_health",
+        )
+        if bf_result.status in ("valid", "inferred_unit") and bf_result.normalized_pct is not None:
+            await user_model.set_fact(
+                _current_db(), user_id, "body_fat_pct",
+                bf_result.normalized_pct,
                 kind=user_model.KIND_FACT,
                 source=user_model.SOURCE_APPLE_HEALTH,
             )

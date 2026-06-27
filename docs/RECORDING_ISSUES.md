@@ -222,3 +222,16 @@ user text authoritative (1), meal totals consistency (2), oil removal (4),
 restriction contradiction (1), meal save confirmation (2), daily totals (1),
 next action button (2), redundant question (4), structured error recovery (3),
 system prompt completeness (3), keyword fallback ordering (4).
+## REC-PROGRAM-04 — Program and meal recording review (2026-06-27)
+
+Independent audit and completion evidence is in `docs/CODEX_AUDIT_REC_PROGRAM_04.md`.
+
+Key production fixes:
+
+- Canonical training availability is used by workout candidate generation, Telegram profile/program views, and Mini App profile/dashboard payloads.
+- Nutrition plan protein options now receive canonical dietary restriction IDs.
+- Dietary matching handles `nut`, `nutmeg`, `coconut milk`, and explicit negation phrases such as `contains no nuts`, `nut-free`, `ללא אגוזים`, and `בלי חלב`.
+- Mini App inline event handlers were removed to satisfy CSP, server text is escaped before HTML rendering, and weekday IDs now match backend `0=Sunday`.
+- `/mini/upload` uses the Health upload body limit rather than the generic small API body limit.
+
+Verification: compileall passed, Ruff passed, pytest `557 passed, 3 warnings`, evaluations `33/33`, preflight passed, startup smoke passed, release ZIP has 169 files and 0 forbidden entries.

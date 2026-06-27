@@ -22,3 +22,9 @@
 - rate limiter הנוכחי הוא מקומי לתהליך. לפני multi-worker יש להעבירו ל־store משותף.
 - SQLite מתאים למופע אישי; לפני multi-user production נדרשים tenant isolation, device pairing, PostgreSQL, queue, object storage מוצפן ובדיקת חדירות.
 - אין להשתמש בתוצאות תזונה/אימון כאבחנה רפואית.
+## REC-PROGRAM-04 Security Notes — 2026-06-27
+
+- Mini App inline event handlers were removed to comply with `script-src 'self'`.
+- Mini App dynamic HTML now escapes server-provided text before rendering.
+- `/mini/upload` uses the Health upload size limit rather than the generic API JSON body limit.
+- Release ZIP was independently inspected: 0 forbidden entries, no `.env`, DB, Health export, storage, cache, `.git`, `.claude`, or IDE entries.

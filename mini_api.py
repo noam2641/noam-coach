@@ -26,6 +26,7 @@ from config import LOGGER, SETTINGS, TZ
 from db import DB
 from helpers import _safe_html_block, friendly_error, today_bounds_utc
 from models import MiniProfileUpdate
+from noam_coach.services.availability import resolve_availability
 
 router = APIRouter()
 
@@ -60,6 +61,7 @@ async def mini_dashboard(user_id: int = Depends(mini_session_user)) -> JSONRespo
     nutrition = await planning.get_active_plan(DB, user_id, "nutrition")
     workout = await planning.get_active_plan(DB, user_id, "workout")
     unified = await planning.get_active_plan(DB, user_id, "unified")
+    availability = await resolve_availability(DB, user_id)
     calories, protein = await coach_bot.today_consumed(user_id)
     brief = await coach_intelligence.build_coaching_brief(
         DB,
@@ -83,6 +85,7 @@ async def mini_dashboard(user_id: int = Depends(mini_session_user)) -> JSONRespo
             },
             "missing": snapshot["missing"],
             "coaching": brief.to_dict(),
+            "availability": availability.__dict__,
         }
     )
 
@@ -91,10 +94,12 @@ async def mini_dashboard(user_id: int = Depends(mini_session_user)) -> JSONRespo
 async def mini_profile(user_id: int = Depends(mini_session_user)) -> JSONResponse:
     snapshot = await planning.profile_snapshot(DB, user_id)
     public = await user_model.get_profile_view(DB, user_id)
+    availability = await resolve_availability(DB, user_id)
     return JSONResponse(
         {
             "snapshot": snapshot,
             "profile": public,
+            "availability": availability.__dict__,
         }
     )
 
@@ -464,4 +469,3 @@ async def mini_upload(
     finally:
         with suppress(Exception):
             saved_path.unlink(missing_ok=True)
-

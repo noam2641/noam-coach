@@ -1004,6 +1004,14 @@ async def build_profile_text(user_id: int) -> str:
             if not spec:
                 continue
             lines.append(f"· {esc(spec.label)}")
+    # REC-PROGRAM-04-01: Show resolved training availability
+    from noam_coach.services.availability import format_availability_summary, resolve_availability
+    avail = await resolve_availability(DB, user_id)
+    avail_text = format_availability_summary(avail)
+    lines += ["", "<b>🗓️ זמינות לאימון</b>"]
+    for avail_line in avail_text.split("\n"):
+        lines.append(esc(avail_line))
+
     constraints = await active_constraints(user_id)
     if constraints:
         lines += ["", "<b>⚠️ מגבלות פעילות</b>"]
@@ -1082,13 +1090,14 @@ def _plan_type_label(plan_type: str) -> str:
 
 @runtime_bound(RUNTIME_NAMES)
 def _format_candidate(candidate: dict[str, Any], index: int | None = None) -> str:
+    """REC-PROGRAM-04-04: Show rationale instead of opaque percentage."""
     title = esc(candidate.get("title", "תוכנית"))
-    score = int(float(candidate.get("fit_score", candidate.get("score", 0))) * 100)
     prefix = f"{index}. " if index is not None else ""
-    lines = [f"<b>{prefix}{title}</b> · התאמה {score}%"]
     rationale = candidate.get("rationale") or []
     tradeoffs = candidate.get("tradeoffs") or []
     assumptions = candidate.get("assumptions") or []
+    # Show a brief explainable summary instead of an opaque score
+    lines = [f"<b>{prefix}{title}</b>"]
     if rationale:
         lines.append("✓ " + " · ".join(esc(str(item)) for item in rationale[:3]))
     if tradeoffs:
@@ -1104,6 +1113,12 @@ async def render_smart_plan_hub(target: Any, user_id: int) -> None:
     nutrition = await planning.get_active_plan(DB, user_id, "nutrition")
     workout = await planning.get_active_plan(DB, user_id, "workout")
     unified = await planning.get_active_plan(DB, user_id, "unified")
+
+    # REC-PROGRAM-04-01: Show resolved availability in program center
+    from noam_coach.services.availability import format_availability_summary, resolve_availability
+    avail = await resolve_availability(DB, user_id)
+    avail_summary = format_availability_summary(avail)
+
     lines = ["<b>מרכז התוכנית האישית</b>", ""]
     for name in ("nutrition", "workout", "safety", "tracking"):
         result = readiness[name]
@@ -1123,6 +1138,11 @@ async def render_smart_plan_hub(target: Any, user_id: int) -> None:
                 ]
                 detail = f" — חסר: {esc(', '.join(missing_labels[:3]))}" if missing_labels else ""
                 lines.append(f"{icon} {esc(label)}: {int(result['score'] * 100)}%{detail}")
+    # REC-PROGRAM-04-01: availability section
+    lines += [""]
+    for avail_line in avail_summary.split("\n"):
+        lines.append(esc(avail_line))
+
     lines += [""]
     lines.append(
         f"תזונה פעילה: <b>{esc(nutrition['title'])}</b>" if nutrition else "תזונה פעילה: טרם נבחרה"
@@ -1177,6 +1197,26 @@ async def render_candidate_list(target: Any, user_id: int, plan_type: str) -> No
     rows = []
     for index, candidate in enumerate(candidates, start=1):
         lines.append(_format_candidate(candidate, index))
+        # REC-PROGRAM-04-02: Show workout session details before selection
+        if plan_type == "workout":
+            payload = candidate.get("payload", {})
+            sessions = payload.get("sessions", [])
+            for session in sessions[:4]:
+                day_name = session.get("weekday_name", "")
+                session_name = session.get("name", "")
+                exercises = session.get("exercises", [])
+                ex_count = len(exercises)
+                session_mins = session.get("minutes", 0)
+                ex_preview = ", ".join(
+                    esc(e.get("name_he") or e.get("name", ""))
+                    for e in exercises[:3]
+                )
+                if ex_count > 3:
+                    ex_preview += f" +{ex_count - 3}"
+                lines.append(
+                    f"  📋 {esc(day_name)} · {esc(session_name)} "
+                    f"({ex_count} תרגילים, {session_mins} דק׳): {ex_preview}"
+                )
         lines.append("")
         callback = conversation.encode_callback(
             "planv2",
@@ -1195,6 +1235,9 @@ async def render_candidate_list(target: Any, user_id: int, plan_type: str) -> No
 async def render_profile_snapshot(target: Any, user_id: int) -> None:
     snapshot = await planning.profile_snapshot(DB, user_id)
     facts = snapshot["facts"]
+    # REC-PROGRAM-04-01: Resolve and display training availability
+    from noam_coach.services.availability import format_availability_summary, resolve_availability
+    avail = await resolve_availability(DB, user_id)
     lines = ["<b>כך הבנתי אותך</b>", ""]
     for key in (
         "primary_goal", "weight_kg", "work_schedule", "commute_minutes",
@@ -1212,6 +1255,11 @@ async def render_profile_snapshot(target: Any, user_id: int) -> None:
         confirm = "" if fact.get("confirmed") else " · טרם אושר"
         display_val = _format_fact_value(key, fact.get("value"))
         lines.append(f"• <b>{esc(label)}</b>: {esc(display_val)} <i>({esc(source)}{confirm})</i>")
+    # REC-PROGRAM-04-01: Availability summary in profile snapshot
+    avail_text = format_availability_summary(avail)
+    lines += [""]
+    for avail_line in avail_text.split("\n"):
+        lines.append(esc(avail_line))
     missing = []
     for group in ("nutrition", "workout", "safety"):
         missing.extend(snapshot["readiness"][group]["missing"])

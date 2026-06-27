@@ -141,9 +141,9 @@ PREPARATION_CALORIE_FACTORS: dict[str, float] = {
 @dataclass(frozen=True)
 class MealCorrection:
     """A structured correction parsed from user text."""
-    kind: str  # "preparation", "quantity", "remove", "add", "rename"
+    kind: str  # "preparation", "quantity", "remove", "add", "rename", "replace"
     item_hint: str  # food item the correction targets ("" = whole meal)
-    value: str  # new value: preparation method key, grams, etc.
+    value: str  # new value: preparation method key, grams, replacement name, etc.
     original_text: str  # the user's raw text for logging
 
 
@@ -196,6 +196,85 @@ def _parse_removal_corrections(text: str) -> list[MealCorrection]:
     return found
 
 
+# ---------------------------------------------------------------------------
+# Item-replacement patterns  (REC-PROGRAM-04-12)
+# ---------------------------------------------------------------------------
+#
+# Supported surface forms (Hebrew):
+#   "X לא Y"       → replace Y with X   (e.g. "שניצל רגיל לא טופו")
+#   "X ולא Y"      → replace Y with X
+#   "X במקום Y"    → replace Y with X
+#   "זה X לא Y"    → replace Y with X
+#
+# Each pattern must expose named groups:
+#   replacement – the NEW item (what the user actually ate)
+#   target      – the OLD item (what needs to be swapped out)
+#
+# NOTE: "אין X" is intentionally NOT handled here; it is a removal, already
+# covered by _REMOVAL_PATTERNS above.
+
+_HEB = r"[\u0590-\u05FF][\u0590-\u05FF\s]{0,40}"  # one or more Hebrew words
+
+_REPLACEMENT_PATTERNS: list[re.Pattern[str]] = [
+    # "זה X לא Y" – "it's X not Y"
+    re.compile(
+        r"^זה\s+(?P<replacement>" + _HEB + r")\s+ולא\s+(?P<target>" + _HEB + r")$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^זה\s+(?P<replacement>" + _HEB + r")\s+לא\s+(?P<target>" + _HEB + r")$",
+        re.IGNORECASE,
+    ),
+    # "X במקום Y" – "X instead of Y"
+    re.compile(
+        r"^(?P<replacement>" + _HEB + r")\s+במקום\s+(?P<target>" + _HEB + r")$",
+        re.IGNORECASE,
+    ),
+    # "X ולא Y" – "X and not Y"
+    re.compile(
+        r"^(?P<replacement>" + _HEB + r")\s+ולא\s+(?P<target>" + _HEB + r")$",
+        re.IGNORECASE,
+    ),
+    # "X לא Y" – "X not Y"  (most general; must come last to avoid false matches)
+    re.compile(
+        r"^(?P<replacement>" + _HEB + r")\s+לא\s+(?P<target>" + _HEB + r")$",
+        re.IGNORECASE,
+    ),
+]
+
+
+def _parse_replacement_corrections(text: str) -> list[MealCorrection]:
+    """Extract item-replacement instructions from *text*.
+
+    Returns a list with at most one :class:`MealCorrection` of ``kind="replace"``.
+    The ``item_hint`` field holds the *target* (old item to swap out) and
+    ``value`` holds the *replacement* (new item name).
+    """
+    normalized = text.strip()
+    for pattern in _REPLACEMENT_PATTERNS:
+        m = pattern.match(normalized)
+        if m is None:
+            continue
+        target = m.group("target").strip()
+        replacement = m.group("replacement").strip()
+        # Sanity: both sides must be non-empty and differ.
+        if not target or not replacement or target == replacement:
+            continue
+        # Skip if either side matches a pure preparation alias (those are not
+        # item names and should be handled by the preparation-correction path).
+        if target in PREPARATION_ALIASES or replacement in PREPARATION_ALIASES:
+            continue
+        return [
+            MealCorrection(
+                kind="replace",
+                item_hint=target,
+                value=replacement,
+                original_text=text,
+            )
+        ]
+    return []
+
+
 # Pattern: "ה<item> <method>" or "<item> <method>"
 _PREP_ITEM_PATTERNS = [
     re.compile(
@@ -222,8 +301,9 @@ def parse_meal_correction(text: str) -> list[MealCorrection]:
 
     Priority order:
     1. Item-removal corrections ("בלי שמן", "ללא שמן", generic "בלי X").
-    2. Preparation-method corrections.
-    3. Quantity corrections (delegate to parse_locked_quantities).
+    2. Item-replacement corrections ("X לא Y", "X ולא Y", "X במקום Y", "זה X לא Y").
+    3. Preparation-method corrections.
+    4. Quantity corrections (delegate to parse_locked_quantities).
     """
     normalized = text.strip().lower()
     corrections: list[MealCorrection] = []
@@ -234,6 +314,14 @@ def parse_meal_correction(text: str) -> list[MealCorrection]:
     if removal_corrections:
         corrections.extend(removal_corrections)
         return corrections  # removal is unambiguous; skip further parsing
+
+    # --- Item-replacement corrections (REC-PROGRAM-04-12) ---
+    # Checked before preparation so "שניצל רגיל לא טופו" is a replace, not a
+    # prep-method change.
+    replacement_corrections = _parse_replacement_corrections(text)
+    if replacement_corrections:
+        corrections.extend(replacement_corrections)
+        return corrections  # replacement is unambiguous; skip further parsing
 
     # --- Preparation corrections ---
     for pattern in _PREP_ITEM_PATTERNS:
@@ -398,6 +486,121 @@ def apply_item_removal_correction(
     analysis.items = [item for item in analysis.items if item is not best]
 
     note = f"הוסר: {removed_name}"
+    if note not in analysis.notes:
+        analysis.notes.append(note)
+
+    return analysis
+
+
+def apply_item_replacement_correction(
+    analysis: MealAnalysis,
+    correction: MealCorrection,
+) -> MealAnalysis:
+    """Replace the item identified by *correction.item_hint* with *correction.value*.
+
+    Implements REC-PROGRAM-04-12 (delta-based meal correction, replace type).
+
+    Behaviour:
+    * Uses token-based similarity (_similarity) to locate the target item.
+    * Only the single best-matching item is renamed; all other items are left
+      completely unchanged.
+    * The original gram weight is preserved so portion size stays accurate.
+    * When the replacement is a nutritionally different food (e.g. tofu →
+      schnitzel), macros are adjusted conservatively using a lookup table of
+      known food-category calorie densities rather than calling any AI service.
+      If neither the old nor the new item appears in the lookup table the macros
+      are kept as-is (i.e. the function is always deterministic).
+    * Adds a note describing the replacement.
+    * If no item matches above the minimum threshold the analysis is returned
+      unchanged.
+    """
+    if correction.kind != "replace":
+        return analysis
+
+    item_hint = correction.item_hint
+    replacement_name = correction.value
+    if not item_hint or not replacement_name:
+        return analysis
+
+    # ------------------------------------------------------------------
+    # Locate target item via similarity
+    # ------------------------------------------------------------------
+    candidates = sorted(
+        analysis.items,
+        key=lambda item: _similarity(item_hint, item.name),
+        reverse=True,
+    )
+    if not candidates:
+        return analysis
+
+    best = candidates[0]
+    score = _similarity(item_hint, best.name)
+
+    # Also accept if any hint token appears verbatim in the item name.
+    hint_tokens = _tokens(item_hint)
+    name_contains_hint = any(t in _tokens(best.name) for t in hint_tokens)
+
+    if score < 0.15 and not name_contains_hint:
+        note = f"פריט לא נמצא להחלפה: {item_hint}"
+        if note not in analysis.notes:
+            analysis.notes.append(note)
+        return analysis
+
+    old_name = best.name
+
+    # ------------------------------------------------------------------
+    # Conservative macro adjustment for known food-category substitutions.
+    #
+    # Table maps a Hebrew keyword (checked via substring) to approximate
+    # kcal per 100 g.  Both the old and new item names are checked; if
+    # either is unknown we leave the macros unchanged to avoid inventing
+    # nutritional data.
+    # ------------------------------------------------------------------
+    _KCAL_PER_100G: dict[str, float] = {
+        "טופו": 76.0,
+        "עוף": 165.0,
+        "שניצל": 220.0,      # breaded, pan-fried estimate
+        "בשר": 250.0,
+        "סלמון": 208.0,
+        "טונה": 132.0,
+        "ביצה": 155.0,
+        "גבינה": 350.0,
+        "קוטג": 98.0,
+        "יוגורט": 59.0,
+        "חלב": 42.0,
+        "אורז": 130.0,       # cooked
+        "פסטה": 131.0,
+        "לחם": 265.0,
+        "תפוח אדמה": 77.0,
+        "בטטה": 86.0,
+        "ברוקולי": 34.0,
+        "גזר": 41.0,
+        "עגבנייה": 18.0,
+        "מלפפון": 16.0,
+    }
+
+    def _lookup_kcal(name: str) -> float | None:
+        for keyword, kcal in _KCAL_PER_100G.items():
+            if keyword in name:
+                return kcal
+        return None
+
+    old_kcal = _lookup_kcal(old_name)
+    new_kcal = _lookup_kcal(replacement_name)
+
+    if old_kcal is not None and new_kcal is not None and old_kcal > 0:
+        ratio = new_kcal / old_kcal
+        best.calories = round(best.calories * ratio, 1)
+        best.protein = round(best.protein * ratio, 1)
+        best.carbs = round(best.carbs * ratio, 1)
+        best.fat = round(best.fat * ratio, 1)
+
+    # ------------------------------------------------------------------
+    # Rename item (keep grams unchanged)
+    # ------------------------------------------------------------------
+    best.name = replacement_name
+
+    note = f"הוחלף: {old_name} → {replacement_name}"
     if note not in analysis.notes:
         analysis.notes.append(note)
 

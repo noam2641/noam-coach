@@ -47,3 +47,10 @@
 - מקור הנתונים הוא export תקופתי של Apple Health.
 - כאשר הבוט רץ מקומית, המשתמש יכול לשלוח נתיב קובץ/תיקייה בצ'אט.
 - Mini App נפתח באמצעות `/app` וכתובת HTTPS של Tunnel או שרת ציבורי.
+## REC-PROGRAM-04 checkpoint (2026-06-27)
+
+- Completed current recording/program batch without starting `REC-NEXT-MEAL-05`.
+- Added canonical dietary restriction, availability, and body-fat services to production paths and tests.
+- Fixed nutrition-plan restriction filtering, dietary alias negation, Mini App CSP/XSS issues, Mini App weekday alignment, and Mini App Health upload body limit handling.
+- Verification gates are green: compileall, Ruff, pytest, evaluations, preflight, bounded startup smoke, and release inspection.
+- Detailed classifications and limitations: `docs/CODEX_AUDIT_REC_PROGRAM_04.md`.

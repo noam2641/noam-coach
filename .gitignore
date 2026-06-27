@@ -38,3 +38,4 @@ export*.zip
 
 # Temporary files
 pytest_full.log
+PROJECT_STATE.md

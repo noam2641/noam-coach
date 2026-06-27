@@ -34,6 +34,18 @@ def test_private_api_rejects_oversized_chunked_body(monkeypatch) -> None:
     assert response.status_code == 413
 
 
+def test_mini_upload_uses_health_upload_limit(monkeypatch) -> None:
+    monkeypatch.setattr(coach_bot.SETTINGS, "api_max_body_bytes", 10)
+    monkeypatch.setattr(coach_bot.SETTINGS, "health_import_max_upload_mb", 1)
+    client = TestClient(coach_bot.api)
+    response = client.post(
+        "/mini/upload",
+        headers={"Content-Length": "11"},
+        content=b"x" * 11,
+    )
+    assert response.status_code != 413
+
+
 def test_device_api_requires_bearer_token(monkeypatch) -> None:
     monkeypatch.setattr(coach_bot.SETTINGS, "enable_healthkit_api", True)
     monkeypatch.setattr(coach_bot.SETTINGS, "healthkit_api_token", "secret-token")

@@ -1,7 +1,6 @@
 // Noam Coach Mini App client.
-// All business calculations happen on the server; this file only renders state
-// and forwards user actions to the API. Never trust client-side values for
-// goals, targets or plans.
+// Business calculations happen on the server; this file renders state and
+// forwards user actions to the API.
 
 async function apiCall(url, options = {}) {
   const response = await fetch(url, { credentials: 'same-origin', ...options });
@@ -14,13 +13,26 @@ async function apiCall(url, options = {}) {
   return data;
 }
 
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function errorHtml(err) {
+  return `<span class="error">${escapeHtml(err.message)}</span>`;
+}
+
 function planCard(plan, index) {
-  const rationale = (plan.rationale || []).slice(0, 3).join(' · ');
-  const tradeoffs = (plan.tradeoffs || []).slice(0, 2).join(' · ');
+  const rationale = (plan.rationale || []).slice(0, 3).map(escapeHtml).join(' · ');
+  const tradeoffs = (plan.tradeoffs || []).slice(0, 2).map(escapeHtml).join(' · ');
   const score = Math.round((plan.fit_score ?? plan.score ?? 0) * 100);
-  return `<div class="candidate"><b>${index}. ${plan.title}</b> · התאמה ${score}%<br>` +
-    `<small>✓ ${rationale}<br>△ ${tradeoffs}</small><br>` +
-    `<button class="action-btn" onclick="activatePlan(${plan.id})">בחר כתוכנית ראשית</button></div>`;
+  return `<div class="candidate"><b>${index}. ${escapeHtml(plan.title)}</b> · התאמה ${score}%<br>` +
+    `<small>✓ ${rationale}<br>▵ ${tradeoffs}</small><br>` +
+    `<button class="action-btn activate-plan-btn" type="button" data-plan-id="${Number(plan.id)}">בחר כתוכנית ראשית</button></div>`;
 }
 
 async function loadDashboard() {
@@ -30,43 +42,57 @@ async function loadDashboard() {
     const plans = data.active_plans || {};
     const action = data.coaching?.next_action;
     box.innerHTML = action ?
-      `<div class="candidate"><b>הפעולה הבאה: ${action.title}</b><br><small>${action.reason}</small></div>` : '';
-    box.innerHTML += `תזונה: <b>${plans.nutrition?.title || 'טרם נבחרה'}</b><br>` +
-      `אימונים: <b>${plans.workout?.title || 'טרם נבחרה'}</b><br>` +
-      `שבוע מאוחד: <b>${plans.unified?.title || 'טרם נבנה'}</b>`;
-  } catch (err) { box.innerHTML = `<span class="error">${err.message}</span>`; }
+      `<div class="candidate"><b>הפעולה הבאה: ${escapeHtml(action.title)}</b><br><small>${escapeHtml(action.reason)}</small></div>` : '';
+    box.innerHTML += `תזונה: <b>${escapeHtml(plans.nutrition?.title || 'טרם נבחרה')}</b><br>` +
+      `אימונים: <b>${escapeHtml(plans.workout?.title || 'טרם נבחרה')}</b><br>` +
+      `שבוע מאוחד: <b>${escapeHtml(plans.unified?.title || 'טרם נבנה')}</b>`;
+  } catch (err) { box.innerHTML = errorHtml(err); }
 }
 
 async function generatePlans(type) {
   const box = document.getElementById('planCandidates');
-  box.textContent = 'בונה ובודק שלוש חלופות…';
+  box.textContent = 'בונה ובודק שלוש חלופות...';
   try {
     const data = await apiCall(`/mini/api/plans/${type}/generate`, { method: 'POST' });
     box.innerHTML = (data.candidates || []).map((plan, i) => planCard(plan, i + 1)).join('');
-  } catch (err) { box.innerHTML = `<span class="error">${err.message}</span>`; }
+  } catch (err) { box.innerHTML = errorHtml(err); }
 }
 
 async function activatePlan(id) {
   const box = document.getElementById('planCandidates');
   try {
     const data = await apiCall(`/mini/api/plans/${id}/activate`, { method: 'POST' });
-    box.innerHTML = `<b>${data.active.title}</b> נבחרה כתוכנית הראשית ✅`;
+    box.innerHTML = `<b>${escapeHtml(data.active.title)}</b> נבחרה כתוכנית הראשית ✅`;
     await loadDashboard();
-  } catch (err) { box.innerHTML = `<span class="error">${err.message}</span>`; }
+  } catch (err) { box.innerHTML = errorHtml(err); }
 }
 
 async function buildUnified() {
   const box = document.getElementById('planCandidates');
-  box.textContent = 'מחבר את התזונה והאימונים לשבוע אחד…';
+  box.textContent = 'מחבר את התזונה והאימונים לשבוע אחד...';
   try {
     await apiCall('/mini/api/plans/unified/build', { method: 'POST' });
     box.textContent = 'התוכנית השבועית נבנתה ✅';
     await loadDashboard();
-  } catch (err) { box.innerHTML = `<span class="error">${err.message}</span>`; }
+  } catch (err) { box.innerHTML = errorHtml(err); }
 }
 
 function factValue(snapshot, key) {
   return snapshot?.facts?.[key]?.value ?? null;
+}
+
+function renderAvailability(availability) {
+  const box = document.getElementById('availabilitySummary');
+  if (!availability) {
+    box.textContent = '';
+    return;
+  }
+  const dayNames = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת'];
+  const days = (availability.preferred_days || [])
+    .map(day => dayNames[Number(day)] || String(day))
+    .join(', ');
+  const time = availability.preferred_time ? `, שעה ${availability.preferred_time}` : '';
+  box.textContent = `לפי מה ששמור: עד ${availability.max_days_per_week} אימונים בשבוע, כ-${availability.session_minutes} דקות${time}. ימים: ${days || 'לא צוין'}.`;
 }
 
 async function loadProfile() {
@@ -74,6 +100,7 @@ async function loadProfile() {
   try {
     const data = await apiCall('/mini/api/profile');
     const snapshot = data.snapshot || {};
+    renderAvailability(data.availability);
     const work = factValue(snapshot, 'work_schedule') || {};
     const mealBreak = factValue(snapshot, 'meal_break_info') || {};
     document.getElementById('workStart').value = work.start || '';
@@ -101,7 +128,7 @@ async function loadProfile() {
 let savingProfile = false;
 async function saveProfile() {
   const statusBox = document.getElementById('profileStatus');
-  if (savingProfile) return; // guard against double-click duplicate writes
+  if (savingProfile) return;
   savingProfile = true;
   const slots = [...document.querySelectorAll('.day-row')].map(row => ({
     weekday: Number(row.dataset.day),
@@ -123,7 +150,7 @@ async function saveProfile() {
     allergies: document.getElementById('allergies').value || null,
     weekly_availability: slots,
   };
-  statusBox.textContent = 'שומר…';
+  statusBox.textContent = 'שומר...';
   statusBox.className = 'upload-status';
   try {
     const result = await apiCall('/mini/api/profile', {
@@ -142,6 +169,16 @@ async function saveProfile() {
 
 loadDashboard();
 loadProfile();
+
+document.getElementById('saveProfileBtn').addEventListener('click', saveProfile);
+document.getElementById('generateNutritionBtn').addEventListener('click', () => generatePlans('nutrition'));
+document.getElementById('generateWorkoutBtn').addEventListener('click', () => generatePlans('workout'));
+document.getElementById('buildUnifiedBtn').addEventListener('click', buildUnified);
+document.getElementById('planCandidates').addEventListener('click', event => {
+  const buttonEl = event.target.closest('.activate-plan-btn');
+  if (!buttonEl) return;
+  activatePlan(Number(buttonEl.dataset.planId));
+});
 
 const dropZone = document.getElementById('dropZone');
 const fileInput = document.getElementById('fileInput');
@@ -183,10 +220,10 @@ let uploading = false;
 form.addEventListener('submit', async e => {
   e.preventDefault();
   const f = fileInput.files[0];
-  if (!f || uploading) return; // guard against double submit
+  if (!f || uploading) return;
   uploading = true;
   submitBtn.disabled = true;
-  status.textContent = '📥 מעלה ומעבד… זה עשוי לקחת דקה.';
+  status.textContent = 'מעלה ומעבד... זה עשוי לקחת דקה.';
   status.className = 'upload-status';
   const body = new FormData();
   body.append('file', f);

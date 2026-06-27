@@ -44,3 +44,40 @@ async def test_mini_profile_update_writes_only_public_facts(
     schedule = await user_model.get_value(db, 1, "work_schedule")
     assert schedule == {"start": "08:00", "end": "17:00"}
     assert await user_model.get_fact(db, 1, "pending_prompt") is None
+
+
+@pytest.mark.asyncio
+async def test_mini_profile_returns_resolved_availability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = Database(str(tmp_path / "mini-profile-availability.db"))
+    await db.init()
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(1,'A',NULL,?)",
+        (utc_now(),),
+    )
+    monkeypatch.setattr(coach_bot, "DB", db)
+    monkeypatch.setattr(mini_api, "DB", db)
+    await user_model.set_fact(
+        db,
+        1,
+        "training_days_per_week",
+        4,
+        source=user_model.SOURCE_USER,
+        confirmed=True,
+    )
+    await user_model.set_fact(
+        db,
+        1,
+        "workout_pattern",
+        {"weekly_frequency": 6, "common_weekdays": [0, 1, 2, 3, 4, 5]},
+        kind=user_model.KIND_ESTIMATE,
+        source=user_model.SOURCE_APPLE_HEALTH,
+        confirmed=False,
+    )
+
+    response = await mini_api.mini_profile(user_id=1)
+    data = json.loads(response.body)
+    assert data["availability"]["max_days_per_week"] == 4
+    assert data["availability"]["source"] == "user_corrected"
