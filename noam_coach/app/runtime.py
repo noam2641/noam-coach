@@ -1,0 +1,276 @@
+# ruff: noqa: F401, F811, F821, I001
+"""Application scheduling, Telegram bootstrap and process runtime.
+
+Extracted from the legacy composition module. Public names are re-exported
+by coach_bot.py for backward compatibility.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import hmac
+import io
+import json
+import math
+import random
+import re
+import secrets
+import shutil
+import time
+from collections import defaultdict, deque
+from contextlib import suppress
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from datetime import time as dttime
+from pathlib import Path
+from typing import Any, Awaitable, Callable
+
+import aiosqlite
+import uvicorn
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo
+from telegram.constants import ParseMode
+from telegram.error import (
+    BadRequest,
+    NetworkError,
+    RetryAfter,
+    TimedOut,
+)
+from telegram.ext import (
+    AIORateLimiter,
+    Application,
+    ApplicationBuilder,
+    CallbackContext,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+import assistant
+import coach_intelligence
+import conversation
+import data_quality
+import event_log
+import health_import
+import meal_intelligence
+import onboarding
+import planning
+import questions
+import recommendations
+import reconcile
+import targets
+import training_intelligence
+import user_model
+
+# --- Extracted modules (re-exported for backward compatibility) ---
+from config import (  # noqa: F401
+    APP_VERSION,
+    LOGGER,
+    OPENAI_CLIENT,
+    RUNTIME_STATE,
+    SETTINGS,
+    TZ,
+    RuntimeState,
+    Settings,
+)
+from db import DB, Database  # noqa: F401
+from helpers import _safe_html_block, esc, friendly_error, today_bounds_utc, utc_now  # noqa: F401
+from models import (  # noqa: F401
+    ClarificationOption,
+    FoodItem,
+    HealthBatch,
+    HealthSample,
+    MealAnalysis,
+    MealCorrectionResult,
+    MiniProfileUpdate,
+    RoutineExtraction,
+    ShortcutHealthPayload,
+    WatchSetPayload,
+)
+from retention import cleanup_loop as cleanup_photos  # noqa: F401
+from retention import (
+    cleanup_operational_data_once,  # noqa: F401
+    cleanup_photos_once,  # noqa: F401
+)
+
+# ---------------------------------------------------------------------------
+# The Settings, Database, Pydantic models, and utility functions have been
+# extracted to config.py, db.py, models.py, and helpers.py respectively.
+# They are re-imported above for backward compatibility.
+# ---------------------------------------------------------------------------
+
+from noam_coach.runtime_bind import runtime_bound
+
+RUNTIME_NAMES = ('AIORateLimiter', 'Application', 'ApplicationBuilder', 'CallbackContext', 'CallbackQueryHandler', 'CommandHandler', 'DB', 'Exception', 'JOB_PRIORITY_COACHING', 'JOB_PRIORITY_SCHEDULED', 'LOGGER', 'MessageHandler', 'Path', 'RUNTIME_STATE', 'RuntimeError', 'SETTINGS', 'TZ', 'api', 'application', 'asyncio', 'build_telegram_app', 'build_weekly_summary_text', 'build_workout_prompt_text', 'builder', 'cleaner', 'cleanup_photos', 'command_app', 'command_cancel', 'command_chart', 'command_flags', 'command_import', 'command_import_path', 'command_profile', 'command_start', 'command_weekly', 'context', 'datetime', 'deliver_proactive_message', 'dttime', 'ensure_user_record', 'evening', 'exc', 'expected', 'filters', 'handle_callback', 'handle_document', 'handle_photo', 'handle_text_message', 'job_calorie_watch', 'job_evening', 'job_morning', 'job_motivation', 'job_weekly_summary', 'job_workout_prompt', 'jq', 'load_pending_state', 'me', 'morning', 'on_error', 'reconcile_onboarding_stage', 'schedule_jobs', 'send_prompt', 'send_to_user', 'send_weekly', 'server', 'suppress', 'telegram', 'text', 'type', 'user_id', 'uvicorn', 'verify_bot_identity')
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def job_workout_prompt(context: CallbackContext) -> None:
+    user_id = SETTINGS.telegram_allowed_user_id
+    text = await build_workout_prompt_text(user_id)
+    if not text:
+        return
+
+    async def send_prompt() -> None:
+        await send_to_user(context, text)
+
+    await deliver_proactive_message(
+        context,
+        key="workout_prompt",
+        sender=send_prompt,
+        priority=JOB_PRIORITY_COACHING,
+        retry_callback=job_workout_prompt,
+    )
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def job_weekly_summary(context: CallbackContext) -> None:
+    user_id = SETTINGS.telegram_allowed_user_id
+    if datetime.now(TZ).weekday() != 5:
+        return
+
+    async def send_weekly() -> None:
+        await send_to_user(
+            context,
+            await build_weekly_summary_text(user_id),
+        )
+
+    await deliver_proactive_message(
+        context,
+        key="weekly_summary",
+        sender=send_weekly,
+        priority=JOB_PRIORITY_SCHEDULED,
+        retry_callback=job_weekly_summary,
+    )
+
+
+@runtime_bound(RUNTIME_NAMES)
+def schedule_jobs(application: Application) -> None:
+    jq = application.job_queue
+    if jq is None:
+        LOGGER.warning("JobQueue לא זמין — הודעות יזומות מושבתות")
+        return
+    morning = dttime(hour=8, minute=0, tzinfo=TZ)
+    evening = dttime(hour=22, minute=0, tzinfo=TZ)
+    jq.run_daily(job_morning, time=morning, name="morning")
+    jq.run_daily(job_evening, time=evening, name="evening")
+    jq.run_repeating(job_calorie_watch, interval=1800, first=300, name="calorie_watch")
+    jq.run_repeating(job_motivation, interval=1800, first=900, name="motivation")
+    jq.run_repeating(job_workout_prompt, interval=3600, first=1200, name="workout_prompt")
+    jq.run_daily(
+        job_weekly_summary,
+        time=dttime(hour=20, minute=30, tzinfo=TZ),
+        name="weekly_summary",
+    )
+
+
+@runtime_bound(RUNTIME_NAMES)
+def build_telegram_app() -> Application:
+    builder = (
+        ApplicationBuilder()
+        .token(SETTINGS.telegram_bot_token)
+        .rate_limiter(AIORateLimiter())
+        # Large health ZIPs need long read/write windows and a bigger pool so
+        # downloading a file doesn't starve the polling connection.
+        .read_timeout(120)
+        .write_timeout(120)
+        .connect_timeout(30)
+        .pool_timeout(30)
+        .connection_pool_size(16)
+    )
+    # When a Local Bot API Server is configured we can receive files far larger
+    # than the 50MB cloud limit (needed for the Apple Health ZIP).
+    if SETTINGS.telegram_base_url:
+        builder = builder.base_url(SETTINGS.telegram_base_url).local_mode(True)
+        if SETTINGS.telegram_base_file_url:
+            builder = builder.base_file_url(SETTINGS.telegram_base_file_url)
+
+    application = builder.build()
+    application.add_handler(CommandHandler("start", command_start))
+    application.add_handler(CommandHandler("import", command_import))
+    application.add_handler(CommandHandler("importpath", command_import_path))
+    application.add_handler(CommandHandler("flags", command_flags))
+    application.add_handler(CommandHandler("profile", command_profile))
+    application.add_handler(CommandHandler("weekly", command_weekly))
+    application.add_handler(CommandHandler("chart", command_chart))
+    application.add_handler(CommandHandler("app", command_app))
+    application.add_handler(CommandHandler("cancel", command_cancel))
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+    application.add_error_handler(on_error)
+    schedule_jobs(application)
+    return application
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def verify_bot_identity(application: Application) -> None:
+    """Log the running bot identity and fail fast on an unexpected username.
+
+    Catches the classic mistake of pointing Noam Coach at the wrong/reused token
+    (e.g. an unrelated bot). The token itself is never logged.
+    """
+    me = await application.bot.get_me()
+    LOGGER.info("Telegram bot identity: @%s (id=%s)", me.username, me.id)
+    expected = (SETTINGS.expected_bot_username or "").lstrip("@").casefold()
+    if expected and (me.username or "").casefold() != expected:
+        raise RuntimeError(
+            f"זהות הבוט אינה תואמת: צפוי @{expected}, בפועל @{me.username}. "
+            "ודא שאתה משתמש ב-TELEGRAM_BOT_TOKEN הנכון של Noam Coach."
+        )
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def run() -> None:
+    SETTINGS.validate_runtime()
+    Path(SETTINGS.storage_dir).mkdir(parents=True, exist_ok=True)
+    try:
+        await DB.init()
+        await ensure_user_record(SETTINGS.telegram_allowed_user_id)
+        await load_pending_state()  # restore mid-flow conversation state
+        await reconcile_onboarding_stage(SETTINGS.telegram_allowed_user_id)
+        RUNTIME_STATE.db_ready = True
+        RUNTIME_STATE.startup_error = None
+    except Exception as exc:
+        RUNTIME_STATE.startup_error = f"{type(exc).__name__}: {exc}"
+        raise
+
+    telegram = build_telegram_app()
+    server = uvicorn.Server(
+        uvicorn.Config(
+            api,
+            host=SETTINGS.host,
+            port=SETTINGS.port,
+            loop="asyncio",
+            log_level="info",
+            access_log=False,
+        )
+    )
+    cleaner = asyncio.create_task(cleanup_photos())
+
+    try:
+        async with telegram:
+            await telegram.start()
+            # Fail fast if the token belongs to the wrong bot (identity guard).
+            await verify_bot_identity(telegram)
+            if telegram.updater is None:
+                raise RuntimeError("Telegram updater לא זמין")
+            await telegram.updater.start_polling(drop_pending_updates=False)
+            RUNTIME_STATE.telegram_ready = True
+            LOGGER.info("Telegram bot and API are running")
+            await server.serve()
+            RUNTIME_STATE.telegram_ready = False
+            await telegram.updater.stop()
+            await telegram.stop()
+    finally:
+        RUNTIME_STATE.telegram_ready = False
+        RUNTIME_STATE.db_ready = False
+        cleaner.cancel()
+        with suppress(asyncio.CancelledError):
+            await cleaner

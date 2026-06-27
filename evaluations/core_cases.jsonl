@@ -1,0 +1,56 @@
+# Offline regression evaluation cases — deterministic properties of real domain
+# functions. Derived in part from Recording_20260623_1752.mht failures.
+# Lines starting with '#' and blank lines are ignored.
+
+# --- locked quantity: user numbers are hard constraints (steps 66-74) ---
+{"id":"rice-150","category":"locked_quantity","text":"150 גרם אורז","item":"אורז","expected_grams":150,"analysis":{"confidence":0.8,"items":[{"name":"אורז לבן מבושל","grams":120,"calories":156,"protein":3,"carbs":34,"fat":0.4,"confidence":0.8}]}}
+{"id":"chicken-200","category":"locked_quantity","text":"200 גרם עוף","item":"עוף","expected_grams":200,"analysis":{"confidence":0.9,"items":[{"name":"חזה עוף","grams":140,"calories":231,"protein":43,"carbs":0,"fat":5,"confidence":0.9}]}}
+{"id":"pasta-90","category":"locked_quantity","text":"פסטה 90 גרם","item":"פסטה","expected_grams":90,"analysis":{"confidence":0.7,"items":[{"name":"פסטה מבושלת","grams":250,"calories":350,"protein":12,"carbs":70,"fat":2,"confidence":0.7}]}}
+
+# --- cooked/raw clarification needed for staples without a stated state ---
+{"id":"rice-needs-state","category":"cooked_raw","text":"100 גרם אורז","expect_clarification":true}
+{"id":"rice-stated-cooked","category":"cooked_raw","text":"100 גרם אורז מבושל","expect_clarification":false}
+{"id":"chicken-no-state","category":"cooked_raw","text":"200 גרם עוף","expect_clarification":false}
+
+# --- meaningful-meal gate: "לא אלכוהול" mis-route produces a non-meal (steps 38-50) ---
+{"id":"empty-meal","category":"meaningful_meal","expect_meaningful":false,"analysis":{"items":[]}}
+{"id":"all-zero-meal","category":"meaningful_meal","expect_meaningful":false,"analysis":{"meal_name":"ארוחה לא אלכוהולית","items":[{"name":"לא אלכוהול","grams":0,"calories":0,"protein":0,"carbs":0,"fat":0,"confidence":0.2}]}}
+{"id":"real-meal","category":"meaningful_meal","expect_meaningful":true,"analysis":{"items":[{"name":"ביצה","grams":50,"calories":78,"protein":6,"carbs":0.6,"fat":5,"confidence":0.9}]}}
+{"id":"zero-cal-drink-no-macros","category":"meaningful_meal","expect_meaningful":false,"analysis":{"meal_name":"מים","items":[{"name":"מים","grams":250,"calories":0,"protein":0,"carbs":0,"fat":0,"confidence":0.9}]}}
+
+# --- macro/calorie consistency: divergent item gets confidence forced low ---
+{"id":"macro-divergent","category":"macro_consistency","max_confidence":0.3,"item":{"name":"מנה","grams":100,"calories":900,"protein":5,"carbs":5,"fat":2,"confidence":0.9}}
+{"id":"macro-consistent","category":"macro_consistency","max_confidence":0.95,"item":{"name":"חזה עוף","grams":100,"calories":165,"protein":31,"carbs":0,"fat":3.6,"confidence":0.9}}
+
+# --- duplicate image detection within tolerance ---
+{"id":"dup-exact","category":"duplicate_detected","left":"0f0f0f0f0f0f0f0f","right":"0f0f0f0f0f0f0f0f","max_distance":8,"expect_duplicate":true}
+{"id":"dup-near","category":"duplicate_detected","left":"0f0f0f0f0f0f0f0f","right":"0f0f0f0f0f0f0f0e","max_distance":8,"expect_duplicate":true}
+{"id":"dup-different","category":"duplicate_detected","left":"0f0f0f0f0f0f0f0f","right":"f0f0f0f0f0f0f0f0","max_distance":8,"expect_duplicate":false}
+{"id":"hash-equal","category":"image_distance","left":"0f0f0f0f0f0f0f0f","right":"0f0f0f0f0f0f0f0f","max_distance":0}
+
+# --- workout status: single set / zero duration is never "completed" (steps 75-84) ---
+{"id":"single-set-zero-duration","category":"workout_status","logged_sets":1,"planned_sets":12,"duration_seconds":0,"expect_status":"partial"}
+{"id":"single-set-of-many","category":"workout_status","logged_sets":1,"planned_sets":12,"duration_seconds":120,"expect_status":"partial"}
+{"id":"all-sets-done","category":"workout_status","logged_sets":12,"planned_sets":12,"duration_seconds":3000,"expect_status":"completed"}
+{"id":"user-chose-partial","category":"workout_status","logged_sets":12,"planned_sets":12,"user_choice":"partial","duration_seconds":3000,"expect_status":"partial"}
+{"id":"user-cancelled","category":"workout_status","logged_sets":3,"planned_sets":12,"user_choice":"cancelled","duration_seconds":300,"expect_status":"cancelled"}
+{"id":"no-sets-logged","category":"workout_status","logged_sets":0,"planned_sets":12,"duration_seconds":600,"expect_status":"partial"}
+
+# --- fatigue / deload: needs enough signal, not a single day ---
+{"id":"fatigue-two-hard-poor-sleep","category":"fatigue","expect_deload":true,"sleep_quality":"poor","energy":"low","soreness":8,"sessions":[{"avg_rir":1,"e1rm":100},{"avg_rir":0,"e1rm":100}]}
+{"id":"fatigue-single-easy-day","category":"fatigue","expect_deload":false,"sessions":[{"avg_rir":3,"e1rm":100}]}
+{"id":"fatigue-plateau-hard","category":"fatigue","expect_deload":true,"sessions":[{"avg_rir":1,"e1rm":100},{"avg_rir":1,"e1rm":100.5},{"avg_rir":1,"e1rm":101}]}
+
+# --- daily readiness score: transparent, bounded, never below 0 ---
+{"id":"readiness-fresh","category":"readiness","sleep_quality":"good","energy":"high","pain_severity":null,"min_score":95,"max_score":100}
+{"id":"readiness-poor-sleep","category":"readiness","sleep_quality":"poor","energy":"low","pain_severity":null,"min_score":55,"max_score":70}
+{"id":"readiness-severe-pain-floor","category":"readiness","sleep_quality":"poor","energy":"low","pain_severity":10,"min_score":0,"max_score":30}
+
+# --- goal target: missing mandatory inputs => provisional; floors held ---
+{"id":"goal-missing-sex-age","category":"goal_provisional","weight_kg":80,"expect_provisional":true}
+{"id":"goal-complete","category":"goal_provisional","weight_kg":80,"avg_steps":9000,"sex":"male","height_cm":178,"age":30,"workouts_per_week":4,"expect_provisional":false}
+{"id":"goal-calorie-floor","category":"goal_provisional","weight_kg":45,"avg_steps":2000,"sex":"female","height_cm":150,"age":25,"expect_provisional":false}
+
+# --- epley 1RM sanity ---
+{"id":"epley-100x5","category":"epley_1rm","weight":100,"reps":5,"expected":116.7}
+{"id":"epley-zero","category":"epley_1rm","weight":0,"reps":5,"expected":0}

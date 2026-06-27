@@ -1,0 +1,40 @@
+.env
+.env.*
+!.env.example
+.venv/
+.claude/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.DS_Store
+*.log
+
+# Release build output
+dist/
+
+# Runtime/private data
+data/*
+!data/.gitkeep
+storage/*
+!storage/.gitkeep
+backups/*
+!backups/.gitkeep
+*.db
+*.db-wal
+*.db-shm
+*.pre_migration_*.db
+
+# IDE
+.idea/
+
+# Apple Health exports (user data)
+HealthKit.zip
+*.health_export
+export*.zip
+
+# Temporary files
+pytest_full.log

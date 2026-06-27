@@ -1,0 +1,51 @@
+services:
+  coach:
+    build:
+      context: .
+    image: noam-coach:2.0.0-rc4
+    env_file:
+      - .env
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - coach_data:/data
+      - coach_storage:/storage
+      - coach_backups:/backups
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      coach:
+        condition: service_healthy
+    environment:
+      DOMAIN: ${DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  coach_data:
+  coach_storage:
+  coach_backups:
+  caddy_data:
+  caddy_config:

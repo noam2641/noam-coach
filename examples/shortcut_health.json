@@ -1,0 +1,10 @@
+{
+  "telegram_user_id": 123456789,
+  "measured_at": "2026-06-18T08:00:00+03:00",
+  "weight_kg": 90.2,
+  "steps": 3200,
+  "active_calories": 410,
+  "sleep_minutes": 430,
+  "resting_heart_rate": 58,
+  "hrv_ms": 47
+}

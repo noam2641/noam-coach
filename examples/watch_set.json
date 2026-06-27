@@ -1,0 +1,7 @@
+{
+  "telegram_user_id": 123456789,
+  "client_event_id": "replace-with-uuid-v4",
+  "reps": 10,
+  "rir": 2,
+  "weight": 50
+}

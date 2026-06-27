@@ -1,0 +1,16 @@
+{$DOMAIN} {
+    encode zstd gzip
+
+    reverse_proxy coach:8000
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "no-referrer"
+        Permissions-Policy "camera=(), microphone=(), geolocation=()"
+        -Server
+    }
+
+    # Access logging is intentionally not enabled here so the short-lived
+    # Mini App login token is not written to ordinary proxy logs.
+}

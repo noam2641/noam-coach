@@ -1,0 +1,72 @@
+<html lang='he' dir='rtl'>
+  <head>
+    <meta charset='utf-8' />
+    <meta name='viewport' content='width=device-width, initial-scale=1' />
+    <meta http-equiv='Content-Security-Policy' content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'" />
+    <title>Noam Coach Mini App</title>
+    <link rel="stylesheet" href="/mini/static/styles.css" />
+  </head>
+  <body>
+    <div class='card'>
+      <h1>המאמן האישי שלך</h1>
+      <div>{{STATUS}}</div>
+    </div>
+    <div class='card'>
+      <h2>סיכום שבועי</h2>
+      <div>{{WEEKLY}}</div>
+    </div>
+    <div class='card'>
+      <h2>הפרופיל והשבוע שלך</h2>
+      <p class="muted">הנתונים כאן משמשים לבניית התפריט והאימונים. שינוי אינו מחליף תוכנית פעילה בלי אישור.</p>
+      <div class="grid">
+        <label>תחילת עבודה<input id="workStart" type="time" /></label>
+        <label>סיום עבודה<input id="workEnd" type="time" /></label>
+        <label>נסיעה בדקות<input id="commuteMinutes" type="number" min="0" max="300" /></label>
+        <label>הפסקת אוכל<input id="mealBreakTime" type="time" /></label>
+        <label>משך אימון<input id="sessionMinutes" type="number" min="15" max="180" /></label>
+        <label>מקום אימון<input id="trainingLocation" placeholder="חדר כושר / בית" /></label>
+        <label>ציוד<textarea id="equipment" rows="2" placeholder="מכונות, משקולות, גומיות..."></textarea></label>
+        <label>יכולת בישול<select id="cookingCapacity"><option value="">לא נבחר</option><option value="none">כמעט לא</option><option value="basic">בסיסית</option><option value="moderate">מסתדר</option><option value="enjoys">נהנה לבשל</option></select></label>
+        <label>מבנה ארוחות<select id="mealStructure"><option value="">לא נבחר</option><option value="structured">3–4 מסודרות</option><option value="small_frequent">קטנות לאורך היום</option><option value="two_large">2 גדולות</option><option value="flexible">מסגרת גמישה</option></select></label>
+        <label>מגבלות תזונה<textarea id="dietRestrictions" rows="2"></textarea></label>
+        <label>אלרגיות<textarea id="allergies" rows="2"></textarea></label>
+      </div>
+      <h3>חלונות אימון</h3>
+      <div id="availabilityRows">
+        <div class="day-row" data-day="0"><b>שני</b><input class="available" type="checkbox" /><input class="start" type="time" /><input class="minutes" type="number" min="15" max="180" placeholder="דקות" /></div>
+        <div class="day-row" data-day="1"><b>שלישי</b><input class="available" type="checkbox" /><input class="start" type="time" /><input class="minutes" type="number" min="15" max="180" placeholder="דקות" /></div>
+        <div class="day-row" data-day="2"><b>רביעי</b><input class="available" type="checkbox" /><input class="start" type="time" /><input class="minutes" type="number" min="15" max="180" placeholder="דקות" /></div>
+        <div class="day-row" data-day="3"><b>חמישי</b><input class="available" type="checkbox" /><input class="start" type="time" /><input class="minutes" type="number" min="15" max="180" placeholder="דקות" /></div>
+        <div class="day-row" data-day="4"><b>שישי</b><input class="available" type="checkbox" /><input class="start" type="time" /><input class="minutes" type="number" min="15" max="180" placeholder="דקות" /></div>
+        <div class="day-row" data-day="5"><b>שבת</b><input class="available" type="checkbox" /><input class="start" type="time" /><input class="minutes" type="number" min="15" max="180" placeholder="דקות" /></div>
+        <div class="day-row" data-day="6"><b>ראשון</b><input class="available" type="checkbox" /><input class="start" type="time" /><input class="minutes" type="number" min="15" max="180" placeholder="דקות" /></div>
+      </div>
+      <button class="action-btn" onclick="saveProfile()">שמור פרופיל</button>
+      <div id="profileStatus" class="upload-status"></div>
+    </div>
+    <div class='card'>
+      <h2>התוכנית האישית</h2>
+      <div id="planStatus">טוען נתוני תוכנית…</div>
+      <div style="margin-top:12px;">
+        <button class="action-btn" onclick="generatePlans('nutrition')">🥗 צור 3 הצעות תזונה</button>
+        <button class="action-btn" onclick="generatePlans('workout')">🏋️ צור 3 הצעות אימון</button>
+        <button class="action-btn secondary" onclick="buildUnified()">📅 בנה שבוע מאוחד</button>
+      </div>
+      <div id="planCandidates"></div>
+    </div>
+    <div class='card'>
+      <h2>ייבוא Apple Health</h2>
+      <form id="uploadForm" enctype="multipart/form-data">
+        <div class="upload-area" id="dropZone">
+          <div>📁 גרור לכאן קובץ ZIP של Apple Health</div>
+          <div style="margin-top:8px; color:#888;">או לחץ לבחירה</div>
+          <input type="file" id="fileInput" name="file" accept=".zip,.xml" />
+        </div>
+        <div id="fileName" style="margin-top:8px; font-weight:bold;"></div>
+        <button type="submit" class="upload-btn" id="submitBtn" disabled>📤 ייבא נתונים</button>
+        <div class="upload-status" id="uploadStatus"></div>
+      </form>
+    </div>
+    <script src="/mini/static/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,114 @@
+Noam Coach 2.0.0-rc5 — clean release structure
+
+coach_bot.py                  # composition root / compatibility facade
+config.py
+db.py
+models.py
+helpers.py
+assistant.py
+health_service.py
+mini_api.py
+retention.py
+conversation.py
+planning.py
+training_intelligence.py
+meal_intelligence.py
+coach_intelligence.py
+data_quality.py
+event_log.py
+evaluation.py
+health_import.py
+onboarding.py
+questions.py
+user_model.py
+recommendations.py
+reconcile.py
+routine.py
+targets.py
+exercise_plans.py
+feature_flags.py
+
+noam_coach/
+  __init__.py
+  runtime_bind.py
+  app/
+    runtime.py
+  api/
+    security.py
+    system_routes.py
+    health_routes.py
+    watch_routes.py
+    mini_auth.py
+  bot/
+    ui.py
+    onboarding.py
+    workout.py
+    workout_runtime.py
+    meals.py
+    meal_text.py
+    assistant.py
+    checkins.py
+    callback_router.py
+    callback_menu.py
+    callback_plans.py
+    callback_meals.py
+    callback_session.py
+    callbacks.py
+  services/
+    core.py
+    profile.py
+    training.py
+    goals.py
+    health_jobs.py
+    local_health_path.py
+  jobs/
+    proactive.py
+
+miniapp/
+  index.html
+  app.js
+  styles.css
+
+evaluations/
+  core_cases.jsonl
+examples/
+docs/
+  ARCHITECTURE.md
+  API.md
+  CONTINUATION_STATE.md
+  IOS_WATCH_IMPLEMENTATION.md
+  OPERATIONS.md
+  MINIAPP_SETUP.md
+  PRODUCT_ROADMAP.md
+  RELEASE_CHECKLIST.md
+  SHORTCUTS_SETUP.md
+  WHAT_REMAINS.md
+scripts/
+  start_miniapp_tunnel.ps1
+tests/
+.github/workflows/ci.yml
+
+README.md
+CHANGELOG.md
+REBUILD_REPORT.md
+IMPLEMENTATION_STATUS.md
+VALIDATION_REPORT.md
+MANIFEST.md
+SECURITY.md
+ENVIRONMENT_VARIABLES.md
+VERSION
+requirements.in
+requirements.txt
+requirements.lock
+requirements-dev.txt
+pyproject.toml
+pytest.ini
+Makefile
+Dockerfile
+compose.yaml
+Caddyfile
+.dockerignore
+.gitignore
+
+Excluded from release: .env, databases, storage, backups, .venv, .git,
+.claude, caches, bytecode, logs, media files and work archives.

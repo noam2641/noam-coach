@@ -1,0 +1,1 @@
+"""Noam Coach structured package."""

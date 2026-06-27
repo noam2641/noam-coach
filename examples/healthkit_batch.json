@@ -1,0 +1,14 @@
+{
+  "telegram_user_id": 123456789,
+  "samples": [
+    {
+      "external_id": "replace-with-stable-device-event-id",
+      "sample_type": "steps",
+      "value": 8500,
+      "unit": "count",
+      "start_time": "2026-06-18T00:00:00+03:00",
+      "end_time": "2026-06-18T23:59:59+03:00",
+      "source_device": "iPhone"
+    }
+  ]
+}
