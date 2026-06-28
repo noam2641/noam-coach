@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+import coach_bot
 import health_import
 import health_service
 import onboarding
@@ -25,6 +27,27 @@ async def _make_db(tmp_path: Path) -> Database:
         (utc_now(),),
     )
     return db
+
+
+class FakeQuery:
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+        self.reply_markups: list[Any] = []
+        self.answers: list[str | None] = []
+
+    async def edit_message_text(
+        self,
+        text: str,
+        reply_markup: Any = None,
+        parse_mode: str | None = None,
+    ) -> None:
+        del parse_mode
+        self.messages.append(text)
+        self.reply_markups.append(reply_markup)
+
+    async def answer(self, text: str | None = None, show_alert: bool = False) -> None:
+        del show_alert
+        self.answers.append(text)
 
 
 # ── REC-ONBOARD-02-01: Structured import result ─────────────────────────
@@ -230,6 +253,119 @@ class TestFactConfirmation:
         assert fact is not None
         assert fact["value"] == "__not_applicable__"
         assert fact["confirmed"] is True
+
+    @pytest.mark.asyncio
+    async def test_pattern_confirmation_rerenders_visible_status(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from noam_coach.bot import onboarding as onboarding_bot
+
+        db = await _make_db(tmp_path)
+        profile = {
+            "workout": {"typical_hour": "18:47", "weekly_frequency": 0.9, "sessions_sampled": 3},
+            "sleep": {"typical_bedtime": "00:19", "typical_wake_time": "06:14", "nights_sampled": 4},
+        }
+        await user_model.set_fact(
+            db,
+            1,
+            "workout_pattern",
+            profile["workout"],
+            kind=user_model.KIND_ESTIMATE,
+            source=user_model.SOURCE_DERIVED,
+            confirmed=False,
+        )
+        await user_model.set_fact(
+            db,
+            1,
+            "sleep_schedule",
+            profile["sleep"],
+            kind=user_model.KIND_ESTIMATE,
+            source=user_model.SOURCE_DERIVED,
+            confirmed=False,
+        )
+
+        async def _load_profile(_user_id: int) -> dict[str, Any]:
+            return profile
+
+        async def _track_event(*_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(coach_bot, "DB", db)
+        monkeypatch.setattr(coach_bot, "load_routine_profile", _load_profile)
+        monkeypatch.setattr(coach_bot, "track_event", _track_event)
+
+        query = FakeQuery()
+        await onboarding_bot.handle_onboarding_callback(query, 1, "onb:pat_ok:workout_pattern")
+
+        fact = await user_model.get_fact(db, 1, "workout_pattern")
+        assert fact is not None
+        assert fact["confirmed"] is True
+        labels = [
+            button.text
+            for row in query.reply_markups[-1].inline_keyboard
+            for button in row
+        ]
+        assert any("מאושר" in label and "דפוס האימונים" in label for label in labels)
+        assert "מאושר ✅" in query.answers
+
+    @pytest.mark.asyncio
+    async def test_basics_ok_confirms_visible_routine_facts(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from noam_coach.bot import onboarding as onboarding_bot
+
+        db = await _make_db(tmp_path)
+        profile = {
+            "workout": {"typical_hour": "19:00", "weekly_frequency": 3, "sessions_sampled": 3},
+            "sleep": {"typical_bedtime": "23:30", "typical_wake_time": "06:30", "nights_sampled": 4},
+        }
+        await user_model.set_fact(
+            db,
+            1,
+            "workout_pattern",
+            profile["workout"],
+            kind=user_model.KIND_ESTIMATE,
+            source=user_model.SOURCE_DERIVED,
+            confirmed=False,
+        )
+        await user_model.set_fact(
+            db,
+            1,
+            "sleep_schedule",
+            profile["sleep"],
+            kind=user_model.KIND_ESTIMATE,
+            source=user_model.SOURCE_DERIVED,
+            confirmed=False,
+        )
+
+        async def _load_profile(_user_id: int) -> dict[str, Any]:
+            return profile
+
+        async def _track_event(*_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(coach_bot, "DB", db)
+        monkeypatch.setattr(coach_bot, "load_routine_profile", _load_profile)
+        monkeypatch.setattr(coach_bot, "track_event", _track_event)
+
+        query = FakeQuery()
+        await onboarding_bot.handle_onboarding_callback(query, 1, "onb:basics_ok")
+
+        workout = await user_model.get_fact(db, 1, "workout_pattern")
+        sleep = await user_model.get_fact(db, 1, "sleep_schedule")
+        assert workout is not None and workout["confirmed"] is True
+        assert sleep is not None and sleep["confirmed"] is True
+        labels = [
+            button.text
+            for row in query.reply_markups[-1].inline_keyboard
+            for button in row
+        ]
+        assert any("מאושר" in label and "דפוס האימונים" in label for label in labels)
+        assert any("מאושר" in label and "שעות השינה" in label for label in labels)
 
 
 # ── REC-ONBOARD-02-05: Persist onboarding across restart ────────────────

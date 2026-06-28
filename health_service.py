@@ -70,10 +70,9 @@ async def upsert_health_rows(
                 )
                 for row in batch
             ]
+            before = conn.total_changes
             await conn.executemany(sql, params)
-            cursor = await conn.execute("SELECT changes()")
-            row = await cursor.fetchone()
-            total_inserted += row[0]
+            total_inserted += conn.total_changes - before
     return total_inserted, len(rows) - total_inserted
 
 

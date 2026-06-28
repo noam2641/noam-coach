@@ -247,17 +247,62 @@ async def show_onboarding_patterns(target: Any, user_id: int) -> None:
     await track_event(user_id, "onboarding_patterns_shown", items=len(items))
     rows = []
     for item in items:
-        rows.append([
-            button("✅ מאושר", f"onb:pat_ok:{item['id']}"),
-            button("✏️ לתקן", f"onb:pat_fix:{item['id']}"),
-            button("⏳ אחר כך", f"onb:pat_defer:{item['id']}"),
-        ])
+        status = await _pattern_confirmation_status(user_id, item["id"])
+        if status == user_model.CONFIRM_CONFIRMED:
+            rows.append([button(f"✅ מאושר: {item['display_label']}", f"onb:pat_noop:{item['id']}")])
+        elif status == user_model.CONFIRM_INVALID:
+            rows.append([button(f"✏️ סומן לתיקון: {item['display_label']}", f"onb:pat_noop:{item['id']}")])
+        elif status == user_model.CONFIRM_DEFERRED:
+            rows.append([button(f"⏳ נדחה: {item['display_label']}", f"onb:pat_noop:{item['id']}")])
+        else:
+            rows.append([
+                button("✅ מאושר", f"onb:pat_ok:{item['id']}"),
+                button("✏️ לתקן", f"onb:pat_fix:{item['id']}"),
+                button("⏳ אחר כך", f"onb:pat_defer:{item['id']}"),
+            ])
     rows.append([button("המשך ➡️", "onb:patterns_done")])
     keyboard = InlineKeyboardMarkup(rows)
     if hasattr(target, "edit_message_text"):
         await safe_edit(target, text, keyboard)
     else:
         await target.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def _pattern_confirmation_status(user_id: int, key: str) -> str:
+    row = await DB.fetch_one(
+        "SELECT kind, source, confirmed, valid FROM user_facts WHERE user_id=? AND key=?",
+        (user_id, key),
+    )
+    if not row:
+        return "missing"
+    if not bool(row.get("valid", True)):
+        return user_model.CONFIRM_INVALID
+    if row.get("kind") == user_model.KIND_GAP and row.get("source") == user_model.SOURCE_USER:
+        return user_model.CONFIRM_DEFERRED
+    if row.get("confirmed"):
+        return user_model.CONFIRM_CONFIRMED
+    return user_model.CONFIRM_INFERRED
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def confirm_visible_basics(user_id: int) -> None:
+    view = await user_model.get_profile_view(DB, user_id)
+    for group in ("measured", "inferred", "reported"):
+        for fact in view.get(group, []):
+            if fact.get("key"):
+                await user_model.confirm_fact(DB, user_id, fact["key"])
+    for key in (
+        "sleep_schedule",
+        "workout_pattern",
+        "work_schedule",
+        "workout_window",
+        "meal_break_info",
+        "cooking_capacity",
+    ):
+        fact = await user_model.get_fact(DB, user_id, key)
+        if fact and fact.get("kind") != user_model.KIND_GAP:
+            await user_model.confirm_fact(DB, user_id, key)
 
 
 @runtime_bound(RUNTIME_NAMES)
@@ -489,9 +534,10 @@ async def handle_onboarding_callback(query: Any, user_id: int, data: str) -> Non
         return
 
     if data == "onb:basics_ok":
-        # Promote measured facts as confirmed.
-        for fact in (await user_model.get_profile_view(DB, user_id))["measured"]:
-            await user_model.confirm_fact(DB, user_id, fact["key"])
+        # Promote every visible fact on the summary screen, not only hard
+        # measurements. The user just approved the combined "what I understood"
+        # summary, which includes routine-derived schedule facts too.
+        await confirm_visible_basics(user_id)
         await show_onboarding_patterns(query, user_id)
         return
 
@@ -511,6 +557,7 @@ async def handle_onboarding_callback(query: Any, user_id: int, data: str) -> Non
             entity="fact", entity_id=parts[2], source="onboarding",
         )
         await query.answer("מאושר ✅")
+        await show_onboarding_patterns(query, user_id)
         return
 
     if head == "pat_fix" and len(parts) >= 3:
@@ -520,6 +567,7 @@ async def handle_onboarding_callback(query: Any, user_id: int, data: str) -> Non
             entity="fact", entity_id=parts[2], source="onboarding",
         )
         await query.answer("סומן לתיקון ✏️")
+        await show_onboarding_patterns(query, user_id)
         return
 
     if head == "pat_defer" and len(parts) >= 3:
@@ -529,6 +577,11 @@ async def handle_onboarding_callback(query: Any, user_id: int, data: str) -> Non
             entity="fact", entity_id=parts[2], source="onboarding",
         )
         await query.answer("נדחה לאחר כך ⏳")
+        await show_onboarding_patterns(query, user_id)
+        return
+
+    if head == "pat_noop":
+        await query.answer("כבר סומן")
         return
 
     if data == "routine:confirm":

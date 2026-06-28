@@ -4,6 +4,8 @@
 
 ### Post-Claude audit hardening
 
+- Fixed onboarding approval feedback so the basics summary and detected-pattern screens visibly refresh after each approval/correction/defer action.
+- Fixed Health import inserted/duplicate counts for batched imports; the stored rows were correct, and the user-facing import summary now is too.
 - Verified baseline `678a160` in an isolated worktree; reproduced the Sunday pytest failure (`1 failed, 626 passed, 3 warnings`).
 - Fixed nutrition context test determinism with an injected clock and matching weekday.
 - Added typed next-meal ingredients with canonical nutrition facts; displayed calories/protein are now computed from ingredient totals.

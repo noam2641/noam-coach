@@ -6,6 +6,9 @@ from pathlib import Path
 import pytest
 
 import health_import
+import health_service
+from db import Database
+from helpers import utc_now
 
 
 def write_zip(path: Path, members: dict[str, bytes]) -> None:
@@ -66,3 +69,38 @@ def test_magic_checks(tmp_path: Path) -> None:
     fake_xml.write_bytes(b"not xml")
     assert not health_import.looks_like_xml(fake_xml)
     assert health_import.is_valid_zip(tmp_path / "health.zip") is False
+
+
+@pytest.mark.asyncio
+async def test_upsert_health_rows_reports_all_batch_inserts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(str(tmp_path / "health.db"))
+    await database.init()
+    await database.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(?,?,?,?)",
+        (1, "Health", "health", utc_now()),
+    )
+    rows = [
+        health_import.HealthRow(
+            external_id=f"batch-{idx}",
+            sample_type="steps",
+            value=float(idx),
+            unit="count",
+            start_time=f"2026-06-{(idx % 28) + 1:02d}T00:00:00+00:00",
+            end_time=None,
+            source_device="test",
+        )
+        for idx in range(1005)
+    ]
+
+    monkeypatch.setattr(health_service, "DB", database)
+
+    inserted, duplicates = await health_service.upsert_health_rows(1, rows)
+    assert inserted == 1005
+    assert duplicates == 0
+
+    inserted_again, duplicates_again = await health_service.upsert_health_rows(1, rows)
+    assert inserted_again == 0
+    assert duplicates_again == 1005
