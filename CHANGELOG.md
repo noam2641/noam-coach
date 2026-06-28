@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.0.0-rc7 — 2026-06-28
+
+### Post-Claude audit hardening
+
+- Verified baseline `678a160` in an isolated worktree; reproduced the Sunday pytest failure (`1 failed, 626 passed, 3 warnings`).
+- Fixed nutrition context test determinism with an injected clock and matching weekday.
+- Added typed next-meal ingredients with canonical nutrition facts; displayed calories/protein are now computed from ingredient totals.
+- Added validation that meal totals match ingredient totals and that protein values remain plausible.
+- Implemented `nextmeal:editqty` as a real Telegram callback flow with persisted quantity scaling and active recommendation snapshots for stable choose/save continuation.
+- Fixed Hebrew availability parsing so per-day durations are preserved (`שישי 10:00 שעה` -> 60 minutes).
+- Narrowed ZIP ignore behavior to allow intentional `tests/fixtures/*.zip`.
+- Added post-Claude regression coverage; full suite now reports `630 passed, 3 warnings`.
+
 ## 2.0.0-rc6 — 2026-06-27
 
 ### REC-PLAN-MEAL-03: Plan, meal and conversation fixes (18 issues)

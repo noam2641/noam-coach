@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 import coach_bot
 import recommendations
 import user_model
+from config import TZ
 from db import Database
 from helpers import utc_now
 from models import FoodItem, MealAnalysis
@@ -31,7 +33,9 @@ async def test_nutrition_context_counts_reported_not_planned_meals(tmp_path: Pat
     db = Database(str(tmp_path / "coach.db"))
     await db.init()
     await _user(db)
-    now = utc_now()
+    fixed_now = datetime(2026, 6, 28, 10, 0, tzinfo=TZ)
+    now = fixed_now.isoformat()
+    sunday_index = (fixed_now.weekday() + 1) % 7
     await db.execute(
         """
         INSERT INTO goal_versions(
@@ -56,7 +60,7 @@ async def test_nutrition_context_counts_reported_not_planned_meals(tmp_path: Pat
                 {
                     "days": [
                         {
-                            "weekday": 6,
+                            "weekday": sunday_index,
                             "meals": [
                                 {"name": "breakfast", "calories": 500},
                                 {"name": "lunch", "calories": 800},
@@ -91,7 +95,7 @@ async def test_nutrition_context_counts_reported_not_planned_meals(tmp_path: Pat
         confirmed=True,
     )
 
-    context = await build_nutrition_context(db, 1, "morning_menu")
+    context = await build_nutrition_context(db, 1, "morning_menu", now=fixed_now)
 
     assert context.consumed_calories == 700
     assert context.remaining_calories == 1500

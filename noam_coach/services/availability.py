@@ -216,18 +216,19 @@ def parse_hebrew_availability_answer(text: str) -> ParsedAvailabilityAnswer:
     # Representative window: first segment that actually carries a time, else a
     # global parse over the whole text (handles "ראשון ורביעי בערב").
     global_time = next(
-        (seg_time for _days, seg_time in segments if seg_time is not None),
+        (seg_time for _days, seg_time, _seg_minutes in segments if seg_time is not None),
         None,
     ) or _parse_hebrew_time(normalized)
 
     slots: dict[int, dict[str, Any]] = {}
-    for seg_days, seg_time in segments:
+    for seg_days, seg_time, seg_minutes in segments:
         start = seg_time if seg_time is not None else global_time
+        day_minutes = seg_minutes or minutes
         for day in seg_days:
             slots[day] = {
                 "weekday": day,
                 "start": start,
-                "minutes": minutes,
+                "minutes": day_minutes,
                 "available": True,
             }
 
@@ -239,7 +240,7 @@ def parse_hebrew_availability_answer(text: str) -> ParsedAvailabilityAnswer:
     )
 
 
-def _segment_availability_by_day(text: str) -> list[tuple[list[int], str | None]]:
+def _segment_availability_by_day(text: str) -> list[tuple[list[int], str | None, int | None]]:
     """Split free text into per-day segments anchored on day-name tokens.
 
     Returns a list of (weekdays, time) where *weekdays* are the day indices that
@@ -252,20 +253,21 @@ def _segment_availability_by_day(text: str) -> list[tuple[list[int], str | None]
     if not matches:
         return []
 
-    segments: list[tuple[list[int], str | None]] = []
+    segments: list[tuple[list[int], str | None, int | None]] = []
     pending_days: list[int] = []
     for position, (start_idx, end_idx, day) in enumerate(matches):
         # Text from just after this day token up to the next day token.
         next_start = matches[position + 1][0] if position + 1 < len(matches) else len(text)
         between = text[end_idx:next_start]
         seg_time = _parse_segment_time(between)
+        seg_minutes = _parse_hebrew_duration_minutes(between)
         pending_days.append(day)
-        if seg_time is not None:
-            segments.append((pending_days, seg_time))
+        if seg_time is not None or seg_minutes is not None:
+            segments.append((pending_days, seg_time, seg_minutes))
             pending_days = []
     if pending_days:
         # Trailing days with no explicit time fall back to the global window.
-        segments.append((pending_days, None))
+        segments.append((pending_days, None, None))
     return segments
 
 

@@ -357,12 +357,13 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
         return True
 
     if data.startswith("nextmeal:choose:"):
-        from noam_coach.services.next_meal import generate_next_meal_recommendation
+        from noam_coach.services.next_meal import generate_next_meal_recommendation, get_active_recommendation_options
 
         try:
             option_number = int(data.rsplit(":", 1)[1])
             recommendation = await generate_next_meal_recommendation(DB, user_id)
-            option = recommendation.options[option_number - 1]
+            active_options = await get_active_recommendation_options(DB, user_id)
+            option = (active_options or recommendation.options)[option_number - 1]
         except (TypeError, ValueError, IndexError):
             await _render_next_meal_screen(query, user_id, prefix="לא מצאתי את האפשרות. הנה שוב ההמלצה.")
             return True
@@ -391,13 +392,15 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
         from noam_coach.services.next_meal import (
             clear_active_recommendation,
             generate_next_meal_recommendation,
+            get_active_recommendation_options,
             save_chosen_meal,
         )
 
         try:
             option_number = int(data.rsplit(":", 1)[1])
             recommendation = await generate_next_meal_recommendation(DB, user_id)
-            option = recommendation.options[option_number - 1]
+            active_options = await get_active_recommendation_options(DB, user_id)
+            option = (active_options or recommendation.options)[option_number - 1]
         except (TypeError, ValueError, IndexError):
             await safe_edit(query, "לא מצאתי את האפשרות לשמירה.", home_keyboard())
             return True
@@ -411,6 +414,21 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
             f"שמרתי את {esc(option.title)} כארוחה ✅\nמצב היום עודכן.",
             InlineKeyboardMarkup([[button("📊 מצב היום", "menu:status"), button("🏠 תפריט", "menu:home")]]),
         )
+        return True
+
+    if data.startswith("nextmeal:qty:"):
+        from noam_coach.services.next_meal import adjust_next_meal_quantity
+
+        try:
+            _, _, option_text, scale_text = data.split(":", 3)
+            option_number = int(option_text)
+            scale = float(scale_text)
+            recommendation = await adjust_next_meal_quantity(DB, user_id, option_number, scale)
+        except (TypeError, ValueError):
+            await _render_next_meal_screen(query, user_id, prefix="לא הצלחתי לעדכן את הכמות. רעננתי את ההמלצה.")
+            return True
+        prefix = "עדכנתי כמויות וחישבתי מחדש את הקלוריות והחלבון."
+        await _render_next_meal_screen(query, user_id, prefix=prefix, recommendation=recommendation)
         return True
 
     if data == "nextmeal:why":
@@ -428,12 +446,33 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
         return True
 
     if data.startswith("nextmeal:editqty:"):
-        # Quantity editing reuses the existing per-item editor entry point.
+        from noam_coach.services.next_meal import generate_next_meal_recommendation, get_active_recommendation_options
+
+        try:
+            option_number = int(data.rsplit(":", 1)[1])
+            recommendation = await generate_next_meal_recommendation(DB, user_id)
+            active_options = await get_active_recommendation_options(DB, user_id)
+            option = (active_options or recommendation.options)[option_number - 1]
+        except (TypeError, ValueError, IndexError):
+            await _render_next_meal_screen(query, user_id, prefix="לא מצאתי את האפשרות הזו. רעננתי את ההמלצה.")
+            return True
+        rows = [
+            [
+                button("➖ 20%", f"nextmeal:qty:{option_number}:0.8"),
+                button("➕ 20%", f"nextmeal:qty:{option_number}:1.2"),
+            ],
+            [button("💾 בחר ושמור", f"nextmeal:choose:{option_number}")],
+            [button("⬅️ חזרה להמלצה", "menu:nextmeal")],
+        ]
         await safe_edit(
             query,
-            "כדי לכוונן כמויות מדויקות, בחר ״שמור כארוחה״ ואז ניתן לערוך פריטים, "
-            "או כתוב לי למשל ״תוסיף 50 גרם אורז״.",
-            InlineKeyboardMarkup([[button("⬅️ חזרה להמלצה", "menu:nextmeal")]]),
+            (
+                f"<b>עריכת כמויות: {esc(option.title)}</b>\n"
+                f"{esc(', '.join(option.ingredients))}\n"
+                f"כ-{option.calories} קל׳ | כ-{option.protein} גרם חלבון\n\n"
+                "בחר שינוי כמות. הערכים יחושבו מחדש מהמרכיבים לפני בחירה או שמירה."
+            ),
+            InlineKeyboardMarkup(rows),
         )
         return True
 

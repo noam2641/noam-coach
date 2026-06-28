@@ -1,4 +1,14 @@
-# Implementation Status — 2.0.0-rc5 (updated 2026-06-25)
+# Implementation Status — 2.0.0-rc7 (updated 2026-06-28)
+
+## Post-Claude audit fixes — 2026-06-28
+
+- Independently verified Claude's `678a160` audit in an isolated worktree.
+- Fixed the Sunday-only nutrition context test; the suite is now time-independent for that case.
+- Next-meal options now carry typed ingredient nutrition and compute displayed calories/protein from ingredient totals.
+- `nextmeal:editqty` now opens a production quantity-adjustment flow; adjusted options are saved through the same active recommendation snapshot used for rendering.
+- Availability parsing preserves per-day durations, e.g. `שישי 10:00 שעה` stores 60 minutes for Friday.
+- `.gitignore` still blocks private ZIP exports while allowing intentional `tests/fixtures/*.zip`.
+- Verification: compile pass, Ruff pass, pytest `630 passed, 3 warnings`, evaluations `33/33`, preflight pass.
 
 ## סקירת אבטחה ותיקוני באגים — 2026-06-25
 

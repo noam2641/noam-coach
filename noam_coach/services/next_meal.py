@@ -101,6 +101,24 @@ class MealBudget:
 
 
 @dataclass
+class MealIngredient:
+    food_id: str
+    display_name: str
+    quantity: float
+    unit: str
+    calories: float
+    protein_g: float
+    carbs_g: float | None = None
+    fat_g: float | None = None
+    source: str = "noam_coach_canonical_v1"
+    confidence: float | None = 0.75
+
+    def display_text(self) -> str:
+        quantity = int(self.quantity) if float(self.quantity).is_integer() else round(self.quantity, 1)
+        return f"{self.display_name} {quantity} {self.unit}".strip()
+
+
+@dataclass
 class MealOption:
     title: str
     ingredients: list[str]
@@ -109,6 +127,13 @@ class MealOption:
     rationale: str
     substitutions: list[str] = field(default_factory=list)
     restriction_validated: bool = True
+    ingredient_details: list[MealIngredient] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.ingredient_details:
+            self.ingredients = [ingredient.display_text() for ingredient in self.ingredient_details]
+            self.calories = _rounded_sum(ingredient.calories for ingredient in self.ingredient_details)
+            self.protein = _rounded_sum(ingredient.protein_g for ingredient in self.ingredient_details)
 
 
 @dataclass
@@ -134,6 +159,10 @@ def _safe_float(value: Any) -> float | None:
     if not math.isfinite(number):
         return None
     return number
+
+
+def _rounded_sum(values: Any) -> int:
+    return int(round(sum(float(value or 0) for value in values)))
 
 
 def _clamp_int(value: float, low: int, high: int) -> int:
@@ -164,6 +193,84 @@ def _parse_hhmm(value: Any) -> time | None:
         return time(int(hour), int(minute))
     except (TypeError, ValueError):
         return None
+
+
+_NUTRITION_FACTS: dict[str, dict[str, float | str]] = {
+    "cottage_5": {"name": "קוטג' 5%", "unit": "גרם", "kcal_per_unit": 0.98, "protein_per_unit": 0.11, "carbs_per_unit": 0.03, "fat_per_unit": 0.05},
+    "cucumber": {"name": "מלפפון", "unit": "גרם", "kcal_per_unit": 0.15, "protein_per_unit": 0.007, "carbs_per_unit": 0.036, "fat_per_unit": 0.001},
+    "tomato": {"name": "עגבנייה", "unit": "גרם", "kcal_per_unit": 0.18, "protein_per_unit": 0.009, "carbs_per_unit": 0.039, "fat_per_unit": 0.002},
+    "protein_yogurt_0": {"name": "יוגורט חלבון 0%", "unit": "גרם", "kcal_per_unit": 0.72, "protein_per_unit": 0.10, "carbs_per_unit": 0.055, "fat_per_unit": 0.001},
+    "apple": {"name": "תפוח", "unit": "גרם", "kcal_per_unit": 0.52, "protein_per_unit": 0.003, "carbs_per_unit": 0.14, "fat_per_unit": 0.002},
+    "egg_white": {"name": "חלבון ביצה", "unit": "יחידה", "kcal_per_unit": 17.0, "protein_per_unit": 3.6, "carbs_per_unit": 0.2, "fat_per_unit": 0.0},
+    "vegetables": {"name": "ירקות", "unit": "גרם", "kcal_per_unit": 0.25, "protein_per_unit": 0.012, "carbs_per_unit": 0.05, "fat_per_unit": 0.002},
+    "olive_oil": {"name": "שמן זית", "unit": "כפית", "kcal_per_unit": 40.0, "protein_per_unit": 0.0, "carbs_per_unit": 0.0, "fat_per_unit": 4.5},
+    "banana": {"name": "בננה", "unit": "גרם", "kcal_per_unit": 0.89, "protein_per_unit": 0.011, "carbs_per_unit": 0.23, "fat_per_unit": 0.003},
+    "protein_powder": {"name": "אבקת חלבון", "unit": "גרם", "kcal_per_unit": 4.0, "protein_per_unit": 0.78, "carbs_per_unit": 0.08, "fat_per_unit": 0.05},
+    "rice_cake": {"name": "פריכית אורז", "unit": "יחידה", "kcal_per_unit": 35.0, "protein_per_unit": 0.7, "carbs_per_unit": 7.3, "fat_per_unit": 0.2},
+    "turkey_breast": {"name": "חזה הודו", "unit": "גרם", "kcal_per_unit": 1.05, "protein_per_unit": 0.22, "carbs_per_unit": 0.0, "fat_per_unit": 0.02},
+    "rice_cooked": {"name": "אורז מבושל", "unit": "גרם", "kcal_per_unit": 1.30, "protein_per_unit": 0.027, "carbs_per_unit": 0.28, "fat_per_unit": 0.003},
+    "chicken_breast": {"name": "חזה עוף", "unit": "גרם", "kcal_per_unit": 1.65, "protein_per_unit": 0.31, "carbs_per_unit": 0.0, "fat_per_unit": 0.036},
+    "lentils_cooked": {"name": "עדשים מבושלות", "unit": "גרם", "kcal_per_unit": 1.16, "protein_per_unit": 0.09, "carbs_per_unit": 0.20, "fat_per_unit": 0.004},
+    "quinoa_cooked": {"name": "קינואה מבושלת", "unit": "גרם", "kcal_per_unit": 1.20, "protein_per_unit": 0.044, "carbs_per_unit": 0.21, "fat_per_unit": 0.019},
+    "tahini": {"name": "טחינה", "unit": "גרם", "kcal_per_unit": 5.95, "protein_per_unit": 0.17, "carbs_per_unit": 0.21, "fat_per_unit": 0.53},
+    "potato": {"name": "תפוח אדמה", "unit": "גרם", "kcal_per_unit": 0.87, "protein_per_unit": 0.019, "carbs_per_unit": 0.20, "fat_per_unit": 0.001},
+    "salad": {"name": "סלט ירקות", "unit": "גרם", "kcal_per_unit": 0.22, "protein_per_unit": 0.01, "carbs_per_unit": 0.045, "fat_per_unit": 0.002},
+    "wheat_tortilla": {"name": "טורטיית חיטה", "unit": "יחידה", "kcal_per_unit": 160.0, "protein_per_unit": 5.0, "carbs_per_unit": 28.0, "fat_per_unit": 4.0},
+}
+
+
+def _ingredient(food_id: str, quantity: float, *, display_name: str | None = None, unit: str | None = None) -> MealIngredient:
+    fact = _NUTRITION_FACTS[food_id]
+    qty = float(quantity)
+    return MealIngredient(
+        food_id=food_id,
+        display_name=str(display_name or fact["name"]),
+        quantity=qty,
+        unit=str(unit or fact["unit"]),
+        calories=round(qty * float(fact["kcal_per_unit"]), 1),
+        protein_g=round(qty * float(fact["protein_per_unit"]), 1),
+        carbs_g=round(qty * float(fact.get("carbs_per_unit") or 0), 1),
+        fat_g=round(qty * float(fact.get("fat_per_unit") or 0), 1),
+    )
+
+
+def _meal_option(
+    title: str,
+    ingredient_details: list[MealIngredient],
+    rationale: str,
+    substitutions: list[str] | None = None,
+) -> MealOption:
+    return MealOption(
+        title=title,
+        ingredients=[],
+        calories=0,
+        protein=0,
+        rationale=rationale,
+        substitutions=substitutions or [],
+        ingredient_details=ingredient_details,
+    )
+
+
+def _option_to_payload(option: MealOption) -> dict[str, Any]:
+    return asdict(option)
+
+
+def _option_from_payload(payload: dict[str, Any]) -> MealOption:
+    ingredient_details = [
+        MealIngredient(**ingredient)
+        for ingredient in (payload.get("ingredient_details") or [])
+        if isinstance(ingredient, dict)
+    ]
+    return MealOption(
+        title=str(payload.get("title") or ""),
+        ingredients=[str(item) for item in (payload.get("ingredients") or [])],
+        calories=int(payload.get("calories") or 0),
+        protein=int(payload.get("protein") or 0),
+        rationale=str(payload.get("rationale") or ""),
+        substitutions=[str(item) for item in (payload.get("substitutions") or [])],
+        restriction_validated=bool(payload.get("restriction_validated", True)),
+        ingredient_details=ingredient_details,
+    )
 
 
 def _sunday_index(local_dt: datetime) -> int:
@@ -719,30 +826,24 @@ def allocate_next_meal_budget(
 
 def _low_remaining_templates(budget: MealBudget) -> list[MealOption]:
     """Protein-dense, low-calorie options for when little budget remains."""
-    cap = max(budget.calories_max, 60)
+    del budget
     return [
-        MealOption(
+        _meal_option(
             "קוטג׳ 5% עם ירקות",
-            ["קוטג׳ 5% 150 גרם", "מלפפון", "עגבנייה"],
-            min(cap, 245),
-            min(max(budget.protein_min, 18), budget.protein_max + 5),
-            "צפיפות חלבון גבוהה בקלוריות נמוכות, נכנס ביתרה.",
+            [_ingredient("cottage_5", 150), _ingredient("cucumber", 100), _ingredient("tomato", 120)],
+            "צפיפות חלבון טובה בקלוריות נמוכות, נכנס ביתרה.",
             ["אם יש מגבלת חלב: 150 גרם טונה במים במקום."],
         ),
-        MealOption(
+        _meal_option(
             "יוגורט חלבון 0% עם פרי קטן",
-            ["יוגורט חלבון 0% 200 גרם", "תפוח קטן"],
-            min(cap, 230),
-            min(max(budget.protein_min, 18), budget.protein_max + 5),
-            "חלבון גבוה, מתוק וקל, ונשאר בתוך היתרה.",
+            [_ingredient("protein_yogurt_0", 200), _ingredient("apple", 120, display_name="תפוח קטן")],
+            "חלבון טוב, מתוק וקל, ונשאר בתוך היתרה.",
             ["בלי חלב: פודינג חלבון על בסיס סויה."],
         ),
-        MealOption(
+        _meal_option(
             "חביתת חלבונים עם ירק",
-            ["3 חלבוני ביצה", "ירקות מוקפצים", "כף שמן זית קטנה"],
-            min(cap, 210),
-            min(max(budget.protein_min, 16), budget.protein_max + 4),
-            "ארוחה חמה דלת קלוריות עם חלבון איכותי.",
+            [_ingredient("egg_white", 3), _ingredient("vegetables", 160, display_name="ירקות מוקפצים"), _ingredient("olive_oil", 1, unit="כפית")],
+            "ארוחה חמה דלת קלוריות עם חלבון מדוד.",
             ["בלי ביצים: 120 גרם גבינה לבנה 5%."],
         ),
     ]
@@ -753,69 +854,54 @@ def _candidate_templates(phase: WorkoutPhase, budget: MealBudget) -> list[MealOp
         return _low_remaining_templates(budget)
     if phase in {WorkoutPhase.PRE_WORKOUT_IMMEDIATE, WorkoutPhase.DURING_WORKOUT}:
         return [
-            MealOption(
+            _meal_option(
                 "בננה ושייק חלבון קל",
-                ["בננה", "אבקת חלבון", "מים"],
-                min(budget.calories_max, 260),
-                min(max(budget.protein_min, 20), budget.protein_max),
+                [_ingredient("banana", 120), _ingredient("protein_powder", 25)],
                 "קל לעיכול ונותן אנרגיה זמינה.",
                 ["אם אין שייק: יוגורט חלבון מתאים רק אם אין מגבלת חלב."],
             ),
-            MealOption(
+            _meal_option(
                 "פריכיות אורז עם חזה הודו",
-                ["פריכיות אורז", "חזה הודו", "מלפפון"],
-                min(budget.calories_max, 300),
-                min(max(budget.protein_min, 18), budget.protein_max),
+                [_ingredient("rice_cake", 3), _ingredient("turkey_breast", 90), _ingredient("cucumber", 100)],
                 "קטן, מלוח, ולא כבד לפני תנועה.",
                 ["אפשר להחליף לעוף קר או טונה אם מתאים למגבלות."],
             ),
         ]
     if phase in {WorkoutPhase.POST_WORKOUT_IMMEDIATE, WorkoutPhase.POST_WORKOUT_LATER}:
         return [
-            MealOption(
+            _meal_option(
                 "קערת אורז ועוף",
-                ["אורז", "חזה עוף", "ירקות", "שמן זית"],
-                _clamp_int((budget.calories_min + budget.calories_max) / 2, budget.calories_min, budget.calories_max),
-                _clamp_int((budget.protein_min + budget.protein_max) / 2, budget.protein_min, budget.protein_max),
+                [_ingredient("rice_cooked", 150), _ingredient("chicken_breast", 120), _ingredient("vegetables", 150), _ingredient("olive_oil", 1)],
                 "ארוחה פשוטה עם חלבון גבוה ופחמימה נוחה אחרי אימון.",
                 ["אפשר להחליף אורז לתפוח אדמה או קינואה."],
             ),
-            MealOption(
+            _meal_option(
                 "קערת עדשים וקינואה",
-                ["עדשים", "קינואה", "ירקות", "טחינה"],
-                min(budget.calories_max, max(budget.calories_min, 520)),
-                max(budget.protein_min, min(budget.protein_max, 34)),
+                [_ingredient("lentils_cooked", 170), _ingredient("quinoa_cooked", 120), _ingredient("vegetables", 150), _ingredient("tahini", 15)],
                 "אפשרות צמחית ומשביעה בלי להישען על מוצרי חלב.",
                 ["אם יש מגבלת שומשום, להחליף טחינה באבוקדו קטן."],
             ),
         ]
     return [
-        MealOption(
+        _meal_option(
             "צלחת עוף, תפוח אדמה וסלט",
-            ["חזה עוף", "תפוח אדמה", "סלט ירקות", "שמן זית"],
-            _clamp_int((budget.calories_min + budget.calories_max) / 2, budget.calories_min, budget.calories_max),
-            _clamp_int((budget.protein_min + budget.protein_max) / 2, budget.protein_min, budget.protein_max),
+            [_ingredient("chicken_breast", 120), _ingredient("potato", 180), _ingredient("salad", 180), _ingredient("olive_oil", 1)],
             "מאוזן, משביע, ומכסה חלבון בלי להעמיס.",
             ["אפשר להחליף עוף בטופו רק אם אין מגבלת סויה."],
         ),
-        MealOption(
+        _meal_option(
             "טורטייה חלבון",
-            ["טורטייה חיטה", "חזה הודו", "ירקות", "טחינה"],
-            min(budget.calories_max, max(budget.calories_min, 480)),
-            max(budget.protein_min, min(budget.protein_max, 35)),
+            [_ingredient("wheat_tortilla", 1), _ingredient("turkey_breast", 100), _ingredient("vegetables", 120), _ingredient("tahini", 12)],
             "מתאים כשצריך משהו מהיר ולא ארוחה כבדה.",
             ["ללא גלוטן: להחליף לטורטייה תירס או קערת אורז."],
         ),
-        MealOption(
+        _meal_option(
             "קערת עדשים ואורז",
-            ["עדשים", "אורז", "ירקות", "שמן זית"],
-            min(budget.calories_max, max(budget.calories_min, 500)),
-            max(budget.protein_min, min(budget.protein_max, 28)),
+            [_ingredient("lentils_cooked", 170), _ingredient("rice_cooked", 140), _ingredient("vegetables", 150), _ingredient("olive_oil", 1)],
             "אפשרות פשוטה בלי חלב, ביצים, דגים או אגוזים.",
             ["אפשר להוסיף עוף אם אין העדפה צמחית."],
         ),
     ]
-
 
 def _filter_options(
     options: list[MealOption],
@@ -836,12 +922,10 @@ def _filter_options(
         return _prioritize_fresh_options(safe, recent_titles)
     # Budget-aware allergen-light fallback (never a hardcoded calorie count that
     # could exceed the remaining balance — it is fitted later by the validator).
-    fallback_cal = budget.calories_max if budget else 450
-    fallback = MealOption(
+    del budget
+    fallback = _meal_option(
         "קערת אורז ועדשים פשוטה",
-        ["אורז", "עדשים", "ירקות", "שמן זית"],
-        max(120, int(fallback_cal)),
-        26,
+        [_ingredient("rice_cooked", 120), _ingredient("lentils_cooked", 150), _ingredient("vegetables", 150), _ingredient("olive_oil", 1)],
         "ברירת מחדל שממעטת באלרגנים נפוצים ומספקת בסיס מאוזן.",
         ["אם אחת מהרכיבים לא מתאימה לך, עדכן מגבלה בפרופיל לפני בחירה."],
     )
@@ -923,6 +1007,33 @@ def _strip_quantity(text: str) -> str:
     return " ".join(cleaned.split())
 
 
+def _ingredient_totals(option: MealOption) -> tuple[int, int]:
+    return (
+        _rounded_sum(ingredient.calories for ingredient in option.ingredient_details),
+        _rounded_sum(ingredient.protein_g for ingredient in option.ingredient_details),
+    )
+
+
+def _scale_option_ingredients(option: MealOption, scale: float) -> MealOption:
+    bounded = max(0.25, min(2.0, scale))
+    scaled = [
+        MealIngredient(
+            food_id=ingredient.food_id,
+            display_name=ingredient.display_name,
+            quantity=round(max(0.1, ingredient.quantity * bounded), 1),
+            unit=ingredient.unit,
+            calories=round(max(0, ingredient.calories * bounded), 1),
+            protein_g=round(max(0, ingredient.protein_g * bounded), 1),
+            carbs_g=None if ingredient.carbs_g is None else round(max(0, ingredient.carbs_g * bounded), 1),
+            fat_g=None if ingredient.fat_g is None else round(max(0, ingredient.fat_g * bounded), 1),
+            source=ingredient.source,
+            confidence=ingredient.confidence,
+        )
+        for ingredient in option.ingredient_details
+    ]
+    return _meal_option(option.title, scaled, option.rationale, list(option.substitutions))
+
+
 def validate_meal_option(
     option: MealOption,
     budget: MealBudget,
@@ -934,6 +1045,21 @@ def validate_meal_option(
         problems.append("negative_values")
     if not option.ingredients:
         problems.append("missing_ingredients")
+    if not option.ingredient_details:
+        problems.append("missing_typed_ingredients")
+    else:
+        ingredient_calories, ingredient_protein = _ingredient_totals(option)
+        if abs(option.calories - ingredient_calories) > 1 or abs(option.protein - ingredient_protein) > 1:
+            problems.append("ingredient_total_mismatch")
+        for ingredient in option.ingredient_details:
+            if ingredient.quantity <= 0 or ingredient.calories < 0 or ingredient.protein_g < 0:
+                problems.append("invalid_ingredient_quantity")
+                break
+            if ingredient.protein_g * 4 > ingredient.calories + 8:
+                problems.append("implausible_ingredient_protein")
+                break
+        if option.protein * 4 > option.calories + 15:
+            problems.append("implausible_total_protein")
     # Budget cap: never exceed calories_max unless the budget explicitly allows
     # an acknowledged overage. A small rounding tolerance is permitted.
     tolerance = max(15, int(budget.calories_max * 0.05))
@@ -956,15 +1082,7 @@ def _repair_option_to_budget(option: MealOption, budget: MealBudget) -> MealOpti
     if target <= 0:
         target = budget.calories_max
     scale = target / option.calories
-    return MealOption(
-        title=option.title,
-        ingredients=option.ingredients,
-        calories=int(round(option.calories * scale)),
-        protein=int(round(option.protein * scale)) if option.protein else option.protein,
-        rationale=option.rationale,
-        substitutions=option.substitutions,
-        restriction_validated=option.restriction_validated,
-    )
+    return _scale_option_ingredients(option, scale)
 
 
 def _fit_and_validate_options(
@@ -1019,7 +1137,7 @@ async def generate_next_meal_recommendation(
     stored_rejections = _active_rejections(flags, now=now)
     excluded = set(excluded_fingerprints or set()) | stored_rejections
 
-    candidates = _candidate_templates(context.workout_phase, budget)
+    candidates = _apply_quantity_scales(_candidate_templates(context.workout_phase, budget), flags)
     filtered = _filter_options(candidates, restrictions, recent_titles, budget)
     options, validation_events = _fit_and_validate_options(
         filtered, budget, restrictions, excluded_fingerprints=excluded
@@ -1027,7 +1145,7 @@ async def generate_next_meal_recommendation(
     if len(options) < 2:
         # Top up from the full candidate pool (still validated & de-duplicated).
         extra, extra_events = _fit_and_validate_options(
-            _candidate_templates(context.workout_phase, budget),
+            _apply_quantity_scales(_candidate_templates(context.workout_phase, budget), flags),
             budget,
             restrictions,
             excluded_fingerprints=excluded | {option_fingerprint(o) for o in options},
@@ -1090,6 +1208,29 @@ def _active_rejections(flags: dict[str, Any], *, now: datetime | None = None) ->
             continue
         active.add(fingerprint)
     return active
+
+
+def _quantity_scales(flags: dict[str, Any]) -> dict[str, float]:
+    raw = flags.get("next_meal_quantity_scales") or {}
+    if not isinstance(raw, dict):
+        return {}
+    scales: dict[str, float] = {}
+    for key, value in raw.items():
+        number = _safe_float(value)
+        if number is not None:
+            scales[str(key)] = max(0.25, min(2.0, number))
+    return scales
+
+
+def _apply_quantity_scales(options: list[MealOption], flags: dict[str, Any]) -> list[MealOption]:
+    scales = _quantity_scales(flags)
+    if not scales:
+        return options
+    adjusted: list[MealOption] = []
+    for option in options:
+        scale = scales.get(option_fingerprint(option))
+        adjusted.append(_scale_option_ingredients(option, scale) if scale else option)
+    return adjusted
 
 
 async def record_next_meal_served(
@@ -1201,6 +1342,34 @@ async def regenerate_with_size(
     flags["next_meal_size_pref"] = "smaller" if smaller else "bigger"
     await _save_daily_flags(db, user_id, (now or datetime.now(TZ)).astimezone(TZ).date().isoformat(), flags)
     return await generate_next_meal_recommendation(db, user_id, now=now, allow_overage=allow_overage)
+
+
+async def adjust_next_meal_quantity(
+    db: Any,
+    user_id: int,
+    option_number: int,
+    scale: float,
+    *,
+    now: datetime | None = None,
+) -> NextMealRecommendation:
+    """Persist a quantity scale for one recommendation option and recalculate.
+
+    The scale is keyed by option fingerprint, so choose/save callbacks that
+    regenerate the recommendation still use the adjusted ingredient quantities.
+    """
+    recommendation = await generate_next_meal_recommendation(db, user_id, now=now)
+    if option_number < 1 or option_number > len(recommendation.options):
+        raise ValueError("Unknown next-meal option")
+    option = recommendation.options[option_number - 1]
+    fingerprint = option_fingerprint(option)
+    local_day = recommendation.context.local_day
+    flags = await _daily_flags(db, user_id, local_day)
+    scales = _quantity_scales(flags)
+    current = scales.get(fingerprint, 1.0)
+    scales[fingerprint] = max(0.25, min(2.0, current * scale))
+    flags["next_meal_quantity_scales"] = scales
+    await _save_daily_flags(db, user_id, local_day, flags)
+    return await generate_next_meal_recommendation(db, user_id, now=now)
 
 
 def workout_clarification_actions(recommendation: NextMealRecommendation) -> list[list[tuple[str, str]]]:
@@ -1357,6 +1526,7 @@ async def remember_active_recommendation(
     current = (now or datetime.now(TZ)).astimezone(TZ)
     payload = {
         "options": [option_fingerprint(o) for o in recommendation.options],
+        "option_payloads": [_option_to_payload(o) for o in recommendation.options],
         "option_titles": [o.title for o in recommendation.options],
         "remaining_calories": recommendation.context.nutrition.calorie_balance,
         "budget_policy": recommendation.budget.policy,
@@ -1385,6 +1555,22 @@ async def get_active_recommendation_state(
         await core_services.clear_flow_state(user_id, ACTIVE_RECOMMENDATION_FLOW)
         return None
     return payload
+
+
+async def get_active_recommendation_options(
+    db: Any,
+    user_id: int,
+    *,
+    now: datetime | None = None,
+) -> list[MealOption]:
+    state = await get_active_recommendation_state(db, user_id, now=now)
+    if not state:
+        return []
+    options = []
+    for payload in state.get("option_payloads") or []:
+        if isinstance(payload, dict):
+            options.append(_option_from_payload(payload))
+    return options
 
 
 async def clear_active_recommendation(db: Any, user_id: int) -> None:

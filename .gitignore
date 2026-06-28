@@ -38,6 +38,8 @@ export*.zip
 
 # Source-dump / recording archives must never be committed
 *.zip
+!tests/fixtures/
+!tests/fixtures/*.zip
 
 # Temporary files
 pytest_full.log
