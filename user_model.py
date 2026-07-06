@@ -1070,6 +1070,68 @@ async def get_profile_view(db: SupportsDB, user_id: int) -> dict[str, list[dict[
     return view
 
 
+def _audit_action_required(key: str, fact: dict[str, Any] | None) -> str:
+    status = fact_confirmation_status(fact, key)
+    if status == "missing":
+        return "ask_user"
+    if status == CONFIRM_DEFERRED:
+        return "ask_user"
+    if status == CONFIRM_STALE:
+        return "refresh_health" if fact and fact.get("source") == SOURCE_APPLE_HEALTH else "confirm"
+    if status == CONFIRM_INVALID:
+        return "correct"
+    if status in {CONFIRM_INFERRED, CONFIRM_NOT_APPLICABLE}:
+        return "confirm"
+    return "none"
+
+
+def _audit_freshness(key: str, fact: dict[str, Any] | None) -> str:
+    if fact is None or fact.get("kind") == KIND_GAP:
+        return "unknown"
+    spec = FACT_REGISTRY.get(key)
+    if spec is None or spec.expires_after_days is None:
+        return "fresh"
+    return "fresh" if fact_is_fresh(key, fact) else "stale"
+
+
+async def build_profile_audit(
+    db: SupportsDB,
+    user_id: int,
+    keys: list[str] | tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
+    """Return an auditable profile row per fact.
+
+    This is the machine-readable basis for the user-facing "profile audit"
+    screen: each row separates source, confidence, approval, freshness and the
+    next action instead of rendering a flat profile blob.
+    """
+    selected = list(keys) if keys is not None else [
+        key for key, spec in FACT_REGISTRY.items() if spec.visibility == "user"
+    ]
+    rows: list[dict[str, Any]] = []
+    for key in selected:
+        fact = await get_fact(db, user_id, key)
+        spec = FACT_REGISTRY.get(key)
+        value = fact.get("value") if fact else None
+        rows.append(
+            {
+                "field_name": key,
+                "label": spec.label if spec else key,
+                "value": value,
+                "display_value": display_value(key, value) if fact else None,
+                "source": fact.get("source", "unknown") if fact else "unknown",
+                "confidence": float(fact.get("confidence", 0.0)) if fact else 0.0,
+                "confidence_label": confidence_label(float(fact.get("confidence", 0.0))) if fact else "נמוכה",
+                "approved": bool(fact.get("confirmed")) if fact else False,
+                "freshness": _audit_freshness(key, fact),
+                "last_updated": fact.get("updated_at") if fact else None,
+                "kind": fact.get("kind", KIND_GAP) if fact else KIND_GAP,
+                "action_required": _audit_action_required(key, fact),
+            }
+        )
+    return rows
+
+
 SOURCE_LABELS = {
     SOURCE_APPLE_HEALTH: "Apple Health",
     SOURCE_DERIVED: "הוסק מהנתונים",

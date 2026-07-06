@@ -104,6 +104,27 @@ async def test_basics_screen_has_no_separate_fix_button(
 
 
 @pytest.mark.asyncio
+async def test_basics_screen_shows_profile_audit_statuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = await _make_db(tmp_path)
+    _patch_db(monkeypatch, db)
+    await user_model.set_fact(
+        db, 1, "weight_kg", 101.8,
+        kind=user_model.KIND_FACT, source=user_model.SOURCE_APPLE_HEALTH, confirmed=False,
+    )
+
+    target = FakeTarget()
+    await onboarding_bot.show_onboarding_basics(target, 1)
+    text = target.messages[-1]
+
+    assert "אישור נתוני בסיס" in text
+    assert "דורש אישור" in text
+    assert "Apple Health" in text
+    assert "חסר" in text
+
+
+@pytest.mark.asyncio
 async def test_typing_correction_directly_at_basics_screen_works(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

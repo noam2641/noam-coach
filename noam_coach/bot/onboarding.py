@@ -105,6 +105,7 @@ from retention import (
 # ---------------------------------------------------------------------------
 
 from noam_coach.runtime_bind import runtime_bound
+from noam_coach.bot.ui import safe_answer_callback
 from noam_coach.services.weekdays import sunday_first_key
 
 RUNTIME_NAMES = ('Any', 'CONFIRM_PENDING', 'ContextTypes', 'DB', 'Exception', 'InlineKeyboardMarkup', 'LOGGER', 'MAX_FREQUENCY', 'MIN_FREQUENCY', 'PENDING_QUESTION', 'PLANS', 'ParseMode', 'PlanConstraint', 'SETTINGS', 'SPLIT_BY_FREQUENCY', 'TypeError', 'Update', 'ValueError', '_CANCEL_WORDS', '_ENUM_DISPLAY_MAP', '_as_float', '_format_candidate', '_format_fact_value', '_parse_dietary_answer', '_plan_type_label', '_re', '_safe_cb', 'a_parts', 'abs', 'active_constraints', 'affects', 'allergies', 'allowed', 'applied', 'apply_basics_fix', 'ask_deferred_for_plan', 'ask_next_question', 'assumptions', 'at', 'block', 'bool', 'build_profile_text', 'build_weekly_plan', 'button', 'c', 'callback', 'candidate', 'candidates', 'chosen_days', 'clear_flow_state', 'clear_meal_fix', 'clear_pending', 'compute_basics_extras', 'confirm', 'confirm_routine_facts', 'confirmation_text', 'constraint_id', 'constraint_text', 'constraints', 'context_pending_fix', 'conversation', 'ctx', 'current', 'd', 'data', 'dataclass', 'datetime', 'day', 'days', 'days_source', 'default_spread', 'deferred', 'delta', 'detail', 'detected_days', 'dict', 'diet', 'direction', 'discard_unconfirmed_routine_facts', 'display', 'display_val', 'ensure_user', 'enumerate', 'esc', 'event_log', 'exc', 'existing', 'existing_a', 'existing_r', 'exp_labels', 'experience', 'extract_daily_routine', 'extraction', 'extras', 'fact', 'facts', 'finish_onboarding', 'first_item', 'float', 'flow', 'flow_name', 'food_item', 'format_constraints_summary', 'format_routine_confirmation', 'format_weekly_plan', 'freq', 'frequency', 'gap', 'gaps', 'gather_plan_constraints', 'get_flow_state', 'goal', 'goal_labels', 'group', 'handle_safety_answer', 'hard', 'hasattr', 'head', 'home_keyboard', 'hour', 'i', 'icon', 'index', 'index_str', 'int', 'is_allowed', 'isinstance', 'item', 'items', 'json', 'k', 'key', 'keyboard', 'kind', 'kind_label', 'label', 'latest_bf', 'latest_weight', 'len', 'lines', 'list', 'load_routine_profile', 'loc', 'loc_labels', 'location', 'mapping', 'mark', 'match', 'max', 'mc', 'meal', 'medical', 'message', 'min', 'mins', 'missing', 'missing_labels', 'name', 'needs_follow_up', 'new_val', 'note', 'num', 'nutrition', 'onboarding', 'onboarding_frequency_keyboard', 'onboarding_open_keyboard', 'out', 'parsed_items', 'parts', 'payload', 'pct', 'pending', 'plan', 'plan_constraints', 'plan_type', 'planning', 'prefix', 'profile', 'progress', 'prompt', 'pts', 'q', 'qid', 'query', 'question', 'question_names', 'questions', 'r', 'range', 'rationale', 're', 'readable', 'readiness', 'record_medication', 'restriction_type', 'result', 'rng', 'round', 'row', 'rows', 's', 'safe_edit', 'save_medical_constraint', 'save_routine_extraction', 'score', 'session', 'session_min', 'sessions', 'set_flow_state', 'set_pending', 'severity', 'show_onboarding_patterns', 'since', 'sleep', 'snapshot', 'soft', 'sorted', 'source', 'spec', 'split', 'stage', 'start_onboarding', 'str', 'suggestions', 'suppress', 'suspend', 'target', 'text', 'time_text', 'timedelta', 'timezone', 'title', 'track_event', 'tradeoffs', 'tuple', 'type_label', 'type_labels', 'understood', 'unified', 'update', 'user', 'user_id', 'user_model', 'utc_now', 'v', 'value', 'view', 'weekday_he', 'when', 'why', 'wk', 'workout', 'workout_window', 'write_audit')
@@ -203,12 +204,77 @@ async def compute_basics_extras(user_id: int) -> dict[str, Any]:
     return extras
 
 
+BASICS_AUDIT_KEYS = (
+    "height_cm",
+    "weight_kg",
+    "body_fat_pct",
+    "avg_steps",
+    "sleep_schedule",
+    "workout_pattern",
+    "goal_weight_kg",
+    "training_days_per_week",
+    "workout_window",
+    "training_location",
+    "equipment",
+    "allergies",
+    "diet_restrictions",
+)
+
+
+def _profile_audit_status_he(row: dict[str, Any]) -> str:
+    action = str(row.get("action_required") or "none")
+    if action == "none":
+        return "מאושר" if row.get("approved") else "זוהה"
+    if action == "confirm":
+        return "דורש אישור"
+    if action == "correct":
+        return "דורש תיקון"
+    if action == "refresh_health":
+        return "ישן - לרענן Health"
+    if action == "ask_user":
+        return "חסר"
+    return action.replace("_", " ")
+
+
+def _profile_audit_lines(rows: list[dict[str, Any]]) -> list[str]:
+    if not rows:
+        return []
+    source_labels = {
+        user_model.SOURCE_APPLE_HEALTH: "Apple Health",
+        user_model.SOURCE_DERIVED: "הוסק",
+        user_model.SOURCE_USER: "דיווח שלך",
+        user_model.SOURCE_SYSTEM: "מערכת",
+        "unknown": "לא ידוע",
+    }
+    lines = ["", "<b>אישור נתוני בסיס</b>"]
+    for row in rows:
+        action = str(row.get("action_required") or "none")
+        value = row.get("display_value")
+        if value is None and action == "none":
+            continue
+        label = esc(str(row.get("label") or row.get("field_name") or ""))
+        display = esc(str(value)) if value is not None else "חסר"
+        source = source_labels.get(str(row.get("source") or "unknown"), str(row.get("source") or "לא ידוע"))
+        confidence = esc(str(row.get("confidence_label") or ""))
+        status = esc(_profile_audit_status_he(row))
+        lines.append(f"• {label}: <b>{display}</b> · {status} · מקור: {esc(source)} · אמינות: {confidence}")
+    if len(lines) == 2:
+        return []
+    lines.append("")
+    lines.append("אפשר לאשר הכול, או לכתוב תיקון ישירות כאן.")
+    return lines
+
+
 @runtime_bound(RUNTIME_NAMES)
 async def show_onboarding_basics(target: Any, user_id: int) -> None:
     await onboarding.set_stage(DB, user_id, onboarding.S_CONFIRM_BASICS)
     view = await user_model.get_profile_view(DB, user_id)
     extras = await compute_basics_extras(user_id)
     text = onboarding.basics_summary(view, extras)
+    audit_rows = await user_model.build_profile_audit(DB, user_id, keys=list(BASICS_AUDIT_KEYS))
+    audit_lines = _profile_audit_lines(audit_rows)
+    if audit_lines:
+        text += "\n" + "\n".join(audit_lines)
     latest_weight = await user_model.get_value(DB, user_id, "weight_kg")
     latest_bf = await user_model.get_value(DB, user_id, "body_fat_pct")
     suggestions = []
@@ -771,7 +837,7 @@ async def handle_onboarding_callback(query: Any, user_id: int, data: str) -> Non
             DB, user_id, "inferred_profile_fact_confirmed",
             entity="fact", entity_id=parts[2], source="onboarding",
         )
-        await query.answer("מאושר ✅")
+        await safe_answer_callback(query, "מאושר ✅")
         await show_onboarding_patterns(query, user_id)
         return
 
@@ -781,7 +847,7 @@ async def handle_onboarding_callback(query: Any, user_id: int, data: str) -> Non
             DB, user_id, "inferred_profile_fact_corrected",
             entity="fact", entity_id=parts[2], source="onboarding",
         )
-        await query.answer("סומן לתיקון ✏️")
+        await safe_answer_callback(query, "סומן לתיקון ✏️")
         await show_onboarding_patterns(query, user_id)
         return
 
@@ -791,12 +857,12 @@ async def handle_onboarding_callback(query: Any, user_id: int, data: str) -> Non
             DB, user_id, "inferred_profile_fact_deferred",
             entity="fact", entity_id=parts[2], source="onboarding",
         )
-        await query.answer("נדחה לאחר כך ⏳")
+        await safe_answer_callback(query, "נדחה לאחר כך ⏳")
         await show_onboarding_patterns(query, user_id)
         return
 
     if head == "pat_noop":
-        await query.answer("כבר סומן")
+        await safe_answer_callback(query, "כבר סומן")
         return
 
     if data == "routine:confirm":
@@ -952,7 +1018,7 @@ async def handle_onboarding_callback(query: Any, user_id: int, data: str) -> Non
             try:
                 trend_value = questions.normalize_answer(question, parts[3])
             except ValueError as exc:
-                await query.answer(str(exc), show_alert=True)
+                await safe_answer_callback(query, str(exc), show_alert=True)
                 return
             await questions.record_answer(DB, user_id, question, trend_value)
             await clear_pending(user_id)
@@ -963,7 +1029,7 @@ async def handle_onboarding_callback(query: Any, user_id: int, data: str) -> Non
         if question:
             existing = await user_model.get_fact(DB, user_id, question.fact_key)
             if existing and existing["kind"] != user_model.KIND_GAP and existing.get("confirmed"):
-                await query.answer("כבר ענית על השאלה הזו")
+                await safe_answer_callback(query, "כבר ענית על השאלה הזו")
                 return
         try:
             _index_int = int(index_str)
@@ -2548,6 +2614,9 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
         if question.numeric:
             import re as _re
 
+            if questions.looks_like_time_range(text):
+                await message.reply_text("זה נראה כמו טווח שעות. כרגע ביקשתי מספר לשאלה הזו.")
+                return True
             match = _re.search(r"\d+(?:\.\d+)?", text)
             if not match:
                 await message.reply_text("כתוב מספר בבקשה, למשל 3.")

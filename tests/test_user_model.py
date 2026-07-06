@@ -155,6 +155,39 @@ async def test_get_profile_view(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_build_profile_audit_marks_source_confirmation_and_action(tmp_path: Path) -> None:
+    db = coach_bot.Database(str(tmp_path / "coach.db"))
+    await db.init()
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(1,'A',NULL,?)",
+        (coach_bot.utc_now(),),
+    )
+    await user_model.set_fact(
+        db,
+        1,
+        "weight_kg",
+        101.8,
+        kind=user_model.KIND_FACT,
+        source=user_model.SOURCE_APPLE_HEALTH,
+        confirmed=False,
+    )
+    await db.execute(
+        "UPDATE user_facts SET updated_at='2026-06-16T00:00:00+00:00' "
+        "WHERE user_id=1 AND key='weight_kg'"
+    )
+
+    rows = await user_model.build_profile_audit(db, 1, keys=["weight_kg", "height_cm"])
+    by_key = {row["field_name"]: row for row in rows}
+
+    assert by_key["weight_kg"]["source"] == user_model.SOURCE_APPLE_HEALTH
+    assert by_key["weight_kg"]["approved"] is False
+    assert by_key["weight_kg"]["freshness"] == "stale"
+    assert by_key["weight_kg"]["action_required"] == "refresh_health"
+    assert by_key["height_cm"]["value"] is None
+    assert by_key["height_cm"]["action_required"] == "ask_user"
+
+
+@pytest.mark.asyncio
 async def test_explain_fact_known(tmp_path: Path) -> None:
     db = coach_bot.Database(str(tmp_path / "coach.db"))
     await db.init()
