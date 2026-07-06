@@ -308,10 +308,59 @@ async def _handle_status_text_action(ctx: FreeTextContext) -> bool:
     return True
 
 
+# An explicit ABC-split request in free text ("תוכנית ABC", "אימון איי בי סי").
+# Detected deterministically so the request becomes a FULL 3-day plan build —
+# never a single-exercise edit screen (Codex audit, images 11-12).
+_ABC_SPLIT_RE = re.compile(r"\babc\b|\ba\s*[/\-]?\s*b\s*[/\-]?\s*c\b|איי\s*בי\s*סי", re.IGNORECASE)
+
+
+def requested_split_frequency(text: str) -> int | None:
+    """Return the weekly frequency implied by an explicit split request."""
+    if _ABC_SPLIT_RE.search(text or ""):
+        return 3  # SPLIT_BY_FREQUENCY[3] == A/B/C
+    return None
+
+
+async def _split_availability_gate(user_id: int, split_freq: int) -> tuple[str, Any] | None:
+    """When the user asked for a split that needs more days than their
+    CONFIRMED availability allows, return (message, keyboard) offering a fit
+    instead of silently building a plan they can't follow. Returns None when
+    the split fits or availability is unknown/unconfirmed."""
+    from noam_coach.bot.ui import button
+    from noam_coach.services.availability import resolve_availability
+
+    try:
+        availability = await resolve_availability(DB, user_id)
+    except Exception:  # noqa: BLE001 - the gate must never block plan building
+        return None
+    days = int(availability.max_days_per_week or 0)
+    if not availability.confirmed or days <= 0 or days >= split_freq:
+        return None
+    text = (
+        f"תוכנית ABC בנויה ל-{split_freq} אימונים בשבוע, אבל לפי הזמינות "
+        f"שאישרת יש לך {days}. אפשר לבנות תוכנית מלאה שמתאימה לימים שלך, "
+        "או בכל זאת ABC."
+    )
+    keyboard = InlineKeyboardMarkup(
+        [
+            [button(f"🏋️ בנה לפי {days} ימים בשבוע", f"plan:set:{days}")],
+            [button(f"בכל זאת ABC ({split_freq} ימים)", f"plan:set:{split_freq}")],
+        ]
+    )
+    return text, keyboard
+
+
 @runtime_bound(RUNTIME_NAMES)
 async def _handle_plan_text_action(ctx: FreeTextContext) -> bool:
     if ctx.action == "build_plan":
         frequency = ctx.slots.get("frequency")
+        split_freq = requested_split_frequency(ctx.text)
+        if split_freq is not None and not isinstance(frequency, (int, float)):
+            gate = await _split_availability_gate(ctx.user_id, split_freq)
+            if gate is not None:
+                await ctx.send(gate[0], gate[1])
+                return True
+            frequency = split_freq
         if isinstance(frequency, (int, float)) and 1 <= frequency <= 7:
             frequency = int(frequency)
             gaps = await check_plan_readiness(ctx.user_id)
@@ -325,8 +374,11 @@ async def _handle_plan_text_action(ctx: FreeTextContext) -> bool:
             if await ask_deferred_for_plan(ctx.message, ctx.user_id, frequency):
                 return True
             plan = await build_weekly_plan(ctx.user_id, frequency)
+            plan_text = format_weekly_plan(plan)
+            if split_freq is not None and frequency == split_freq:
+                plan_text = "בניתי לך תוכנית ABC מלאה — A חזה, B גב, C כתפיים ורגליים:\n\n" + plan_text
             await ctx.send(
-                format_weekly_plan(plan),
+                plan_text,
                 InlineKeyboardMarkup(
                     [
                         [button("🏋️ התחל אימון", "menu:workout")],
