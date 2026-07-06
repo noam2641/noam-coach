@@ -923,7 +923,15 @@ async def finish_health_confirm_wizard(
         if report and (report.get("freshness") or {}).get("latest_sample_date"):
             from noam_coach.services.health_quality import quality_summary_lines_he
 
-            quality_section = "\n\n" + "\n".join(quality_summary_lines_he(report))
+            # The import summary itself may already carry the "not fresh —
+            # export a new ZIP" warning; don't repeat the same advice twice
+            # in one message.
+            already_advised = "הנתונים אינם טריים" in (summary_text or "")
+            quality_section = "\n\n" + "\n".join(
+                quality_summary_lines_he(
+                    report, include_export_recommendation=not already_advised
+                )
+            )
     text = (
         (summary_text + quality_section + followup)
         if summary_text

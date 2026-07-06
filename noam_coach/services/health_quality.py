@@ -281,10 +281,15 @@ async def build_health_quality_report(
     }
 
 
-def quality_summary_lines_he(report: dict[str, Any]) -> list[str]:
+def quality_summary_lines_he(
+    report: dict[str, Any], *, include_export_recommendation: bool = True
+) -> list[str]:
     """Short user-facing summary shown at the end of the import wizard.
 
     Plain Hebrew, no JSON, one line per signal + one recommendation.
+    ``include_export_recommendation=False`` drops the closing recommendation
+    line — used when the surrounding screen already tells the user to export
+    a fresh ZIP, so the same advice is not repeated twice in one message.
     """
     workout = report.get("workout_frequency", {})
     steps = report.get("steps", {})
@@ -321,8 +326,9 @@ def quality_summary_lines_he(report: dict[str, Any]) -> list[str]:
     else:
         lines.append("• קובץ הבריאות: עדכני")
 
-    if freshness.get("is_stale"):
-        lines.append("• המלצה: כדאי לייצא קובץ Apple Health חדש מהאייפון.")
-    else:
-        lines.append("• המלצה: אפשר להמשיך לבניית התוכנית.")
+    if include_export_recommendation:
+        if freshness.get("is_stale"):
+            lines.append("• המלצה: כדאי לייצא קובץ Apple Health חדש מהאייפון.")
+        else:
+            lines.append("• המלצה: אפשר להמשיך לבניית התוכנית.")
     return lines

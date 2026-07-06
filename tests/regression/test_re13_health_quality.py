@@ -579,3 +579,19 @@ async def test_quality_summary_appears_after_wizard(
     final = target.messages[-1]
     assert "סיכום איכות הנתונים" in final
     assert "צעדים" in final
+
+
+@pytest.mark.asyncio
+async def test_quality_summary_can_skip_export_recommendation() -> None:
+    """When the surrounding screen already tells the user to export a fresh
+    ZIP, the quality digest must not repeat the same advice in the same
+    message (Codex audit follow-up)."""
+    report = await health_quality.build_health_quality_report(
+        QualityDB(newest=_newest_iso(21)), 1, TZ
+    )
+    with_recommendation = health_quality.quality_summary_lines_he(report)
+    without_recommendation = health_quality.quality_summary_lines_he(
+        report, include_export_recommendation=False
+    )
+    assert any("המלצה" in line for line in with_recommendation)
+    assert not any("המלצה" in line for line in without_recommendation)
