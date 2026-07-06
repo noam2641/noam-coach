@@ -110,6 +110,39 @@ class TestHealthImportOutcomeFields:
         assert outcome.import_started == "2025-01-01T00:00:00Z"
         assert outcome.import_completed == "2025-01-01T00:01:00Z"
 
+    def test_old_health_import_success_text_warns_without_error(self) -> None:
+        import datetime as dt
+        from noam_coach.services import health_jobs
+        from noam_coach.services.health_jobs import HealthImportOutcome
+
+        s = health_import.ImportSummary()
+        s.note("steps", dt.date(2026, 6, 16))
+        outcome = HealthImportOutcome(
+            inserted=1,
+            duplicates=0,
+            updated=0,
+            invalid=0,
+            summary=s,
+            profile={},
+            source_file="export.zip",
+            total_stored=1,
+            import_started="2026-07-06T00:00:00Z",
+            import_completed="2026-07-06T00:01:00Z",
+        )
+
+        warning = health_jobs._health_import_staleness_warning(
+            "2026-06-16",
+            today=dt.datetime(2026, 7, 6, tzinfo=dt.timezone.utc),
+        )
+        text = health_jobs._health_import_success_text(outcome)
+
+        assert "יובא בהצלחה" in warning
+        assert "2026-06-16" in warning
+        assert "אינם טריים" in warning
+        assert "2026-06-16" in text
+        assert "אינם טריים" in text
+        assert "שגיאה" not in text
+
     @pytest.mark.asyncio
     async def test_followup_summary_lists_missing_without_raw_keys(
         self,

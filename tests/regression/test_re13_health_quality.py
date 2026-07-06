@@ -224,6 +224,13 @@ def test_sleep_two_nights_is_not_confirmable() -> None:
     assert "לא מספיק" in section["warning_he"] or "אין מספיק" in section["warning_he"]
 
 
+def test_sleep_five_nights_is_still_not_confirmable() -> None:
+    section = health_quality._sleep_section(5)
+    assert section["should_ask_confirmation"] is False
+    assert section["confidence"] == health_quality.CONFIDENCE_LOW
+    assert section["minimum_required"] == 7
+
+
 def test_sleep_seven_nights_confirmable_with_warning() -> None:
     section = health_quality._sleep_section(7)
     assert section["should_ask_confirmation"] is True
@@ -251,6 +258,17 @@ async def test_fresh_export_has_no_warning() -> None:
     freshness = report["freshness"]
     assert freshness["is_stale"] is False
     assert freshness["warning_he"] == ""
+
+
+@pytest.mark.asyncio
+async def test_eight_day_old_export_warns() -> None:
+    report = await health_quality.build_health_quality_report(
+        QualityDB(newest=_newest_iso(8)), 1, TZ
+    )
+    freshness = report["freshness"]
+    assert freshness["is_stale"] is True
+    assert freshness["days_old"] == 8
+    assert freshness["warning_he"]
 
 
 @pytest.mark.asyncio

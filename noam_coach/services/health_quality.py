@@ -35,7 +35,7 @@ POLICY_NO_WEAR = "no_wear_data"
 
 # Sleep: below the minimum the wizard must NOT offer a regular confirmation —
 # two nights are an anecdote, not a routine.
-SLEEP_MIN_NIGHTS_FOR_CONFIRMATION = 5
+SLEEP_MIN_NIGHTS_FOR_CONFIRMATION = 7
 SLEEP_NIGHTS_FOR_HIGH_CONFIDENCE = 10
 
 # Steps: how many fully-covered days make the daily average trustworthy.
@@ -226,7 +226,7 @@ async def _freshness_section(db: Any, user_id: int, tz: ZoneInfo) -> dict[str, A
             f"{days_old} ימים. הנתונים ישנים מאוד, וההערכות עלולות לא "
             "לשקף את המצב הנוכחי. מומלץ מאוד לייצא ZIP חדש מהאייפון."
         )
-    elif days_old > FRESHNESS_STALE_DAYS:
+    elif days_old > FRESHNESS_OK_DAYS:
         warning = (
             f"שים לב: קובץ הבריאות האחרון מסתיים ב-{newest_date.isoformat()}, "
             "ולכן השבועות האחרונים לא נכנסו לחישוב. מומלץ לייצא ZIP חדש "
@@ -237,7 +237,7 @@ async def _freshness_section(db: Any, user_id: int, tz: ZoneInfo) -> dict[str, A
     return {
         "latest_sample_date": newest_date.isoformat(),
         "days_old": days_old,
-        "is_stale": days_old > FRESHNESS_STALE_DAYS,
+        "is_stale": days_old > FRESHNESS_OK_DAYS,
         "warning_he": warning,
     }
 

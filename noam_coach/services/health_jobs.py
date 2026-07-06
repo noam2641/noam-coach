@@ -149,6 +149,24 @@ class HealthImportOutcome:
     import_completed: str  # ISO-8601 UTC
 
 
+def _health_import_staleness_warning(max_date: Any, *, today: datetime | None = None) -> str:
+    if not max_date:
+        return ""
+    try:
+        newest = datetime.fromisoformat(str(max_date)).date()
+    except ValueError:
+        return ""
+    current = (today or datetime.now(TZ)).date()
+    days_old = max(0, (current - newest).days)
+    if days_old <= 7:
+        return ""
+    return (
+        "⚠️ הקובץ יובא בהצלחה, אבל הנתונים אינם טריים: "
+        f"הרשומה האחרונה היא מ-{newest.isoformat()} "
+        f"({days_old} ימים אחורה). כדי לדייק את השבוע האחרון צריך ZIP חדש."
+    )
+
+
 def _health_import_success_text(outcome: HealthImportOutcome) -> str:
     s = outcome.summary
     sleep = outcome.profile.get("sleep", {}) or {}
@@ -161,6 +179,10 @@ def _health_import_success_text(outcome: HealthImportOutcome) -> str:
         lines.append(f"• טווח נתונים: {s.min_date} עד {s.max_date}")
         lines.append(f"• הרשומות החדשות ביותר הן מתאריך: {s.max_date}")
     lines.append(f"• רשומות בקובץ: {s.rows:,}")
+    if s.min_date and s.max_date:
+        warning = _health_import_staleness_warning(s.max_date)
+        if warning:
+            lines.append(warning)
     lines.append("")
 
     # --- Current import section ---
