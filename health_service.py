@@ -7,7 +7,7 @@ handling and routing.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 import db as _db
@@ -266,16 +266,16 @@ async def sync_health_measurements_to_facts(user_id: int) -> None:
                 source=user_model.SOURCE_APPLE_HEALTH,
             )
 
-    since = (datetime.now(timezone.utc) - timedelta(days=SETTINGS.routine_window_days)).isoformat()
-    avg = await _current_db().fetch_one(
-        "SELECT AVG(value) AS v FROM health "
-        "WHERE user_id=? AND sample_type='steps' AND start_time>=?",
-        (user_id, since),
+    # Daily-steps average counts only days the watch was worn through the
+    # evening — a partial day undercounts steps, so it is burned rather than
+    # allowed to drag the average down (routine.average_daily_steps).
+    steps = await routine.average_daily_steps(
+        _current_db(), user_id, TZ, SETTINGS.routine_window_days
     )
-    if avg and avg["v"] is not None:
+    if steps.avg is not None:
         await user_model.set_fact(
             _current_db(), user_id, "avg_steps",
-            round(float(avg["v"])),
+            round(float(steps.avg)),
             kind=user_model.KIND_FACT,
             source=user_model.SOURCE_APPLE_HEALTH,
         )

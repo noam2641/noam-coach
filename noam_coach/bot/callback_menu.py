@@ -580,8 +580,15 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
     if data.startswith("health:confirm:") and ":trend:" in data:
         # RE11: user picked one of the trend-proposal buttons (stay at N /
         # go to M) for a Health-derived metric instead of accepting the raw
-        # detected value or typing a correction.
-        from noam_coach.services.health_jobs import ask_next_health_confirm_step, finish_health_confirm_wizard
+        # detected value or typing a correction. RE12: this only settles the
+        # FREQUENCY sub-step — the wizard continues to the remaining
+        # confirmations (training days, typical hour) instead of swallowing
+        # them with the whole pattern.
+        from noam_coach.services.health_jobs import (
+            apply_health_wizard_trend_choice,
+            ask_next_health_confirm_step,
+            finish_health_confirm_wizard,
+        )
 
         _, _, key, _, value_text = data.split(":", 4)
         try:
@@ -589,32 +596,24 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
         except ValueError:
             await query.answer("ערך לא תקין", show_alert=True)
             return True
-        if key == "workout_pattern":
-            current = await user_model.get_value(DB, user_id, key) or {}
-            updated = {**current, "weekly_frequency": trend_value} if isinstance(current, dict) else {
-                "weekly_frequency": trend_value
-            }
-            await user_model.set_fact(
-                DB, user_id, key, updated,
-                kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
-            )
-        await user_model.set_fact(
-            DB, user_id, "training_days_per_week", trend_value,
-            kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
-        )
+        ack = await apply_health_wizard_trend_choice(user_id, key, trend_value)
         await track_event(user_id, "health_wizard_trend_choice", key=key, value=trend_value)
-        if not await ask_next_health_confirm_step(query, user_id):
-            await finish_health_confirm_wizard(query, user_id)
+        if not await ask_next_health_confirm_step(query, user_id, ack_text=ack):
+            await finish_health_confirm_wizard(query, user_id, ack_text=ack)
         return True
 
     if data.startswith("health:confirm:"):
-        from noam_coach.services.health_jobs import ask_next_health_confirm_step, finish_health_confirm_wizard
+        from noam_coach.services.health_jobs import (
+            ask_next_health_confirm_step,
+            confirm_health_wizard_step,
+            finish_health_confirm_wizard,
+        )
 
-        key = data.split(":", 2)[2]
-        await user_model.confirm_fact(DB, user_id, key)
-        await track_event(user_id, "health_wizard_fact_confirmed", key=key)
-        if not await ask_next_health_confirm_step(query, user_id):
-            await finish_health_confirm_wizard(query, user_id)
+        step_id = data.split(":", 2)[2]
+        ack = await confirm_health_wizard_step(user_id, step_id)
+        await track_event(user_id, "health_wizard_fact_confirmed", key=step_id)
+        if not await ask_next_health_confirm_step(query, user_id, ack_text=ack):
+            await finish_health_confirm_wizard(query, user_id, ack_text=ack)
         return True
 
     if data == "health:skip_item":
@@ -622,12 +621,13 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
             HEALTH_CONFIRM_FLOW,
             ask_next_health_confirm_step,
             finish_health_confirm_wizard,
+            skip_health_wizard_item,
         )
         from noam_coach.bot.onboarding import get_flow_state, clear_pending
 
         state = await get_flow_state(user_id, HEALTH_CONFIRM_FLOW)
         if state and state.get("step"):
-            await user_model.invalidate_fact(DB, user_id, str(state["step"]))
+            await skip_health_wizard_item(user_id, str(state["step"]))
         await clear_pending(user_id)
         if not await ask_next_health_confirm_step(query, user_id):
             await finish_health_confirm_wizard(query, user_id)

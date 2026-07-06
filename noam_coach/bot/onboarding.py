@@ -2228,10 +2228,25 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
         return True
 
     if pending.startswith("__health_edit_") and pending.endswith("__"):
-        # RE10-4: user typed a corrected value for one imported Health fact.
-        from noam_coach.services.health_jobs import ask_next_health_confirm_step, finish_health_confirm_wizard
+        # RE10-4: user typed a corrected value for one imported Health item.
+        from noam_coach.services.health_jobs import (
+            apply_health_wizard_text_edit,
+            ask_next_health_confirm_step,
+            finish_health_confirm_wizard,
+        )
 
         key = pending[len("__health_edit_"):-2]
+        if "." in key:
+            # RE12: a workout sub-step (frequency / days / hour) — parse the
+            # correction into the pattern and the matching plan facts.
+            handled, reply = await apply_health_wizard_text_edit(user_id, key, text)
+            if not handled:
+                await message.reply_text(reply)
+                return True
+            await clear_pending(user_id)
+            if not await ask_next_health_confirm_step(message, user_id, ack_text=reply):
+                await finish_health_confirm_wizard(message, user_id, ack_text=reply)
+            return True
         await user_model.set_fact(
             DB, user_id, key, text.strip(),
             kind=user_model.KIND_FACT,
@@ -2239,9 +2254,9 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
             confirmed=True,
         )
         await clear_pending(user_id)
-        await message.reply_text(f"עודכן: {esc(user_model.display_label(key))} — {esc(text.strip())} ✅")
-        if not await ask_next_health_confirm_step(message, user_id):
-            await finish_health_confirm_wizard(message, user_id)
+        ack = f"עודכן: {esc(user_model.display_label(key))} — {esc(text.strip())} ✅"
+        if not await ask_next_health_confirm_step(message, user_id, ack_text=ack):
+            await finish_health_confirm_wizard(message, user_id, ack_text=ack)
         return True
 
     if pending == "__med_name__":

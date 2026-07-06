@@ -122,6 +122,13 @@ from noam_coach.services.nutrition_context import (
     build_nutrition_ai_request,
     build_nutrition_context,
 )
+from noam_coach.services.weekdays import (
+    WEEKDAY_SCHEMA_VERSION,
+    normalize_weekday,
+    sunday_first_order,
+    weekday_he,
+    with_weekday_schema,
+)
 
 RUNTIME_NAMES = ('Any', 'CallbackContext', 'ContextTypes', 'DB', 'Exception', 'InlineKeyboardButton', 'InlineKeyboardMarkup', 'JOB_PRIORITY_COACHING', 'JOB_PRIORITY_HIGH', 'JOB_PRIORITY_LOW', 'JOB_PRIORITY_SCHEDULED', 'LOGGER', 'OPENAI_CLIENT', 'ParseMode', 'Path', 'RuntimeError', 'SETTINGS', 'TZ', 'Update', 'ValueError', '_ctx_has_workout', '_data_quality_disclaimer', 'abs', 'action', 'actual_bytes', 'any', 'asyncio', 'at', 'bool', 'build_daily_context', 'build_evening_summary_text', 'build_morning_menu_text', 'build_next_meal_text', 'button', 'context', 'conversation', 'ctx', 'current_flow', 'datetime', 'deliver_proactive_message', 'document', 'duplicates', 'ensure_user', 'enumerate', 'esc', 'exc', 'extract_dir', 'fasting_negated', 'flags', 'float', 'folder', 'format_evening_summary', 'format_morning_menu', 'format_next_meals', 'fraction_used', 'friendly_error', 'get_daily_flags', 'health_import', 'hh', 'hhmm', 'hint', 'hour', 'idx', 'inserted', 'insights', 'int', 'is_allowed', 'items', 'job_calorie_watch', 'job_evening', 'job_morning', 'job_motivation', 'keyboard', 'known_medications', 'learned', 'learned_block', 'lines', 'list', 'load_routine_profile', 'local_day_str', 'lowered', 'max_bytes', 'med', 'meds', 'menu', 'message', 'mm', 'moment', 'morning_checkin_keyboard', 'name', 'near', 'notify_admin', 'now', 'onboarding', 'parse_to_rows', 'profile', 'progress', 'random', 're', 'recommendations', 'reconcile', 'resumed', 'ritalin_negated', 'route_decision', 'rows', 'run_post_import_reconciliation', 'save_routine_profile', 'saved_path', 'secrets', 'send_checkin', 'send_menu', 'send_motivation', 'send_nudge', 'send_overpace', 'send_summary', 'send_to_user', 'sent', 'set_daily_flags', 'show_onboarding_basics', 'shutil', 'sleep', 'snack_hours', 'str', 'suffix', 'suggestion', 'summary', 'suppress', 'sync_health_measurements_to_facts', 'target', 'target_cal', 'telegram_file', 'text', 'today_meal_items', 'top', 'track_event', 'tuple', 'update', 'upsert_health_rows', 'user_id', 'user_model', 'value', 'weekly', 'window', 'workout', 'workout_hour', 'write_audit', 'x', 'xml_path')
 
@@ -184,6 +191,9 @@ def _health_import_success_text(outcome: HealthImportOutcome) -> str:
         hour = workout.get("typical_hour")
         at = f", בדרך כלל ~{hour}" if hour else ""
         learned.append(f"🏋️ ~{workout['weekly_frequency']} אימונים בשבוע{at}")
+        day_labels = _workout_days_labels(workout)
+        if day_labels:
+            learned.append(f"📅 ימי אימון נפוצים: {', '.join(day_labels)}")
     if learned:
         lines.append("<b>מה למדתי על השגרה שלך:</b>")
         lines.extend(learned)
@@ -248,23 +258,86 @@ async def activate_imported_health_facts(user_id: int) -> int:
     return len(pending)
 
 
-# RE10-4: per-fact confirmation wizard shown right after a Health import,
-# replacing the old single "activate everything at once" gate. The order
-# matters: workout frequency first (feeds the day-selection step next),
-# then the days themselves, then typical time, then weight — mirroring the
-# order a coach would actually confirm data with a client.
+# RE10-4 / RE12: per-item confirmation wizard shown right after a Health
+# import, replacing the old single "activate everything at once" gate.
+# RE12 splits the bundled "workout pattern" approval into three SEPARATE
+# confirmations — weekly frequency, training days, typical hour — so each
+# data point is approved on its own, in the order a coach would actually
+# confirm data with a client (frequency feeds the day step, then the time),
+# then weight, sleep, and any remaining imported item (steps, body fat...).
 HEALTH_CONFIRM_FLOW = "health_confirm"
-_WIZARD_FACT_ORDER = ("workout_pattern", "weight_kg", "sleep_schedule")
+
+WIZARD_STEP_WORKOUT_FREQUENCY = "workout_pattern.frequency"
+WIZARD_STEP_WORKOUT_DAYS = "workout_pattern.days"
+WIZARD_STEP_WORKOUT_HOUR = "workout_pattern.hour"
+_WORKOUT_SUBSTEPS = (
+    WIZARD_STEP_WORKOUT_FREQUENCY,
+    WIZARD_STEP_WORKOUT_DAYS,
+    WIZARD_STEP_WORKOUT_HOUR,
+)
+_WIZARD_STEP_ORDER = (*_WORKOUT_SUBSTEPS, "weight_kg", "sleep_schedule")
+
+# What to type when the detected value is wrong — per fact key.
+_WIZARD_EDIT_HINTS: dict[str, str] = {
+    "weight_kg": 'משקל עדכני בק"ג (למשל: 82.5)',
+    "sleep_schedule": "שעות שינה רצויות (למשל: 23:00-07:00)",
+    "avg_steps": "ממוצע צעדים יומי (למשל: 9000)",
+    "body_fat_pct": "אחוז שומן עדכני (למשל: 22)",
+    "resting_hr": "דופק מנוחה עדכני (למשל: 55)",
+    "eating_windows": "שעות אכילה (למשל: 09:00, 13:00, 19:00)",
+}
+
+
+def wizard_step_fact_key(step_id: str) -> str:
+    """Map a wizard step id (possibly ``fact.sub``) to its user_facts key."""
+    return step_id.split(".", 1)[0]
+
+
+def _workout_substep_applicable(step_id: str, value: Any) -> bool:
+    """A workout sub-step is only shown when the import actually detected
+    that piece of data (no empty confirmations)."""
+    if not isinstance(value, dict):
+        return False
+    if step_id == WIZARD_STEP_WORKOUT_FREQUENCY:
+        return value.get("weekly_frequency") is not None
+    if step_id == WIZARD_STEP_WORKOUT_DAYS:
+        return bool(value.get("common_weekdays"))
+    if step_id == WIZARD_STEP_WORKOUT_HOUR:
+        return bool(value.get("typical_hour"))
+    return True
+
+
+def _workout_days_indices(value: dict[str, Any]) -> list[int]:
+    """Normalized (Monday-first) detected training-day indices."""
+    schema = value.get("weekday_schema") or WEEKDAY_SCHEMA_VERSION
+    days: set[int] = set()
+    for raw in value.get("common_weekdays") or []:
+        normalized = normalize_weekday(raw, schema)
+        if normalized.weekday is not None:
+            days.add(normalized.weekday)
+    return sorted(days)
+
+
+def _workout_days_labels(value: dict[str, Any]) -> list[str]:
+    """Hebrew day names for the detected training days, in Israeli order."""
+    return [weekday_he(d) for d in sunday_first_order(_workout_days_indices(value))]
 
 
 def _format_pending_fact_value(key: str, value: Any) -> str:
-    """Human-readable "what was detected" line for one pending fact (RE10-4)."""
+    """Human-readable "what was detected" text for one pending fact.
+
+    RE12: every fact shows its actual VALUE (steps, body fat, resting HR...)
+    — never just the label, so the user always sees what they are approving.
+    """
     if key == "workout_pattern" and isinstance(value, dict):
         freq = value.get("weekly_frequency")
         hour = value.get("typical_hour")
         parts = []
-        if freq:
+        if freq is not None:
             parts.append(f"~{freq:g} אימונים בשבוע")
+        days = _workout_days_labels(value)
+        if days:
+            parts.append(f"בימים {', '.join(days)}")
         if hour:
             parts.append(f"בדרך כלל בסביבות {hour}")
         return ", ".join(parts) or "דפוס אימונים"
@@ -274,66 +347,158 @@ def _format_pending_fact_value(key: str, value: Any) -> str:
         if bedtime and wake:
             return f"שינה {bedtime}–{wake}"
         return "שגרת שינה"
-    if key == "weight_kg":
-        try:
-            return f'{float(value):.1f} ק"ג'
-        except (TypeError, ValueError):
-            return str(value)
+    if key == "eating_windows" and isinstance(value, dict):
+        hours = value.get("typical_meal_hours") or []
+        if hours:
+            return f"ארוחות בדרך כלל סביב {', '.join(hours)}"
+        first, last = value.get("first_meal_time"), value.get("last_meal_time")
+        if first and last:
+            return f"אכילה בין {first} ל-{last}"
+        return "חלונות אכילה"
+    display = user_model.display_value(key, value)
+    if display and display != "לא צוין":
+        return display
     return user_model.display_label(key)
 
 
-async def _next_wizard_fact(user_id: int) -> dict[str, Any] | None:
-    """Return the next unconfirmed imported fact to review, in wizard order."""
+def _wizard_step_prompt(step_id: str, fact: dict[str, Any]) -> tuple[str, str, str]:
+    """Build (detected_line, plan_scope, correction_hint) for one wizard step.
+
+    All prompts share one format:
+    "זוהה X. האם לאשר גם עבור <scope>? אם לא — ציין <hint>."
+    """
+    key = wizard_step_fact_key(step_id)
+    value = fact.get("value")
+    if step_id == WIZARD_STEP_WORKOUT_FREQUENCY and isinstance(value, dict):
+        freq = value.get("weekly_frequency")
+        detected = f"זוהתה שגרת אימונים של כ-{float(freq):g} אימונים בשבוע"
+        if value.get("wear_filtered") and value.get("valid_weeks_sampled"):
+            weeks_n = int(value["valid_weeks_sampled"])
+            weeks_text = "שבוע אחד" if weeks_n == 1 else f"{weeks_n} שבועות"
+            detected += f" (על בסיס {weeks_text} עם נתוני שעון מלאים)"
+        return detected, "תוכנית האימונים", "כמות אימונים רצויה בשבוע (למשל: 3)"
+    if step_id == WIZARD_STEP_WORKOUT_DAYS and isinstance(value, dict):
+        days = ", ".join(_workout_days_labels(value))
+        return (
+            f"זוהו ימי אימון קבועים מהנתונים: {days}",
+            "תוכנית האימונים",
+            "את ימי האימון הרצויים (למשל: ראשון, שלישי, חמישי)",
+        )
+    if step_id == WIZARD_STEP_WORKOUT_HOUR and isinstance(value, dict):
+        return (
+            f"זוהתה שעת אימון טיפוסית סביב {value.get('typical_hour')}",
+            "תוכנית האימונים",
+            "שעה רצויה (למשל: 18:30)",
+        )
+    label = user_model.display_label(key)
+    display = _format_pending_fact_value(key, value)
+    return (
+        f"זוהה {label}: {display}",
+        "התוכנית וההמלצות",
+        _WIZARD_EDIT_HINTS.get(key, "ערך אחר"),
+    )
+
+
+async def _wizard_done_steps(user_id: int) -> list[str]:
+    from noam_coach.bot.onboarding import get_flow_state
+
+    state = await get_flow_state(user_id, HEALTH_CONFIRM_FLOW)
+    payload = (state or {}).get("payload") or {}
+    done = payload.get("done") or []
+    return [str(step) for step in done if isinstance(step, str)]
+
+
+async def _next_wizard_step(
+    user_id: int, done: list[str]
+) -> tuple[str, dict[str, Any]] | None:
+    """Return (step_id, fact) for the next confirmation, honoring sub-steps."""
     pending = await pending_import_facts(user_id)
-    pending_keys = {str(row["key"]) for row in pending}
-    for key in _WIZARD_FACT_ORDER:
-        if key in pending_keys:
-            fact = await user_model.get_fact(DB, user_id, key)
-            if fact is not None:
-                return fact
-    # Anything imported but not in the known wizard order still gets reviewed,
-    # just after the ordered ones, so nothing silently skips confirmation.
-    for row in pending:
-        if str(row["key"]) not in _WIZARD_FACT_ORDER:
-            fact = await user_model.get_fact(DB, user_id, str(row["key"]))
-            if fact is not None:
-                return fact
+    pending_keys = [str(row["key"]) for row in pending]
+    ordered_keys = {wizard_step_fact_key(step) for step in _WIZARD_STEP_ORDER}
+
+    facts: dict[str, dict[str, Any] | None] = {}
+
+    async def fact_for(key: str) -> dict[str, Any] | None:
+        if key not in facts:
+            facts[key] = await user_model.get_fact(DB, user_id, key)
+        return facts[key]
+
+    for step_id in _WIZARD_STEP_ORDER:
+        key = wizard_step_fact_key(step_id)
+        if key not in pending_keys or step_id in done:
+            continue
+        fact = await fact_for(key)
+        if fact is None:
+            continue
+        if key == "workout_pattern" and not _workout_substep_applicable(
+            step_id, fact.get("value")
+        ):
+            continue
+        return step_id, fact
+
+    # Anything imported but not in the known wizard order still gets reviewed
+    # (steps average, body fat, resting HR, eating windows...), so nothing
+    # silently skips confirmation.
+    for key in pending_keys:
+        if key in done:
+            continue
+        fact = await fact_for(key)
+        if fact is None:
+            continue
+        if key in ordered_keys:
+            # workout_pattern with no applicable sub-step falls back to a
+            # generic single confirmation; otherwise the ordered loop owns it.
+            if key != "workout_pattern" or any(
+                _workout_substep_applicable(s, fact.get("value"))
+                for s in _WORKOUT_SUBSTEPS
+            ):
+                continue
+        return key, fact
     return None
 
 
 HEALTH_POST_WIZARD_FLOW = "health_post_wizard"
 
 
-async def ask_next_health_confirm_step(target: Any, user_id: int) -> bool:
-    """Ask the user to confirm the next pending imported fact.
+async def ask_next_health_confirm_step(
+    target: Any, user_id: int, *, ack_text: str | None = None
+) -> bool:
+    """Ask the user to confirm the next pending imported data point.
 
-    RE11: the prompt itself accepts a typed correction directly (no separate
-    "ציין אחרת" tap first) — pending is set to the same key used by the old
-    edit flow from the start. "✅ אשר" remains as the one-tap fast path when
-    the detected value is already correct.
+    RE12: each item is confirmed SEPARATELY (frequency / training days /
+    typical hour are three independent steps) and every prompt shows the
+    detected value in one uniform format. ``ack_text`` (what was just
+    approved) is echoed above the next prompt so the user always sees the
+    information that was confirmed.
 
-    For workout_pattern specifically, if the recent Health data has drifted
-    from the long-run average by a meaningful amount, show a trend-aware
-    proposal (recent value + a recommended step-up) with structured choice
-    buttons instead of the plain confirm prompt — typing a number still
-    always works.
+    RE11: the prompt itself accepts a typed correction directly — pending is
+    set to the step's edit key from the start. "✅ אשר" remains the one-tap
+    fast path when the detected value is already correct.
+
+    For the frequency step, if the recent Health data has drifted from the
+    long-run average by a meaningful amount, a trend-aware proposal (recent
+    value + a recommended step-up) is shown with structured choice buttons
+    instead of the plain confirm prompt — typing a number still always works.
 
     Returns False once nothing is left to review — the caller should then
-    show the final import summary (RE10-4 replaces the old bulk
-    health:activate gate with this step-by-step wizard).
+    show the final import summary.
     """
     from noam_coach.bot.onboarding import set_flow_state, clear_flow_state, set_pending
 
-    fact = await _next_wizard_fact(user_id)
-    if fact is None:
+    done = await _wizard_done_steps(user_id)
+    next_step = await _next_wizard_step(user_id, done)
+    if next_step is None:
         await clear_flow_state(user_id, HEALTH_CONFIRM_FLOW)
         return False
 
-    key = fact["key"]
-    await set_flow_state(user_id, HEALTH_CONFIRM_FLOW, key, {})
-    await set_pending(user_id, f"__health_edit_{key}__")
+    step_id, fact = next_step
+    await set_flow_state(user_id, HEALTH_CONFIRM_FLOW, step_id, {"done": done})
+    await set_pending(user_id, f"__health_edit_{step_id}__")
 
-    if key == "workout_pattern" and isinstance(fact.get("value"), dict):
+    prefix = f"{ack_text}\n\n" if ack_text else ""
+    header = f"{prefix}<b>אישור נתונים מהייבוא</b>\n\n"
+
+    if step_id == WIZARD_STEP_WORKOUT_FREQUENCY and isinstance(fact.get("value"), dict):
         import routine
 
         value = fact["value"]
@@ -345,10 +510,11 @@ async def ask_next_health_confirm_step(target: Any, user_id: int) -> bool:
         )
         proposal = routine.build_frequency_trend_proposal(pattern)
         if proposal is not None:
-            text = f"<b>אישור נתונים מהייבוא</b>\n\n{esc(proposal.message)}"
+            key = wizard_step_fact_key(step_id)
+            text = f"{header}{esc(proposal.message)}"
             rows = [
-                [InlineKeyboardButton(label, callback_data=f"health:confirm:{key}:trend:{value:g}")]
-                for label, value in proposal.choices
+                [InlineKeyboardButton(label, callback_data=f"health:confirm:{key}:trend:{choice:g}")]
+                for label, choice in proposal.choices
             ]
             rows.append(
                 [InlineKeyboardButton("⏭️ דלג על שאר האישורים", callback_data="health:skip_wizard")]
@@ -360,12 +526,15 @@ async def ask_next_health_confirm_step(target: Any, user_id: int) -> bool:
                 await target.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
             return True
 
-    display = _format_pending_fact_value(key, fact.get("value"))
-    label = user_model.display_label(key)
-    text = f"<b>אישור נתונים מהייבוא</b>\n\nזוהה: {esc(label)} — {esc(display)}\n\nלאשר, או לכתוב ערך אחר."
+    detected, scope, hint = _wizard_step_prompt(step_id, fact)
+    text = (
+        f"{header}{esc(detected)}.\n"
+        f"האם לאשר גם עבור {esc(scope)}?\n"
+        f"אם לא — ציין {esc(hint)}."
+    )
     keyboard = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("✅ אשר", callback_data=f"health:confirm:{key}")],
+            [InlineKeyboardButton("✅ אשר", callback_data=f"health:confirm:{step_id}")],
             [InlineKeyboardButton("⏭️ דלג על שאר האישורים", callback_data="health:skip_wizard")],
         ]
     )
@@ -374,6 +543,184 @@ async def ask_next_health_confirm_step(target: Any, user_id: int) -> bool:
     else:
         await target.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
     return True
+
+
+async def _mark_wizard_substep_done(
+    user_id: int, step_id: str, value: Any
+) -> None:
+    """Record one workout sub-step as handled; once every applicable sub-step
+    is handled the workout_pattern fact itself is confirmed."""
+    from noam_coach.bot.onboarding import set_flow_state
+
+    done = await _wizard_done_steps(user_id)
+    if step_id not in done:
+        done.append(step_id)
+    await set_flow_state(user_id, HEALTH_CONFIRM_FLOW, step_id, {"done": done})
+    remaining = [
+        s
+        for s in _WORKOUT_SUBSTEPS
+        if s not in done and _workout_substep_applicable(s, value)
+    ]
+    if not remaining:
+        await user_model.confirm_fact(DB, user_id, "workout_pattern")
+
+
+async def confirm_health_wizard_step(user_id: int, step_id: str) -> str:
+    """Apply one "✅ אשר" tap: harden the data point AND feed it into the
+    training plan facts (that is what the approval means). Returns the
+    "here is what was approved" line echoed above the next prompt."""
+    key = wizard_step_fact_key(step_id)
+    fact = await user_model.get_fact(DB, user_id, key)
+    value = (fact or {}).get("value")
+
+    if step_id in _WORKOUT_SUBSTEPS and isinstance(value, dict):
+        if step_id == WIZARD_STEP_WORKOUT_FREQUENCY:
+            freq = value.get("weekly_frequency")
+            approved = max(1, min(7, round(float(freq or 1))))
+            await user_model.set_fact(
+                DB, user_id, "training_days_per_week", approved,
+                kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
+                confirmed=True,
+            )
+            ack = f"✅ אושר: {approved} אימונים בשבוע"
+        elif step_id == WIZARD_STEP_WORKOUT_DAYS:
+            indices = _workout_days_indices(value)
+            slots = [
+                with_weekday_schema({
+                    "weekday": day,
+                    "start": value.get("typical_hour"),
+                    "available": True,
+                })
+                for day in indices
+            ]
+            await user_model.set_fact(
+                DB, user_id, "weekly_availability", slots,
+                kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
+                confirmed=True,
+            )
+            ack = f"✅ אושר: ימי אימון — {', '.join(_workout_days_labels(value))}"
+        else:  # WIZARD_STEP_WORKOUT_HOUR
+            hour = str(value.get("typical_hour"))
+            await user_model.set_fact(
+                DB, user_id, "workout_window", hour,
+                kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
+                confirmed=True,
+            )
+            ack = f"✅ אושר: שעת אימון סביב {hour}"
+        await _mark_wizard_substep_done(user_id, step_id, value)
+        return ack
+
+    await user_model.confirm_fact(DB, user_id, key)
+    label = user_model.display_label(key)
+    display = _format_pending_fact_value(key, value)
+    return f"✅ אושר: {esc(label)} — {esc(display)}"
+
+
+async def apply_health_wizard_trend_choice(
+    user_id: int, key: str, trend_value: float
+) -> str:
+    """Apply a trend-proposal button tap on the frequency step: record the
+    chosen weekly frequency for the training plan and inside the detected
+    pattern, then let the wizard continue to the remaining sub-steps
+    (days, hour) instead of swallowing them."""
+    fact = await user_model.get_fact(DB, user_id, key)
+    current = fact.get("value") if fact and isinstance(fact.get("value"), dict) else {}
+    updated = {**current, "weekly_frequency": trend_value}
+    await user_model.set_fact(
+        DB, user_id, key, updated,
+        kind=(fact or {}).get("kind") or user_model.KIND_ESTIMATE,
+        source=(fact or {}).get("source") or user_model.SOURCE_DERIVED,
+    )
+    await user_model.set_fact(
+        DB, user_id, "training_days_per_week", trend_value,
+        kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
+    )
+    if key == "workout_pattern":
+        await _mark_wizard_substep_done(user_id, WIZARD_STEP_WORKOUT_FREQUENCY, updated)
+    return f"✅ אושר: {trend_value:g} אימונים בשבוע"
+
+
+async def apply_health_wizard_text_edit(
+    user_id: int, step_id: str, text: str
+) -> tuple[bool, str]:
+    """Apply a typed correction for a workout sub-step. Returns (handled_ok,
+    reply): on parse failure the reply is a retry hint and pending stays."""
+    key = wizard_step_fact_key(step_id)
+    fact = await user_model.get_fact(DB, user_id, key)
+    current = fact.get("value") if fact and isinstance(fact.get("value"), dict) else {}
+    kind = (fact or {}).get("kind") or user_model.KIND_ESTIMATE
+    source = (fact or {}).get("source") or user_model.SOURCE_DERIVED
+
+    if step_id == WIZARD_STEP_WORKOUT_FREQUENCY:
+        match = re.search(r"\d+", text)
+        if not match:
+            return False, "כתוב מספר אימונים בשבוע, למשל: 3."
+        approved = max(1, min(7, int(match.group(0))))
+        updated = {**current, "weekly_frequency": float(approved)}
+        await user_model.set_fact(DB, user_id, key, updated, kind=kind, source=source)
+        await user_model.set_fact(
+            DB, user_id, "training_days_per_week", approved,
+            kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
+        )
+        await _mark_wizard_substep_done(user_id, step_id, updated)
+        return True, f"עודכן: {approved} אימונים בשבוע ✅"
+
+    if step_id == WIZARD_STEP_WORKOUT_DAYS:
+        from noam_coach.services.availability import parse_hebrew_availability_answer
+
+        parsed = parse_hebrew_availability_answer(text)
+        slots = [
+            {**slot, "start": slot.get("start") or current.get("typical_hour")}
+            for slot in parsed.weekly_availability
+        ]
+        if not slots:
+            return False, "לא זיהיתי ימים. כתוב למשל: ראשון, שלישי, חמישי."
+        indices = sorted({int(slot["weekday"]) for slot in slots})
+        await user_model.set_fact(
+            DB, user_id, "weekly_availability", slots,
+            kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
+        )
+        updated = {
+            **current,
+            "common_weekdays": indices,
+            "weekday_schema": WEEKDAY_SCHEMA_VERSION,
+        }
+        await user_model.set_fact(DB, user_id, key, updated, kind=kind, source=source)
+        await _mark_wizard_substep_done(user_id, step_id, updated)
+        labels = [weekday_he(d) for d in sunday_first_order(indices)]
+        return True, f"עודכן: ימי אימון — {', '.join(labels)} ✅"
+
+    if step_id == WIZARD_STEP_WORKOUT_HOUR:
+        match = re.search(r"\b(\d{1,2})(?::(\d{2}))?\b", text)
+        hour = int(match.group(1)) if match else -1
+        minute = int(match.group(2) or 0) if match else 0
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            return False, "כתוב שעה, למשל: 18:30."
+        hhmm = f"{hour:02d}:{minute:02d}"
+        await user_model.set_fact(
+            DB, user_id, "workout_window", hhmm,
+            kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
+        )
+        updated = {**current, "typical_hour": hhmm}
+        await user_model.set_fact(DB, user_id, key, updated, kind=kind, source=source)
+        await _mark_wizard_substep_done(user_id, step_id, updated)
+        return True, f"עודכן: שעת אימון {hhmm} ✅"
+
+    return False, "לא הצלחתי לעדכן את הפריט הזה."
+
+
+async def skip_health_wizard_item(user_id: int, step_id: str) -> None:
+    """Skip one wizard item without applying it: a workout sub-step is only
+    marked as handled (no plan fact written); a whole fact is invalidated."""
+    if step_id in _WORKOUT_SUBSTEPS:
+        done = await _wizard_done_steps(user_id)
+        if step_id not in done:
+            done.append(step_id)
+        from noam_coach.bot.onboarding import set_flow_state
+
+        await set_flow_state(user_id, HEALTH_CONFIRM_FLOW, step_id, {"done": done})
+        return
+    await user_model.invalidate_fact(DB, user_id, wizard_step_fact_key(step_id))
 
 
 async def start_health_confirm_wizard(
@@ -389,8 +736,11 @@ async def start_health_confirm_wizard(
     wizard completes — rendered once here since HealthImportOutcome itself
     is not safely JSON-serializable for flow-state storage.
     """
-    from noam_coach.bot.onboarding import set_flow_state
+    from noam_coach.bot.onboarding import set_flow_state, clear_flow_state
 
+    # A fresh import starts a fresh wizard — forget sub-steps handled in a
+    # previous run so every newly-detected item is confirmed again.
+    await clear_flow_state(user_id, HEALTH_CONFIRM_FLOW)
     await set_flow_state(
         user_id, HEALTH_POST_WIZARD_FLOW, next_step, {"summary_text": summary_text}
     )
@@ -399,10 +749,14 @@ async def start_health_confirm_wizard(
         await finish_health_confirm_wizard(message, user_id)
 
 
-async def finish_health_confirm_wizard(target: Any, user_id: int) -> None:
+async def finish_health_confirm_wizard(
+    target: Any, user_id: int, *, ack_text: str | None = None
+) -> None:
     """Show the final import summary + run the step that used to follow the
     old bulk health:activate gate immediately (onboarding basics or
     reconciliation), then clear the post-wizard continuation marker.
+    ``ack_text`` echoes the last approval above the summary so the user sees
+    what was just confirmed even on the final step.
     """
     from noam_coach.bot.onboarding import get_flow_state, clear_flow_state, show_onboarding_basics
 
@@ -414,6 +768,8 @@ async def finish_health_confirm_wizard(target: Any, user_id: int) -> None:
 
     followup = await _health_import_followup_text(user_id)
     text = (summary_text + followup) if summary_text else ("<b>סיכום הייבוא</b>" + followup)
+    if ack_text:
+        text = f"{ack_text}\n\n{text}"
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ תפריט", callback_data="menu:home")]])
     if hasattr(target, "edit_message_text"):
         await target.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)

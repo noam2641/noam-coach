@@ -35,6 +35,14 @@ DEFAULT_WINDOW_DAYS = 45
 # than exponentially-weighted so the comparison is easy to explain to users.
 RECENT_WINDOW_DAYS = 14
 
+# Watch-wear coverage thresholds (local clock hours). A day counts as
+# "covered until the evening" only when the watch produced samples from the
+# morning (first sample by WEAR_MORNING_HOUR) through the evening (last sample
+# at or after WEAR_EVENING_HOUR) — otherwise the day's step count is partial
+# and the day is burned for daily-average purposes.
+WEAR_MORNING_HOUR = 12.0
+WEAR_EVENING_HOUR = 19.0
+
 
 class SupportsFetchAll(Protocol):
     async def fetch_all(
@@ -145,6 +153,12 @@ class WorkoutPattern:
     recent_weekly_frequency: float | None = None
     recent_window_days: int = RECENT_WINDOW_DAYS
     recent_sessions_sampled: int = 0
+    # True when weekly_frequency was computed only over complete weeks in
+    # which the watch was worn every day (weeks with an unworn day are
+    # burned — their data is unknown, not zero). valid_weeks_sampled is how
+    # many such weeks the average is based on.
+    wear_filtered: bool = False
+    valid_weeks_sampled: int = 0
 
 
 @dataclass
@@ -164,6 +178,201 @@ class RoutineProfile:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+# ---------------------------------------------------------------------------
+# Watch-wear awareness
+#
+# "No data" is not "no activity": a day without watch samples is unknown, and
+# any weekly statistic that treats it as a zero silently drags the average
+# down. Days the watch was not worn are therefore *burned* — and a week that
+# contains a burned day is burned for weekly-frequency purposes.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DayWear:
+    """Wear coverage for one local day.
+
+    ``first_hour``/``last_hour`` are local clock hours of the first/last watch
+    sample. They are ``None`` when wear was inferred from legacy data (rows
+    imported before watch_wear tracking existed) — the day is known to be
+    worn, but the intra-day coverage is unknown.
+    """
+
+    first_hour: float | None = None
+    last_hour: float | None = None
+
+    @property
+    def covers_until_evening(self) -> bool:
+        """Worn through the day, at least into the evening."""
+        if self.last_hour is None or self.first_hour is None:
+            return True  # legacy inference — coverage unknown, don't burn
+        return (
+            self.first_hour <= WEAR_MORNING_HOUR
+            and self.last_hour >= WEAR_EVENING_HOUR
+        )
+
+
+async def load_wear_days(
+    db: SupportsFetchAll,
+    user_id: int,
+    tz: ZoneInfo,
+    window_days: int = DEFAULT_WINDOW_DAYS,
+) -> dict[dt.date, DayWear] | None:
+    """Map each local day in the window to its watch-wear coverage.
+
+    Days absent from the returned dict were NOT worn. Returns ``None`` when
+    there is no wear evidence at all in the window (e.g. no watch, or an
+    import from before wear tracking) — callers must then skip wear filtering
+    rather than burn everything.
+
+    Precise ``watch_wear`` rows (one per worn day, written by the importer)
+    win. For data imported before those rows existed, wear is inferred from
+    watch-only signals: resting heart rate, sleep sessions, workouts, and
+    steps rows whose source is the watch.
+    """
+    since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=window_days)).isoformat()
+    rows = await db.fetch_all(
+        """
+        SELECT sample_type, start_time, end_time, source_device
+        FROM health
+        WHERE user_id=? AND start_time>=?
+          AND sample_type IN ('watch_wear','resting_heart_rate','sleep_session','workout','steps')
+        ORDER BY start_time
+        """,
+        (user_id, since),
+    )
+    if not rows:
+        return None
+
+    precise: dict[dt.date, DayWear] = {}
+    inferred: set[dt.date] = set()
+    for row in rows:
+        stype = row.get("sample_type")
+        start_raw = row.get("start_time")
+        if not start_raw:
+            continue
+        try:
+            start_local = _to_local(str(start_raw), tz)
+        except ValueError:
+            continue
+        end_raw = row.get("end_time")
+        end_local = None
+        if end_raw:
+            try:
+                end_local = _to_local(str(end_raw), tz)
+            except ValueError:
+                end_local = None
+
+        if stype == "watch_wear":
+            last = end_local or start_local
+            precise[start_local.date()] = DayWear(
+                first_hour=_hour_of_day(start_local),
+                last_hour=_hour_of_day(last) if last.date() == start_local.date() else 24.0,
+            )
+        elif stype == "steps":
+            source = str(row.get("source_device") or "")
+            if "watch" in source.lower():
+                inferred.add(start_local.date())
+        else:  # resting_heart_rate / sleep_session / workout — watch signals
+            inferred.add(start_local.date())
+            if end_local is not None:
+                inferred.add(end_local.date())
+
+    if precise:
+        return precise
+    if inferred:
+        return {day: DayWear() for day in inferred}
+    return None
+
+
+def _complete_weeks(
+    window_start: dt.date, today: dt.date
+) -> list[tuple[dt.date, dt.date]]:
+    """Monday-first calendar weeks fully inside [window_start, yesterday]."""
+    first_monday = window_start + dt.timedelta(days=(7 - window_start.weekday()) % 7)
+    weeks: list[tuple[dt.date, dt.date]] = []
+    week_start = first_monday
+    while week_start + dt.timedelta(days=6) < today:
+        weeks.append((week_start, week_start + dt.timedelta(days=6)))
+        week_start += dt.timedelta(days=7)
+    return weeks
+
+
+def _fully_worn(
+    week: tuple[dt.date, dt.date], wear_days: dict[dt.date, DayWear]
+) -> bool:
+    start, _end = week
+    return all(start + dt.timedelta(days=offset) in wear_days for offset in range(7))
+
+
+@dataclass(frozen=True)
+class StepsAverage:
+    """Daily-steps average restricted to fully-covered wear days."""
+
+    avg: float | None
+    days_sampled: int
+    days_excluded: int
+    wear_filtered: bool
+
+
+async def average_daily_steps(
+    db: SupportsFetchAll,
+    user_id: int,
+    tz: ZoneInfo,
+    window_days: int = DEFAULT_WINDOW_DAYS,
+) -> StepsAverage:
+    """Average daily steps counting only days the watch was worn through the
+    evening — partial days (watch off, or put on late / taken off early)
+    are burned. Falls back to the plain average when wear coverage is
+    unknown or no day qualifies (some signal beats none, and the caller can
+    tell via ``wear_filtered``).
+    """
+    since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=window_days)).isoformat()
+    rows = await db.fetch_all(
+        """
+        SELECT value, start_time
+        FROM health
+        WHERE user_id=? AND sample_type='steps' AND start_time>=?
+        ORDER BY start_time
+        """,
+        (user_id, since),
+    )
+    per_day: dict[dt.date, float] = {}
+    for row in rows:
+        start_raw = row.get("start_time")
+        if not start_raw:
+            continue
+        try:
+            day = _to_local(str(start_raw), tz).date()
+        except ValueError:
+            continue
+        per_day[day] = max(per_day.get(day, 0.0), float(row.get("value") or 0.0))
+    if not per_day:
+        return StepsAverage(avg=None, days_sampled=0, days_excluded=0, wear_filtered=False)
+
+    wear_days = await load_wear_days(db, user_id, tz, window_days)
+    if wear_days is not None:
+        valid = {
+            day: steps
+            for day, steps in per_day.items()
+            if (wear := wear_days.get(day)) is not None and wear.covers_until_evening
+        }
+        if valid:
+            return StepsAverage(
+                avg=statistics.fmean(valid.values()),
+                days_sampled=len(valid),
+                days_excluded=len(per_day) - len(valid),
+                wear_filtered=True,
+            )
+
+    return StepsAverage(
+        avg=statistics.fmean(per_day.values()),
+        days_sampled=len(per_day),
+        days_excluded=0,
+        wear_filtered=False,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -218,8 +427,10 @@ def build_frequency_trend_proposal(
 
     message = (
         f"זוהתה שגרת אימונים לאחרונה של כ-{recent_rounded} אימונים בשבוע "
-        f"(ממוצע כללי: {overall:g}). אמליץ על {recommended_low}-{recommended_high} "
-        "אימונים בשבוע. אנא ציין את מספר האימונים הרצוי לשבוע."
+        f"(ממוצע כללי: {overall:g}), ואמליץ על {recommended_low}-{recommended_high} "
+        "אימונים בשבוע.\n"
+        "האם לאשר גם עבור תוכנית האימונים? "
+        "אם לא — בחר אפשרות או ציין כמות אימונים רצויה."
     )
     choices = [
         (f"המשך עם {recent_rounded}", float(recent_rounded)),
@@ -323,31 +534,85 @@ async def learn_workout_pattern(
 
     hours: list[float] = []
     durations: list[float] = []
-    weekday_counts: dict[int, int] = {}
+    workout_days: list[dt.date] = []
     for row in rows:
         local = _to_local(row["start_time"], tz)
         hours.append(_hour_of_day(local))
         durations.append(float(row["value"] or 0.0))
-        weekday_counts[local.weekday()] = weekday_counts.get(local.weekday(), 0) + 1
+        workout_days.append(local.date())
 
-    common = sorted(weekday_counts, key=lambda d: weekday_counts[d], reverse=True)
-    weeks = max(1.0, window_days / 7.0)
     _mean_duration = robust_mean(durations)
-
     recent_cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=RECENT_WINDOW_DAYS)
     recent_rows = [row for row in rows if _to_local(row["start_time"], tz) >= recent_cutoff]
-    recent_weeks = max(1.0, RECENT_WINDOW_DAYS / 7.0)
+
+    # --- Wear-aware weekly frequency -----------------------------------
+    # Only complete Mon-Sun weeks where the watch was worn on all 7 days are
+    # trusted; a week containing an unworn day is burned (its true workout
+    # count is unknown). When no wear evidence exists, or no week survives,
+    # fall back to the naive window average so legacy data keeps working.
+    today_local = dt.datetime.now(tz).date()
+    window_start = today_local - dt.timedelta(days=window_days)
+    wear_days = await load_wear_days(db, user_id, tz, window_days)
+    valid_weeks: list[tuple[dt.date, dt.date]] = []
+    if wear_days is not None:
+        valid_weeks = [
+            week
+            for week in _complete_weeks(window_start, today_local)
+            if _fully_worn(week, wear_days)
+        ]
+
+    counted_days = workout_days
+    if valid_weeks:
+        per_week = [
+            sum(1 for day in workout_days if start <= day <= end)
+            for start, end in valid_weeks
+        ]
+        weekly_frequency = round(sum(per_week) / len(valid_weeks), 1)
+        counted_days = [
+            day
+            for day in workout_days
+            if any(start <= day <= end for start, end in valid_weeks)
+        ] or workout_days
+
+        recent_start = today_local - dt.timedelta(days=RECENT_WINDOW_DAYS)
+        recent_valid = [
+            (start, end) for start, end in valid_weeks if end >= recent_start
+        ]
+        if recent_valid:
+            recent_count = sum(
+                1
+                for day in workout_days
+                if any(start <= day <= end for start, end in recent_valid)
+            )
+            recent_weekly_frequency = round(recent_count / len(recent_valid), 1)
+            recent_sessions_sampled = recent_count
+        else:
+            recent_weekly_frequency = None
+            recent_sessions_sampled = 0
+    else:
+        weeks = max(1.0, window_days / 7.0)
+        weekly_frequency = round(len(rows) / weeks, 1)
+        recent_weeks = max(1.0, RECENT_WINDOW_DAYS / 7.0)
+        recent_weekly_frequency = (
+            round(len(recent_rows) / recent_weeks, 1) if recent_rows else None
+        )
+        recent_sessions_sampled = len(recent_rows)
+
+    weekday_counts: dict[int, int] = {}
+    for day in counted_days:
+        weekday_counts[day.weekday()] = weekday_counts.get(day.weekday(), 0) + 1
+    common = sorted(weekday_counts, key=lambda d: weekday_counts[d], reverse=True)
 
     return WorkoutPattern(
-        weekly_frequency=round(len(rows) / weeks, 1),
+        weekly_frequency=weekly_frequency,
         typical_hour=hour_to_hhmm(circular_hour_mean(hours)),
         common_weekdays=[d for d in common if weekday_counts[d] >= 2][:4] or common[:2],
         avg_duration_minutes=(round(_mean_duration, 1) if _mean_duration is not None else None),
         sessions_sampled=len(rows),
-        recent_weekly_frequency=(
-            round(len(recent_rows) / recent_weeks, 1) if recent_rows else None
-        ),
-        recent_sessions_sampled=len(recent_rows),
+        recent_weekly_frequency=recent_weekly_frequency,
+        recent_sessions_sampled=recent_sessions_sampled,
+        wear_filtered=bool(valid_weeks),
+        valid_weeks_sampled=len(valid_weeks),
     )
 
 

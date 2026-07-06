@@ -99,20 +99,89 @@ async def test_wizard_walks_facts_in_documented_order(tmp_path: Path, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_confirming_a_fact_hardens_it_and_advances(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_confirming_each_item_separately_and_advancing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """RE12: frequency and hour are confirmed as SEPARATE steps; only after
+    the last applicable workout sub-step is the pattern fact hardened."""
     db = await _make_db(tmp_path)
     _patch_db(monkeypatch, db)
     await _seed_pending_import(db)
 
     target = FakeTarget()
     await health_jobs.ask_next_health_confirm_step(target, 1)
+    # Step 1: weekly frequency (detected value shown, uniform phrasing).
+    assert "אימונים בשבוע" in target.messages[-1]
+    assert "האם לאשר" in target.messages[-1]
 
-    handled = await callback_menu_bot.handle_menu_callback(target, 1, "health:confirm:workout_pattern")
+    handled = await callback_menu_bot.handle_menu_callback(
+        target, 1, "health:confirm:workout_pattern.frequency"
+    )
     assert handled is True
+    training_days = await user_model.get_fact(db, 1, "training_days_per_week")
+    assert training_days["value"] == 3
+    assert training_days["confirmed"] is True
+    # Pattern is NOT confirmed yet — the hour step is still pending.
+    fact = await user_model.get_fact(db, 1, "workout_pattern")
+    assert fact["confirmed"] is False
+    assert "שעת אימון" in target.messages[-1]
+
+    handled = await callback_menu_bot.handle_menu_callback(
+        target, 1, "health:confirm:workout_pattern.hour"
+    )
+    assert handled is True
+    window = await user_model.get_fact(db, 1, "workout_window")
+    assert window["value"] == "18:30"
+    assert window["confirmed"] is True
     fact = await user_model.get_fact(db, 1, "workout_pattern")
     assert fact["confirmed"] is True
-    # Advanced to the next fact (weight_kg per _WIZARD_FACT_ORDER).
+    # Advanced to the next fact (weight_kg), echoing what was just approved.
     assert 'ק"ג' in target.messages[-1]
+    assert "אושר" in target.messages[-1]
+
+
+@pytest.mark.asyncio
+async def test_detected_training_days_get_their_own_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RE12: detected training days are surfaced for explicit approval, and
+    approving them feeds the plan's weekly_availability."""
+    db = await _make_db(tmp_path)
+    _patch_db(monkeypatch, db)
+    await user_model.set_fact(
+        db, 1, "workout_pattern",
+        {
+            "weekly_frequency": 3,
+            "typical_hour": "18:30",
+            "common_weekdays": [6, 1, 3],  # Sun, Tue, Thu (Monday-first)
+            "weekday_schema": "monday_first_v1",
+        },
+        kind=user_model.KIND_ESTIMATE, source=user_model.SOURCE_DERIVED, confirmed=False,
+    )
+
+    target = FakeTarget()
+    await health_jobs.ask_next_health_confirm_step(target, 1)
+    await callback_menu_bot.handle_menu_callback(
+        target, 1, "health:confirm:workout_pattern.frequency"
+    )
+    # Step 2: the detected days are shown by name and offered for approval.
+    days_prompt = target.messages[-1]
+    assert "ימי אימון" in days_prompt
+    assert "ראשון" in days_prompt and "שלישי" in days_prompt and "חמישי" in days_prompt
+
+    handled = await callback_menu_bot.handle_menu_callback(
+        target, 1, "health:confirm:workout_pattern.days"
+    )
+    assert handled is True
+    availability = await user_model.get_fact(db, 1, "weekly_availability")
+    assert availability["confirmed"] is True
+    weekdays = sorted(slot["weekday"] for slot in availability["value"])
+    assert weekdays == [1, 3, 6]
+
+    # Hour step still follows; after it the pattern hardens.
+    await callback_menu_bot.handle_menu_callback(
+        target, 1, "health:confirm:workout_pattern.hour"
+    )
+    fact = await user_model.get_fact(db, 1, "workout_pattern")
+    assert fact["confirmed"] is True
 
 
 @pytest.mark.asyncio
@@ -123,7 +192,6 @@ async def test_edit_persists_user_value_and_advances(tmp_path: Path, monkeypatch
 
     target = FakeTarget()
     await health_jobs.ask_next_health_confirm_step(target, 1)
-    await callback_menu_bot.handle_menu_callback(target, 1, "health:edit:workout_pattern")
 
     class FakeUpdate:
         effective_message = FakeMessage()
@@ -131,10 +199,51 @@ async def test_edit_persists_user_value_and_advances(tmp_path: Path, monkeypatch
 
     handled = await onboarding_bot.handle_onboarding_text(FakeUpdate(), 1)
     assert handled is True
+    # RE12: a typed number at the frequency step corrects the frequency INSIDE
+    # the pattern (not clobbering the whole dict) and records the plan fact.
     fact = await user_model.get_fact(db, 1, "workout_pattern")
-    assert fact["value"] == "4"
-    assert fact["source"] == user_model.SOURCE_USER
-    assert fact["confirmed"] is True
+    assert fact["value"]["weekly_frequency"] == 4.0
+    assert fact["value"]["typical_hour"] == "18:30"
+    training_days = await user_model.get_fact(db, 1, "training_days_per_week")
+    assert training_days["value"] == 4
+    assert training_days["source"] == user_model.SOURCE_USER
+    assert training_days["confirmed"] is True
+
+
+@pytest.mark.asyncio
+async def test_edit_training_days_by_hebrew_names(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db = await _make_db(tmp_path)
+    _patch_db(monkeypatch, db)
+    await user_model.set_fact(
+        db, 1, "workout_pattern",
+        {
+            "weekly_frequency": 3,
+            "typical_hour": "18:30",
+            "common_weekdays": [0, 2],
+            "weekday_schema": "monday_first_v1",
+        },
+        kind=user_model.KIND_ESTIMATE, source=user_model.SOURCE_DERIVED, confirmed=False,
+    )
+
+    target = FakeTarget()
+    await health_jobs.ask_next_health_confirm_step(target, 1)
+    await callback_menu_bot.handle_menu_callback(
+        target, 1, "health:confirm:workout_pattern.frequency"
+    )
+    assert "ימי אימון" in target.messages[-1]
+
+    class FakeUpdate:
+        effective_message = FakeMessage()
+        effective_message.text = "ראשון, שלישי, חמישי"  # type: ignore[attr-defined]
+
+    handled = await onboarding_bot.handle_onboarding_text(FakeUpdate(), 1)
+    assert handled is True
+    availability = await user_model.get_fact(db, 1, "weekly_availability")
+    assert availability["confirmed"] is True
+    weekdays = sorted(slot["weekday"] for slot in availability["value"])
+    assert weekdays == [1, 3, 6]  # Tue, Thu, Sun in Monday-first indices
+    fact = await user_model.get_fact(db, 1, "workout_pattern")
+    assert sorted(fact["value"]["common_weekdays"]) == [1, 3, 6]
 
 
 @pytest.mark.asyncio

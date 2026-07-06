@@ -118,13 +118,20 @@ def patterns_text(profile: dict[str, Any]) -> tuple[str, list[dict[str, str]]]:
     items: list[dict[str, str]] = []
 
     if workout.get("typical_hour"):
+        days_text = ""
+        day_indices = workout.get("common_weekdays") or []
+        if day_indices:
+            from noam_coach.services.weekdays import sunday_first_order, weekday_he
+
+            names = [weekday_he(d) for d in sunday_first_order(day_indices)]
+            days_text = f", בימים {', '.join(names)}"
         items.append(
             {
                 "id": "workout_pattern",
                 "display_label": user_model.display_label("workout_pattern"),
                 "text": (
                     f"רוב האימונים שלך סביב {workout['typical_hour']}, "
-                    f"~{workout.get('weekly_frequency')} בשבוע."
+                    f"~{workout.get('weekly_frequency')} בשבוע{days_text}."
                 ),
             }
         )

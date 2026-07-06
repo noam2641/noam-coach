@@ -81,6 +81,17 @@ DAILY_LAST_TYPES = {
 # double-counting. For these we accumulate per-source and pick the preferred one.
 _DEDUP_SUM_METRICS = {"steps", "active_calories"}
 
+# Daily watch-wear coverage row. One row per local day the Apple Watch produced
+# any sample: value = hours between the first and last watch sample of the day,
+# start_time/end_time = those first/last instants (UTC). Downstream weekly
+# statistics use these rows to "burn" days/weeks where the watch was not worn
+# (no data ≠ no activity).
+WEAR_SAMPLE_TYPE = "watch_wear"
+
+
+def _is_watch_source(source: str | None) -> bool:
+    return bool(source) and "watch" in source.lower()
+
 # Source preference: Apple Watch is most accurate for motion/energy, then iPhone,
 # then anything else. Matched by substring (case-insensitive) in sourceName.
 _SOURCE_PRIORITY = [
@@ -336,9 +347,25 @@ def iter_health_rows(
     last_acc: dict[tuple[str, str, dt.date], tuple] = {}
     # Sleep intervals grouped by night (local date), for interval-union dedup.
     sleep_intervals: dict[dt.date, list[tuple[dt.datetime, dt.datetime, str | None]]] = {}
+    # Watch-wear bounds per local day: day → [first_local_dt, last_local_dt].
+    # Built from EVERY watch-sourced sample (including record types we do not
+    # otherwise keep, e.g. raw heart rate), since any watch sample proves the
+    # watch was on the wrist at that instant.
+    wear_acc: dict[dt.date, list[dt.datetime]] = {}
 
     def in_window(start: dt.datetime) -> bool:
         return start >= cutoff
+
+    def note_wear(local_instant: dt.datetime) -> None:
+        day_key = local_instant.date()
+        bounds = wear_acc.get(day_key)
+        if bounds is None:
+            wear_acc[day_key] = [local_instant, local_instant]
+        else:
+            if local_instant < bounds[0]:
+                bounds[0] = local_instant
+            if local_instant > bounds[1]:
+                bounds[1] = local_instant
 
     for _event, el in ET.iterparse(str(xml_path), events=("end",)):
         tag = el.tag
@@ -348,8 +375,12 @@ def iter_health_rows(
             if start is None or not in_window(start):
                 el.clear()
                 continue
-            day = start.astimezone(local_tz).date()
+            local_start = start.astimezone(local_tz)
+            day = local_start.date()
             source = el.get("sourceName")
+            watch_source = _is_watch_source(source)
+            if watch_source:
+                note_wear(local_start)
 
             if rtype in DAILY_SUM_TYPES:
                 metric, unit = DAILY_SUM_TYPES[rtype]
@@ -391,10 +422,13 @@ def iter_health_rows(
                 if el.get("value") in ASLEEP_VALUES:
                     end = parse_apple_datetime(el.get("endDate"))
                     if end is not None:
+                        if watch_source:
+                            # A sleep sample ending in the morning proves wear
+                            # on the wake-up day too, not just the night's day.
+                            note_wear(end.astimezone(local_tz))
                         # Group by "sleep night" — the local date the sleep
                         # started on (if before 18:00 local, assign to previous
                         # date since it's a nap continuation of the prior night).
-                        local_start = start.astimezone(local_tz)
                         night_date = local_start.date()
                         if local_start.hour < 18:
                             night_date -= dt.timedelta(days=1)
@@ -409,6 +443,10 @@ def iter_health_rows(
                 el.clear()
                 continue
             end = parse_apple_datetime(el.get("endDate"))
+            if _is_watch_source(el.get("sourceName")):
+                note_wear(start.astimezone(local_tz))
+                if end is not None:
+                    note_wear(end.astimezone(local_tz))
             try:
                 duration = float(el.get("duration") or 0.0)
             except ValueError:
@@ -448,6 +486,19 @@ def iter_health_rows(
             start_time=earliest_start.isoformat(),
             end_time=latest_end.isoformat(),
             source_device=source_name,
+        )
+
+    # Flush watch-wear coverage — one row per local day the watch was worn.
+    for day, (first_local, last_local) in wear_acc.items():
+        span_hours = (last_local - first_local).total_seconds() / 3600.0
+        yield HealthRow(
+            external_id=f"ah:{WEAR_SAMPLE_TYPE}:{day.isoformat()}",
+            sample_type=WEAR_SAMPLE_TYPE,
+            value=round(span_hours, 2),
+            unit="h",
+            start_time=first_local.astimezone(dt.timezone.utc).isoformat(),
+            end_time=last_local.astimezone(dt.timezone.utc).isoformat(),
+            source_device="apple_watch",
         )
 
     # Flush dedup'd daily sums (steps, active_calories) — pick preferred source.
