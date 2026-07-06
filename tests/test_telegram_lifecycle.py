@@ -489,3 +489,23 @@ async def test_stop_telegram_application_is_idempotent() -> None:
 
     # Second call must be a no-op because running flags are now False.
     assert calls == ["updater", "application"]
+
+
+def test_sensitive_flow_callbacks_are_debounced() -> None:
+    """Codex audit: single-shot flow actions must not run twice on a
+    double-tap — e.g. two quick health:skip_item taps would silently skip
+    TWO wizard items. Navigation stays debounce-free."""
+    from noam_coach.bot import callback_router
+
+    uid = 987_654  # unique user id so _LAST_CALLBACK state is fresh
+    assert callback_router._is_duplicate_tap(uid, "health:skip_item") is False
+    assert callback_router._is_duplicate_tap(uid, "health:skip_item") is True
+    assert callback_router._is_duplicate_tap(uid, "health:confirm:weight_kg") is False
+    assert callback_router._is_duplicate_tap(uid, "health:confirm:weight_kg") is True
+    assert callback_router._is_duplicate_tap(uid, "plan:set:3") is False
+    assert callback_router._is_duplicate_tap(uid, "plan:set:3") is True
+    assert callback_router._is_duplicate_tap(uid, "qa:q_age:1") is False
+    assert callback_router._is_duplicate_tap(uid, "qa:q_age:1") is True
+    # Navigation is never debounced — repeats are legitimate.
+    assert callback_router._is_duplicate_tap(uid, "menu:home") is False
+    assert callback_router._is_duplicate_tap(uid, "menu:home") is False

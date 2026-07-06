@@ -133,6 +133,15 @@ _DEBOUNCE_PREFIXES = (
     "nextmeal:save:",
     "nextmeal:plan:",
     "nextmeal:choose:",
+    # Codex audit round: sensitive single-shot writes that advance a flow —
+    # a double-tap must not apply/skip TWO steps (e.g. health:skip_item
+    # tapped twice would silently discard the next wizard item too).
+    "health:confirm",
+    "health:activate",
+    "health:skip",
+    "reconcile_ok:",
+    "plan:set:",
+    "qa:",
 )
 
 @runtime_bound(RUNTIME_NAMES)
