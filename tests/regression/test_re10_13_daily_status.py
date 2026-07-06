@@ -133,3 +133,25 @@ async def test_meal_list_still_shown_and_framed_as_reported_only(
     assert "פסטה" in text
     assert "דווחו" in text
     assert "שדווחו בלבד" in text
+
+
+@pytest.mark.asyncio
+async def test_goal_source_is_explicit_without_meals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex audit: the user must always see where the daily target comes
+    from — approved, provisional computation, or default."""
+    await _db_with_user(tmp_path, monkeypatch)
+    text = await coach_bot.build_daily_status(1)
+    assert "מקור היעד" in text
+
+
+@pytest.mark.asyncio
+async def test_goal_source_shows_user_approved_with_meals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = await _db_with_user(tmp_path, monkeypatch)
+    await _approve_goal(db)
+    await _log_meal(db, "ביצים", 300, 20)
+    text = await coach_bot.build_daily_status(1)
+    assert "מקור היעד: יעד שאישרת" in text

@@ -116,6 +116,17 @@ async def today_meals(user_id: int) -> list[dict[str, Any]]:
     return await daily_state.consumed_meals(DB, user_id)
 
 
+def _goal_source_line(goal: dict[str, Any]) -> str:
+    """One explicit provenance line for the daily target (Codex audit round):
+    the user must always see whether the numbers are an approved goal, a
+    provisional computation, or a default."""
+    if goal.get("provisional"):
+        return "מקור היעד: חישוב זמני מהנתונים — טרם אושר סופית."
+    if goal.get("source") in {"manual", "user_approved", "legacy"}:
+        return "מקור היעד: יעד שאישרת."
+    return "מקור היעד: יעד פעיל מחושב."
+
+
 @runtime_bound(RUNTIME_NAMES)
 async def build_daily_status(user_id: int) -> str:
     """RE10-13: rich "מצב היום" built from the single nutrition-context source
@@ -147,6 +158,7 @@ async def build_daily_status(user_id: int) -> str:
         goal_note = " <i>(יעד זמני — עוד לא אושר)</i>" if provisional else ""
         lines.append(f"יעד קלוריות: <b>{goal['calories']}</b>{goal_note}")
         lines.append(f"יעד חלבון: <b>{goal['protein']} גרם</b>")
+        lines.append(f"<i>{_goal_source_line(goal)}</i>")
         if provisional:
             lines.append("<i>אשר את היעד דרך \"יעדים\" כדי שההמלצות יהיו מדויקות.</i>")
         lines.append("")
@@ -176,6 +188,7 @@ async def build_daily_status(user_id: int) -> str:
         cal_line += f"{goal_note}."
 
     lines.append(cal_line)
+    lines.append(f"<i>{_goal_source_line(goal)}</i>")
 
     if context.hours_until_sleep is not None:
         bedtime_line = f"עד שינה נשאר כ-{context.hours_until_sleep:.1f} שעות."
