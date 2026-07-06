@@ -18,6 +18,7 @@ goals. It does **not** scan messages continuously and never diagnoses.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -27,6 +28,8 @@ import user_model
 #   priority = safety*3 + plan_impact*2 + urgency + uncertainty - burden
 W_SAFETY = 3
 W_PLAN = 2
+
+TIME_RANGE_RE = re.compile(r"\b\d{1,2}:\d{2}\s*[-–—]\s*\d{1,2}:\d{2}\b")
 
 
 @dataclass
@@ -468,6 +471,8 @@ def normalize_answer(question: Question, value: Any) -> Any:
     """Normalize and validate an answer consistently for text and callbacks."""
     if not question.numeric:
         return value
+    if looks_like_time_range(value):
+        raise ValueError("זה נראה כמו טווח שעות, לא מספר לשאלה הזו.")
     try:
         numeric = float(value)
     except (TypeError, ValueError) as exc:
@@ -477,6 +482,10 @@ def normalize_answer(question: Question, value: Any) -> Any:
     if question.max_value is not None and numeric > question.max_value:
         raise ValueError(f"הערך חייב להיות לכל היותר {question.max_value:g} {question.unit}".strip())
     return int(numeric) if numeric.is_integer() else numeric
+
+
+def looks_like_time_range(value: Any) -> bool:
+    return bool(TIME_RANGE_RE.search(str(value or "")))
 
 
 def question_by_id(qid: str) -> Question | None:

@@ -72,6 +72,47 @@ def test_diet_and_allergy_questions_use_distinct_user_language() -> None:
     assert allergy_q.fact_key == "allergies"
 
 
+def test_numeric_answers_are_contextual_for_height_weight_and_goal() -> None:
+    height = questions.question_by_id("q_height")
+    goal = questions.question_by_id("q_goal_weight")
+    assert height is not None
+    assert goal is not None
+
+    current_weight = questions.Question(
+        id="q_current_weight",
+        fact_key="weight_kg",
+        text="weight?",
+        options=[],
+        numeric=True,
+        min_value=30,
+        max_value=300,
+        unit="kg",
+        affects=("calorie_target",),
+    )
+
+    assert questions.normalize_answer(height, "174") == 174
+    assert questions.normalize_answer(goal, "83") == 83
+    assert questions.normalize_answer(current_weight, "101.8") == 101.8
+
+
+def test_time_range_is_not_accepted_as_numeric_answer() -> None:
+    calories = questions.Question(
+        id="q_calories",
+        fact_key="calorie_target",
+        text="calories?",
+        options=[],
+        numeric=True,
+        min_value=1000,
+        max_value=5000,
+        unit="cal",
+        affects=("calorie_target",),
+    )
+
+    assert questions.looks_like_time_range("00:20-06:50")
+    with pytest.raises(ValueError, match="טווח שעות"):
+        questions.normalize_answer(calories, "00:20-06:50")
+
+
 def test_all_questions_have_affects() -> None:
     for q in questions.ALL_QUESTIONS:
         assert q.affects, f"{q.id} has no affects"
