@@ -9,6 +9,7 @@ import planning
 import user_model
 from db import Database
 from helpers import utc_now
+from noam_coach.services.weekdays import WEEKDAY_SCHEMA_VERSION
 
 
 async def _ready_db(tmp_path: Path) -> Database:
@@ -34,10 +35,10 @@ async def _ready_db(tmp_path: Path) -> Database:
         "equipment": "חדר כושר מלא",
         "strength_experience": "intermediate",
         "weekly_availability": [
-            {"weekday": 0, "start": "19:00", "minutes": 50},
-            {"weekday": 2, "start": "19:00", "minutes": 50},
-            {"weekday": 4, "start": "10:00", "minutes": 60},
-            {"weekday": 5, "start": "10:00", "minutes": 60},
+            {"weekday": 0, "weekday_schema": WEEKDAY_SCHEMA_VERSION, "start": "19:00", "minutes": 50},
+            {"weekday": 2, "weekday_schema": WEEKDAY_SCHEMA_VERSION, "start": "19:00", "minutes": 50},
+            {"weekday": 4, "weekday_schema": WEEKDAY_SCHEMA_VERSION, "start": "10:00", "minutes": 60},
+            {"weekday": 5, "weekday_schema": WEEKDAY_SCHEMA_VERSION, "start": "10:00", "minutes": 60},
         ],
     }
     for key, value in facts.items():
@@ -66,6 +67,115 @@ async def test_three_nutrition_and_workout_candidates_are_generated(tmp_path: Pa
         for exercise in session["exercises"]
     )
     assert all(not planning.workout_quality_issues(item.payload) for item in workout)
+
+
+@pytest.mark.asyncio
+async def test_workout_candidates_keep_confirmed_four_days_and_1900_time(tmp_path: Path) -> None:
+    """RE10-3 (D13): the three candidates now legitimately differ in
+    frequency (consistency=desired-1, balanced=desired, performance=desired+1,
+    each bounded by the user's confirmed availability) — so only the
+    "balanced" candidate (which always uses the user's stated/resolved
+    frequency) is asserted to keep exactly the 4 confirmed 19:00 slots.
+    The other two must still only ever use days/times drawn from real
+    confirmed availability, never invented ones.
+    """
+    db = await _ready_db(tmp_path)
+    slots = [
+        {"weekday": day, "weekday_schema": WEEKDAY_SCHEMA_VERSION, "start": "19:00", "minutes": 50}
+        for day in [0, 2, 4, 6]
+    ]
+    await user_model.set_fact(db, 1, "training_days_per_week", 4, source=user_model.SOURCE_USER, confirmed=True)
+    await user_model.set_fact(db, 1, "weekly_availability", slots, source=user_model.SOURCE_USER, confirmed=True)
+    await user_model.set_fact(db, 1, "workout_window", "19:00", source=user_model.SOURCE_USER, confirmed=True)
+
+    workout = await planning.generate_candidates(db, 1, "workout")
+
+    assert len(workout) == 3
+    balanced = next(c for c in workout if c.strategy == "balanced")
+    sessions = balanced.payload["sessions"]
+    assert balanced.payload["frequency"] == 4
+    assert [session["weekday"] for session in sessions] == [0, 2, 4, 6]
+    assert {session["time"] for session in sessions} == {"19:00"}
+
+    confirmed_days = {0, 2, 4, 6}
+    for candidate in workout:
+        for session in candidate.payload["sessions"]:
+            assert session["weekday"] in confirmed_days
+            assert session["time"] == "19:00"
+
+
+@pytest.mark.asyncio
+async def test_workout_candidates_differ_in_frequency_and_content(tmp_path: Path) -> None:
+    """RE10-3: the three workout candidates must be genuinely different, not
+    just differently-labeled copies of the same days/exercises/sets."""
+    db = await _ready_db(tmp_path)
+    # desired=4 (explicit statement) with 6 confirmed slots gives performance
+    # (desired+1=5) real headroom below MAX_FREQUENCY=6, while consistency
+    # (desired-1=3) has headroom below desired too.
+    slots = [
+        {"weekday": day, "weekday_schema": WEEKDAY_SCHEMA_VERSION, "start": "19:00", "minutes": 50}
+        for day in [0, 1, 2, 3, 4, 5]
+    ]
+    await user_model.set_fact(db, 1, "training_days_per_week", 4, source=user_model.SOURCE_USER, confirmed=True)
+    await user_model.set_fact(db, 1, "weekly_availability", slots, source=user_model.SOURCE_USER, confirmed=True)
+
+    workout = await planning.generate_candidates(db, 1, "workout")
+    by_strategy = {c.strategy: c for c in workout}
+    consistency, balanced, performance = (
+        by_strategy["consistency"], by_strategy["balanced"], by_strategy["performance"],
+    )
+
+    # Frequency must differ: consistency trades a day down, performance adds
+    # a day up — bounded by (but here comfortably inside) declared availability.
+    assert consistency.payload["frequency"] < balanced.payload["frequency"] < performance.payload["frequency"]
+
+    # Content must differ too: at minimum, the payloads are not byte-identical
+    # once "strategy"/"title" are excluded — same-day/same-split plans used to
+    # be indistinguishable except for their marketing text.
+    def _session_signature(candidate: planning.PlanCandidate) -> list[tuple]:
+        return [
+            (s["weekday"], s["code"], tuple(e["sets"] for e in s["exercises"]))
+            for s in candidate.payload["sessions"]
+        ]
+
+    assert _session_signature(consistency) != _session_signature(balanced)
+    assert _session_signature(balanced) != _session_signature(performance)
+
+
+@pytest.mark.asyncio
+async def test_three_day_consistency_uses_full_body_not_abc(tmp_path: Path) -> None:
+    """E3: A/B/C at 3 days/week trains legs only once (shared with shoulders),
+    a real weakness for fat-loss goals — consistency should offer Full-Body x3
+    instead of A/B/C when IT specifically runs at a 3-day frequency."""
+    db = await _ready_db(tmp_path)
+    # Force consistency to land on exactly 3 days: desired=4 -> consistency=3.
+    await user_model.set_fact(db, 1, "training_days_per_week", 4, source=user_model.SOURCE_USER, confirmed=True)
+
+    workout = await planning.generate_candidates(db, 1, "workout")
+    consistency = next(c for c in workout if c.strategy == "consistency")
+    assert consistency.payload["frequency"] == 3
+    codes = [s["code"] for s in consistency.payload["sessions"]]
+    assert codes == ["F", "F", "F"]
+
+    # A/B/C (shared leg day) is still legitimate for other strategies at 3 days.
+    balanced_at_three = planning._workout_candidate(
+        "מאוזנת", "balanced", 3, await planning.collect_facts(db, 1),
+        score=0.9, rationale=[], tradeoffs=[],
+    )
+    assert [s["code"] for s in balanced_at_three.payload["sessions"]] == ["A", "B", "C"]
+
+
+@pytest.mark.asyncio
+async def test_strategy_volume_bounds_are_respected(tmp_path: Path) -> None:
+    """E4: consistency never drops sets below the safe floor; performance
+    never exceeds the safe ceiling, for a non-advanced lifter."""
+    db = await _ready_db(tmp_path)
+    workout = await planning.generate_candidates(db, 1, "workout")
+    by_strategy = {c.strategy: c for c in workout}
+    for candidate in by_strategy.values():
+        for session in candidate.payload["sessions"]:
+            for exercise_entry in session["exercises"]:
+                assert planning._MIN_SETS_PER_EXERCISE <= exercise_entry["sets"] <= planning._MAX_SETS_PER_EXERCISE
 
 
 @pytest.mark.asyncio

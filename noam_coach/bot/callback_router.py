@@ -122,11 +122,13 @@ _DEBOUNCE_PREFIXES = (
     "undo_meal:",
     "chk:med",
     "param:",
+    "wparamtext:",
     "sub:",
     "wpause:",
     "wdone:",
     "wcancel:",
     "nextmeal:save:",
+    "nextmeal:plan:",
     "nextmeal:choose:",
 )
 
@@ -218,7 +220,7 @@ async def handle_callback(
     if _is_duplicate_tap(user_id, data):
         return
 
-    if data.startswith("onb:") or data.startswith("qa:"):
+    if data.startswith("onb:") or data.startswith("qa:") or data.startswith("routine:"):
         await handle_onboarding_callback(query, user_id, data)
         return
 
@@ -294,5 +296,5 @@ async def on_error(
             with suppress(Exception):
                 await update.effective_message.reply_text(
                     "לא הצלחתי להשלים את הפעולה. הנתונים שלך נשמרו — רק התצוגה נכשלה. "
-                    f"אפשר לנסות שוב. (קוד תקלה: {error_id})"
+                    "אפשר לנסות שוב או לחזור למסך הקודם."
                 )

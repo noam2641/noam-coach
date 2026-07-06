@@ -374,6 +374,12 @@ async def _handle_goal_text_action(ctx: FreeTextContext) -> bool:
         return True
 
     if ctx.action == "set_calorie_goal":
+        if not _is_explicit_calorie_goal_change(ctx.text):
+            await ctx.send(
+                "לא שיניתי יעד. כדי לעדכן יעד קלורי כתוב במפורש למשל: \"שנה יעד ל-2100 קלוריות\".",
+                ctx.follow,
+            )
+            return True
         await _handle_calorie_goal_change(ctx)
         return True
 
@@ -381,6 +387,21 @@ async def _handle_goal_text_action(ctx: FreeTextContext) -> bool:
         await record_dietary_preference(ctx.user_id, ctx.slots, ctx.text, ctx.send)
         return True
     return False
+
+
+def _is_explicit_calorie_goal_change(text: str) -> bool:
+    t = f" {text.strip().lower()} "
+    explicit_markers = (
+        "יעד",
+        "מטרה קלורית",
+        "קלוריות ליום",
+        "שנה ל",
+        "עדכן ל",
+        "קבע ל",
+        "set goal",
+        "calorie goal",
+    )
+    return any(marker in t for marker in explicit_markers)
 
 
 @runtime_bound(RUNTIME_NAMES)
@@ -539,7 +560,7 @@ async def _send_free_text_help(ctx: FreeTextContext) -> None:
         '"מה לאכול עכשיו" / "המשקל שלי 89" / "כואבת לי הברך"',
         InlineKeyboardMarkup(
             [
-                [button("📋 תפריט היום", "menu:today"), button("🏋️ אימון", "menu:workout")],
+                [button("📋 תפריט היום", "menu:morning"), button("🏋️ אימון", "menu:workout")],
                 [button("📊 סיכום יומי", "menu:status"), button("📅 תוכנית", "menu:plan")],
                 [button("👤 פרופיל", "menu:profile"), button("📈 שבועי", "menu:weekly")],
             ]
@@ -554,6 +575,67 @@ async def route_free_text(update: Update, user_id: int) -> None:
     text = (message.text or "").strip()
     if not text:
         return
+
+    if "מה לאכול עכשיו" in text:
+        from noam_coach.services.next_meal import (
+            format_next_meal_recommendation,
+            generate_next_meal_recommendation,
+            next_meal_action_rows,
+            record_next_meal_served,
+            remember_active_recommendation,
+        )
+
+        await message.chat.send_action("typing")
+        recommendation = await generate_next_meal_recommendation(DB, user_id)
+        keyboard_rows = [
+            [button(label, callback_data) for label, callback_data in row]
+            for row in next_meal_action_rows(recommendation)
+        ]
+        keyboard_rows.append([button("📊 מצב היום", "menu:status"), button("🏠 תפריט", "menu:home")])
+        prefix = ""
+        if "למה" in text or "אין" in text:
+            prefix = "הנה כפתור והמלצה ל״מה לאכול עכשיו״. זה שייך לתזונה, לא לאימון.\n\n"
+        sent = await message.reply_text(
+            prefix + format_next_meal_recommendation(recommendation),
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+            parse_mode=ParseMode.HTML,
+        )
+        await record_next_meal_served(DB, user_id, recommendation)
+        await remember_active_recommendation(
+            DB, user_id, recommendation, message_id=getattr(sent, "message_id", None)
+        )
+        return
+
+    from noam_coach.services.next_meal import (
+        format_next_meal_recommendation,
+        get_active_recommendation_state,
+        handle_recommendation_correction,
+        next_meal_action_rows,
+        remember_active_recommendation,
+    )
+
+    active_recommendation = await get_active_recommendation_state(DB, user_id)
+    if active_recommendation:
+        correction = await handle_recommendation_correction(DB, user_id, text)
+        if correction is not None:
+            prefix, recommendation = correction
+            keyboard_rows = [
+                [button(label, callback_data) for label, callback_data in row]
+                for row in next_meal_action_rows(recommendation)
+            ]
+            keyboard_rows.append([button("📊 מצב היום", "menu:status"), button("🏠 תפריט", "menu:home")])
+            body = format_next_meal_recommendation(recommendation)
+            if prefix:
+                body = f"{prefix}\n\n{body}"
+            sent = await message.reply_text(
+                body,
+                reply_markup=InlineKeyboardMarkup(keyboard_rows),
+                parse_mode=ParseMode.HTML,
+            )
+            await remember_active_recommendation(
+                DB, user_id, recommendation, message_id=getattr(sent, "message_id", None)
+            )
+            return
 
     summary = await assistant_profile_summary(user_id)
     intent = await assistant.classify_intent(
@@ -717,7 +799,7 @@ async def log_meal_from_text(message: Any, user_id: int, text: str) -> None:
         return
     progress = await message.reply_text("רושם את הארוחה… ⏳")
     try:
-        analysis = await analyze_meal_text(text)
+        analysis = await analyze_meal_text(text, user_id=user_id)
         if not analysis.is_meaningful():
             await progress.edit_text(
                 "זה לא נראה כמו ארוחה שאפשר לרשום (אין מזון או ערכים תזונתיים).\n"

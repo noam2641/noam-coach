@@ -23,10 +23,12 @@ from noam_coach.services.next_meal import (
     format_next_meal_explanation,
     format_next_meal_recommendation,
     generate_next_meal_recommendation,
+    next_meal_action_rows,
     record_next_meal_served,
     save_next_meal_option_feedback,
     save_next_meal_workout_status,
 )
+from noam_coach.services.weekdays import WEEKDAY_SCHEMA_VERSION, local_weekday
 
 
 @pytest.fixture
@@ -86,11 +88,12 @@ async def _meal(
 
 
 async def _workout_plan(db: Database, now: datetime, *, time_text: str, minutes: int = 60) -> None:
-    weekday = (now.weekday() + 1) % 7
+    weekday = local_weekday(now)
     payload = {
         "sessions": [
             {
                 "weekday": weekday,
+                "weekday_schema": WEEKDAY_SCHEMA_VERSION,
                 "weekday_name": "today",
                 "time": time_text,
                 "minutes": minutes,
@@ -149,6 +152,52 @@ async def test_rest_day_balances_are_signed_and_reasonable(db: Database) -> None
     # Full signed-balance detail lives in the 'why it fits' view.
     assert "נותר להיום: 1300" in format_next_meal_explanation(rec)
     assert rec.budget.calories_max <= 750
+
+
+@pytest.mark.asyncio
+async def test_next_meal_explanation_shows_remaining_calculation(db: Database) -> None:
+    now = datetime.now(TZ).replace(hour=14, minute=0, second=0, microsecond=0)
+    await _ready_user(db, now)
+
+    rec = await generate_next_meal_recommendation(db, 1, now=now)
+    explanation = format_next_meal_explanation(rec)
+
+    assert "איך חושב?" in explanation
+    assert "יעד: 2000 קלוריות" in explanation
+    assert "נאכל: 700 קלוריות" in explanation
+    assert "מתוכנן: 0 קלוריות" in explanation
+    assert "נשאר: 1300 קלוריות" in explanation
+
+
+@pytest.mark.asyncio
+async def test_next_meal_actions_include_how_calculated_button(db: Database) -> None:
+    now = datetime.now(TZ).replace(hour=14, minute=0, second=0, microsecond=0)
+    await _ready_user(db, now)
+
+    rec = await generate_next_meal_recommendation(db, 1, now=now)
+    rows = next_meal_action_rows(rec)
+    callbacks = [callback for row in rows for _label, callback in row]
+
+    assert ("איך חושב?", "nextmeal:why") in [button for row in rows for button in row]
+    assert any(callback.startswith("nextmeal:save:") for callback in callbacks)
+    assert any(callback.startswith("nextmeal:plan:") for callback in callbacks)
+    assert not any(callback.startswith("nextmeal:choose:") for callback in callbacks)
+
+
+@pytest.mark.asyncio
+async def test_next_meal_decision_audit_is_internal(db: Database) -> None:
+    now = datetime.now(TZ).replace(hour=14, minute=0, second=0, microsecond=0)
+    await _ready_user(db, now)
+
+    rec = await generate_next_meal_recommendation(db, 1, now=now)
+    payload = rec.to_dict()
+    text = format_next_meal_recommendation(rec)
+
+    assert payload["decision_audit"]["confidence"] >= 0
+    assert payload["decision_audit"]["data_completeness"] >= 0
+    assert payload["decision_audit"]["recommendation_quality"] in {"high", "medium", "low"}
+    assert "confidence" not in text.lower()
+    assert "data_completeness" not in text
 
 
 @pytest.mark.asyncio

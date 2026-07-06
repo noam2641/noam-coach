@@ -120,9 +120,9 @@ def test_availability_friday_one_hour_keeps_per_day_duration() -> None:
     parsed = parse_hebrew_availability_answer("ראשון 19:00, שני 19, רביעי 18:30 45 דקות, שישי 10:00 שעה")
 
     by_day = {slot["weekday"]: slot for slot in parsed.weekly_availability}
+    assert by_day[6]["start"] == "19:00"
     assert by_day[0]["start"] == "19:00"
-    assert by_day[1]["start"] == "19:00"
-    assert by_day[3]["start"] == "18:30"
-    assert by_day[3]["minutes"] == 45
-    assert by_day[5]["start"] == "10:00"
-    assert by_day[5]["minutes"] == 60
+    assert by_day[2]["start"] == "18:30"
+    assert by_day[2]["minutes"] == 45
+    assert by_day[4]["start"] == "10:00"
+    assert by_day[4]["minutes"] == 60

@@ -204,10 +204,11 @@ def split_summary_line(
     rir: int,
 ) -> str:
     total_reps = first_reps + second_reps
+    rir_label = "0 / כשל" if rir == 0 else str(rir)
     return (
         f"{first_weight:g}×{first_reps} + "
         f"{second_weight:g}×{second_reps} | "
-        f"סה״כ {total_reps} | RIR {rir}"
+        f"סה״כ {total_reps} | RIR {rir_label}"
     )
 
 
@@ -349,7 +350,7 @@ def rest_text(
     progress = 1 - (remaining / max(1, total_seconds))
     completed_blocks = min(10, max(0, round(progress * 10)))
     progress_bar = "█" * completed_blocks + "░" * (10 - completed_blocks)
-    rir_label = "לא דווח" if not _rir_known(rir) else str(rir)
+    rir_label = "לא דווח" if not _rir_known(rir) else ("0 / כשל" if rir == 0 else str(rir))
     set_line = summary_line or f"{weight:g} ק״ג × {reps} | RIR {rir_label}"
 
     if remaining <= 0:

@@ -105,6 +105,7 @@ from retention import (
 # ---------------------------------------------------------------------------
 
 from noam_coach.runtime_bind import runtime_bound
+from noam_coach.services.weekdays import sunday_first_key
 
 RUNTIME_NAMES = ('Any', 'CONFIRM_PENDING', 'ContextTypes', 'DB', 'Exception', 'InlineKeyboardMarkup', 'LOGGER', 'MAX_FREQUENCY', 'MIN_FREQUENCY', 'PENDING_QUESTION', 'PLANS', 'ParseMode', 'PlanConstraint', 'SETTINGS', 'SPLIT_BY_FREQUENCY', 'TypeError', 'Update', 'ValueError', '_CANCEL_WORDS', '_ENUM_DISPLAY_MAP', '_as_float', '_format_candidate', '_format_fact_value', '_parse_dietary_answer', '_plan_type_label', '_re', '_safe_cb', 'a_parts', 'abs', 'active_constraints', 'affects', 'allergies', 'allowed', 'applied', 'apply_basics_fix', 'ask_deferred_for_plan', 'ask_next_question', 'assumptions', 'at', 'block', 'bool', 'build_profile_text', 'build_weekly_plan', 'button', 'c', 'callback', 'candidate', 'candidates', 'chosen_days', 'clear_flow_state', 'clear_meal_fix', 'clear_pending', 'compute_basics_extras', 'confirm', 'confirm_routine_facts', 'confirmation_text', 'constraint_id', 'constraint_text', 'constraints', 'context_pending_fix', 'conversation', 'ctx', 'current', 'd', 'data', 'dataclass', 'datetime', 'day', 'days', 'days_source', 'default_spread', 'deferred', 'delta', 'detail', 'detected_days', 'dict', 'diet', 'direction', 'discard_unconfirmed_routine_facts', 'display', 'display_val', 'ensure_user', 'enumerate', 'esc', 'event_log', 'exc', 'existing', 'existing_a', 'existing_r', 'exp_labels', 'experience', 'extract_daily_routine', 'extraction', 'extras', 'fact', 'facts', 'finish_onboarding', 'first_item', 'float', 'flow', 'flow_name', 'food_item', 'format_constraints_summary', 'format_routine_confirmation', 'format_weekly_plan', 'freq', 'frequency', 'gap', 'gaps', 'gather_plan_constraints', 'get_flow_state', 'goal', 'goal_labels', 'group', 'handle_safety_answer', 'hard', 'hasattr', 'head', 'home_keyboard', 'hour', 'i', 'icon', 'index', 'index_str', 'int', 'is_allowed', 'isinstance', 'item', 'items', 'json', 'k', 'key', 'keyboard', 'kind', 'kind_label', 'label', 'latest_bf', 'latest_weight', 'len', 'lines', 'list', 'load_routine_profile', 'loc', 'loc_labels', 'location', 'mapping', 'mark', 'match', 'max', 'mc', 'meal', 'medical', 'message', 'min', 'mins', 'missing', 'missing_labels', 'name', 'needs_follow_up', 'new_val', 'note', 'num', 'nutrition', 'onboarding', 'onboarding_frequency_keyboard', 'onboarding_open_keyboard', 'out', 'parsed_items', 'parts', 'payload', 'pct', 'pending', 'plan', 'plan_constraints', 'plan_type', 'planning', 'prefix', 'profile', 'progress', 'prompt', 'pts', 'q', 'qid', 'query', 'question', 'question_names', 'questions', 'r', 'range', 'rationale', 're', 'readable', 'readiness', 'record_medication', 'restriction_type', 'result', 'rng', 'round', 'row', 'rows', 's', 'safe_edit', 'save_medical_constraint', 'save_routine_extraction', 'score', 'session', 'session_min', 'sessions', 'set_flow_state', 'set_pending', 'severity', 'show_onboarding_patterns', 'since', 'sleep', 'snapshot', 'soft', 'sorted', 'source', 'spec', 'split', 'stage', 'start_onboarding', 'str', 'suggestions', 'suppress', 'suspend', 'target', 'text', 'time_text', 'timedelta', 'timezone', 'title', 'track_event', 'tradeoffs', 'tuple', 'type_label', 'type_labels', 'understood', 'unified', 'update', 'user', 'user_id', 'user_model', 'utc_now', 'v', 'value', 'view', 'weekday_he', 'when', 'why', 'wk', 'workout', 'workout_window', 'write_audit')
 
@@ -219,8 +220,11 @@ async def show_onboarding_basics(target: Any, user_id: int) -> None:
         text += (
             "\n\n<b>זיהיתי מהנתונים שיובאו:</b>\n"
             + "\n".join(f"• {s}" for s in suggestions)
-            + "\n\nלאשר את הנתונים האלו או לתקן?"
+            + '\n\nלאשר, או לכתוב תיקון (למשל "המשקל 90").'
         )
+        # RE11: accept a typed correction directly at this screen — no forced
+        # tap on "יש מה לתקן" first.
+        await context_pending_fix(user_id)
     await track_event(
         user_id,
         "onboarding_basics_shown",
@@ -230,7 +234,6 @@ async def show_onboarding_basics(target: Any, user_id: int) -> None:
     keyboard = InlineKeyboardMarkup(
         [
             [button("✅ הכול נכון", "onb:basics_ok")],
-            [button("✏️ יש מה לתקן", "onb:basics_fix")],
         ]
     )
     if hasattr(target, "edit_message_text"):
@@ -306,6 +309,47 @@ async def confirm_visible_basics(user_id: int) -> None:
 
 
 @runtime_bound(RUNTIME_NAMES)
+async def _ask_training_frequency_trend_question(
+    target: Any, user_id: int, question: questions.Question
+) -> bool:
+    """RE11: when Health data shows the user's recent training frequency has
+    drifted from their long-run average, propose a number based on the
+    recent trend (not the stale overall average) instead of the plain
+    question/"already have" flows. Returns True if this proposal was shown.
+    """
+    import routine
+
+    existing = await user_model.get_fact(DB, user_id, "training_days_per_week")
+    if existing and existing.get("kind") != user_model.KIND_GAP and existing.get("confirmed"):
+        return False  # user already has a confirmed answer — nothing to propose
+
+    profile = await load_routine_profile(user_id)
+    workout = profile.get("workout") or {}
+    pattern = routine.WorkoutPattern(
+        weekly_frequency=workout.get("weekly_frequency"),
+        sessions_sampled=workout.get("sessions_sampled", 0),
+        recent_weekly_frequency=workout.get("recent_weekly_frequency"),
+        recent_sessions_sampled=workout.get("recent_sessions_sampled", 0),
+    )
+    proposal = routine.build_frequency_trend_proposal(pattern)
+    if proposal is None:
+        return False
+
+    await set_pending(user_id, question.id)
+    text = f"<b>שאלה</b>\n\n{esc(proposal.message)}"
+    rows = [
+        [button(label, f"qa:{question.id}:trend:{value:g}")]
+        for label, value in proposal.choices
+    ]
+    keyboard = InlineKeyboardMarkup(rows)
+    if hasattr(target, "edit_message_text"):
+        await safe_edit(target, text, keyboard)
+    else:
+        await target.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+    return True
+
+
+@runtime_bound(RUNTIME_NAMES)
 async def ask_next_question(target: Any, user_id: int) -> bool:
     """Ask the highest-priority pending question. Returns False when none left.
 
@@ -318,8 +362,19 @@ async def ask_next_question(target: Any, user_id: int) -> bool:
     if question is None:
         return False
 
+    # RE11: for training frequency, prefer a trend-aware proposal (recent
+    # vs. overall Health-derived average) over the plain question/confirm
+    # flows below, when Health data actually shows a meaningful shift.
+    if question.fact_key == "training_days_per_week":
+        trend_shown = await _ask_training_frequency_trend_question(target, user_id, question)
+        if trend_shown:
+            return True
+
     # REC-PLAN-MEAL-03-05: If we already have data for this fact (e.g. from
     # Apple Health import), show it for confirmation instead of re-asking.
+    # RE11: a typed correction is accepted directly at this same prompt (no
+    # forced tap on "לא, אעדכן" first) for any question that accepts free
+    # text at all — plain free-text questions and free_text_fallback ones.
     existing = await user_model.get_fact(DB, user_id, question.fact_key)
     if existing and existing.get("value") is not None and existing["kind"] != user_model.KIND_GAP:
         val_display = _format_fact_value(question.fact_key, existing["value"])
@@ -327,15 +382,17 @@ async def ask_next_question(target: Any, user_id: int) -> bool:
             existing.get("source"), existing.get("source", "")
         )
         await set_pending(user_id, question.id)
+        accepts_free_text = not question.options or question.free_text_fallback
+        confirm_line = "זה נכון?" if not accepts_free_text else "זה נכון, או שיש עדכון? (אפשר גם לכתוב ישירות)"
         text = (
             f"<b>שאלה</b>\n\n{question.text}\n\n"
             f"💡 כבר יש לי: <b>{esc(val_display)}</b> "
-            f"<i>({esc(source_label)})</i>\nזה נכון?"
+            f"<i>({esc(source_label)})</i>\n{confirm_line}"
         )
-        keyboard = InlineKeyboardMarkup([
-            [button("✅ כן, נכון", f"qa:{question.id}:confirm_existing")],
-            [button("✏️ לא, אעדכן", f"qa:{question.id}:update_existing")],
-        ])
+        rows = [[button("✅ כן, נכון", f"qa:{question.id}:confirm_existing")]]
+        if not accepts_free_text:
+            rows.append([button("✏️ לא, אעדכן", f"qa:{question.id}:update_existing")])
+        keyboard = InlineKeyboardMarkup(rows)
         if hasattr(target, "edit_message_text"):
             await safe_edit(target, text, keyboard)
         else:
@@ -388,11 +445,31 @@ async def clear_flow_state(user_id: int, flow: str) -> None:
 
 
 @runtime_bound(RUNTIME_NAMES)
-async def first_missing_plan_question(user_id: int) -> questions.Question | None:
-    """Return the next missing profile question for the plan-completion flow."""
+def _plan_completion_profile_order(plan_type: str | None) -> tuple[str, ...]:
+    """Order readiness profiles so the plan the user actually asked for is
+    completed first (RE10-6). ``safety`` always stays reachable — it never
+    blocks the requested plan's questions, but it is still asked afterwards
+    if still missing, since it protects exercise selection for any plan.
+    """
+    if plan_type in PLAN_COMPLETION_PROFILES:
+        rest = [p for p in PLAN_COMPLETION_PROFILES if p != plan_type]
+        return (plan_type, *rest)
+    return PLAN_COMPLETION_PROFILES
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def first_missing_plan_question(
+    user_id: int, plan_type: str | None = None
+) -> questions.Question | None:
+    """Return the next missing profile question for the plan-completion flow.
+
+    ``plan_type`` (RE10-6) prioritizes the profile the user actually asked to
+    complete (e.g. "nutrition") so a nutrition completion never opens with
+    workout questions just because ``workout`` is first in the static tuple.
+    """
     readiness = await user_model.compute_all_readiness(DB, user_id)
     seen: set[str] = set()
-    for profile_name in PLAN_COMPLETION_PROFILES:
+    for profile_name in _plan_completion_profile_order(plan_type):
         for key in readiness.get(profile_name, {}).get("missing", []):
             if key in seen:
                 continue
@@ -404,11 +481,19 @@ async def first_missing_plan_question(user_id: int) -> questions.Question | None
 
 
 @runtime_bound(RUNTIME_NAMES)
-async def ask_next_plan_completion_question(target: Any, user_id: int) -> bool:
+async def ask_next_plan_completion_question(
+    target: Any, user_id: int, plan_type: str | None = None
+) -> bool:
     """Ask the next missing plan detail and keep the user inside plan setup."""
     from noam_coach.bot.ui import button, safe_edit
 
-    question = await first_missing_plan_question(user_id)
+    if plan_type is None:
+        # Resume: read back the plan_type recorded when this flow started.
+        state = await get_flow_state(user_id, PLAN_COMPLETION_FLOW)
+        if state:
+            plan_type = (state.get("payload") or {}).get("plan_type")
+
+    question = await first_missing_plan_question(user_id, plan_type)
     if question is None:
         await clear_flow_state(user_id, PLAN_COMPLETION_FLOW)
         await render_smart_plan_hub(target, user_id)
@@ -417,7 +502,7 @@ async def ask_next_plan_completion_question(target: Any, user_id: int) -> bool:
         user_id,
         PLAN_COMPLETION_FLOW,
         question.id,
-        {"return_to": "menu:smartplan"},
+        {"return_to": "menu:smartplan", "plan_type": plan_type},
     )
     await set_pending(user_id, question.id)
     rows = []
@@ -437,12 +522,134 @@ async def ask_next_plan_completion_question(target: Any, user_id: int) -> bool:
 
 
 @runtime_bound(RUNTIME_NAMES)
+async def advance_after_answer(target: Any, user_id: int) -> None:
+    """Shared "what happens after any question is answered" continuation.
+
+    Checks, in order: plan-completion/goal-wizard/profile-edit flows, then a
+    deferred-plan flow (asks the next deferred question or builds the plan),
+    then falls back to the normal onboarding question loop. Every answer path
+    (button and free text) must call this so a deferred-plan flow is resumed
+    correctly regardless of how the answer was given.
+    """
+    if await continue_after_plan_completion_answer(target, user_id):
+        return
+    deferred = await get_flow_state(user_id, "deferred_plan")
+    if deferred:
+        freq = int(deferred["step"])
+        message = target.message if hasattr(target, "message") else target
+        if await ask_deferred_for_plan(message, user_id, freq):
+            return
+        plan = await build_weekly_plan(user_id, freq)
+        await message.reply_text(
+            format_weekly_plan(plan),
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [button("🏋️ התחל אימון", "menu:workout")],
+                    [button("⬅️ תפריט", "menu:home")],
+                ]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if not await ask_next_question(target, user_id):
+        await finish_onboarding(target, user_id)
+
+
+@runtime_bound(RUNTIME_NAMES)
 async def continue_after_plan_completion_answer(target: Any, user_id: int) -> bool:
-    """Continue plan-completion questions; return True when this flow owned it."""
-    if not await get_flow_state(user_id, PLAN_COMPLETION_FLOW):
-        return False
-    if await ask_next_plan_completion_question(target, user_id):
+    """Continue plan-completion OR goal-wizard questions after an answer.
+
+    Both flows use the same "ask next missing question, else finish" shape
+    and both need to be checked after any generic question answer, so this
+    single entry point (already called from every answer-handling path) is
+    where the goal wizard (RE10-9) hooks in too — that avoids touching every
+    individual call site that already checks plan-completion.
+    """
+    state = await get_flow_state(user_id, PLAN_COMPLETION_FLOW)
+    if state:
+        plan_type = (state.get("payload") or {}).get("plan_type")
+        if await ask_next_plan_completion_question(target, user_id, plan_type):
+            return True
         return True
+
+    goal_state = await get_flow_state(user_id, GOAL_WIZARD_FLOW)
+    if goal_state:
+        return await continue_after_goal_wizard_answer(target, user_id)
+
+    edit_state = await get_flow_state(user_id, "profile_field_edit")
+    if edit_state:
+        return await finish_profile_field_edit(target, user_id, str(edit_state["step"]))
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# RE10-9 — goal wizard: complete height / goal weight / timeframe BEFORE
+# showing the calorie/protein proposal, so the proposal doesn't open with
+# "⚠️ missing: height" the very first time the user taps "יעדים".
+# ---------------------------------------------------------------------------
+
+GOAL_WIZARD_FLOW = "goal_wizard"
+GOAL_WIZARD_FACT_KEYS = ("height_cm", "goal_weight_kg", "goal_timeframe_weeks")
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def _first_missing_goal_wizard_question(user_id: int) -> questions.Question | None:
+    for key in GOAL_WIZARD_FACT_KEYS:
+        fact = await user_model.get_fact(DB, user_id, key)
+        if fact is not None and fact.get("kind") != user_model.KIND_GAP:
+            continue
+        question = questions.question_by_fact_key(key)
+        if question is not None:
+            return question
+    return None
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def ask_next_goal_wizard_question(target: Any, user_id: int) -> bool:
+    """Ask the next missing goal-wizard fact. Returns False when nothing is
+    missing (caller should render the proposal instead)."""
+    from noam_coach.bot.ui import button, safe_edit
+
+    question = await _first_missing_goal_wizard_question(user_id)
+    if question is None:
+        await clear_flow_state(user_id, GOAL_WIZARD_FLOW)
+        return False
+    await set_flow_state(user_id, GOAL_WIZARD_FLOW, question.id, {})
+    await set_pending(user_id, question.id)
+    rows = []
+    if question.options:
+        rows = [
+            [button(label, f"qa:{question.id}:{index}")]
+            for index, (label, _value) in enumerate(question.options)
+        ]
+    rows.append([button("⬅️ תפריט", "menu:home")])
+    keyboard = InlineKeyboardMarkup(rows) if rows else InlineKeyboardMarkup(
+        [[button("⬅️ תפריט", "menu:home")]]
+    )
+    text = f"<b>שאלה להשלמת היעד</b>\n\n{question.text}"
+    if hasattr(target, "edit_message_text"):
+        await safe_edit(target, text, keyboard)
+    else:
+        await target.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+    return True
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def continue_after_goal_wizard_answer(target: Any, user_id: int) -> bool:
+    """Continue the goal wizard, or render the final proposal once done.
+
+    Returns True when this flow owned the answer (caller must not also
+    advance the generic onboarding-question flow for the same answer).
+    """
+    state = await get_flow_state(user_id, GOAL_WIZARD_FLOW)
+    if not state:
+        return False
+    if await ask_next_goal_wizard_question(target, user_id):
+        return True
+    from noam_coach.bot.callback_plans import render_goal_proposal
+
+    await render_goal_proposal(target, user_id)
     return True
 
 
@@ -515,6 +722,14 @@ async def load_pending_state() -> None:
 async def handle_onboarding_callback(query: Any, user_id: int, data: str) -> None:
     parts = data.split(":")
     head = parts[1] if len(parts) > 1 else ""
+
+    if data == "onb:edit_menu":
+        await render_profile_edit_menu(query, user_id)
+        return
+
+    if head == "edit" and len(parts) >= 3:
+        await start_profile_field_edit(query, user_id, parts[2])
+        return
 
     if data == "onb:export_help":
         await onboarding.set_stage(DB, user_id, onboarding.S_EXPORT_HELP)
@@ -621,9 +836,8 @@ async def handle_onboarding_callback(query: Any, user_id: int, data: str) -> Non
         food_item = parts[3] if len(parts) > 3 else ""
         if restriction_type == "cancel":
             # User didn't mean to avoid this food — remove it
-            existing = await user_model.get_value(DB, user_id, "diet_restrictions")
-            if existing and food_item:
-                current = [p.strip() for p in str(existing).split(",") if p.strip()]
+            current = await _existing_list_value(user_id, "diet_restrictions")
+            if food_item:
                 current = [p for p in current if food_item not in p]
                 new_val = ", ".join(current)
                 await user_model.set_fact(
@@ -635,9 +849,8 @@ async def handle_onboarding_callback(query: Any, user_id: int, data: str) -> Non
             await safe_edit(query, f"הסרתי את {esc(food_item)} מרשימת ההימנעות.", None)
         elif restriction_type == "allergy":
             # Move from diet_restrictions to allergies
-            existing_r = await user_model.get_value(DB, user_id, "diet_restrictions")
-            if existing_r and food_item:
-                current = [p.strip() for p in str(existing_r).split(",") if p.strip()]
+            current = await _existing_list_value(user_id, "diet_restrictions")
+            if food_item:
                 current = [p for p in current if food_item not in p]
                 await user_model.set_fact(
                     DB, user_id, "diet_restrictions", ", ".join(current) or "none",
@@ -645,8 +858,7 @@ async def handle_onboarding_callback(query: Any, user_id: int, data: str) -> Non
                     source=user_model.SOURCE_USER,
                     confirmed=True,
                 )
-            existing_a = await user_model.get_value(DB, user_id, "allergies")
-            a_parts = [p.strip() for p in str(existing_a).split(",") if p.strip()] if existing_a else []
+            a_parts = await _existing_list_value(user_id, "allergies")
             if food_item and food_item not in a_parts:
                 a_parts.append(food_item)
             await user_model.set_fact(
@@ -734,6 +946,20 @@ async def handle_onboarding_callback(query: Any, user_id: int, data: str) -> Non
                 await safe_edit(query, f"<b>שאלה</b>\n\n{question.text}", kb)
             return
 
+        if index_str == "trend" and len(parts) >= 4 and question:
+            # RE11: user picked one of the trend-proposal buttons (stay at N /
+            # go to M) instead of typing a number directly.
+            try:
+                trend_value = questions.normalize_answer(question, parts[3])
+            except ValueError as exc:
+                await query.answer(str(exc), show_alert=True)
+                return
+            await questions.record_answer(DB, user_id, question, trend_value)
+            await clear_pending(user_id)
+            await safe_edit(query, f"נרשם: {trend_value:g} אימונים בשבוע ✅", None)
+            await advance_after_answer(query, user_id)
+            return
+
         if question:
             existing = await user_model.get_fact(DB, user_id, question.fact_key)
             if existing and existing["kind"] != user_model.KIND_GAP and existing.get("confirmed"):
@@ -752,28 +978,7 @@ async def handle_onboarding_callback(query: Any, user_id: int, data: str) -> Non
                 # do NOT clear it or advance; wait for the user's reply.
                 return
         await clear_pending(user_id)
-        if await continue_after_plan_completion_answer(query, user_id):
-            return
-        # If we're in a deferred-plan flow, continue asking or build the plan.
-        deferred = await get_flow_state(user_id, "deferred_plan")
-        if deferred:
-            freq = int(deferred["step"])
-            if await ask_deferred_for_plan(query.message, user_id, freq):
-                return
-            plan = await build_weekly_plan(user_id, freq)
-            await query.message.reply_text(
-                format_weekly_plan(plan),
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [button("🏋️ התחל אימון", "menu:workout")],
-                        [button("⬅️ תפריט", "menu:home")],
-                    ]
-                ),
-                parse_mode=ParseMode.HTML,
-            )
-            return
-        if not await ask_next_question(query, user_id):
-            await finish_onboarding(query, user_id)
+        await advance_after_answer(query, user_id)
         return
 
 
@@ -786,53 +991,26 @@ async def context_pending_fix(user_id: int) -> None:
 async def handle_safety_answer(
     query: Any, user_id: int, question: questions.Question, value: Any
 ) -> bool:
-    """If a safety question flags an issue, record a constraint and open a
-    free-text follow-up — without diagnosing.
+    """If a safety question flags an issue, record a constraint.
+
+    RE11: "has X" detail is now captured directly as free text at the initial
+    question prompt (see the free_text_fallback branch in
+    handle_onboarding_text), so button presses here only ever carry "none" or
+    a genuine multi-choice value — no follow-up prompt is needed.
 
     Returns True when a follow-up prompt is now pending (so the caller must not
     clear it or advance to the next question).
     """
-    if question.fact_key == "active_pain" and value == "has_pain":
-        await save_medical_constraint(
-            user_id,
-            kind="pain",
-            note="reported during onboarding",
+    if question.fact_key == "training_location" and value == "gym":
+        # RE10-7: a full gym implies full equipment — do not re-ask q_equipment.
+        # "home"/"mixed" still need the equipment question (home gear varies).
+        await user_model.set_fact(
+            DB, user_id, "equipment", "full_gym",
+            kind=user_model.KIND_FACT,
+            source=user_model.SOURCE_USER,
+            confirmed=True,
             affects=("exercise_selection",),
         )
-        await query.message.reply_text(
-            "תודה שעדכנת. אתאים את התרגילים כדי לא להחמיר את הכאב.\n"
-            "אם הכאב חד, מתגבר או מלווה בנפיחות — כדאי בדיקה מקצועית לפני "
-            "העמסה.\n\n"
-            'אנא ציין איפה הכאב (למשל "ברך ימין") ואסיר תרגילים '
-            'שמעמיסים עליו.\n\n(כתוב "ביטול" כדי לדלג.)'
-        )
-        await set_pending(user_id, "__pain_location__")
-        return True
-    if question.fact_key == "medical_avoidance" and value == "has_avoidance":
-        await save_medical_constraint(
-            user_id,
-            kind="medical_avoidance",
-            note="reported during onboarding",
-            affects=("exercise_selection",),
-        )
-        await query.message.reply_text(
-            "מובן. אני לא נותן אישור רפואי — ההמלצה הרפואית גוברת תמיד.\n\n"
-            'אנא פרט ממה הונחית להימנע ואתאים את התוכנית בהתאם.\n\n(כתוב "ביטול" כדי לדלג.)'
-        )
-        await set_pending(user_id, "__avoidance_detail__")
-        return True
-    if question.fact_key == "allergies" and value == "has":
-        await query.message.reply_text(
-            'אנא פרט אילו אלרגיות או רגישויות מזון יש לך.\n\n(כתוב "ביטול" כדי לדלג.)'
-        )
-        await set_pending(user_id, "__allergy_detail__")
-        return True
-    if question.fact_key == "equipment" and value == "custom":
-        await query.message.reply_text(
-            'אנא ציין איזה ציוד זמין לך (למשל "מוט, משקולות, מתח").\n\n(כתוב "ביטול" כדי לדלג.)'
-        )
-        await set_pending(user_id, "__equipment_detail__")
-        return True
     return False
 
 
@@ -893,6 +1071,40 @@ class PlanConstraint:
 
 
 @runtime_bound(RUNTIME_NAMES)
+async def _usable_fact_value(user_id: int, key: str) -> Any:
+    """Return a fact's value only when it is a real (non-gap) answer.
+
+    REC-PLAN-MEAL-03-07 / RE10-2: ``record_gap`` stores unanswered questions as
+    a dict (``{"missing": True, "why_matters": ...}``). Reading that value with
+    plain ``get_value`` and interpolating it into a label leaks a raw Python
+    dict (and English keys) into user-facing text. Callers that build display
+    labels must go through this helper instead of ``user_model.get_value``.
+    """
+    fact = await user_model.get_fact(DB, user_id, key)
+    if fact is None or fact.get("kind") == user_model.KIND_GAP:
+        return None
+    return fact.get("value")
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def _existing_list_value(user_id: int, key: str) -> list[str]:
+    """Return a comma-separated fact's items as a clean list, never a gap dict.
+
+    RE10-2 path B: several handlers merge a new item into an *existing*
+    comma-separated fact (e.g. ``diet_restrictions``) by reading the current
+    value and splitting on ",". When the current value is still an unanswered
+    gap (a dict), that repr was being split and persisted back as part of the
+    new answer — permanently poisoning the fact even for screens that already
+    filter gaps. This helper treats a gap (or any non-string value) as "no
+    existing items yet" instead of stringifying it.
+    """
+    value = await _usable_fact_value(user_id, key)
+    if not value or not isinstance(value, str):
+        return []
+    return [p.strip() for p in value.split(",") if p.strip()]
+
+
+@runtime_bound(RUNTIME_NAMES)
 async def gather_plan_constraints(user_id: int) -> list[PlanConstraint]:
     """Collect all constraints relevant to plan building for a user."""
     constraints: list[PlanConstraint] = []
@@ -910,43 +1122,43 @@ async def gather_plan_constraints(user_id: int) -> list[PlanConstraint]:
         ))
 
     # Hard: allergies
-    allergies = await user_model.get_value(DB, user_id, "allergies")
+    allergies = await _usable_fact_value(user_id, "allergies")
     if allergies and allergies != "none":
         constraints.append(PlanConstraint(
             key="allergies",
             kind="hard",
-            label=f"אלרגיות: {allergies}",
+            label=f"אלרגיות: {_format_fact_value('allergies', allergies)}",
             check="nutrition",
             source="safety",
             value=allergies,
         ))
 
     # Soft: diet restrictions
-    diet = await user_model.get_value(DB, user_id, "diet_restrictions")
+    diet = await _usable_fact_value(user_id, "diet_restrictions")
     if diet:
         constraints.append(PlanConstraint(
             key="diet_restrictions",
             kind="soft",
-            label=f"העדפות תזונה: {diet}",
+            label=f"העדפות תזונה: {_format_fact_value('diet_restrictions', diet)}",
             check="nutrition",
             source="user_pref",
             value=diet,
         ))
 
     # Soft: workout time preference
-    workout_window = await user_model.get_value(DB, user_id, "workout_window")
+    workout_window = await _usable_fact_value(user_id, "workout_window")
     if workout_window:
         constraints.append(PlanConstraint(
             key="workout_window",
             kind="soft",
-            label=f"חלון אימון מועדף: {workout_window}",
+            label=f"חלון אימון מועדף: {_format_fact_value('workout_window', workout_window)}",
             check="timing",
             source="user_pref",
             value=workout_window,
         ))
 
     # Soft: session duration
-    session_min = await user_model.get_value(DB, user_id, "session_minutes")
+    session_min = await _usable_fact_value(user_id, "session_minutes")
     if session_min:
         constraints.append(PlanConstraint(
             key="session_duration",
@@ -958,12 +1170,12 @@ async def gather_plan_constraints(user_id: int) -> list[PlanConstraint]:
         ))
 
     # Soft: training location
-    location = await user_model.get_value(DB, user_id, "training_location")
+    location = await _usable_fact_value(user_id, "training_location")
     if location:
         constraints.append(PlanConstraint(
             key="training_location",
             kind="soft",
-            label=f"מיקום: {location}",
+            label=f"מיקום: {_format_fact_value('training_location', location)}",
             check="exercise",
             source="user_pref",
             value=location,
@@ -1101,6 +1313,16 @@ def _format_fact_value(key: str, value: Any) -> str:
         return f"{value} בשבוע"
     if key == "session_minutes":
         return f"{value} דקות"
+    if key == "goal_timeframe_weeks":
+        num = _as_float()
+        if num is None:
+            return "לא צוין"
+        if num >= 52:
+            return f"{num / 52:.0f} שנה" if num % 52 == 0 else f"{num:.0f} שבועות"
+        if num >= 4:
+            months = num / 4.33
+            return f"{months:.0f} חודשים" if months >= 1.5 else f"{num:.0f} שבועות"
+        return f"{num:.0f} שבועות"
     # Fallback: clean snake_case from string values
     s = str(value)
     if "_" in s and s.replace("_", "").isalpha():
@@ -1258,8 +1480,108 @@ async def command_profile_query(query: Any, user_id: int) -> None:
     await safe_edit(
         query,
         await build_profile_text(user_id),
-        InlineKeyboardMarkup([[button("⬅️ תפריט", "menu:home")]]),
+        InlineKeyboardMarkup([
+            [button("✏️ ערוך פרטים", "onb:edit_menu")],
+            [button("⬅️ תפריט", "menu:home")],
+        ]),
     )
+
+
+# RE10-14: fields the user can edit from "הפרופיל שלך". Each maps to a
+# fact_key that already has a question in questions.py (reused as-is) except
+# weight_kg, which is captured via free text (no dedicated question exists —
+# it is normally set by Apple Health import or the numeric-confirmation flow).
+_EDITABLE_PROFILE_FIELDS: tuple[tuple[str, str], ...] = (
+    ("weight_kg", "⚖️ משקל נוכחי"),
+    ("height_cm", "📏 גובה"),
+    ("age", "🎂 גיל"),
+    ("goal_weight_kg", "🎯 משקל יעד"),
+    ("goal_timeframe_weeks", "⏳ משך זמן ליעד"),
+    ("allergies", "🚫 אלרגיות"),
+    ("diet_restrictions", "🥗 איסורים תזונתיים"),
+    ("training_location", "📍 מקום אימון"),
+    ("equipment", "🏋️ ציוד זמין"),
+    ("session_minutes", "⏱️ זמן לאימון"),
+    ("training_days_per_week", "📅 ימי אימון בשבוע"),
+)
+
+# Editing one of these facts changes the calorie/protein target — offer
+# (never force) a re-check of the goal afterward.
+_EDIT_TRIGGERS_GOAL_REVIEW = {"weight_kg", "height_cm", "age", "goal_weight_kg", "goal_timeframe_weeks"}
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def render_profile_edit_menu(target: Any, user_id: int) -> None:
+    lines = ["<b>איזה פרט לערוך?</b>", ""]
+    rows = []
+    for key, label in _EDITABLE_PROFILE_FIELDS:
+        fact = await user_model.get_fact(DB, user_id, key)
+        if fact is not None and fact.get("kind") != user_model.KIND_GAP:
+            display = _format_fact_value(key, fact.get("value"))
+            lines.append(f"{label}: <b>{esc(display)}</b>")
+        else:
+            lines.append(f"{label}: <i>טרם דווח</i>")
+        rows.append([button(label, f"onb:edit:{key}")])
+    rows.append([button("⬅️ חזרה לפרופיל", "menu:profile")])
+    await safe_edit(target, "\n".join(lines), InlineKeyboardMarkup(rows))
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def start_profile_field_edit(target: Any, user_id: int, key: str) -> None:
+    """Begin editing one profile field (RE10-14): invalidate the old fact and
+    either ask its existing question (reusing questions.py) or, for fields
+    with no question (weight_kg), prompt free text directly.
+    """
+    existing = await user_model.get_fact(DB, user_id, key)
+    if existing is not None:
+        await user_model.invalidate_fact(DB, user_id, key)
+
+    question = questions.question_by_fact_key(key)
+    if question is not None:
+        await set_flow_state(user_id, "profile_field_edit", key, {})
+        rows = []
+        if question.options:
+            rows = [
+                [button(label, f"qa:{question.id}:{index}")]
+                for index, (label, _value) in enumerate(question.options)
+            ]
+        rows.append([button("⬅️ ביטול", "onb:edit_menu")])
+        text = f"<b>עריכת פרט</b>\n\n{question.text}"
+        await set_pending(user_id, question.id)
+        if hasattr(target, "edit_message_text"):
+            await safe_edit(target, text, InlineKeyboardMarkup(rows))
+        else:
+            await target.reply_text(text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+        return
+
+    # No question exists for this field (currently only weight_kg) — free text.
+    await set_pending(user_id, f"__profile_edit_{key}__")
+    text = f"כתוב את הערך החדש עבור {esc(user_model.display_label(key))}."
+    keyboard = InlineKeyboardMarkup([[button("⬅️ ביטול", "onb:edit_menu")]])
+    if hasattr(target, "edit_message_text"):
+        await safe_edit(target, text, keyboard)
+    else:
+        await target.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def finish_profile_field_edit(target: Any, user_id: int, key: str) -> bool:
+    """After a profile-edit question is answered, show the updated profile
+    and — for fields that affect the calorie target — offer (not force) a
+    goal recheck. Returns True (always owns the answer once called)."""
+    await clear_flow_state(user_id, "profile_field_edit")
+    label = user_model.display_label(key)
+    text = f"עודכן: {esc(label)} ✅"
+    rows = []
+    if key in _EDIT_TRIGGERS_GOAL_REVIEW:
+        text += "\n\nהנתון הזה משפיע על היעד הקלורי. לבדוק יעד מעודכן?"
+        rows.append([button("🎯 בדוק יעד מעודכן", "menu:goal")])
+    rows.append([button("👤 חזרה לפרופיל", "menu:profile")])
+    if hasattr(target, "edit_message_text"):
+        await safe_edit(target, text, InlineKeyboardMarkup(rows))
+    else:
+        await target.reply_text(text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+    return True
 
 
 @runtime_bound(RUNTIME_NAMES)
@@ -1350,6 +1672,177 @@ async def render_smart_plan_hub(target: Any, user_id: int) -> None:
         await target.reply_text("\n".join(lines), reply_markup=keyboard, parse_mode=ParseMode.HTML)
 
 
+# RE10-11 — three-step workout wizard: type -> structure -> exercises.
+# Reuses the existing 3-candidate generation (planning.generate_candidates)
+# and the existing single-plan activation (planv2:select) — the wizard only
+# changes what the user sees at each step, not the underlying data model.
+_STRATEGY_RECOMMENDATION_FOR_GOAL: dict[str, str] = {
+    "fat_loss_muscle_retention": "consistency",
+    "muscle_gain": "performance",
+    "strength": "performance",
+    "general_health": "balanced",
+}
+_STRATEGY_LABELS: dict[str, str] = {
+    "consistency": "מקסימום עקביות",
+    "balanced": "מאוזנת",
+    "performance": "ביצועים",
+}
+_STRATEGY_WHY: dict[str, str] = {
+    "consistency": "פחות ימים, קל יותר להתמיד — טוב לירידה במשקל ולשמירה על שגרה.",
+    "balanced": "איזון בין נפח להתאוששות — טוב לבריאות וכושר כללי.",
+    "performance": "יותר נפח והזדמנויות להתקדם — טוב לבניית מסה או כוח.",
+}
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def render_workout_type_choice(target: Any, user_id: int) -> None:
+    """Wizard step A (RE10-11): choose a workout TYPE before seeing structure."""
+    candidates = await planning.list_plan_candidates(DB, user_id, "workout")  # type: ignore[arg-type]
+    if not candidates:
+        await safe_edit(
+            target,
+            "אין כרגע הצעות שמורות. צור הצעות חדשות.",
+            InlineKeyboardMarkup([[button("⬅️ לתוכניות", "menu:smartplan")]]),
+        )
+        return
+    primary_goal = str(await user_model.get_value(DB, user_id, "primary_goal") or "")
+    recommended = _STRATEGY_RECOMMENDATION_FOR_GOAL.get(primary_goal)
+
+    flow = await conversation.get_active_flow(DB, user_id)
+    if flow.name != conversation.FlowName.workout_plan_selection:
+        await conversation.set_active_flow(
+            DB, user_id, conversation.FlowName.workout_plan_selection,
+            step="choose_type",
+            payload={"candidate_ids": [int(item["id"]) for item in candidates]},
+            expiry_minutes=24 * 60,
+        )
+        flow = await conversation.get_active_flow(DB, user_id)
+
+    lines = ["<b>שלב 1 מתוך 3 — איזה סוג תוכנית אימונים?</b>", ""]
+    rows = []
+    for candidate in candidates:
+        strategy = str(candidate.get("strategy") or "")
+        label = _STRATEGY_LABELS.get(strategy, candidate.get("title", strategy))
+        why = _STRATEGY_WHY.get(strategy, "")
+        badge = " (מומלץ עבורך)" if strategy == recommended else ""
+        lines.append(f"<b>{esc(label)}{badge}</b>")
+        if why:
+            lines.append(f"<i>{esc(why)}</i>")
+        lines.append("")
+        callback = conversation.encode_callback(
+            "planv2", "wiz_type", strategy, version=flow.version, flow_id=flow.flow_id,
+        )
+        button_label = f"{label}{' ⭐' if strategy == recommended else ''}"
+        rows.append([button(button_label, callback)])
+    rows.append([button("⬅️ לתוכניות", "menu:smartplan")])
+    await safe_edit(target, "\n".join(lines), InlineKeyboardMarkup(rows))
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def render_workout_structure_choice(target: Any, user_id: int, strategy: str) -> None:
+    """Wizard step B (RE10-11): show the chosen type's day/session structure."""
+    candidates = await planning.list_plan_candidates(DB, user_id, "workout")  # type: ignore[arg-type]
+    candidate = next((c for c in candidates if c.get("strategy") == strategy), None)
+    if candidate is None:
+        await render_workout_type_choice(target, user_id)
+        return
+
+    flow = await conversation.get_active_flow(DB, user_id)
+    await conversation.set_active_flow(
+        DB, user_id, conversation.FlowName.workout_plan_selection,
+        step="choose_structure",
+        payload={**flow.payload, "chosen_strategy": strategy, "chosen_plan_id": int(candidate["id"])},
+        expiry_minutes=24 * 60,
+    )
+    flow = await conversation.get_active_flow(DB, user_id)
+
+    label = _STRATEGY_LABELS.get(strategy, candidate.get("title", strategy))
+    lines = [f"<b>שלב 2 מתוך 3 — מבנה התוכנית: {esc(label)}</b>", ""]
+    lines.append(_format_candidate(candidate, None))
+    payload = candidate.get("payload", {})
+    sessions = sorted(payload.get("sessions", []), key=lambda s: sunday_first_key(s.get("weekday", 0)))
+    for session in sessions:
+        day_name = session.get("weekday_name", "")
+        session_name = session.get("name", "")
+        exercises = session.get("exercises", [])
+        ex_count = len(exercises)
+        session_mins = session.get("minutes", 0)
+        ex_preview = ", ".join(esc(e.get("name_he") or e.get("name", "")) for e in exercises[:3])
+        if ex_count > 3:
+            ex_preview += f" +{ex_count - 3}"
+        lines.append(
+            f"  📋 {esc(day_name)} · {esc(session_name)} "
+            f"({ex_count} תרגילים, {session_mins} דק׳): {ex_preview}"
+        )
+    lines.append("")
+
+    confirm_cb = conversation.encode_callback(
+        "planv2", "wiz_review", str(candidate["id"]), version=flow.version, flow_id=flow.flow_id,
+    )
+    back_cb = conversation.encode_callback(
+        "planv2", "wiz_back_type", "0", version=flow.version, flow_id=flow.flow_id,
+    )
+    rows = [
+        [button("➡️ המשך לאישור תרגילים", confirm_cb)],
+        [button("⬅️ חזרה לבחירת סוג", back_cb)],
+        [button("⬅️ לתוכניות", "menu:smartplan")],
+    ]
+    await safe_edit(target, "\n".join(lines), InlineKeyboardMarkup(rows))
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def render_workout_exercise_review(target: Any, user_id: int, plan_id: int) -> None:
+    """Wizard step C (RE10-11): final exercise list before activation, with
+    the existing per-exercise edit entry point (editparams_menu) available
+    before the user commits."""
+    candidates = await planning.list_plan_candidates(DB, user_id, "workout")  # type: ignore[arg-type]
+    candidate = next((c for c in candidates if int(c["id"]) == plan_id), None)
+    if candidate is None:
+        await render_workout_type_choice(target, user_id)
+        return
+
+    flow = await conversation.get_active_flow(DB, user_id)
+    await conversation.set_active_flow(
+        DB, user_id, conversation.FlowName.workout_plan_selection,
+        step="review_exercises",
+        payload={**flow.payload, "chosen_plan_id": plan_id},
+        expiry_minutes=24 * 60,
+    )
+    flow = await conversation.get_active_flow(DB, user_id)
+
+    label = _STRATEGY_LABELS.get(candidate.get("strategy", ""), candidate.get("title", ""))
+    lines = [f"<b>שלב 3 מתוך 3 — אישור תרגילים: {esc(label)}</b>", ""]
+    payload = candidate.get("payload", {})
+    rows = []
+    sessions = sorted(payload.get("sessions", []), key=lambda s: sunday_first_key(s.get("weekday", 0)))
+    for session in sessions:
+        day_name = session.get("weekday_name", "")
+        session_name = session.get("name", "")
+        exercises = session.get("exercises", [])
+        lines.append(f"<b>{esc(day_name)} · {esc(session_name)}</b>")
+        for exercise_entry in exercises:
+            name = esc(exercise_entry.get("name_he") or exercise_entry.get("name", ""))
+            sets = exercise_entry.get("sets")
+            rmin = exercise_entry.get("rmin")
+            rmax = exercise_entry.get("rmax")
+            lines.append(f"  • {name} — {sets}×{rmin}-{rmax}")
+        lines.append("")
+        code = session.get("code")
+        if code:
+            rows.append([button(f"🔁 החלף/ערוך תרגילים ב-{esc(session_name)}", f"editparams_menu:{code}")])
+
+    select_cb = conversation.encode_callback(
+        "planv2", "select", str(plan_id), version=flow.version, flow_id=flow.flow_id,
+    )
+    back_cb = conversation.encode_callback(
+        "planv2", "wiz_type", str(candidate.get("strategy", "")), version=flow.version, flow_id=flow.flow_id,
+    )
+    rows.append([button("✅ אשר תוכנית", select_cb)])
+    rows.append([button("⬅️ חזרה למבנה", back_cb)])
+    rows.append([button("⬅️ לתוכניות", "menu:smartplan")])
+    await safe_edit(target, "\n".join(lines), InlineKeyboardMarkup(rows))
+
+
 @runtime_bound(RUNTIME_NAMES)
 async def render_candidate_list(target: Any, user_id: int, plan_type: str) -> None:
     candidates = await planning.list_plan_candidates(DB, user_id, plan_type)  # type: ignore[arg-type]
@@ -1378,11 +1871,16 @@ async def render_candidate_list(target: Any, user_id: int, plan_type: str) -> No
     rows = []
     for index, candidate in enumerate(candidates, start=1):
         lines.append(_format_candidate(candidate, index))
-        # REC-PROGRAM-04-02: Show workout session details before selection
+        # REC-PROGRAM-04-02 / D6: show every session, not just the first 4 —
+        # once workout candidates can differ in frequency (RE10-3 D13), a
+        # 5- or 6-day performance plan must not have its later days hidden
+        # from the user before they choose.
         if plan_type == "workout":
             payload = candidate.get("payload", {})
-            sessions = payload.get("sessions", [])
-            for session in sessions[:4]:
+            sessions = sorted(
+                payload.get("sessions", []), key=lambda s: sunday_first_key(s.get("weekday", 0))
+            )
+            for session in sessions:
                 day_name = session.get("weekday_name", "")
                 session_name = session.get("name", "")
                 exercises = session.get("exercises", [])
@@ -1467,12 +1965,19 @@ async def render_unified_plan(target: Any, user_id: int) -> None:
     lines = ["<b>התוכנית השבועית שלי</b>", ""]
     for day in plan["payload"].get("days", []):
         lines.append(f"<b>{esc(day['weekday_name'])}</b>")
-        for meal in day.get("meals", [])[:5]:
-            time_text = f"{meal.get('time')} · " if meal.get("time") else ""
-            lines.append(f"🍽️ {esc(time_text + meal.get('name', 'ארוחה'))}")
-        for session in day.get("workouts", []):
-            time_text = f"{session.get('time')} · " if session.get("time") else ""
-            lines.append(f"🏋️ {esc(time_text + session.get('name', 'אימון'))}")
+        # D12: render the chronologically-merged "items" list (falls back to
+        # the old meals-then-workouts order only for a unified plan payload
+        # saved before this field existed).
+        items = day.get("items")
+        if items is None:
+            items = [{**m, "type": "meal"} for m in day.get("meals", [])] + [
+                {**s, "type": "workout"} for s in day.get("workouts", [])
+            ]
+        for item in items:
+            time_text = f"{item.get('time')} · " if item.get("time") else ""
+            icon = "🏋️" if item.get("type") == "workout" else "🍽️"
+            default_name = "אימון" if item.get("type") == "workout" else "ארוחה"
+            lines.append(f"{icon} {esc(time_text + item.get('name', default_name))}")
         lines.append("")
     await safe_edit(target, "\n".join(lines), InlineKeyboardMarkup([[button("⬅️ לתוכניות", "menu:smartplan")]]))
 
@@ -1653,7 +2158,8 @@ def format_weekly_plan(plan: dict[str, Any]) -> str:
         f"<b>התוכנית השבועית שלך — {plan['frequency']} אימונים</b>",
         "",
     ]
-    for i, s in enumerate(plan["sessions"], start=1):
+    sorted_sessions = sorted(plan["sessions"], key=lambda s: sunday_first_key(s["weekday"]))
+    for i, s in enumerate(sorted_sessions, start=1):
         when = weekday_he(s["weekday"])
         at = f" · {s['time']}" if s.get("time") else ""
         lines.append(f"{i}. יום {when}{at} — {s['name']}")
@@ -1702,12 +2208,48 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
         await message.reply_text("בוטל. אפשר להמשיך כרגיל.")
         return True
 
+    if pending.startswith("__profile_edit_") and pending.endswith("__"):
+        # RE10-14: free-text edit for a profile field with no dedicated
+        # question (currently only weight_kg).
+        key = pending[len("__profile_edit_"):-2]
+        try:
+            value: Any = float(text.strip().replace(",", "."))
+        except ValueError:
+            await message.reply_text("כתוב מספר, למשל 82.5.")
+            return True
+        await user_model.set_fact(
+            DB, user_id, key, value,
+            kind=user_model.KIND_FACT,
+            source=user_model.SOURCE_USER,
+            confirmed=True,
+        )
+        await clear_pending(user_id)
+        await finish_profile_field_edit(message, user_id, key)
+        return True
+
+    if pending.startswith("__health_edit_") and pending.endswith("__"):
+        # RE10-4: user typed a corrected value for one imported Health fact.
+        from noam_coach.services.health_jobs import ask_next_health_confirm_step, finish_health_confirm_wizard
+
+        key = pending[len("__health_edit_"):-2]
+        await user_model.set_fact(
+            DB, user_id, key, text.strip(),
+            kind=user_model.KIND_FACT,
+            source=user_model.SOURCE_USER,
+            confirmed=True,
+        )
+        await clear_pending(user_id)
+        await message.reply_text(f"עודכן: {esc(user_model.display_label(key))} — {esc(text.strip())} ✅")
+        if not await ask_next_health_confirm_step(message, user_id):
+            await finish_health_confirm_wizard(message, user_id)
+        return True
+
     if pending == "__med_name__":
         await clear_pending(user_id)
         await record_medication(user_id, text.strip(), source="user_text")
         await message.reply_text(
-            f"רשמתי שלקחת {esc(text.strip())}. אזכור את זה ואלמד את ההשפעה על "
-            "התיאבון והאימונים שלך."
+            f"רשמתי שלקחת {esc(text.strip())}. זה יישמר ביומן שלך, "
+            "ובהמשך נוכל להשוות מול תיאבון ואימונים."
         )
         return True
 
@@ -1766,7 +2308,10 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
             confirmed=True,
         )
         await clear_pending(user_id)
-        await message.reply_text(f"רשמתי כאב ב{text}. אסיר או אחליף תרגילים שמעמיסים על האזור הזה.")
+        await message.reply_text(
+            f"רשמתי כאב ב{text}. אנסה להסיר או להחליף תרגילים שמעמיסים על האזור הזה. "
+            "אם הכאב חד, מתגבר או מגביל תנועה — כדאי בדיקה מקצועית."
+        )
         if await continue_after_plan_completion_answer(message, user_id):
             return True
         if not await ask_next_question(message, user_id):
@@ -1816,6 +2361,30 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
             await finish_onboarding(message, user_id)
         return True
 
+    if pending == "__manual_goal_calories__":
+        import re as _re
+
+        match = _re.search(r"\d+(?:\.\d+)?", text)
+        if not match:
+            await message.reply_text("כתוב מספר קלוריות, למשל 2100.")
+            return True
+        value = float(match.group(0))
+        if not (800 <= value <= 6000):
+            await message.reply_text("המספר צריך להיות בטווח סביר של 800–6000 קלוריות ליום.")
+            return True
+        await clear_pending(user_id)
+        await message.reply_text(
+            f"לוודא: יעד קלורי יומי של <b>{value:g}</b>?",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [button("✅ אשר", f"confirm:goal_cal:{value:g}")],
+                    [button("❌ בטל", "confirm:cancel:0")],
+                ]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return True
+
     if pending == "q_daily_routine":
         progress = await message.reply_text("מנתח את התיאור שלך…")
         extraction = await extract_daily_routine(text)
@@ -1856,6 +2425,109 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
 
     # Otherwise it's a free-text answer to a normal question.
     question = questions.question_by_id(pending)
+
+    # RE11: questions with free_text_fallback=True keep a single "none" button
+    # but also accept a typed answer directly at the same prompt — the user
+    # should never have to tap "יש"/"אחר" before typing. Route the typed text
+    # through the same detail-persistence used by the button follow-up flow.
+    if question is not None and question.free_text_fallback and question.fact_key in (
+        "active_pain", "medical_avoidance", "allergies", "equipment",
+    ):
+        if question.fact_key == "equipment":
+            # Free text may also match one of the quick-pick categories.
+            normalized = text.strip()
+            matched_value = next(
+                (value for label, value in question.options if label == normalized),
+                None,
+            )
+            final_value = matched_value if matched_value is not None else text
+            await user_model.set_fact(
+                DB, user_id, "equipment", final_value,
+                kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
+                confirmed=True, affects=("exercise_selection",),
+            )
+            await clear_pending(user_id)
+            await message.reply_text(f"רשמתי: {text}. אבחר תרגילים בהתאם.")
+        elif question.fact_key == "active_pain":
+            await save_medical_constraint(
+                user_id, kind="pain", note="reported during onboarding",
+                affects=("exercise_selection",),
+            )
+            await DB.execute(
+                "UPDATE medical_constraints SET location=? "
+                "WHERE id=(SELECT MAX(id) FROM medical_constraints "
+                "WHERE user_id=? AND kind='pain')",
+                (text, user_id),
+            )
+            await user_model.set_fact(
+                DB, user_id, "active_pain", {"location": text, "status": "active"},
+                kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
+                confirmed=True,
+            )
+            await clear_pending(user_id)
+            await message.reply_text(
+                f"רשמתי כאב ב{text}. אנסה להסיר או להחליף תרגילים שמעמיסים על האזור הזה. "
+                "אם הכאב חד, מתגבר או מגביל תנועה — כדאי בדיקה מקצועית."
+            )
+        elif question.fact_key == "medical_avoidance":
+            await save_medical_constraint(
+                user_id, kind="medical_avoidance", note="reported during onboarding",
+                affects=("exercise_selection",),
+            )
+            await DB.execute(
+                "UPDATE medical_constraints SET note=? "
+                "WHERE id=(SELECT MAX(id) FROM medical_constraints "
+                "WHERE user_id=? AND kind='medical_avoidance')",
+                (text, user_id),
+            )
+            await user_model.set_fact(
+                DB, user_id, "medical_avoidance", text,
+                kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
+                confirmed=True, affects=("exercise_selection", "safety"),
+            )
+            await clear_pending(user_id)
+            await message.reply_text("נרשם, אתאים את התוכנית בהתאם.")
+        else:  # allergies — reuse the existing dietary-answer parser/classifier.
+            try:
+                parsed_items = _parse_dietary_answer(text)
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Dietary restriction parse failed for: %r", text)
+                parsed_items = []
+                await event_log.append_event(
+                    DB, user_id, "dietary_restriction_parse_failed",
+                    entity="fact", entity_id=question.fact_key,
+                    source="onboarding",
+                    properties={"raw_text": text[:200]},
+                )
+            if parsed_items:
+                first_item = parsed_items[0]
+                await clear_pending(user_id)
+                await message.reply_text(
+                    f"איך להתייחס ל{esc(first_item)}?",
+                    reply_markup=InlineKeyboardMarkup([
+                        [button("🚫 מעדיף להימנע", f"qa:diet_type:preference:{_safe_cb(first_item)}")],
+                        [button("🤢 גורם לי לאי־נוחות", f"qa:diet_type:intolerance:{_safe_cb(first_item)}")],
+                        [button("⚠️ רגישות", f"qa:diet_type:sensitivity:{_safe_cb(first_item)}")],
+                        [button("🆘 אלרגיה מאובחנת", f"qa:diet_type:allergy:{_safe_cb(first_item)}")],
+                        [button("❌ לא התכוונתי להימנע", f"qa:diet_type:cancel:{_safe_cb(first_item)}")],
+                    ]),
+                    parse_mode=ParseMode.HTML,
+                )
+                return True
+            if not text.strip():
+                await message.reply_text("לא קיבלתי תשובה. אפשר לכתוב למשל: \"אני נמנע מקשיו\".")
+                return True
+            await user_model.set_fact(
+                DB, user_id, "allergies", text,
+                kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
+                confirmed=True, affects=("menu_planning", "safety"),
+            )
+            await clear_pending(user_id)
+            await message.reply_text(f"רשמתי: {text}. אתחשב בזה בתכנון התזונה.")
+
+        await advance_after_answer(message, user_id)
+        return True
+
     if question is not None and not question.options:
         value: Any = text
         if question.numeric:
@@ -1893,8 +2565,7 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
                     properties={"items": parsed_items, "raw_text": text[:200]},
                 )
                 # Store structured restrictions provisionally
-                existing = await user_model.get_value(DB, user_id, "diet_restrictions")
-                parts = [p.strip() for p in str(existing).split(",") if p.strip()] if existing else []
+                parts = await _existing_list_value(user_id, "diet_restrictions")
                 for item_name in parsed_items:
                     if item_name and item_name not in parts:
                         parts.append(item_name)
@@ -1988,10 +2659,7 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
             )
             return True
         await clear_pending(user_id)
-        if await continue_after_plan_completion_answer(message, user_id):
-            return True
-        if not await ask_next_question(message, user_id):
-            await finish_onboarding(message, user_id)
+        await advance_after_answer(message, user_id)
         return True
 
     return False

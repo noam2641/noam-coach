@@ -66,7 +66,7 @@ def _callback_data(markup: Any) -> set[str]:
 
 
 @pytest.mark.asyncio
-async def test_next_meal_menu_exposes_feedback_buttons(
+async def test_next_meal_menu_exposes_direct_eat_and_plan_buttons(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -78,8 +78,15 @@ async def test_next_meal_menu_exposes_feedback_buttons(
     handled = await callback_menu_bot.handle_menu_callback(query, 1, "menu:nextmeal")
 
     assert handled is True
-    assert "nextmeal:dislike:1" in _callback_data(query.reply_markups[-1])
-    assert "nextmeal:dislike:2" in _callback_data(query.reply_markups[-1])
+    callbacks = _callback_data(query.reply_markups[-1])
+    assert "nextmeal:save:1" in callbacks
+    assert "nextmeal:plan:1" in callbacks
+    assert "nextmeal:save:2" in callbacks
+    assert "nextmeal:plan:2" in callbacks
+    assert "nextmeal:refresh" in callbacks
+    assert not any(data.startswith("nextmeal:choose:") for data in callbacks)
+    assert not any(data.startswith("nextmeal:dislike:") for data in callbacks)
+    assert not any(data.startswith("nextmeal:editqty:") for data in callbacks)
 
 
 @pytest.mark.asyncio
@@ -100,4 +107,6 @@ async def test_next_meal_not_suitable_is_temporary_not_permanent_dislike(
     assert await user_model.get_value(db, 1, "disliked_foods") in (None, "", "none", [])
     # A refreshed recommendation is shown.
     assert "רעננתי" in query.messages[-1] or "אפשרות" in query.messages[-1]
-    assert "nextmeal:dislike:1" in _callback_data(query.reply_markups[-1])
+    callbacks = _callback_data(query.reply_markups[-1])
+    assert "nextmeal:save:1" in callbacks
+    assert "nextmeal:plan:1" in callbacks

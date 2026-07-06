@@ -22,3 +22,7 @@ label { display:flex; flex-direction:column; gap:4px; font-size:14px; }
 input, select, textarea { padding:9px; border:1px solid #ccd3da; border-radius:8px; font:inherit; }
 .day-row { display:grid; grid-template-columns:80px 1fr 1fr 1fr; gap:8px; align-items:center; margin:6px 0; }
 .muted { color:#666; font-size:13px; }
+.ops-grid { display:grid; gap:8px; }
+.ops-item { border:1px solid #e3e7eb; border-radius:8px; padding:10px; }
+.ops-item b, .ops-item span { display:block; }
+.ops-item span { color:#444; margin-top:4px; }

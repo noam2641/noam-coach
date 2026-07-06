@@ -90,10 +90,10 @@ _WORKOUT_FACTS: dict = {
     "equipment": "חדר כושר מלא",
     "strength_experience": "intermediate",
     "weekly_availability": [
-        {"weekday": 0, "start": "18:30", "minutes": 50, "available": True},
-        {"weekday": 1, "start": "18:30", "minutes": 50, "available": True},
-        {"weekday": 3, "start": "18:30", "minutes": 50, "available": True},
-        {"weekday": 5, "start": "10:00", "minutes": 60, "available": True},
+        {"weekday": 0, "weekday_schema": "monday_first_v1", "start": "18:30", "minutes": 50, "available": True},
+        {"weekday": 1, "weekday_schema": "monday_first_v1", "start": "18:30", "minutes": 50, "available": True},
+        {"weekday": 3, "weekday_schema": "monday_first_v1", "start": "18:30", "minutes": 50, "available": True},
+        {"weekday": 5, "weekday_schema": "monday_first_v1", "start": "10:00", "minutes": 60, "available": True},
     ],
 }
 
@@ -121,7 +121,7 @@ class TestRecording04ReplayFlow:
         )
         await user_model.set_fact(
             db, 1, "workout_pattern",
-            {"weekly_frequency": 6, "common_weekdays": [0, 1, 2, 3, 4, 5],
+            {"weekly_frequency": 6, "common_weekdays": [0, 1, 2, 3, 4, 5], "weekday_schema": "monday_first_v1",
              "typical_hour": "07:00", "avg_duration_minutes": 45},
             kind=user_model.KIND_ESTIMATE,
             source=user_model.SOURCE_APPLE_HEALTH,
@@ -149,7 +149,7 @@ class TestRecording04ReplayFlow:
         )
         summary = format_availability_summary(avail)
         assert "4" in summary, "Must show max_days_per_week=4"
-        assert "ראשון" in summary, "Must mention Sunday (weekday 0)"
+        assert "שני" in summary, "Must mention Monday (weekday 0)"
 
     # ------------------------------------------------------------------ #
     # Step 3: workout proposal generation produces 3 candidates           #

@@ -197,7 +197,13 @@ class TestAvailabilityResolver:
         assert avail.max_days_per_week >= 1
         assert avail.session_minutes >= 10
         assert avail.source in (
-            "default", "inferred_history", "user_confirmed", "active_plan"
+            "default",
+            "legacy",
+            "fresh_health_inference",
+            "confirmed_health_inference",
+            "user_reported",
+            "user_confirmed",
+            "user_corrected",
         )
 
     async def test_explicit_overrides_inferred(self, tmp_path: Path):
@@ -237,8 +243,8 @@ class TestAvailabilityResolver:
         )
         summary = format_availability_summary(avail)
         assert "3" in summary
-        # "ראשון" (Sunday/day-0), "שלישי" (day-2), or "חמישי" (day-4)
-        day_names = ["ראשון", "שלישי", "חמישי"]
+        # Monday-first convention: 0=Monday, 2=Wednesday, 4=Friday.
+        day_names = ["שני", "רביעי", "שישי"]
         assert any(name in summary for name in day_names), (
             f"Summary must mention at least one day name: {summary!r}"
         )

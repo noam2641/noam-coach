@@ -19,6 +19,7 @@ from noam_coach.services.nutrition_context import (
     build_nutrition_ai_request,
     build_nutrition_context,
 )
+from noam_coach.services.weekdays import local_weekday
 
 
 async def _user(db: Database) -> None:
@@ -35,7 +36,7 @@ async def test_nutrition_context_counts_reported_not_planned_meals(tmp_path: Pat
     await _user(db)
     fixed_now = datetime(2026, 6, 28, 10, 0, tzinfo=TZ)
     now = fixed_now.isoformat()
-    sunday_index = (fixed_now.weekday() + 1) % 7
+    today_index = local_weekday(fixed_now)
     await db.execute(
         """
         INSERT INTO goal_versions(
@@ -60,7 +61,7 @@ async def test_nutrition_context_counts_reported_not_planned_meals(tmp_path: Pat
                 {
                     "days": [
                         {
-                            "weekday": sunday_index,
+                            "weekday": today_index,
                             "meals": [
                                 {"name": "breakfast", "calories": 500},
                                 {"name": "lunch", "calories": 800},
@@ -105,6 +106,9 @@ async def test_nutrition_context_counts_reported_not_planned_meals(tmp_path: Pat
 
     request = build_nutrition_ai_request(context, "menu")
     assert request["safety"]["do_not_treat_planned_meals_as_consumed"] is True
+    assert request["safety"]["require_output_validation"] is True
+    assert request["context_quality"]["data_completeness"] >= 0
+    assert request["context_quality"]["recommendation_quality"] in {"high", "medium", "low"}
     assert request["context"]["consumed_calories"] == 700
 
 

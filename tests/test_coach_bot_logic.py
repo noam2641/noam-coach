@@ -222,7 +222,7 @@ def test_more_keyboard_holds_rare_actions() -> None:
 def test_plans_keyboard_has_all_plans() -> None:
     kb = coach_bot.plans_keyboard()
     text = str(kb)
-    assert "A" in text and "B" in text and "C" in text and "Full Body" in text
+    assert "A" in text and "B" in text and "C" in text and "אימון גוף מלא" in text
 
 
 def test_onboarding_frequency_keyboard() -> None:
@@ -245,10 +245,12 @@ def test_exercise_picker_keyboard_has_exercises() -> None:
     assert len(flat) == len(plan_a["exercises"]) + 1  # + back button
 
 
-def test_exercise_params_keyboard_has_weight_adjustment() -> None:
+def test_exercise_params_keyboard_uses_text_edit_confirmation() -> None:
     kb = coach_bot.exercise_params_keyboard("A", 0)
     flat = [btn for row in kb.inline_keyboard for btn in row]
-    assert any("weight" in btn.callback_data for btn in flat)
+    callbacks = {btn.callback_data for btn in flat}
+    assert callbacks == {"workout:A", "editparams_menu:A"}
+    assert not any(str(btn.callback_data).startswith("param:") for btn in flat)
 
 
 def test_onboarding_open_keyboard() -> None:
@@ -316,6 +318,7 @@ def test_split_summary_line_zero_weight() -> None:
     result = coach_bot.split_summary_line(0.0, 10, 0.0, 10, 0)
     assert "0" in result
     assert "20" in result  # total reps
+    assert "RIR 0 / כשל" in result
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +367,11 @@ def test_rest_text_finished() -> None:
     result = coach_bot.rest_text(50.0, 8, 2, remaining=0, total_seconds=120)
     assert "הסתיימה" in result
     assert "🔔" in result
+
+
+def test_rest_text_labels_rir_zero_as_failure() -> None:
+    result = coach_bot.rest_text(50.0, 8, 0, remaining=90, total_seconds=120)
+    assert "RIR 0 / כשל" in result
 
 
 def test_rest_text_negative_remaining() -> None:

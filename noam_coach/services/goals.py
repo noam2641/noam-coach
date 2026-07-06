@@ -286,6 +286,7 @@ async def compute_personal_targets(user_id: int) -> targets.Targets | None:
     age = await user_model.get_value(DB, user_id, "age")
     goal_weight = await user_model.get_value(DB, user_id, "goal_weight_kg")
     body_fat = await user_model.get_value(DB, user_id, "body_fat_pct")
+    timeframe = await user_model.get_value(DB, user_id, "goal_timeframe_weeks")
     profile = await load_routine_profile(user_id)
     workouts = (profile.get("workout") or {}).get("weekly_frequency")
     goal_type = _goal_type_from_fact(await user_model.get_value(DB, user_id, "primary_goal"))
@@ -299,6 +300,7 @@ async def compute_personal_targets(user_id: int) -> targets.Targets | None:
         workouts_per_week=workouts,
         goal_weight_kg=float(goal_weight) if goal_weight is not None else None,
         body_fat_pct=float(body_fat) if body_fat is not None else None,
+        goal_timeframe_weeks=float(timeframe) if timeframe is not None else None,
     )
 
 

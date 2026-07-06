@@ -46,7 +46,29 @@ async function loadDashboard() {
     box.innerHTML += `תזונה: <b>${escapeHtml(plans.nutrition?.title || 'טרם נבחרה')}</b><br>` +
       `אימונים: <b>${escapeHtml(plans.workout?.title || 'טרם נבחרה')}</b><br>` +
       `שבוע מאוחד: <b>${escapeHtml(plans.unified?.title || 'טרם נבנה')}</b>`;
+    renderOperations(data.operations || {});
   } catch (err) { box.innerHTML = errorHtml(err); }
+}
+
+function renderOperations(operations) {
+  const box = document.getElementById('operationsBox');
+  if (!box) return;
+  const pain = operations.active_pain || [];
+  const session = operations.active_session;
+  const load = operations.current_load_decision;
+  const painText = pain.length
+    ? pain.map(item => `${escapeHtml(item.label || item.region)} (${escapeHtml(item.severity ?? 'לא צוין')})`).join(', ')
+    : 'אין כאב פעיל';
+  const sessionText = session
+    ? `${escapeHtml(session.name || session.code || 'אימון')} · תרגיל ${Number(session.exercise_index) + 1} · סט ${escapeHtml(session.set_number)}`
+    : 'אין אימון פעיל';
+  const loadText = load
+    ? `${escapeHtml(load.decision)} · ${escapeHtml(load.recommended_weight)} ק״ג × ${escapeHtml(load.recommended_reps)}`
+    : 'אין החלטת עומס פעילה';
+  box.innerHTML =
+    `<div class="ops-item"><b>כאב פעיל</b><span>${painText}</span></div>` +
+    `<div class="ops-item"><b>אימון פעיל</b><span>${sessionText}</span></div>` +
+    `<div class="ops-item"><b>החלטת עומס</b><span>${loadText}</span></div>`;
 }
 
 async function loadNextMeal() {

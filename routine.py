@@ -24,9 +24,16 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Protocol, Sequence
 from zoneinfo import ZoneInfo
 
+from noam_coach.services.weekdays import WEEKDAY_SCHEMA_VERSION
+
 # Default learning window. Long enough to be stable, short enough to track
 # recent changes in routine.
 DEFAULT_WINDOW_DAYS = 45
+
+# Fixed recent window used to detect a shift away from the long-run average
+# (e.g. "overall 2.5/week, but the last 14 days show 2/week"). Fixed rather
+# than exponentially-weighted so the comparison is easy to explain to users.
+RECENT_WINDOW_DAYS = 14
 
 
 class SupportsFetchAll(Protocol):
@@ -131,6 +138,13 @@ class WorkoutPattern:
     common_weekdays: list[int] = field(default_factory=list)  # 0=Mon
     avg_duration_minutes: float | None = None
     sessions_sampled: int = 0
+    weekday_schema: str = WEEKDAY_SCHEMA_VERSION
+    # Recent-window frequency, for detecting a shift away from the long-run
+    # average (see RECENT_WINDOW_DAYS). None when there isn't enough recent
+    # data sampled to compute it separately.
+    recent_weekly_frequency: float | None = None
+    recent_window_days: int = RECENT_WINDOW_DAYS
+    recent_sessions_sampled: int = 0
 
 
 @dataclass
@@ -150,6 +164,77 @@ class RoutineProfile:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+# ---------------------------------------------------------------------------
+# Trend proposals — compare the long-run average against the recent window
+# and, when they meaningfully disagree, recommend based on the recent trend
+# rather than silently defaulting to whichever number was computed last.
+# ---------------------------------------------------------------------------
+
+# A recent vs. overall gap below this (in the metric's own units) is treated
+# as noise, not a real behavior shift.
+FREQUENCY_TREND_THRESHOLD = 0.5
+
+
+@dataclass
+class TrendProposal:
+    metric: str
+    overall_value: float
+    recent_value: float
+    recommended_value: float
+    message: str
+    # Button choices offered alongside free-text entry: (label, value).
+    choices: list[tuple[str, float]] = field(default_factory=list)
+
+
+def build_frequency_trend_proposal(
+    pattern: WorkoutPattern,
+    *,
+    min_sessions_sampled: int = 3,
+) -> TrendProposal | None:
+    """Compare overall vs. recent weekly training frequency.
+
+    Returns None when there isn't enough data to trust the comparison, or the
+    recent window agrees with the overall average (nothing to surface).
+    Otherwise returns a proposal anchored on the *recent* trend: the
+    recommendation is the recent frequency rounded up by one training day,
+    capped at a realistic increment, matching the product intent of nudging
+    the plan toward what the user is actually doing lately rather than a
+    stale long-run average.
+    """
+    overall = pattern.weekly_frequency
+    recent = pattern.recent_weekly_frequency
+    if overall is None or recent is None:
+        return None
+    if pattern.sessions_sampled < min_sessions_sampled or pattern.recent_sessions_sampled < min_sessions_sampled:
+        return None
+    if abs(overall - recent) < FREQUENCY_TREND_THRESHOLD:
+        return None
+
+    recent_rounded = max(1, round(recent))
+    recommended_low = min(6, recent_rounded + 1)
+    recommended_high = min(6, recent_rounded + 2)
+
+    message = (
+        f"זוהתה שגרת אימונים לאחרונה של כ-{recent_rounded} אימונים בשבוע "
+        f"(ממוצע כללי: {overall:g}). אמליץ על {recommended_low}-{recommended_high} "
+        "אימונים בשבוע. אנא ציין את מספר האימונים הרצוי לשבוע."
+    )
+    choices = [
+        (f"המשך עם {recent_rounded}", float(recent_rounded)),
+        (f"עבור ל-{recommended_low}", float(recommended_low)),
+    ]
+    if recommended_high != recommended_low:
+        choices.append((f"עבור ל-{recommended_high}", float(recommended_high)))
+    return TrendProposal(
+        metric="training_frequency",
+        overall_value=overall,
+        recent_value=recent,
+        recommended_value=float(recommended_low),
+        message=message,
+        choices=choices,
+    )
 
 
 def _to_local(iso: str, tz: ZoneInfo) -> dt.datetime:
@@ -248,12 +333,21 @@ async def learn_workout_pattern(
     common = sorted(weekday_counts, key=lambda d: weekday_counts[d], reverse=True)
     weeks = max(1.0, window_days / 7.0)
     _mean_duration = robust_mean(durations)
+
+    recent_cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=RECENT_WINDOW_DAYS)
+    recent_rows = [row for row in rows if _to_local(row["start_time"], tz) >= recent_cutoff]
+    recent_weeks = max(1.0, RECENT_WINDOW_DAYS / 7.0)
+
     return WorkoutPattern(
         weekly_frequency=round(len(rows) / weeks, 1),
         typical_hour=hour_to_hhmm(circular_hour_mean(hours)),
         common_weekdays=[d for d in common if weekday_counts[d] >= 2][:4] or common[:2],
         avg_duration_minutes=(round(_mean_duration, 1) if _mean_duration is not None else None),
         sessions_sampled=len(rows),
+        recent_weekly_frequency=(
+            round(len(recent_rows) / recent_weeks, 1) if recent_rows else None
+        ),
+        recent_sessions_sampled=len(recent_rows),
     )
 
 

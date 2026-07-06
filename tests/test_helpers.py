@@ -45,7 +45,8 @@ def test_safe_html_block_newlines():
 def test_friendly_error_hides_secrets():
     msg = friendly_error(RuntimeError("password=secret123"), "test")
     assert "secret123" not in msg
-    assert "קוד תקלה" in msg
+    assert "קוד תקלה" not in msg
+    assert "לנסות שוב" in msg
 
 
 def test_today_bounds_utc():

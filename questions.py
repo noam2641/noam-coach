@@ -37,6 +37,10 @@ class Question:
     options: list[tuple[str, Any]]  # (label, value); empty -> free text
     affects: tuple[str, ...]  # decisions changed by the answer (must be set)
     numeric: bool = False  # free-text answer should be parsed as a number
+    # When True, the question keeps a single "none" button but also accepts a
+    # typed free-text answer directly at the same prompt — no extra tap to
+    # reach a "yes"/"other" button before typing is required.
+    free_text_fallback: bool = False
     min_value: float | None = None
     max_value: float | None = None
     unit: str = ""
@@ -77,7 +81,8 @@ SAFETY_QUESTIONS: list[Question] = [
             "לפני שאבנה תוכנית אימון — יש כרגע כאב, פציעה או מגבלה פעילה "
             "שכדאי שאתחשב בה בבחירת התרגילים?"
         ),
-        options=[("אין", "none"), ("יש", "has_pain")],
+        options=[("אין", "none")],
+        free_text_fallback=True,
         affects=("exercise_selection", "safety"),
         safety=5,
         plan_impact=4,
@@ -89,7 +94,8 @@ SAFETY_QUESTIONS: list[Question] = [
         id="safety_medical_avoidance",
         fact_key="medical_avoidance",
         text=("האם רופא הנחה אותך להימנע מסוג פעילות מסוים? זה ישפיע על אילו תרגילים אכלול."),
-        options=[("לא", "none"), ("כן", "has_avoidance")],
+        options=[("לא", "none")],
+        free_text_fallback=True,
         affects=("exercise_selection", "safety"),
         safety=5,
         plan_impact=3,
@@ -144,6 +150,48 @@ PLAN_QUESTIONS: list[Question] = [
         burden=1,
     ),
     Question(
+        id="q_height",
+        fact_key="height_cm",
+        text="מה הגובה שלך בס\"מ? כתוב מספר (למשל 175).",
+        options=[],  # free text number
+        numeric=True,
+        min_value=120,
+        max_value=230,
+        unit="ס\"מ",
+        affects=("calorie_target",),
+        plan_impact=3,
+        uncertainty=3,
+        burden=1,
+    ),
+    Question(
+        id="q_goal_weight",
+        fact_key="goal_weight_kg",
+        text="מה משקל היעד שלך? כתוב מספר בק\"ג (למשל 80).",
+        options=[],  # free text number
+        numeric=True,
+        min_value=30,
+        max_value=300,
+        unit='ק"ג',
+        affects=("calorie_target", "rate_of_loss"),
+        plan_impact=5,
+        uncertainty=3,
+        burden=1,
+    ),
+    Question(
+        id="q_goal_timeframe",
+        fact_key="goal_timeframe_weeks",
+        text="תוך כמה זמן תרצה להגיע למשקל היעד?",
+        options=[
+            ("3 חודשים", 13),
+            ("6 חודשים", 26),
+            ("שנה", 52),
+        ],
+        affects=("calorie_target", "rate_of_loss"),
+        plan_impact=4,
+        uncertainty=3,
+        burden=1,
+    ),
+    Question(
         id="q_training_days",
         fact_key="training_days_per_week",
         text="כמה ימים בשבוע תוכל להתאמן בפועל? כתוב מספר (למשל 3).",
@@ -194,7 +242,7 @@ PLAN_QUESTIONS: list[Question] = [
     Question(
         id="q_diet_restrictions",
         fact_key="diet_restrictions",
-        text="יש מאכלים שאתה לא אוכל או מעדיף להימנע מהם? (אפשר לכתוב חופשי)",
+        text="איזה מזונות אתה מעדיף לא לאכול? (אפשר לכתוב חופשי)",
         options=[],
         affects=("menu_planning",),
         plan_impact=3,
@@ -205,8 +253,9 @@ PLAN_QUESTIONS: list[Question] = [
     Question(
         id="q_allergies",
         fact_key="allergies",
-        text="יש אלרגיות או רגישויות מזון שחשוב שאדע? (אפשר לכתוב חופשי)",
-        options=[("אין", "none"), ("יש", "has")],
+        text="איזה מזונות עושים לך רגישות או אסורים לך? (אפשר לכתוב חופשי)",
+        options=[("אין אלרגיות/רגישויות", "none")],
+        free_text_fallback=True,
         affects=("menu_planning", "safety"),
         safety=3,
         plan_impact=3,
@@ -264,8 +313,9 @@ JIT_QUESTIONS: list[Question] = [
     Question(
         id="q_equipment",
         fact_key="equipment",
-        text="איזה ציוד זמין במקום שבו תתאמן? אפשר לכתוב בקצרה או לבחור חדר כושר מלא.",
-        options=[("חדר כושר מלא", "full_gym"), ("משקולות בבית", "home_dumbbells"), ("משקל גוף", "bodyweight"), ("אחר", "custom")],
+        text="איזה ציוד זמין במקום שבו תתאמן? אפשר לכתוב בקצרה או לבחור אחת מהאפשרויות.",
+        options=[("חדר כושר מלא", "full_gym"), ("משקולות בבית", "home_dumbbells"), ("משקל גוף", "bodyweight")],
+        free_text_fallback=True,
         affects=("exercise_selection",),
         plan_impact=5,
         uncertainty=4,

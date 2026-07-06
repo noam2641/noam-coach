@@ -37,6 +37,14 @@ class FakeContext:
         self.bot = object()
 
 
+class FakeMessage:
+    def __init__(self) -> None:
+        self.replies: list[str] = []
+
+    async def reply_text(self, text: str) -> None:
+        self.replies.append(text)
+
+
 @pytest.mark.asyncio
 async def test_transient_telegram_error_is_not_admin_spam(
     monkeypatch: pytest.MonkeyPatch,
@@ -56,6 +64,36 @@ async def test_transient_telegram_error_is_not_admin_spam(
     assert logger.warnings
     assert not logger.errors
     assert admin_messages == []
+
+
+@pytest.mark.asyncio
+async def test_user_error_message_does_not_expose_error_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeUser:
+        id = 1
+
+    class FakeUpdate:
+        def __init__(self) -> None:
+            self.effective_message = FakeMessage()
+            self.effective_user = FakeUser()
+            self.callback_query = None
+
+    update = FakeUpdate()
+
+    async def notify_admin(_bot: object, _text: str) -> None:
+        return None
+
+    monkeypatch.setattr(coach_bot, "Update", FakeUpdate)
+    monkeypatch.setattr(coach_bot, "LOGGER", FakeLogger())
+    monkeypatch.setattr(coach_bot, "notify_admin", notify_admin)
+
+    await callback_router.on_error(update, FakeContext(RuntimeError("boom")))  # type: ignore[arg-type]
+
+    assert update.effective_message.replies
+    reply = update.effective_message.replies[0]
+    assert "קוד תקלה" not in reply
+    assert "error" not in reply.lower()
 
 
 def test_admin_notifications_are_deduplicated_by_fingerprint() -> None:

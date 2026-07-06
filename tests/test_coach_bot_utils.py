@@ -44,7 +44,8 @@ def test_friendly_error_hides_details() -> None:
     msg = coach_bot.friendly_error(RuntimeError("db_password=secret"), "test")
     assert "secret" not in msg
     assert "db_password" not in msg
-    assert "קוד תקלה" in msg
+    assert "קוד תקלה" not in msg
+    assert "לנסות שוב" in msg
 
 
 def test_today_bounds_utc_returns_pair() -> None:

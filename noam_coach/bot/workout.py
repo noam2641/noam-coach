@@ -66,6 +66,7 @@ import reconcile
 import targets
 import training_intelligence
 import user_model
+from noam_coach.services import daily_state
 
 # --- Extracted modules (re-exported for backward compatibility) ---
 from config import (  # noqa: F401
@@ -112,48 +113,26 @@ RUNTIME_NAMES = ('Any', 'DB', 'Exception', 'InlineKeyboardMarkup', 'KeyError', '
 @runtime_bound(RUNTIME_NAMES)
 async def today_meals(user_id: int) -> list[dict[str, Any]]:
     """Return today's saved meals (the rows that make up the daily total)."""
-    start, end = today_bounds_utc()
-    return await DB.fetch_all(
-        """
-        SELECT id, name, calories, protein, eaten_at
-        FROM meals WHERE user_id=? AND eaten_at>=? AND eaten_at<?
-        ORDER BY eaten_at
-        """,
-        (user_id, start, end),
-    )
+    return await daily_state.consumed_meals(DB, user_id)
 
 
 @runtime_bound(RUNTIME_NAMES)
 async def build_daily_status(user_id: int) -> str:
-    # Single source of truth: the same computed targets the recommendations use.
+    """RE10-13: rich "מצב היום" built from the single nutrition-context source
+    of truth (D4/D9/D10), with NO stale Apple Health activity section (that
+    freshness warning belongs to the Health screens, not here).
+    """
+    from noam_coach.services.next_meal import (
+        build_workout_nutrition_context,
+        generate_next_meal_recommendation,
+    )
+    from noam_coach.services.nutrition_context import build_nutrition_context
+    from noam_coach.services.next_meal import build_remaining_slot_allocations
+
     goal = await fetch_goal(user_id)
-    calories, protein = await today_consumed(user_id)
     meals = await today_meals(user_id)
     meal_count = len(meals)
-
-    # Weight: show the 7-day moving average (smoothing) alongside the latest.
-    weight = await user_model.get_value(DB, user_id, "weight_kg")
-    avg7 = await DB.fetch_one(
-        "SELECT AVG(value) AS v FROM health "
-        "WHERE user_id=? AND sample_type='weight' "
-        "AND start_time >= ?",
-        (user_id, (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()),
-    )
-
-    # Steps are retrospective (no live watch). Show the last imported day, not a
-    # misleading "today" that is almost always zero.
-    last_steps = await DB.fetch_one(
-        "SELECT value, start_time FROM health "
-        "WHERE user_id=? AND sample_type='steps' "
-        "ORDER BY start_time DESC LIMIT 1",
-        (user_id,),
-    )
-
-    cal_remaining = goal["calories"] - calories
-    prot_remaining = goal["protein"] - protein
-
     provisional = bool(goal.get("provisional"))
-    goal_note = " <i>(יעד זמני)</i>" if provisional else ""
 
     lines = ["<b>מצב היום</b>", ""]
 
@@ -164,79 +143,112 @@ async def build_daily_status(user_id: int) -> str:
             "עדיין לא דיווחת ארוחות היום.",
             "",
             "<b>יעדים:</b>",
-            f"יעד קלוריות: <b>{goal['calories']}</b>{goal_note}",
-            f"יעד חלבון: <b>{goal['protein']} גרם</b>",
         ]
+        goal_note = " <i>(יעד זמני — עוד לא אושר)</i>" if provisional else ""
+        lines.append(f"יעד קלוריות: <b>{goal['calories']}</b>{goal_note}")
+        lines.append(f"יעד חלבון: <b>{goal['protein']} גרם</b>")
         if provisional:
-            lines.append(
-                "<i>היעד זמני כי עדיין חסרים נתוני פעילות או אישור סופי של התוכנית.</i>"
-            )
-        # Health freshness
-        from health_service import health_export_freshness, freshness_warning_text
-        freshness_info = await health_export_freshness(user_id)
-        warning = freshness_warning_text(freshness_info)
-        lines.append("")
-        if warning:
-            lines.append("<b>נתוני פעילות:</b>")
-            lines.append(f"<i>{esc(warning)}</i>")
-        else:
-            lines.append("<b>נתוני פעילות:</b>")
-            lines.append("נתוני Apple Health עדכניים ✅")
+            lines.append("<i>אשר את היעד דרך \"יעדים\" כדי שההמלצות יהיו מדויקות.</i>")
         lines.append("")
         lines.append("<i>שלח תמונה של אוכל או כתוב מה אכלת כדי להתחיל מעקב.</i>")
         return "\n".join(lines)
 
-    if cal_remaining >= 0:
-        cal_line = f"נותרו: <b>{cal_remaining:.0f}</b>"
-    else:
-        cal_line = f"חריגה: <b>{abs(cal_remaining):.0f} קלוריות מעל היעד</b>"
+    context = await build_nutrition_context(DB, user_id, "daily_status")
+    workout_context = await build_workout_nutrition_context(DB, user_id)
 
-    if prot_remaining >= 0:
-        prot_line = f"נותרו: <b>{prot_remaining:.0f} גרם</b>"
-    else:
-        prot_line = f"מעל היעד ב־<b>{abs(prot_remaining):.0f} גרם</b>"
+    cal_remaining = context.remaining_calories
+    prot_remaining = context.remaining_protein
+    goal_note = " <i>(יעד זמני — עוד לא אושר)</i>" if provisional else ""
 
-    lines += [
-        f"דווחו <b>{meal_count}</b> ארוחות היום:",
-        *[
-            f"• {esc(m['name'])} — {float(m['calories']):.0f} קק\"ל, {float(m['protein']):.0f}ג׳ חלבון"
-            for m in meals
-        ],
-        "",
-        f"קלוריות: <b>{calories:.0f} מתוך {goal['calories']}</b>{goal_note}",
-        cal_line,
-        "",
-        f"חלבון: <b>{protein:.0f} מתוך {goal['protein']} גרם</b>",
-        prot_line,
-        "",
-        "<i>הסכום מחושב מהארוחות שדווחו בלבד — ייתכן שאכלת עוד.</i>",
-        "",
-    ]
-    if weight is not None:
-        wline = f'משקל אחרון: <b>{float(weight):.1f} ק"ג</b>'
-        if avg7 and avg7["v"]:
-            wline += f" (ממוצע 7 ימים: {float(avg7['v']):.1f})"
-        lines.append(wline)
+    if cal_remaining is None:
+        cal_line = "לא ניתן לחשב יתרה (אין יעד פעיל)."
+    elif cal_remaining >= 0:
+        cal_line = f"נשארו לך היום <b>{cal_remaining:.0f}</b> קלוריות"
     else:
-        lines.append("משקל: <b>לא התקבל</b>")
-    if last_steps and last_steps["value"]:
-        day = (last_steps["start_time"] or "")[:10]
-        lines.append(f"צעדים (יום אחרון שנקלט {day}): <b>{round(float(last_steps['value'])):,}</b>")
-        lines.append("<i>צעדי היום אינם בזמן אמת — מחושבים מהייצוא.</i>")
+        cal_line = f"חריגה של <b>{abs(cal_remaining):.0f}</b> קלוריות מעל היעד"
 
-    # REC-ONBOARD-02-13: health freshness section
-    from health_service import health_export_freshness, freshness_warning_text
-    freshness_info = await health_export_freshness(user_id)
-    warning = freshness_warning_text(freshness_info)
-    if warning:
+    if prot_remaining is not None:
+        if prot_remaining >= 0:
+            cal_line += f" ו-<b>{prot_remaining:.0f}</b> גרם חלבון{goal_note}."
+        else:
+            cal_line += f", וחריגה של <b>{abs(prot_remaining):.0f}</b> גרם חלבון מעל היעד{goal_note}."
+    else:
+        cal_line += f"{goal_note}."
+
+    lines.append(cal_line)
+
+    if context.hours_until_sleep is not None:
+        bedtime_line = f"עד שינה נשאר כ-{context.hours_until_sleep:.1f} שעות."
+        lines.append(bedtime_line)
+
+    # RE10-13: "planned workout that has not been reported" gets a single,
+    # explicit assumption line — never silently assumed without saying so.
+    workout_assumed_pre = (
+        workout_context.workout_source == "active_workout_plan"
+        and workout_context.workout_phase.value.startswith("pre_workout")
+    )
+    if workout_assumed_pre:
+        lines.append("תוכנן אימון היום שעדיין לא דווח — אניח שאתה לפני אימון.")
+
+    lines.append("")
+    lines.append(f"דווחו <b>{meal_count}</b> ארוחות היום:")
+    lines.extend(
+        f"• {esc(m['name'])} — {float(m['calories']):.0f} קק\"ל, {float(m['protein']):.0f}ג׳ חלבון"
+        for m in meals
+    )
+    lines.append("<i>הסכום שדווחו בלבד — ייתכן שאכלת עוד.</i>")
+
+    allocations = build_remaining_slot_allocations(workout_context)
+    if allocations:
         lines.append("")
-        lines.append(f"<i>{esc(warning)}</i>")
+        lines.append("<b>ארוחות עד סוף היום:</b>")
+        for allocation in allocations:
+            if allocation.is_night_meal:
+                lines.append(f"{esc(allocation.label)} — כ-{allocation.calories} קל'")
+            else:
+                lines.append(
+                    f"{esc(allocation.label)} — כ-{allocation.calories} קל' | כ-{allocation.protein} גרם חלבון"
+                )
+        lines.append("<i>(הקלוריות והחלבון לפי היתרה שנותרה, ומתעדכנים ככל שמדווחים ארוחות)</i>")
+
+    try:
+        recommendation = await generate_next_meal_recommendation(DB, user_id)
+    except Exception:  # noqa: BLE001 - the day summary must render even if the recommender fails
+        recommendation = None
+    if recommendation is not None and recommendation.options:
+        from noam_coach.services.next_meal import format_next_meal_recommendation
+
+        lines.append("")
+        lines.append("<b>הארוחה הבאה שלך:</b>")
+        lines.append(format_next_meal_recommendation(recommendation))
 
     if provisional:
         lines.append("")
-        lines.append("<i>היעד זמני כי עדיין חסרים נתוני פעילות או אישור סופי של התוכנית.</i>")
+        lines.append("<i>היעד זמני כי עדיין חסר אישור סופי — אפשר לאשר דרך \"יעדים\".</i>")
 
     return "\n".join(lines)
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def _exercise_pain_warning_line(user_id: int, current: dict[str, Any]) -> str:
+    """A specific, per-exercise warning when this exercise loads a region the
+    user recently reported pain in — shown on the exercise card itself
+    (not just a general banner at the start of the workout), and offered
+    before the user has to tap "⚠️ כאב" again."""
+    profile = training_intelligence.CATALOG.get(str(current.get("id")))
+    if profile is None or not profile.joint_load:
+        return ""
+    rows = await DB.fetch_all(
+        "SELECT * FROM medical_constraints WHERE user_id=? AND kind='pain'",
+        (user_id,),
+    )
+    if not rows:
+        return ""
+    regions = training_intelligence.active_pain_regions(rows)
+    hit = next((regions[j] for j in profile.joint_load if j in regions), None)
+    if hit is None:
+        return ""
+    return f"⚠️ <i>{esc(training_intelligence.pain_safety_guidance(hit))}</i>\n"
 
 
 @runtime_bound(RUNTIME_NAMES)
@@ -265,6 +277,7 @@ async def show_session(query: Any, user_id: int, session_id: int) -> None:
     cues = "\n".join(f"• {cue}" for cue in current["cues"])
     muscle = current.get("muscle")
     muscle_line = f"🎯 שריר מטרה: <b>{muscle}</b>\n" if muscle else ""
+    pain_warning_line = await _exercise_pain_warning_line(user_id, current)
 
     # Progression rationale comes from recommend_load — surface it so the weight
     # is explained rather than appearing arbitrary (P1).
@@ -313,6 +326,7 @@ async def show_session(query: Any, user_id: int, session_id: int) -> None:
         f"{rest_line}"
         f"{why_line}"
         f"{prev_line}"
+        f"{pain_warning_line}"
         f"\n<b>דגשים</b>\n{cues}"
     )
     keyboard = InlineKeyboardMarkup(
@@ -328,9 +342,10 @@ async def show_session(query: Any, user_id: int, session_id: int) -> None:
                 button("סט מפוצל", session_action_data("split", session)),
             ],
             [
-                button("מכשיר תפוס", session_action_data("occupied", session)),
+                button("ציוד/מכשיר תפוס", session_action_data("occupied", session)),
                 button("⚠️ כאב", session_action_data("pain", session)),
             ],
+            [button("איך חושב?", session_action_data("loadwhy", session))],
             [button("סיים", session_action_data("finish", session))],
         ]
     )
@@ -536,7 +551,7 @@ async def workout_summary(user_id: int, session_id: int) -> str:
         "",
         f"משך: <b>{duration} דקות</b>",
         f"סטים: <b>{set_count}" + (f" מתוך {planned_sets}" if planned_sets else "") + "</b>",
-        f"נפח: <b>{volume:,.0f} ק״ג</b> <i>(סכום משקל×חזרות)</i>",
+        f"נפח עבודה: <b>{volume:,.0f} ק״ג×חזרות</b> <i>(סכום משקל×חזרות)</i>",
     ]
     if duration <= 0 or set_count <= 1:
         lines.append("")

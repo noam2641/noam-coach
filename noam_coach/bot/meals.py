@@ -109,9 +109,10 @@ from noam_coach.services.nutrition_context import (
     build_nutrition_ai_request,
     build_nutrition_context,
 )
-from noam_coach.services.dietary_restrictions import (
-    load_restrictions_from_facts,
-    validate_meal_restrictions,
+from noam_coach.services.meal_validation import (
+    MealValidationResult,
+    validate_meal_analysis,
+    validate_meal_analysis_for_user,
 )
 
 RUNTIME_NAMES = ('Any', 'ContextTypes', 'DB', 'Exception', 'FoodItem', 'InlineKeyboardButton', 'InlineKeyboardMarkup', 'LOGGER', 'MealAnalysis', 'ParseMode', 'Path', 'SETTINGS', 'Update', 'ValueError', '_AlreadyDecided', '_dt', '_item_line', 'abs', 'allergies_val', 'analysis', 'analyze_meal_image', 'any', 'approval', 'approval_id', 'asyncio', 'auto_save_meal', 'bool', 'button', 'bytes', 'cal', 'caption', 'clear_meal_fix', 'conn', 'conversation', 'count', 'create_approval', 'cur', 'cursor', 'cutoff', 'data_quality', 'datetime', 'decide_approval', 'dict', 'diet_restrictions', 'diff', 'duplicate_approval_id', 'duplicate_id', 'edit_meal_id', 'edited_existing', 'ensure_user', 'enumerate', 'esc', 'event_log', 'exc', 'fetch_approval', 'file_unique_id', 'float', 'folder', 'friendly_error', 'handed_off', 'hasattr', 'high', 'home_keyboard', 'i', 'image_bytes', 'image_path', 'index', 'int', 'is_allowed', 'item', 'item_count', 'item_index', 'item_name_lower', 'items', 'json', 'keyboard', 'line', 'list', 'low', 'macro_cal', 'macro_diff', 'max', 'meal', 'meal_id', 'meal_intelligence', 'message', 'now', 'option', 'option_rows', 'path', 'payload', 'pending_dup', 'persist_meal', 'photo_obj', 'progress', 'query', 'range', 'reanalyze_meal_with_text_and_image', 'recent', 'refine_count', 'refine_hint', 'render_meal', 'report', 'restriction', 'restriction_block', 'restriction_lower', 'restriction_warnings', 'restricted_items', 'row', 'rows', 'safe_edit', 'saved_dup', 'secrets', 'set_meal_fix', 'should_auto_approve', 'str', 'suppress', 'target', 'telegram_file', 'telegram_file_unique_id', 'text', 'timedelta', 'timezone', 'totals', 'update', 'user_id', 'user_model', 'utc_now', 'write_audit')
@@ -193,7 +194,7 @@ async def analyze_duplicate_candidate(
             nutrition_context=nutrition_payload,
         )
     else:
-        analysis = await analyze_meal_image(image_bytes)
+        analysis = await analyze_meal_image(image_bytes, user_id=user_id)
     approval_id = await create_approval(
         user_id,
         "meal",
@@ -306,7 +307,7 @@ async def handle_photo(
             )
             analysis.notes = (analysis.notes + [f"תיאור מהמשתמש: {caption}"])[-10:]
         else:
-            analysis = await analyze_meal_image(image_bytes)
+            analysis = await analyze_meal_image(image_bytes, user_id=user_id)
         if not analysis.is_meaningful():
             await progress.edit_text("לא זוהתה ארוחה (אין מזון או ערכים תזונתיים). נסה תמונה ברורה יותר.")
             return
@@ -447,6 +448,8 @@ async def persist_meal(user_id: int, approval_id: str) -> int | None:
     telegram_file_unique_id: str | None = None
     edited_existing = False
     try:
+        diet_restrictions = await user_model.get_value(DB, user_id, "diet_restrictions")
+        allergies_val = await user_model.get_value(DB, user_id, "allergies")
         async with DB.transaction() as conn:
             cursor = await conn.execute(
                 "SELECT * FROM approvals WHERE id=? AND user_id=? AND status='pending'",
@@ -460,6 +463,13 @@ async def persist_meal(user_id: int, approval_id: str) -> int | None:
             if not analysis.is_meaningful():
                 # Final gate: never persist an empty / all-zero "meal" (P0).
                 raise ValueError("אי אפשר לשמור ארוחה ללא מזון או ערכים תזונתיים")
+            validation = validate_meal_analysis(
+                analysis,
+                diet_restrictions=diet_restrictions,
+                allergies=allergies_val,
+            )
+            if validation.blocked:
+                raise ValueError(validation.issues[0].message)
             totals = analysis.totals()
             image_path = payload.get("image")
             telegram_file_unique_id = approval["telegram_file_unique_id"]
@@ -563,6 +573,9 @@ async def persist_meal(user_id: int, approval_id: str) -> int | None:
 @runtime_bound(RUNTIME_NAMES)
 async def should_auto_approve(user_id: int, analysis: MealAnalysis) -> bool:
     """Auto-approve only after learning and a strict data-quality gate."""
+    validation = await validate_meal_analysis_for_user(DB, user_id, analysis)
+    if validation.blocked:
+        return False
     report = data_quality.assess_meal(analysis)
     if not report.usable or report.score < 0.9:
         return False
@@ -607,33 +620,11 @@ async def render_meal(target: Any, user_id: int, approval_id: str, refine_count:
     analysis = MealAnalysis.model_validate(row["data"]["analysis"])
     totals = analysis.totals()
 
-    # REC-PROGRAM-04-06: Allergy-safe recommendation firewall
+    validation: MealValidationResult = await validate_meal_analysis_for_user(DB, user_id, analysis)
     restriction_warnings = []
-    diet_restrictions = await user_model.get_value(DB, user_id, "diet_restrictions")
-    allergies_val = await user_model.get_value(DB, user_id, "allergies")
-    active_restrictions = load_restrictions_from_facts(diet_restrictions, allergies_val)
-    if active_restrictions:
-        item_dicts = [{"item_name": item.name} for item in analysis.items]
-        violations = validate_meal_restrictions(item_dicts, active_restrictions)
-        for violation in violations:
-            item_name = violation["item_name"]
-            restr = violation["restriction"]
-            action = violation["action"]
-            if action == "block":
-                restriction_warnings.append(
-                    f"⛔ <b>{esc(item_name)}</b> — "
-                    f"אלרגיה/רגישות: {esc(restr.user_label or restr.canonical_id)}"
-                )
-            elif action == "warn":
-                restriction_warnings.append(
-                    f"⚠️ <b>{esc(item_name)}</b> — "
-                    f"רשום אצלך כהימנעות: {esc(restr.user_label or restr.canonical_id)}"
-                )
-            elif action == "substitute":
-                restriction_warnings.append(
-                    f"🔄 <b>{esc(item_name)}</b> — "
-                    f"מרכיב לא זמין: {esc(restr.user_label or restr.canonical_id)}"
-                )
+    for issue in validation.issues:
+        icon = "⛔" if issue.severity == "block" else "⚠️"
+        restriction_warnings.append(f"{icon} {esc(issue.message)}")
 
     def _item_line(index: int, item: "FoodItem") -> str:
         line = (
@@ -697,12 +688,16 @@ async def render_meal(target: Any, user_id: int, approval_id: str, refine_count:
             for index, option in enumerate(analysis.options[:4])
         ]
         option_rows.append([button("✍️ תיאור נוסף", f"fixmeal:{approval_id}")])
-        option_rows.append(
-            [
-                button("✅ אישור", f"approve_meal:{approval_id}"),
-                button("❌ דחה", f"reject_meal:{approval_id}"),
-            ]
-        )
+        if validation.blocked:
+            text += "\n\n<b>אי אפשר לשמור עד שמתקנים את זה.</b>"
+            option_rows.append([button("❌ דחה", f"reject_meal:{approval_id}")])
+        else:
+            option_rows.append(
+                [
+                    button("✅ אישור", f"approve_meal:{approval_id}"),
+                    button("❌ דחה", f"reject_meal:{approval_id}"),
+                ]
+            )
         keyboard = InlineKeyboardMarkup(option_rows)
     else:
         text = (
@@ -714,18 +709,27 @@ async def render_meal(target: Any, user_id: int, approval_id: str, refine_count:
             f"שומן: <b>{totals['fat']:.0f} גרם</b>\n\n"
             "הארוחה תיספר רק לאחר אישור." + restriction_block + refine_hint
         )
-        keyboard = InlineKeyboardMarkup(
-            [
+        if validation.blocked:
+            text += "\n\n<b>אי אפשר לשמור עד שמתקנים את זה.</b>"
+            keyboard = InlineKeyboardMarkup(
                 [
-                    button("✅ שמור", f"approve_meal:{approval_id}"),
-                    button("⚖️ ערוך כמויות", f"editqtymenu:{approval_id}"),
-                ],
+                    [button("✍️ תקן במלל", f"fixmeal:{approval_id}")],
+                    [button("❌ דחה", f"reject_meal:{approval_id}")],
+                ]
+            )
+        else:
+            keyboard = InlineKeyboardMarkup(
                 [
-                    button("✍️ תקן במלל", f"fixmeal:{approval_id}"),
-                    button("❌ דחה", f"reject_meal:{approval_id}"),
-                ],
-            ]
-        )
+                    [
+                        button("✅ שמור", f"approve_meal:{approval_id}"),
+                        button("⚖️ ערוך כמויות", f"editqtymenu:{approval_id}"),
+                    ],
+                    [
+                        button("✍️ תקן במלל", f"fixmeal:{approval_id}"),
+                        button("❌ דחה", f"reject_meal:{approval_id}"),
+                    ],
+                ]
+            )
 
     if hasattr(target, "edit_message_text"):
         await safe_edit(target, text, keyboard)

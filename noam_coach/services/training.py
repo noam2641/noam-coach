@@ -126,6 +126,77 @@ async def active_session(user_id: int) -> dict[str, Any] | None:
 RIR_UNKNOWN = -1
 
 
+@dataclass(frozen=True)
+class LoadRecommendation:
+    weight: float
+    reps: int
+    explanation: str
+    decision: str
+    signals: tuple[str, ...] = ()
+    missing_context: tuple[str, ...] = ()
+    confidence: int = 80
+    data_completeness: int = 80
+
+    def to_tuple(self) -> tuple[float, int, str]:
+        return self.weight, self.reps, self.explanation
+
+    def to_audit_dict(self) -> dict[str, Any]:
+        return {
+            "decision": self.decision,
+            "recommended_weight": self.weight,
+            "recommended_reps": self.reps,
+            "explanation": self.explanation,
+            "signals": list(self.signals),
+            "missing_context": list(self.missing_context),
+            "confidence": self.confidence,
+            "data_completeness": self.data_completeness,
+        }
+
+
+def format_load_decision_details(decision: LoadRecommendation) -> str:
+    """Render an auditable load decision for the workout "how was this decided" UI."""
+    lines = [
+        "<b>איך חושב?</b>",
+        f"משקל מומלץ: <b>{decision.weight:g} ק״ג</b>",
+        f"חזרות מומלצות: <b>{decision.reps}</b>",
+        f"סיבה: {decision.explanation}",
+    ]
+    if decision.signals:
+        labels = {
+            "active_pain": "כאב פעיל",
+            "hard_sessions": "אימונים קשים לאחרונה",
+            "sleep_quality": "שינה",
+            "energy": "אנרגיה",
+            "mastered_top_range": "שליטה בטווח העליון",
+            "recovery_hold": "שמירה להתאוששות",
+            "mixed_load_latest_session": "עומסים מעורבים באימון האחרון",
+            "split_or_drop_set": "סט מפוצל/ירידת משקל",
+            "rir_allows_rep_progression": "RIR מאפשר התקדמות בחזרות",
+            "rir_missing": "RIR חסר",
+        }
+        rendered_signals: list[str] = []
+        for signal in decision.signals:
+            key, _, value = signal.partition(":")
+            label = labels.get(key, key.replace("_", " "))
+            rendered_signals.append(f"{label}: {value}" if value else label)
+        lines.extend(["", "<b>נתונים שהשפיעו</b>"])
+        lines.extend(f"• {signal}" for signal in rendered_signals)
+    if decision.missing_context:
+        missing_labels = {
+            "exercise_history": "אין עדיין היסטוריית ביצוע לתרגיל",
+            "comparable_sets": "אין סטים בני השוואה",
+        }
+        lines.extend(["", "<b>מה חסר כדי לדייק</b>"])
+        lines.extend(f"• {missing_labels.get(item, item)}" for item in decision.missing_context)
+    lines.extend(
+        [
+            "",
+            f"<i>ביטחון: {decision.confidence}/100 · שלמות מידע: {decision.data_completeness}/100</i>",
+        ]
+    )
+    return "\n".join(lines)
+
+
 @runtime_bound(RUNTIME_NAMES)
 def _rir_known(value: Any) -> bool:
     try:
@@ -140,17 +211,54 @@ def _known_rirs(rows: list[dict[str, Any]]) -> list[int]:
 
 
 @runtime_bound(RUNTIME_NAMES)
-async def recommend_load(
+async def _exercise_pain_caution(
+    user_id: int, current_exercise: dict[str, Any]
+) -> training_intelligence.ActivePainRegion | None:
+    """Return the active pain region (if any) that this exercise loads.
+
+    Reads medical_constraints directly (kind='pain', status='active', within
+    the TTL window) rather than only the onboarding-time active_pain fact, so
+    a pain report made mid-workout also caps progression on the very next
+    session for the same joint, not just on plans generated after it.
+    """
+    profile = training_intelligence.CATALOG.get(str(current_exercise.get("id")))
+    if profile is None or not profile.joint_load:
+        return None
+    rows = await DB.fetch_all(
+        "SELECT * FROM medical_constraints WHERE user_id=? AND kind='pain'",
+        (user_id,),
+    )
+    if not rows:
+        return None
+    regions = training_intelligence.active_pain_regions(rows)
+    for joint in profile.joint_load:
+        if joint in regions:
+            return regions[joint]
+    return None
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def recommend_load_decision(
     user_id: int,
     current_exercise: dict[str, Any],
-) -> tuple[float, int, str]:
-    """Recommend the next working load from complete, comparable sessions.
+) -> LoadRecommendation:
+    """Recommend the next working load with an auditable decision record.
 
     Only the latest completed/partial session is used for the immediate
     recommendation, so a partial workout can never be mixed with older sets.
     Three consecutive clearly hard sessions trigger a small exercise-specific
     load reduction. Split/drop sets never trigger an automatic progression.
+    An active, reported pain in a region this exercise loads (per
+    training_intelligence.CATALOG joint_load) also blocks any weight/rep
+    increase, regardless of RIR history — pain caution always outranks a
+    "mastered" reading.
     """
+    pain_caution = await _exercise_pain_caution(user_id, current_exercise)
+    missing_context: list[str] = []
+    signals: list[str] = []
+    if pain_caution is not None:
+        signals.append(f"active_pain:{pain_caution.region}")
+
     session_rows = await DB.fetch_all(
         """
         SELECT ws.id, COALESCE(ws.ended_at, ws.started_at) AS performed_at
@@ -167,10 +275,16 @@ async def recommend_load(
     )
 
     if not session_rows:
-        return (
+        missing_context.append("exercise_history")
+        return LoadRecommendation(
             float(current_exercise["weight"]),
             int(current_exercise["rmin"]),
-            "משקל פתיחה",
+            "משקל מתוכנן",
+            "planned_load",
+            tuple(signals),
+            tuple(missing_context),
+            confidence=55,
+            data_completeness=45,
         )
 
     history: list[list[dict[str, Any]]] = []
@@ -190,10 +304,16 @@ async def recommend_load(
             history.append(rows)
 
     if not history:
-        return (
+        missing_context.append("comparable_sets")
+        return LoadRecommendation(
             float(current_exercise["weight"]),
             int(current_exercise["rmin"]),
-            "משקל פתיחה",
+            "משקל מתוכנן",
+            "planned_load",
+            tuple(signals),
+            tuple(missing_context),
+            confidence=55,
+            data_completeness=45,
         )
 
     latest = history[0]
@@ -205,14 +325,25 @@ async def recommend_load(
 
     flags = await get_daily_flags(user_id)
     hold_for_recovery = flags.get("sleep_quality") == "bad" or flags.get("energy") == "low"
+    if flags.get("sleep_quality") == "bad":
+        signals.append("sleep_quality:bad")
+    if flags.get("energy") == "low":
+        signals.append("energy:low")
 
     comparable_load = all(abs(float(row["weight"]) - last_weight) < 0.01 for row in latest)
     used_split_set = any(row["source"] == "telegram_split_primary" for row in latest)
+    if not comparable_load:
+        signals.append("mixed_load_latest_session")
+    if used_split_set:
+        signals.append("split_or_drop_set")
     # Mastery requires hitting the top rep range AND a *reported* RIR >= 2 on
     # every planned set. An unknown RIR never counts as proof of mastery, so we
-    # do not auto-progress on fabricated data.
+    # do not auto-progress on fabricated data. An active, reported pain in a
+    # region this exercise loads blocks mastery outright — RIR history can
+    # never justify a load increase while that pain is still active.
     mastered = (
-        len(latest) >= planned_sets
+        pain_caution is None
+        and len(latest) >= planned_sets
         and comparable_load
         and not used_split_set
         and all(
@@ -222,17 +353,30 @@ async def recommend_load(
     )
 
     if mastered and hold_for_recovery:
-        return (
+        signals.append("mastered_top_range")
+        signals.append("recovery_hold")
+        return LoadRecommendation(
             last_weight,
             rmin,
             "שלטת בטווח, אבל היום שומרים עומס בגלל שינה או אנרגיה נמוכה",
+            "hold_for_recovery",
+            tuple(signals),
+            tuple(missing_context),
+            confidence=82,
+            data_completeness=90,
         )
 
     if mastered:
-        return (
+        signals.append("mastered_top_range")
+        return LoadRecommendation(
             round(last_weight + increment, 2),
             rmin,
             "השלמת את כל הסטים בטווח העליון עם RIR מתאים — עולים מדרגה",
+            "increase_load",
+            tuple(signals),
+            tuple(missing_context),
+            confidence=88,
+            data_completeness=92,
         )
 
     hard_sessions = 0
@@ -252,6 +396,8 @@ async def recommend_load(
             hard_sessions += 1
         else:
             break
+    if hard_sessions:
+        signals.append(f"hard_sessions:{hard_sessions}")
 
     if hard_sessions >= 3:
         reduction_steps = max(
@@ -262,10 +408,41 @@ async def recommend_load(
             0.0,
             round(last_weight - reduction_steps * increment, 2),
         )
-        return (
+        if pain_caution is not None:
+            return LoadRecommendation(
+                reduced_weight,
+                rmin,
+                f"דיווחת לאחרונה על כאב ב{pain_caution.label} וגם הביצועים היו קשים — מורידים מעט עומס",
+                "reduce_load_for_pain_and_hard_history",
+                tuple(signals),
+                tuple(missing_context),
+                confidence=90,
+                data_completeness=92,
+            )
+        return LoadRecommendation(
             reduced_weight,
             rmin,
             "שלושה אימונים רצופים היו קשים בתחתית הטווח — מורידים מעט עומס כדי לבנות מחדש",
+            "reduce_load_for_hard_history",
+            tuple(signals),
+            tuple(missing_context),
+            confidence=86,
+            data_completeness=90,
+        )
+
+    if pain_caution is not None:
+        # Never raise weight or reps while a reported pain is active in a
+        # region this exercise loads. If recent hard sessions already meet the
+        # normal deload rule above, that reduction still wins.
+        return LoadRecommendation(
+            last_weight,
+            rmin,
+            f"דיווחת לאחרונה על כאב ב{pain_caution.label} — שומר עומס שמרני בתרגיל הזה",
+            "hold_for_active_pain",
+            tuple(signals),
+            tuple(missing_context),
+            confidence=86,
+            data_completeness=88,
         )
 
     average_reps = sum(int(row["reps"]) for row in latest) / len(latest)
@@ -274,7 +451,10 @@ async def recommend_load(
     # Only nudge reps up when the user actually reported RIR >= 2 (reps in
     # reserve). With no reported RIR we keep the current target.
     if known_latest and (sum(known_latest) / len(known_latest)) >= 2 and not used_split_set:
+        signals.append("rir_allows_rep_progression")
         target_reps += 1
+    elif not known_latest:
+        signals.append("rir_missing")
     target_reps = max(rmin, min(rmax, target_reps))
 
     if used_split_set:
@@ -284,7 +464,27 @@ async def recommend_load(
     else:
         explanation = "נשארים באותו עומס ומתקדמים בהדרגה בתוך טווח החזרות"
 
-    return last_weight, target_reps, explanation
+    decision = "hold_after_split_set" if used_split_set else "hold_or_progress_reps"
+    return LoadRecommendation(
+        last_weight,
+        target_reps,
+        explanation,
+        decision,
+        tuple(signals),
+        tuple(missing_context),
+        confidence=78 if known_latest else 68,
+        data_completeness=86 if known_latest else 70,
+    )
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def recommend_load(
+    user_id: int,
+    current_exercise: dict[str, Any],
+) -> tuple[float, int, str]:
+    """Backward-compatible tuple wrapper for the auditable load decision."""
+    decision = await recommend_load_decision(user_id, current_exercise)
+    return decision.to_tuple()
 
 
 _SLEEP_FLAG_TO_ENGINE = {"bad": "poor", "ok": "average", "good": "good"}

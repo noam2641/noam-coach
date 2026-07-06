@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 
@@ -23,30 +24,62 @@ class ExerciseProfile:
 
 
 CATALOG: dict[str, ExerciseProfile] = {
-    "bench": ExerciseProfile("bench", "horizontal_push", ("chest",), ("barbell", "bench"), ("shoulder",)),
-    "incline_db": ExerciseProfile("incline_db", "horizontal_push", ("chest",), ("dumbbell", "bench"), ("shoulder",)),
+    "bench": ExerciseProfile("bench", "horizontal_push", ("chest",), ("barbell", "bench"), ("shoulder", "elbow")),
+    "db_bench": ExerciseProfile("db_bench", "horizontal_push", ("chest",), ("dumbbell", "bench"), ("shoulder", "elbow")),
+    "smith_bench": ExerciseProfile("smith_bench", "horizontal_push", ("chest",), ("barbell", "bench", "machine"), ("shoulder", "elbow")),
+    "incline_db": ExerciseProfile("incline_db", "horizontal_push", ("chest",), ("dumbbell", "bench"), ("shoulder", "elbow")),
+    "incline_bar": ExerciseProfile("incline_bar", "horizontal_push", ("chest",), ("barbell", "bench"), ("shoulder", "elbow")),
+    "incline_machine": ExerciseProfile("incline_machine", "horizontal_push", ("chest",), ("machine",), ("shoulder", "elbow")),
+    "incline_smith": ExerciseProfile("incline_smith", "horizontal_push", ("chest",), ("barbell", "bench", "machine"), ("shoulder", "elbow")),
     "fly": ExerciseProfile("fly", "chest_isolation", ("chest",), ("dumbbell", "bench"), ("shoulder",)),
-    "lat_pull": ExerciseProfile("lat_pull", "vertical_pull", ("back",), ("cable",), ("shoulder",)),
-    "lat_pull_fb": ExerciseProfile("lat_pull_fb", "vertical_pull", ("back",), ("cable",), ("shoulder",)),
-    "one_arm_row": ExerciseProfile("one_arm_row", "horizontal_pull", ("back",), ("dumbbell", "bench"), ("back",)),
-    "rope_push": ExerciseProfile("rope_push", "elbow_extension", ("triceps",), ("cable",)),
-    "military": ExerciseProfile("military", "vertical_push", ("shoulder",), ("barbell",), ("shoulder", "back")),
-    "squat": ExerciseProfile("squat", "squat", ("quads", "glutes"), ("barbell", "rack"), ("knee", "back"), "intermediate"),
-    "leg_press": ExerciseProfile("leg_press", "squat", ("quads", "glutes"), ("machine",), ("knee",)),
-    "rdl": ExerciseProfile("rdl", "hinge", ("hamstrings", "glutes"), ("barbell",), ("back",), "intermediate"),
+    "cable_fly": ExerciseProfile("cable_fly", "chest_isolation", ("chest",), ("cable",), ("shoulder",)),
+    "one_arm_fly": ExerciseProfile("one_arm_fly", "chest_isolation", ("chest",), ("cable",), ("shoulder",)),
+    "pec_deck": ExerciseProfile("pec_deck", "chest_isolation", ("chest",), ("machine",), ("shoulder",)),
+    "lat_pull": ExerciseProfile("lat_pull", "vertical_pull", ("back",), ("cable",), ("shoulder", "elbow")),
+    "lat_pull_fb": ExerciseProfile("lat_pull_fb", "vertical_pull", ("back",), ("cable",), ("shoulder", "elbow")),
+    "assisted_pullup": ExerciseProfile("assisted_pullup", "vertical_pull", ("back",), ("machine",), ("shoulder", "elbow", "back")),
+    "neutral_pull": ExerciseProfile("neutral_pull", "vertical_pull", ("back",), ("cable",), ("shoulder", "elbow", "back")),
+    "one_arm_pull": ExerciseProfile("one_arm_pull", "vertical_pull", ("back",), ("cable",), ("shoulder", "elbow", "back")),
+    "one_arm_row": ExerciseProfile("one_arm_row", "horizontal_pull", ("back",), ("dumbbell", "bench"), ("back", "elbow")),
+    "cable_row": ExerciseProfile("cable_row", "horizontal_pull", ("back",), ("cable",), ("back", "elbow")),
+    "supported_row": ExerciseProfile("supported_row", "horizontal_pull", ("back",), ("dumbbell", "bench"), ("back", "elbow")),
+    "row_machine": ExerciseProfile("row_machine", "horizontal_pull", ("back",), ("machine",), ("back", "elbow")),
+    "rope_push": ExerciseProfile("rope_push", "elbow_extension", ("triceps",), ("cable",), ("elbow",)),
+    "bar_push": ExerciseProfile("bar_push", "elbow_extension", ("triceps",), ("cable",), ("elbow",)),
+    "one_arm_push": ExerciseProfile("one_arm_push", "elbow_extension", ("triceps",), ("cable",), ("elbow",)),
+    "dip_machine": ExerciseProfile("dip_machine", "horizontal_push", ("chest", "triceps"), ("machine",), ("shoulder", "elbow")),
+    "military": ExerciseProfile("military", "vertical_push", ("shoulder",), ("barbell",), ("shoulder", "elbow", "back")),
+    "db_shoulder": ExerciseProfile("db_shoulder", "vertical_push", ("shoulder",), ("dumbbell",), ("shoulder", "elbow")),
+    "shoulder_machine": ExerciseProfile("shoulder_machine", "vertical_push", ("shoulder",), ("machine",), ("shoulder", "elbow")),
+    "landmine": ExerciseProfile("landmine", "vertical_push", ("shoulder",), ("barbell",), ("shoulder", "elbow", "back")),
+    "squat": ExerciseProfile("squat", "squat", ("quads", "glutes"), ("barbell", "rack"), ("knee", "hip", "back"), "intermediate"),
+    "leg_press": ExerciseProfile("leg_press", "squat", ("quads", "glutes"), ("machine",), ("knee", "hip")),
+    "hack": ExerciseProfile("hack", "squat", ("quads", "glutes"), ("machine",), ("knee", "hip", "back")),
+    "smith_squat": ExerciseProfile("smith_squat", "squat", ("quads", "glutes"), ("barbell", "machine"), ("knee", "hip", "back")),
+    "goblet": ExerciseProfile("goblet", "squat", ("quads", "glutes"), ("dumbbell",), ("knee", "hip", "back")),
+    "rdl": ExerciseProfile("rdl", "hinge", ("hamstrings", "glutes"), ("barbell",), ("back", "hip"), "intermediate"),
+    "hip_thrust": ExerciseProfile("hip_thrust", "hinge", ("glutes",), ("barbell", "bench"), ("hip", "back")),
+    "back_ext": ExerciseProfile("back_ext", "hinge", ("hamstrings", "glutes", "back"), ("machine",), ("hip", "back")),
+    "cable_pull_through": ExerciseProfile("cable_pull_through", "hinge", ("hamstrings", "glutes"), ("cable",), ("hip", "back")),
     "lateral": ExerciseProfile("lateral", "shoulder_isolation", ("shoulder",), ("dumbbell",), ("shoulder",)),
-    "bar_curl": ExerciseProfile("bar_curl", "elbow_flexion", ("biceps",), ("barbell",)),
-    "incline_curl": ExerciseProfile("incline_curl", "elbow_flexion", ("biceps",), ("dumbbell", "bench")),
+    "cable_lateral": ExerciseProfile("cable_lateral", "shoulder_isolation", ("shoulder",), ("cable",), ("shoulder",)),
+    "lateral_machine": ExerciseProfile("lateral_machine", "shoulder_isolation", ("shoulder",), ("machine",), ("shoulder",)),
+    "lean_lateral": ExerciseProfile("lean_lateral", "shoulder_isolation", ("shoulder",), ("dumbbell",), ("shoulder",)),
+    "bar_curl": ExerciseProfile("bar_curl", "elbow_flexion", ("biceps",), ("barbell",), ("elbow",)),
+    "incline_curl": ExerciseProfile("incline_curl", "elbow_flexion", ("biceps",), ("dumbbell", "bench"), ("elbow",)),
+    "cable_curl": ExerciseProfile("cable_curl", "elbow_flexion", ("biceps",), ("cable",), ("elbow",)),
+    "preacher": ExerciseProfile("preacher", "elbow_flexion", ("biceps",), ("machine", "bench"), ("elbow",)),
+    "db_curl": ExerciseProfile("db_curl", "elbow_flexion", ("biceps",), ("dumbbell",), ("elbow",)),
     "crossover": ExerciseProfile("crossover", "chest_isolation", ("chest",), ("cable",), ("shoulder",)),
-    "chest_machine": ExerciseProfile("chest_machine", "horizontal_push", ("chest", "triceps"), ("machine",), ("shoulder",)),
+    "chest_machine": ExerciseProfile("chest_machine", "horizontal_push", ("chest", "triceps"), ("machine",), ("shoulder", "elbow")),
     # Home/bodyweight replacements.
-    "pushup": ExerciseProfile("pushup", "horizontal_push", ("chest",), ("bodyweight",), ("shoulder",)),
-    "incline_pushup": ExerciseProfile("incline_pushup", "horizontal_push", ("chest",), ("bodyweight",), ("shoulder",)),
-    "backpack_row": ExerciseProfile("backpack_row", "horizontal_pull", ("back",), ("household",), ("back",)),
-    "band_row": ExerciseProfile("band_row", "horizontal_pull", ("back",), ("band",)),
-    "glute_bridge": ExerciseProfile("glute_bridge", "hinge", ("glutes",), ("bodyweight",), ("back",)),
-    "chair_squat": ExerciseProfile("chair_squat", "squat", ("quads", "glutes"), ("bodyweight",), ("knee",)),
-    "wall_push": ExerciseProfile("wall_push", "horizontal_push", ("chest",), ("bodyweight",), ("shoulder",)),
+    "pushup": ExerciseProfile("pushup", "horizontal_push", ("chest",), ("bodyweight",), ("shoulder", "elbow")),
+    "incline_pushup": ExerciseProfile("incline_pushup", "horizontal_push", ("chest",), ("bodyweight",), ("shoulder", "elbow")),
+    "backpack_row": ExerciseProfile("backpack_row", "horizontal_pull", ("back",), ("household",), ("back", "elbow")),
+    "band_row": ExerciseProfile("band_row", "horizontal_pull", ("back",), ("band",), ("back", "elbow")),
+    "glute_bridge": ExerciseProfile("glute_bridge", "hinge", ("glutes",), ("bodyweight",), ("back", "hip")),
+    "chair_squat": ExerciseProfile("chair_squat", "squat", ("quads", "glutes"), ("bodyweight",), ("knee", "hip")),
+    "wall_push": ExerciseProfile("wall_push", "horizontal_push", ("chest",), ("bodyweight",), ("shoulder", "elbow")),
     "dead_bug": ExerciseProfile("dead_bug", "core", ("core",), ("bodyweight",), ("back",)),
 }
 
@@ -112,21 +145,133 @@ def normalize_equipment(value: Any, location: Any = None) -> set[str]:
     return available
 
 
+PAIN_REGION_TOKENS: dict[str, tuple[str, ...]] = {
+    "knee": ("ברך", "knee"),
+    "shoulder": ("כתף", "shoulder"),
+    "back": ("גב", "back", "מותן"),
+    "elbow": ("מרפק", "elbow", "טניס אלכן", "טניס אלבו", "אלבו"),
+    "wrist": ("שורש כף", "wrist"),
+    "hip": ("ירך", "מפשעה", "hip"),
+}
+
+# Clean Hebrew labels for each region — used anywhere a region token from
+# medical_constraints/pain_regions is shown to the user, so raw English
+# tokens (e.g. "elbow") or mixed free text never reach the UI unmapped.
+PAIN_REGION_LABELS: dict[str, str] = {
+    "knee": "ברך",
+    "shoulder": "כתף",
+    "back": "גב",
+    "elbow": "מרפק",
+    "wrist": "שורש כף יד",
+    "hip": "ירך",
+}
+
+
+def pain_region_label(region: str) -> str:
+    return PAIN_REGION_LABELS.get(region, region)
+
+
 def pain_regions(pain: Any, medical_avoidance: Any) -> set[str]:
     text = f"{_text(pain)} {_text(medical_avoidance)}"
     regions = set()
-    mapping = {
-        "knee": ("ברך", "knee"),
-        "shoulder": ("כתף", "shoulder"),
-        "back": ("גב", "back", "מותן"),
-        "elbow": ("מרפק", "elbow"),
-        "wrist": ("שורש כף", "wrist"),
-        "hip": ("ירך", "מפשעה", "hip"),
-    }
-    for region, tokens in mapping.items():
+    for region, tokens in PAIN_REGION_TOKENS.items():
         if any(token in text for token in tokens):
             regions.add(region)
     return regions
+
+
+# A reported pain stays "active" for this many days without the user
+# confirming it again — matches the recommended 7-14 day window; a
+# constraint row's own status/resolved_at (set elsewhere) always wins over
+# this if the user has already said it's resolved.
+PAIN_CONSTRAINT_TTL_DAYS = 14
+
+
+@dataclass(frozen=True)
+class ActivePainRegion:
+    region: str
+    label: str
+    severity: int | None
+    age_days: float
+
+
+def _parse_created_at(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def active_pain_regions(
+    constraint_rows: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+    ttl_days: int = PAIN_CONSTRAINT_TTL_DAYS,
+) -> dict[str, ActivePainRegion]:
+    """Reduce raw medical_constraints rows (kind='pain') to the set of body
+    regions that are still within the TTL window, each with its worst
+    (highest) reported severity.
+
+    Rows with an explicit status other than "active" are skipped (the
+    resolved/cleared decision from elsewhere always wins). Rows older than
+    ``ttl_days`` are treated as expired even if still marked "active", since
+    nothing currently prompts the user to confirm/clear old reports.
+    """
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=ttl_days)
+    result: dict[str, ActivePainRegion] = {}
+    for row in constraint_rows:
+        if row.get("kind") != "pain":
+            continue
+        if row.get("status") != "active":
+            continue
+        created_at = _parse_created_at(row.get("created_at"))
+        if created_at is not None and created_at < cutoff:
+            continue
+        age_days = (now - created_at).total_seconds() / 86400 if created_at else 0.0
+        location_text = f"{_text(row.get('location'))} {_text(row.get('note'))}"
+        severity = row.get("severity")
+        try:
+            severity_int = int(severity) if severity is not None else None
+        except (TypeError, ValueError):
+            severity_int = None
+        for region, tokens in PAIN_REGION_TOKENS.items():
+            if not any(token in location_text for token in tokens):
+                continue
+            existing = result.get(region)
+            if existing is None or (severity_int or 0) > (existing.severity or 0):
+                result[region] = ActivePainRegion(
+                    region=region,
+                    label=PAIN_REGION_LABELS.get(region, region),
+                    severity=severity_int,
+                    age_days=age_days,
+                )
+    return result
+
+
+def pain_safety_guidance(region: ActivePainRegion) -> str:
+    """User-facing, non-diagnostic safety guidance for an active pain region."""
+    base = (
+        f"בגלל שדיווחת לאחרונה על כאב ב{region.label}, "
+        "שמרתי עומס שמרני בתרגיל הזה. בצע רק בטווח ללא כאב."
+    )
+    if region.severity is not None and region.severity >= 3:
+        return (
+            f"כאב חד/חזק ב{region.label} הוא סימן לעצור את התרגיל עכשיו. "
+            "אל תנסה לעבוד סביב כאב חד. אם הכאב מתגבר, מופיעה נפיחות, הקרנה "
+            "או מגבלה בתנועה, כדאי לפנות לבדיקה מקצועית."
+        )
+    if region.age_days >= 7:
+        return (
+            f"הכאב ב{region.label} עדיין מסומן כפעיל כבר כמה ימים. "
+            "נמשיך להימנע מהעמסה ישירה, ואם הוא לא משתפר כדאי בדיקה מקצועית."
+        )
+    return base
 
 
 def exercise_allowed(

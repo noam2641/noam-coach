@@ -119,7 +119,9 @@ async def test_database_initialization_is_idempotent(tmp_path: Path) -> None:
     await db.init()
     await db.init()
     rows = await db.fetch_all("SELECT version FROM schema_migrations ORDER BY version")
-    assert [row["version"] for row in rows] == list(range(1, 10))
+    # RE10-2 added migration 10 (clean_polluted_gap_values); bump the expected
+    # range whenever a new schema migration is registered in db.SCHEMA_MIGRATIONS.
+    assert [row["version"] for row in rows] == list(range(1, 11))
 
 
 @pytest.mark.asyncio

@@ -142,10 +142,17 @@ async def test_complete_missing_callback_starts_continuous_completion_flow(
 
 
 @pytest.mark.asyncio
-async def test_planning_blocked_generation_saves_pending_action_without_error_log(
+async def test_missing_active_goal_is_shown_upfront_without_calling_generate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """RE10-8: an unapproved goal is now detected on the FIRST nutrition
+    screen (before ever calling generate_candidates), instead of only
+    surfacing after the user completes the other facts and hits a second
+    PlanningBlockedError. See test below for that older two-screen bug case,
+    which is now unreachable for active_goal specifically but is still
+    exercised here for readiness-based blocks that aren't pre-checked.
+    """
     db = await _make_db(tmp_path)
     monkeypatch.setattr(coach_bot, "DB", db)
     monkeypatch.setattr(onboarding_bot, "DB", db)
@@ -155,14 +162,59 @@ async def test_planning_blocked_generation_saves_pending_action_without_error_lo
     async def ready(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         return {"ready": True, "missing": [], "missing_labels": []}
 
+    async def never_called(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("generate_candidates must not run while active_goal is missing")
+
+    async def no_goal(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(user_model, "compute_readiness", ready)
+    monkeypatch.setattr(planning, "generate_candidates", never_called)
+    monkeypatch.setattr(planning, "active_goal", no_goal)
+
+    target = FakeTarget()
+    handled = await callback_plans_bot.handle_plan_callback(target, 1, "planv2:generate:nutrition")
+
+    assert handled is True
+    text = target.messages[-1]
+    assert "חסרים פרטים" in text
+    assert "active_goal" not in text
+    assert "יעד יומי מאושר" in text
+    markup = target.reply_markups[-1]
+    button_labels = [btn.text for row in markup.inline_keyboard for btn in row]
+    assert any("אשר יעד ואז נמשיך" in label for label in button_labels)
+
+
+@pytest.mark.asyncio
+async def test_planning_blocked_generation_saves_pending_action_without_error_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PlanningBlockedError raised by generate_candidates itself (for a
+    reason that is NOT pre-checked upfront, e.g. readiness) must still be
+    caught gracefully and never logged at ERROR level.
+    """
+    db = await _make_db(tmp_path)
+    monkeypatch.setattr(coach_bot, "DB", db)
+    monkeypatch.setattr(onboarding_bot, "DB", db)
+    monkeypatch.setattr(core_services, "DB", db)
+    monkeypatch.setattr(callback_plans_bot, "DB", db)
+
+    async def ready(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"ready": True, "missing": [], "missing_labels": []}
+
+    async def has_goal(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"id": 1, "status": "active"}
+
     async def blocked(*_args: Any, **_kwargs: Any) -> None:
-        raise planning.PlanningBlockedError("צריך לאשר יעד לפני יצירת תוכנית תזונה", missing=["active_goal"])
+        raise planning.PlanningBlockedError("לא נמצאו מספיק נתונים לבניית תוכנית", missing=["some_other_key"])
 
     class NoErrorLogger:
         def exception(self, *_args: Any, **_kwargs: Any) -> None:
             raise AssertionError("business planning blocks must not be logged as ERROR")
 
     monkeypatch.setattr(user_model, "compute_readiness", ready)
+    monkeypatch.setattr(planning, "active_goal", has_goal)
     monkeypatch.setattr(planning, "generate_candidates", blocked)
     monkeypatch.setattr(coach_bot, "LOGGER", NoErrorLogger())
 

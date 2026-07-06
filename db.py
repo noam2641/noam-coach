@@ -561,6 +561,7 @@ SCHEMA_MIGRATIONS: tuple[tuple[int, str], ...] = (
     (7, "active_flow_expiry"),
     (8, "meal_origin"),
     (9, "single_active_goal_version"),
+    (10, "clean_polluted_gap_values"),
 )
 
 FK_MIGRATION_TABLES: tuple[str, ...] = (
@@ -1146,6 +1147,69 @@ async def _migration_single_active_goal_version(db: Database) -> None:
         await _record_migration(connection, 9, "single_active_goal_version")
 
 
+_POLLUTED_GAP_MARKER = "missing"
+
+
+def _strip_polluted_gap_repr(raw_value: str) -> tuple[str, bool]:
+    """Remove a leaked gap-dict repr from a persisted fact string value.
+
+    RE10-2 path B: several onboarding handlers used to read an unanswered
+    (gap) fact with plain string interpolation and merge new items into it,
+    e.g. ``"{'missing': True, 'why_matters': 'בטיחות תזונתית'}, אגוזים"``.
+    That string was then persisted as a real ``KIND_FACT`` value, so the
+    corruption survives even after the handlers are fixed. This helper
+    extracts any real comma-separated items that follow the leaked dict
+    fragment and drops the fragment itself.
+
+    Returns (cleaned_value, changed).
+    """
+    if "{'missing'" not in raw_value and '{"missing"' not in raw_value:
+        return raw_value, False
+    # Drop the dict-repr fragment: "{...}" possibly followed by ", " then real items.
+    cleaned = re.sub(r"\{[^{}]*['\"]missing['\"][^{}]*\}\s*,?\s*", "", raw_value)
+    cleaned = cleaned.strip(" ,")
+    return cleaned, True
+
+
+async def _migration_clean_polluted_gap_values(db: Database) -> None:
+    """Migration 10: repair user_facts values that leaked a gap-dict repr.
+
+    Scans every ``KIND_FACT`` string value for the poisoned pattern produced
+    by the RE10-2 bug and rewrites it to contain only the real items the user
+    actually provided (or reverts the fact to empty/"none" when nothing real
+    was left). This does not touch legitimate gap rows (``kind='gap'``) —
+    those already display correctly once filtered — only facts that were
+    incorrectly promoted out of gap state with corrupted content.
+    """
+    async with db.transaction() as connection:
+        cursor = await connection.execute(
+            "SELECT user_id, key, value FROM user_facts "
+            "WHERE kind='fact' AND value LIKE '%missing%'"
+        )
+        rows = await cursor.fetchall()
+        now = utc_now()
+        fixed = 0
+        for row in rows:
+            raw = row["value"]
+            try:
+                decoded = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(decoded, str):
+                continue
+            cleaned, changed = _strip_polluted_gap_repr(decoded)
+            if not changed:
+                continue
+            new_value = cleaned if cleaned else "none"
+            await connection.execute(
+                "UPDATE user_facts SET value=?, updated_at=? WHERE user_id=? AND key=?",
+                (json.dumps(new_value, ensure_ascii=False), now, row["user_id"], row["key"]),
+            )
+            fixed += 1
+        LOGGER.info("Migration 10: cleaned %d polluted user_facts values", fixed)
+        await _record_migration(connection, 10, "clean_polluted_gap_values")
+
+
 async def run_migrations(
     db: Database,
     *,
@@ -1182,6 +1246,8 @@ async def run_migrations(
             await _migration_meal_origin(db)
         elif version == 9:
             await _migration_single_active_goal_version(db)
+        elif version == 10:
+            await _migration_clean_polluted_gap_values(db)
         else:
             raise RuntimeError(f"Unknown schema migration {version}")
         LOGGER.info("Applied schema migration %s: %s", version, name)

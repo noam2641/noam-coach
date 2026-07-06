@@ -16,7 +16,8 @@ import data_quality
 import planning
 import user_model
 from config import SETTINGS, TZ
-from helpers import today_bounds_utc, utc_now
+from helpers import utc_now
+from noam_coach.services.daily_state import local_day_bounds_utc
 from noam_coach.services.dietary_restrictions import (
     load_restrictions_from_facts,
 )
@@ -24,6 +25,7 @@ from noam_coach.services.next_meal import (
     WorkoutPhase,
     build_workout_nutrition_context,
 )
+from noam_coach.services.weekdays import local_weekday
 
 # Sentinel sent to the AI for a field that has no real source yet. It is
 # deliberately NOT an empty list/None so the model does not infer "the user has
@@ -195,8 +197,8 @@ async def _routine_profile(db: Any, user_id: int) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-async def _reported_meals(db: Any, user_id: int) -> list[MealSnapshot]:
-    start_utc, end_utc = today_bounds_utc()
+async def _reported_meals(db: Any, user_id: int, local_now: datetime | None = None) -> list[MealSnapshot]:
+    start_utc, end_utc = local_day_bounds_utc(local_now)
     rows = await db.fetch_all(
         """
         SELECT id, name, calories, protein, carbs, fat, confidence, eaten_at
@@ -225,7 +227,7 @@ def _today_plan(active_plan: dict[str, Any] | None, local_now: datetime) -> dict
     if not active_plan:
         return None
     days = (active_plan.get("payload") or {}).get("days") or []
-    today = (local_now.weekday() + 1) % 7
+    today = local_weekday(local_now)
     for day in days:
         if int(day.get("weekday", -1)) == today:
             return dict(day)
@@ -237,6 +239,27 @@ def _planned_meals(today_plan: dict[str, Any] | None) -> list[dict[str, Any]]:
         return []
     meals = today_plan.get("meals") or []
     return [dict(meal) for meal in meals if isinstance(meal, dict)]
+
+
+def _planned_next_meals(flags: dict[str, Any]) -> list[dict[str, Any]]:
+    """RE9-019: next-meal options the user chose to *plan* (not eat) for later.
+
+    Stored in daily_flags by next_meal.plan_chosen_meal. Surfaced as planned —
+    never folded into consumed, preserving the planned/consumed separation.
+    """
+    planned = flags.get("next_meal_planned") or []
+    result: list[dict[str, Any]] = []
+    for meal in planned:
+        if isinstance(meal, dict) and meal.get("name"):
+            result.append({
+                "fingerprint": meal.get("fingerprint"),
+                "name": str(meal.get("name")),
+                "calories": int(meal.get("calories") or 0),
+                "protein": int(meal.get("protein") or 0),
+                "planned_at": meal.get("planned_at"),
+                "source": "next_meal_plan",
+            })
+    return result
 
 
 def _target_from_goal(goal: dict[str, Any] | None, key: str, default_name: str) -> int | None:
@@ -292,7 +315,7 @@ async def build_nutrition_context(
     local_day = local_now.date().isoformat()
     flags = dict(getattr(daily_ctx, "flags", None) or await _daily_flags(db, user_id, local_day))
     profile = dict(getattr(daily_ctx, "profile", None) or await _routine_profile(db, user_id))
-    meals = await _reported_meals(db, user_id)
+    meals = await _reported_meals(db, user_id, local_now)
     consumed_calories = round(sum(meal.calories for meal in meals), 1)
     consumed_protein = round(sum(meal.protein for meal in meals), 1)
     consumed_carbs = round(sum(meal.carbs for meal in meals), 1)
@@ -301,9 +324,9 @@ async def build_nutrition_context(
     goal = await planning.active_goal(db, user_id)
     nutrition_plan = await planning.get_active_plan(db, user_id, "nutrition")
     today_plan = _today_plan(nutrition_plan, local_now)
-    planned_meals = _planned_meals(today_plan)
+    planned_meals = [*_planned_meals(today_plan), *_planned_next_meals(flags)]
     expected_meals = max(1, len(planned_meals) or len(((profile.get("eating") or {}).get("typical_meal_hours") or [])) or 3)
-    start_utc, end_utc = today_bounds_utc()
+    start_utc, end_utc = local_day_bounds_utc(local_now)
     quality = await data_quality.assess_day(db, user_id, start_utc, end_utc, expected_meals=expected_meals)
     workout_context = await build_workout_nutrition_context(db, user_id, now=local_now)
 
@@ -413,13 +436,11 @@ def build_nutrition_ai_request(
     context: NutritionContext,
     user_request: str,
 ) -> dict[str, Any]:
-    """Build the structured payload every nutrition AI call can share."""
-    return {
-        "user_request": user_request,
-        "context": context.to_ai_payload(),
-        "safety": {
-            "do_not_treat_planned_meals_as_consumed": True,
-            "validate_against_allergies_after_generation": True,
-            "avoid_medical_diagnosis_or_dosage_advice": True,
-        },
-    }
+    """Build the structured payload every nutrition AI call shares.
+
+    Delegates to the unified Prompt Builder (RE9-034) so the envelope shape and
+    safety contract are identical across all AI domains.
+    """
+    from noam_coach.services.prompt_builder import build_nutrition_request
+
+    return build_nutrition_request(context, user_request)

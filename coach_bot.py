@@ -159,11 +159,14 @@ from noam_coach.services.profile import (
 
 
 from noam_coach.services.training import (
+    LoadRecommendation,
     active_session,
     RIR_UNKNOWN,
     _rir_known,
     _known_rirs,
+    format_load_decision_details,
     recommend_load,
+    recommend_load_decision,
     _SLEEP_FLAG_TO_ENGINE,
     _ENERGY_FLAG_TO_ENGINE,
     build_fatigue_assessment,

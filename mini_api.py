@@ -7,6 +7,7 @@ application via ``api.include_router(mini_api.router)``.
 from __future__ import annotations
 
 import asyncio
+import json
 import secrets
 from contextlib import suppress
 from datetime import datetime
@@ -21,6 +22,7 @@ import data_quality
 import event_log
 import miniapp
 import planning
+import training_intelligence
 import user_model
 from config import LOGGER, SETTINGS, TZ
 from db import DB
@@ -32,6 +34,11 @@ from noam_coach.services.next_meal import (
     generate_next_meal_recommendation,
     save_next_meal_workout_status,
     workout_clarification_actions,
+)
+from noam_coach.services.weekdays import (
+    monday_first_to_sunday_first,
+    sunday_first_to_monday_first,
+    with_weekday_schema,
 )
 
 router = APIRouter()
@@ -92,8 +99,67 @@ async def mini_dashboard(user_id: int = Depends(mini_session_user)) -> JSONRespo
             "missing": snapshot["missing"],
             "coaching": brief.to_dict(),
             "availability": availability.__dict__,
+            "operations": await _operational_snapshot(user_id),
         }
     )
+
+
+async def _operational_snapshot(user_id: int) -> dict[str, Any]:
+    """Compact support/debug snapshot for the Mini App dashboard.
+
+    This intentionally avoids raw logs or free-form message bodies. It exposes
+    enough state to understand the user's current coaching situation without
+    leaking extra Telegram/chat context.
+    """
+    import coach_bot
+
+    pain_rows = await DB.fetch_all(
+        "SELECT * FROM medical_constraints WHERE user_id=? AND kind='pain'",
+        (user_id,),
+    )
+    active_pain = training_intelligence.active_pain_regions(pain_rows)
+    latest_session = await DB.fetch_one(
+        """
+        SELECT id, code, name, status, exercise_index, set_number, started_at, ended_at
+        FROM sessions
+        WHERE user_id=?
+        ORDER BY COALESCE(ended_at, started_at) DESC, id DESC
+        LIMIT 1
+        """,
+        (user_id,),
+    )
+    active = await coach_bot.active_session(user_id)
+    current_load = None
+    if active:
+        try:
+            plan = json.loads(active["plan"])
+            current = plan["exercises"][active["exercise_index"]]
+            decision = await coach_bot.recommend_load_decision(user_id, current)
+            current_load = decision.to_audit_dict()
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            current_load = {"error": "active_session_plan_unreadable"}
+    return {
+        "active_pain": [
+            {
+                "region": region.region,
+                "label": region.label,
+                "severity": region.severity,
+                "age_days": round(region.age_days, 1),
+            }
+            for region in active_pain.values()
+        ],
+        "latest_session": dict(latest_session) if latest_session else None,
+        "active_session": {
+            "id": active["id"],
+            "code": active["code"],
+            "name": active["name"],
+            "exercise_index": active["exercise_index"],
+            "set_number": active["set_number"],
+        }
+        if active
+        else None,
+        "current_load_decision": current_load,
+    }
 
 
 @router.get("/mini/api/next-meal", include_in_schema=False)
@@ -145,11 +211,29 @@ async def mini_profile(user_id: int = Depends(mini_session_user)) -> JSONRespons
     snapshot = await planning.profile_snapshot(DB, user_id)
     public = await user_model.get_profile_view(DB, user_id)
     availability = await resolve_availability(DB, user_id)
+    availability_view = availability.__dict__.copy()
+    availability_view["preferred_days"] = [
+        monday_first_to_sunday_first(d) for d in availability_view.get("preferred_days") or []
+    ]
+    weekly_availability_fact = snapshot.get("facts", {}).get("weekly_availability")
+    if isinstance(weekly_availability_fact, dict) and isinstance(weekly_availability_fact.get("value"), list):
+        # The Mini App's day picker is Sunday-first (0=Sunday); convert the
+        # Monday-first stored schema for display, mirroring the write-side
+        # conversion in mini_update_profile.
+        weekly_availability_fact = dict(weekly_availability_fact)
+        weekly_availability_fact["value"] = [
+            {**slot, "weekday": monday_first_to_sunday_first(slot["weekday"])}
+            if isinstance(slot, dict) and "weekday" in slot
+            else slot
+            for slot in weekly_availability_fact["value"]
+        ]
+        snapshot = dict(snapshot)
+        snapshot["facts"] = {**snapshot["facts"], "weekly_availability": weekly_availability_fact}
     return JSONResponse(
         {
             "snapshot": snapshot,
             "profile": public,
-            "availability": availability.__dict__,
+            "availability": availability_view,
         }
     )
 
@@ -219,10 +303,16 @@ async def mini_update_profile(
         if key in values:
             await save(key, values[key], affects)
     if "weekly_availability" in values:
-        slots = [
-            slot.model_dump() if hasattr(slot, "model_dump") else slot
-            for slot in payload.weekly_availability or []
-        ]
+        # The Mini App's day picker is Sunday-first (0=Sunday), matching the
+        # Israeli week, while every backend consumer stores/expects the
+        # Monday-first schema (0=Monday) from noam_coach.services.weekdays.
+        # Convert at this boundary so downstream planning never sees a
+        # mismatched index.
+        slots = []
+        for slot in payload.weekly_availability or []:
+            data = slot.model_dump() if hasattr(slot, "model_dump") else dict(slot)
+            data["weekday"] = sunday_first_to_monday_first(data["weekday"])
+            slots.append(with_weekday_schema(data))
         await save("weekly_availability", slots, ("workout_plan", "weekly_plan"))
 
     review_required = bool(changed) and bool(

@@ -17,17 +17,24 @@ from typing import Any
 import planning
 import user_model
 from config import SETTINGS, TZ
-from helpers import esc, today_bounds_utc, utc_now
+from helpers import esc, utc_now
+from noam_coach.services import daily_state
+from noam_coach.services.decision_engine import evaluate_next_meal_decision
 from noam_coach.services.dietary_restrictions import (
     DietaryRestriction,
     load_restrictions_from_facts,
     validate_meal_restrictions,
+)
+from noam_coach.services.explainability import (
+    format_remaining_calculation,
+    nutrition_remaining_calculation,
 )
 from noam_coach.services.food_preferences import (
     merge_with_preference_restrictions,
     preference_restrictions_from_facts,
     record_food_preference_from_slots,
 )
+from noam_coach.services.weekdays import local_weekday
 
 
 class WorkoutPhase(str, Enum):
@@ -128,6 +135,11 @@ class MealOption:
     substitutions: list[str] = field(default_factory=list)
     restriction_validated: bool = True
     ingredient_details: list[MealIngredient] = field(default_factory=list)
+    # RE9-052/053/013: deterministic match score + whether this is the single
+    # "⭐ מומלץ עבורך" option, with a one-line reason.
+    score: float = 0.0
+    recommended: bool = False
+    recommended_reason: str = ""
 
     def __post_init__(self) -> None:
         if self.ingredient_details:
@@ -144,6 +156,7 @@ class NextMealRecommendation:
     needs_workout_clarification: bool = False
     notices: list[str] = field(default_factory=list)
     validation_events: list[str] = field(default_factory=list)
+    decision_audit: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         out = asdict(self)
@@ -273,8 +286,8 @@ def _option_from_payload(payload: dict[str, Any]) -> MealOption:
     )
 
 
-def _sunday_index(local_dt: datetime) -> int:
-    return (local_dt.weekday() + 1) % 7
+def _local_weekday_index(local_dt: datetime) -> int:
+    return local_weekday(local_dt)
 
 
 async def _daily_flags(db: Any, user_id: int, local_day: str) -> dict[str, Any]:
@@ -318,20 +331,25 @@ async def _save_daily_flags(db: Any, user_id: int, local_day: str, flags: dict[s
     )
 
 
-async def _today_meals(db: Any, user_id: int) -> list[dict[str, Any]]:
-    start_utc, end_utc = today_bounds_utc()
-    return await db.fetch_all(
-        """
-        SELECT name, calories, protein, eaten_at
-        FROM meals
-        WHERE user_id=? AND eaten_at>=? AND eaten_at<?
-        ORDER BY eaten_at DESC
-        """,
-        (user_id, start_utc, end_utc),
-    )
+async def _today_meals(db: Any, user_id: int, now: datetime | None = None) -> list[dict[str, Any]]:
+    rows = await daily_state.consumed_meals(db, user_id, now=now, descending=True)
+    return [
+        {
+            "name": row.get("name"),
+            "calories": row.get("calories"),
+            "protein": row.get("protein"),
+            "eaten_at": row.get("eaten_at"),
+        }
+        for row in rows
+    ]
 
 
-async def _nutrition_totals(db: Any, user_id: int) -> tuple[NutritionTotals, dict[str, Any] | None]:
+async def _nutrition_totals(
+    db: Any,
+    user_id: int,
+    *,
+    now: datetime | None = None,
+) -> tuple[NutritionTotals, dict[str, Any] | None]:
     goal = await planning.active_goal(db, user_id)
     target_calories = None
     target_protein = None
@@ -354,7 +372,7 @@ async def _nutrition_totals(db: Any, user_id: int) -> tuple[NutritionTotals, dic
 
     consumed_calories = 0
     consumed_protein = 0
-    for row in await _today_meals(db, user_id):
+    for row in await _today_meals(db, user_id, now):
         calories = _safe_float(row.get("calories"))
         protein = _safe_float(row.get("protein"))
         if calories is not None and calories > 0:
@@ -382,7 +400,7 @@ async def _nutrition_totals(db: Any, user_id: int) -> tuple[NutritionTotals, dic
 
 
 async def _recent_meal(db: Any, user_id: int, now: datetime) -> tuple[str | None, int | None]:
-    rows = await _today_meals(db, user_id)
+    rows = await _today_meals(db, user_id, now)
     if not rows:
         return None, None
     row = rows[0]
@@ -437,28 +455,15 @@ async def _active_session(db: Any, user_id: int) -> dict[str, Any] | None:
     )
 
 
-async def _latest_closed_session_today(db: Any, user_id: int) -> dict[str, Any] | None:
-    start_utc, end_utc = today_bounds_utc()
-    return await db.fetch_one(
-        """
-        SELECT *
-        FROM sessions
-        WHERE user_id=?
-          AND ended_at>=?
-          AND ended_at<?
-          AND status IN ('completed', 'partial', 'cancelled')
-        ORDER BY ended_at DESC, id DESC
-        LIMIT 1
-        """,
-        (user_id, start_utc, end_utc),
-    )
+async def _latest_closed_session_today(db: Any, user_id: int, now: datetime) -> dict[str, Any] | None:
+    return await daily_state.latest_closed_session_today(db, user_id, now=now)
 
 
 def _planned_session_for_today(workout_plan: dict[str, Any] | None, now: datetime) -> dict[str, Any] | None:
     if not workout_plan:
         return None
     sessions = (workout_plan.get("payload") or {}).get("sessions") or []
-    today = _sunday_index(now)
+    today = _local_weekday_index(now)
     candidates = [session for session in sessions if int(session.get("weekday", -1)) == today]
     if not candidates:
         return None
@@ -514,7 +519,7 @@ async def _workout_state(
             "actual_start": _parse_dt(active.get("started_at")),
         }
 
-    closed = await _latest_closed_session_today(db, user_id)
+    closed = await _latest_closed_session_today(db, user_id, now)
     if closed:
         ended = _parse_dt(closed.get("ended_at"))
         if str(closed.get("status")) == "cancelled":
@@ -615,7 +620,7 @@ async def build_workout_nutrition_context(
     local_now = (now or datetime.now(TZ)).astimezone(TZ)
     local_day = local_now.date().isoformat()
     flags = await _daily_flags(db, user_id, local_day)
-    nutrition, _goal = await _nutrition_totals(db, user_id)
+    nutrition, _goal = await _nutrition_totals(db, user_id, now=local_now)
     workout = await _workout_state(db, user_id, local_now, flags)
     recent_name, recent_minutes = await _recent_meal(db, user_id, local_now)
     hours_until_bedtime = await _bedtime_hours(db, user_id, local_now)
@@ -961,7 +966,7 @@ def _matches_free_text_preference(
     disliked = [
         _free_text_preference_key(restriction.canonical_id or restriction.user_label)
         for restriction in restrictions
-        if restriction.restriction_type == "preference"
+        if restriction.restriction_type in {"preference", "unavailable"}
     ]
     if not disliked:
         return False
@@ -1014,21 +1019,45 @@ def _ingredient_totals(option: MealOption) -> tuple[int, int]:
     )
 
 
+def _round_quantity_by_unit(quantity: float, unit: str) -> float:
+    unit_text = str(unit)
+    if any(marker in unit_text for marker in ("יחידה", "פריכית")):
+        return float(max(1, round(quantity)))
+    if "כפית" in unit_text:
+        return float(max(1, round(quantity)))
+    if "גרם" in unit_text or unit_text in {"ג", "g"}:
+        if quantity >= 100:
+            step = 10
+        elif quantity >= 30:
+            step = 5
+        else:
+            step = 1
+        return float(max(step, round(quantity / step) * step))
+    return round(max(0.1, quantity), 1)
+
+
+def _with_quantity(ingredient: MealIngredient, quantity: float) -> MealIngredient:
+    rounded_quantity = _round_quantity_by_unit(quantity, ingredient.unit)
+    base_quantity = max(float(ingredient.quantity or 1), 0.001)
+    scale = rounded_quantity / base_quantity
+    return MealIngredient(
+        food_id=ingredient.food_id,
+        display_name=ingredient.display_name,
+        quantity=rounded_quantity,
+        unit=ingredient.unit,
+        calories=round(max(0, ingredient.calories * scale), 1),
+        protein_g=round(max(0, ingredient.protein_g * scale), 1),
+        carbs_g=None if ingredient.carbs_g is None else round(max(0, ingredient.carbs_g * scale), 1),
+        fat_g=None if ingredient.fat_g is None else round(max(0, ingredient.fat_g * scale), 1),
+        source=ingredient.source,
+        confidence=ingredient.confidence,
+    )
+
+
 def _scale_option_ingredients(option: MealOption, scale: float) -> MealOption:
     bounded = max(0.25, min(2.0, scale))
     scaled = [
-        MealIngredient(
-            food_id=ingredient.food_id,
-            display_name=ingredient.display_name,
-            quantity=round(max(0.1, ingredient.quantity * bounded), 1),
-            unit=ingredient.unit,
-            calories=round(max(0, ingredient.calories * bounded), 1),
-            protein_g=round(max(0, ingredient.protein_g * bounded), 1),
-            carbs_g=None if ingredient.carbs_g is None else round(max(0, ingredient.carbs_g * bounded), 1),
-            fat_g=None if ingredient.fat_g is None else round(max(0, ingredient.fat_g * bounded), 1),
-            source=ingredient.source,
-            confidence=ingredient.confidence,
-        )
+        _with_quantity(ingredient, max(0.1, ingredient.quantity * bounded))
         for ingredient in option.ingredient_details
     ]
     return _meal_option(option.title, scaled, option.rationale, list(option.substitutions))
@@ -1060,6 +1089,8 @@ def validate_meal_option(
                 break
         if option.protein * 4 > option.calories + 15:
             problems.append("implausible_total_protein")
+        if option.calories >= 250 and option.protein * 4 > option.calories * 0.9:
+            problems.append("missing_macro_room")
     # Budget cap: never exceed calories_max unless the budget explicitly allows
     # an acknowledged overage. A small rounding tolerance is permitted.
     tolerance = max(15, int(budget.calories_max * 0.05))
@@ -1075,14 +1106,97 @@ def validate_meal_option(
 
 
 def _repair_option_to_budget(option: MealOption, budget: MealBudget) -> MealOption:
-    """Scale an option's calories/protein down to fit the budget cap."""
-    if budget.allows_overage or option.calories <= budget.calories_max or option.calories <= 0:
+    """Scale an option into the meal budget when that is nutritionally sane."""
+    if option.calories <= 0:
         return option
-    target = max(budget.calories_min or 0, min(option.calories, budget.calories_max))
-    if target <= 0:
-        target = budget.calories_max
+    if option.calories > budget.calories_max and budget.allows_overage:
+        return option
+    if option.calories > budget.calories_max:
+        target = max(budget.calories_min or 0, min(option.calories, budget.calories_max))
+    elif budget.calories_min and option.calories < budget.calories_min and budget.policy not in {"low_remaining", "at_or_over_target"}:
+        target = min(budget.calories_max, max(budget.calories_min, int((budget.calories_min + budget.calories_max) / 2)))
+    else:
+        return option
+    if target <= 0 or target == option.calories:
+        return option
     scale = target / option.calories
     return _scale_option_ingredients(option, scale)
+
+
+def _score_option(
+    option: MealOption,
+    budget: MealBudget,
+    context: WorkoutNutritionContext,
+    recent_keys: set[str],
+) -> tuple[float, str]:
+    """Deterministic match score in [0,1] plus the single strongest reason.
+
+    RE9-052/053/013. Combines protein-fit, calorie-fit, timing, freshness and
+    simplicity so ranking is explainable and stable (no AI, no randomness).
+    """
+    reasons: list[tuple[float, str]] = []
+
+    # Protein fit: reward hitting the protein window; weight higher when the day
+    # still needs a lot of protein.
+    protein_mid = (budget.protein_min + budget.protein_max) / 2 or 1
+    protein_gap = abs(option.protein - protein_mid) / protein_mid
+    protein_fit = max(0.0, 1.0 - protein_gap)
+    protein_short = context.nutrition.protein_balance
+    protein_weight = 0.35 if (protein_short is not None and protein_short >= 40) else 0.25
+    if protein_short is not None and protein_short >= 40 and option.protein >= protein_mid:
+        reasons.append((protein_fit * protein_weight + 0.2, "הכי קרוב ליעד החלבון שנותר"))
+    else:
+        reasons.append((protein_fit * protein_weight, "מאזן חלבון טוב"))
+
+    # Calorie fit within the budget window.
+    cal_mid = (budget.calories_min + budget.calories_max) / 2 or 1
+    cal_gap = abs(option.calories - cal_mid) / cal_mid
+    cal_fit = max(0.0, 1.0 - cal_gap)
+    reasons.append((cal_fit * 0.3, "הכי מתאים לתקציב הקלורי"))
+
+    # Timing: pre/post-workout phases favour the templates built for them; the
+    # candidate pool is already phase-specific, so this is a small steady bonus.
+    timing = 0.15 if context.workout_phase not in {
+        WorkoutPhase.WORKOUT_STATUS_UNKNOWN,
+        WorkoutPhase.WORKOUT_PLANNED_TIME_PASSED,
+    } else 0.05
+    if context.workout_phase in {WorkoutPhase.PRE_WORKOUT_IMMEDIATE, WorkoutPhase.DURING_WORKOUT}:
+        reasons.append((timing, "מתאים לזמן שלפני האימון"))
+    elif context.workout_phase in {WorkoutPhase.POST_WORKOUT_IMMEDIATE, WorkoutPhase.POST_WORKOUT_LATER}:
+        reasons.append((timing, "טוב להתאוששות אחרי אימון"))
+    else:
+        reasons.append((timing, ""))
+
+    # Simplicity: fewer ingredients is a mild tie-breaker (RE9-144).
+    simplicity = max(0.0, 0.1 - 0.02 * max(0, len(option.ingredient_details or option.ingredients) - 3))
+    reasons.append((simplicity, "פשוט ומהיר להכנה"))
+
+    base = min(1.0, sum(weight for weight, _ in reasons))
+    best_reason = max((r for r in reasons if r[1]), key=lambda r: r[0], default=(0.0, ""))[1]
+
+    # Freshness dominates ordering (RE9-041): a recently-served title must never
+    # outrank a fresh one, so apply a large penalty rather than a small bonus.
+    if _free_text_preference_key(option.title) in recent_keys:
+        return base - 1.0, best_reason
+    if base >= 0.5 and "לאחרונה" not in best_reason:
+        best_reason = best_reason or "לא הצעתי לך את זה לאחרונה"
+    return base, best_reason
+
+
+def _rank_and_recommend(
+    options: list[MealOption],
+    budget: MealBudget,
+    context: WorkoutNutritionContext,
+    recent_keys: set[str],
+) -> list[MealOption]:
+    """Score, sort (desc) and mark exactly one option as recommended."""
+    for option in options:
+        option.score, option.recommended_reason = _score_option(option, budget, context, recent_keys)
+        option.recommended = False
+    ranked = sorted(options, key=lambda o: o.score, reverse=True)
+    if ranked:
+        ranked[0].recommended = True
+    return ranked
 
 
 def _fit_and_validate_options(
@@ -1091,6 +1205,7 @@ def _fit_and_validate_options(
     restrictions: list[DietaryRestriction],
     *,
     excluded_fingerprints: set[str] | None = None,
+    honor_user_quantity_scales: bool = False,
 ) -> tuple[list[MealOption], list[str]]:
     """Repair-or-drop options so a broken / over-budget option is never shown.
 
@@ -1103,7 +1218,12 @@ def _fit_and_validate_options(
         if option_fingerprint(option) in excluded:
             continue
         problems = validate_meal_option(option, budget, restrictions)
-        if "over_budget" in problems and not budget.allows_overage:
+        if ("over_budget" in problems and not budget.allows_overage) or (
+            budget.calories_min
+            and option.calories < budget.calories_min
+            and budget.policy not in {"low_remaining", "at_or_over_target"}
+            and not honor_user_quantity_scales
+        ):
             events.append("next_meal_validation_failed")
             option = _repair_option_to_budget(option, budget)
             problems = validate_meal_option(option, budget, restrictions)
@@ -1127,6 +1247,7 @@ async def generate_next_meal_recommendation(
     budget = allocate_next_meal_budget(context, allow_overage=allow_overage)
     restrictions = await _restrictions(db, user_id)
     flags = await _daily_flags(db, user_id, context.local_day)
+    restrictions = [*restrictions, *_temporary_avoid_restrictions(flags)]
     recent_titles = [
         str(title)
         for title in (flags.get("next_meal_recent_titles") or [])
@@ -1137,10 +1258,15 @@ async def generate_next_meal_recommendation(
     stored_rejections = _active_rejections(flags, now=now)
     excluded = set(excluded_fingerprints or set()) | stored_rejections
 
+    has_user_quantity_scales = bool(_quantity_scales(flags))
     candidates = _apply_quantity_scales(_candidate_templates(context.workout_phase, budget), flags)
     filtered = _filter_options(candidates, restrictions, recent_titles, budget)
     options, validation_events = _fit_and_validate_options(
-        filtered, budget, restrictions, excluded_fingerprints=excluded
+        filtered,
+        budget,
+        restrictions,
+        excluded_fingerprints=excluded,
+        honor_user_quantity_scales=has_user_quantity_scales,
     )
     if len(options) < 2:
         # Top up from the full candidate pool (still validated & de-duplicated).
@@ -1149,14 +1275,18 @@ async def generate_next_meal_recommendation(
             budget,
             restrictions,
             excluded_fingerprints=excluded | {option_fingerprint(o) for o in options},
+            honor_user_quantity_scales=has_user_quantity_scales,
         )
         validation_events += extra_events
         for option in extra:
             if option_fingerprint(option) not in {option_fingerprint(o) for o in options}:
                 options.append(option)
-            if len(options) >= 2:
+            if len(options) >= 4:
                 break
-    options = options[:3] if budget.policy in {"low_remaining", "at_or_over_target"} else options[:2]
+    # RE9-052/053/013: rank the validated pool by deterministic score, then keep
+    # the top options and mark exactly one as "⭐ מומלץ עבורך".
+    recent_keys = {_free_text_preference_key(title) for title in recent_titles if str(title).strip()}
+    options = _rank_and_recommend(options, budget, context, recent_keys)[:2]
 
     notices: list[str] = []
     if budget.policy == "low_remaining":
@@ -1164,6 +1294,15 @@ async def generate_next_meal_recommendation(
     if budget.policy == "at_or_over_target":
         notices.append(
             "הגעת ליעד הקלוריות היומי. אם אתה עדיין רעב, אפשר לבקש חריגה מבוקרת."
+        )
+    if (
+        budget.policy == "normal"
+        and context.nutrition.calorie_balance is not None
+        and context.nutrition.calorie_balance >= 1200
+        and budget.calories_max >= 650
+    ):
+        notices.append(
+            "נשארה לך יתרה גדולה, לכן בניתי ארוחה עיקרית גדולה יחסית. לא צריך להשלים את כל היתרה בבת אחת; אפשר להשאיר מקום לעוד ארוחה קטנה בהמשך."
         )
     if budget.allows_overage and budget.overage_reason:
         notices.append(
@@ -1180,6 +1319,11 @@ async def generate_next_meal_recommendation(
         WorkoutPhase.WORKOUT_STATUS_UNKNOWN,
         WorkoutPhase.WORKOUT_PLANNED_TIME_PASSED,
     }
+    decision_audit = evaluate_next_meal_decision(
+        context,
+        option_count=len(options),
+        validation_events=validation_events,
+    )
     return NextMealRecommendation(
         context=context,
         budget=budget,
@@ -1187,6 +1331,7 @@ async def generate_next_meal_recommendation(
         needs_workout_clarification=needs_clarification,
         notices=notices,
         validation_events=validation_events,
+        decision_audit=decision_audit.to_dict(),
     )
 
 
@@ -1208,6 +1353,47 @@ def _active_rejections(flags: dict[str, Any], *, now: datetime | None = None) ->
             continue
         active.add(fingerprint)
     return active
+
+
+def _temporary_avoid_restrictions(flags: dict[str, Any]) -> list[DietaryRestriction]:
+    items = flags.get("next_meal_temp_avoid_items") or []
+    if not isinstance(items, list):
+        return []
+    restrictions: list[DietaryRestriction] = []
+    for item in items:
+        label = str(item).strip()
+        if not label:
+            continue
+        restrictions.append(
+            DietaryRestriction(
+                canonical_id=_free_text_preference_key(label),
+                user_label=label,
+                original_input=label,
+                restriction_type="unavailable",
+                severity="medium",
+                confirmed=True,
+                source="next_meal_active_flow",
+            )
+        )
+    return restrictions
+
+
+async def _record_temporary_avoid_item(
+    db: Any,
+    user_id: int,
+    item: str,
+    recommendation: NextMealRecommendation,
+) -> None:
+    label = item.strip()
+    if not label:
+        return
+    flags = await _daily_flags(db, user_id, recommendation.context.local_day)
+    items = [str(value).strip() for value in (flags.get("next_meal_temp_avoid_items") or []) if str(value).strip()]
+    existing = {_free_text_preference_key(value) for value in items}
+    if _free_text_preference_key(label) not in existing:
+        items.append(label)
+    flags["next_meal_temp_avoid_items"] = items[-20:]
+    await _save_daily_flags(db, user_id, recommendation.context.local_day, flags)
 
 
 def _quantity_scales(flags: dict[str, Any]) -> dict[str, float]:
@@ -1389,29 +1575,21 @@ def option_feedback_actions(recommendation: NextMealRecommendation) -> list[list
 
 
 def next_meal_action_rows(recommendation: NextMealRecommendation) -> list[list[tuple[str, str]]]:
-    """Full re7 P1-11 action set: per-option actions + global actions.
+    """Primary next-meal actions shown on the recommendation screen.
 
-    Each option gets choose / replace / smaller / bigger / edit-quantities /
-    unavailable / dislike-ingredient. Global: why-it-fits. Workout clarification
-    buttons are prepended when needed. Returns (label, callback_data) rows.
+    RE9 recording follow-up: choosing must not be ambiguous. The first screen
+    separates "I ate this" from "plan this for later" so consumed and planned
+    stay distinct without forcing an extra tap through a generic choice screen.
     """
     rows: list[list[tuple[str, str]]] = []
     rows.extend(workout_clarification_actions(recommendation))
-    allow_bigger = (
-        recommendation.budget.policy not in {"at_or_over_target"}
-    )
     for index, _option in enumerate(recommendation.options, 1):
-        rows.append([(f"✅ אבחר ב-{index}", f"nextmeal:choose:{index}")])
-        size_row = [("🔁 החלף", f"nextmeal:dislike:{index}"), ("➖ קטן יותר", f"nextmeal:smaller:{index}")]
-        if allow_bigger:
-            size_row.append(("➕ גדול יותר", f"nextmeal:bigger:{index}"))
-        rows.append(size_row)
         rows.append([
-            ("✏️ עריכת כמויות", f"nextmeal:editqty:{index}"),
-            ("🏠 אין לי בבית", f"nextmeal:nostock:{index}"),
-            ("🚫 לא אוהב מרכיב", f"nextmeal:dislikeitem:{index}"),
+            (f"🍽 אכלתי אפשרות {index}", f"nextmeal:save:{index}"),
+            (f"📅 תכנן אפשרות {index}", f"nextmeal:plan:{index}"),
         ])
-    rows.append([("ℹ️ למה זה מתאים", "nextmeal:why")])
+    rows.append([("איך חושב?", "nextmeal:why")])
+    rows.append([("🔄 הצעות אחרות", "nextmeal:refresh")])
     return rows
 
 
@@ -1442,6 +1620,37 @@ def _remaining_headline(nutrition: NutritionTotals) -> str:
     return f"{cal_part}."
 
 
+def after_meal_balance(nutrition: NutritionTotals, option: MealOption) -> tuple[int | None, int | None]:
+    """RE9-020: consumed-based remaining if this option were eaten now.
+
+    Planned meals are deliberately excluded — this shows the honest effect of
+    eating this specific option, matching the consumed-only remaining balance.
+    """
+    after_cal = None if nutrition.calorie_balance is None else nutrition.calorie_balance - option.calories
+    after_prot = None if nutrition.protein_balance is None else nutrition.protein_balance - option.protein
+    return after_cal, after_prot
+
+
+def _after_meal_line(nutrition: NutritionTotals, option: MealOption) -> str:
+    after_cal, after_prot = after_meal_balance(nutrition, option)
+    if after_cal is None:
+        return ""
+    if after_cal >= 0:
+        cal_txt = f"יישארו כ-{after_cal} קל׳"
+    else:
+        cal_txt = f"חריגה של כ-{abs(after_cal)} קל׳"
+    if after_prot is not None and after_prot > 0:
+        return f"<i>אחרי הארוחה: {cal_txt} ו-{after_prot} ג׳ חלבון להיום</i>"
+    return f"<i>אחרי הארוחה: {cal_txt} להיום</i>"
+
+
+def _fit_score_label(option: MealOption) -> str:
+    score = int(round(max(0.0, min(1.0, option.score)) * 100))
+    if score <= 0:
+        return ""
+    return f" | התאמה {score}%"
+
+
 def format_next_meal_recommendation(recommendation: NextMealRecommendation) -> str:
     """Answer-first message (re7 P1-10): remaining + options first, short note,
     and the long explanation only via the 'why it fits' detail view."""
@@ -1455,12 +1664,18 @@ def format_next_meal_recommendation(recommendation: NextMealRecommendation) -> s
 
     lines = [_remaining_headline(nutrition) + goal_note, ""]
     for index, option in enumerate(recommendation.options, 1):
+        star = " ⭐ מומלץ עבורך" if option.recommended else ""
+        after = _after_meal_line(nutrition, option)
         lines += [
-            f"<b>אפשרות {index}: {esc(option.title)}</b>",
+            f"<b>אפשרות {index}: {esc(option.title)}</b>{star}",
             f"{esc(', '.join(option.ingredients))}",
-            f"כ-{option.calories} קל׳ | כ-{option.protein} גרם חלבון",
-            "",
+            f"כ-{option.calories} קל׳ | כ-{option.protein} גרם חלבון{_fit_score_label(option)}",
         ]
+        if after:
+            lines.append(after)
+        if option.recommended and option.recommended_reason:
+            lines.append(f"<i>{esc(option.recommended_reason)}</i>")
+        lines.append("")
     if recommendation.options:
         if nutrition.calorie_balance is not None and nutrition.calorie_balance >= 0 and not recommendation.budget.allows_overage:
             lines.append("שתיהן מתאימות ליתרה שלך כרגע.")
@@ -1478,6 +1693,9 @@ def format_next_meal_explanation(recommendation: NextMealRecommendation) -> str:
     budget = recommendation.budget
     lines = [
         "<b>למה זה מתאים</b>",
+        "",
+        "<b>איך חושב?</b>",
+        *format_remaining_calculation(nutrition_remaining_calculation(nutrition)),
         "",
         "<b>מצב היום</b>",
         *_signed_balance_line("קלוריות", nutrition.target_calories, nutrition.consumed_calories, nutrition.calorie_balance, "קל׳"),
@@ -1499,11 +1717,148 @@ def format_next_meal_explanation(recommendation: NextMealRecommendation) -> str:
     ]
     if context.meals_remaining_estimate:
         lines.append(f"• הערכת ארוחות שנותרו היום: {context.meals_remaining_estimate}")
+    timeline = build_day_timeline(context)
+    if timeline:
+        lines += ["", "<b>המשך היום</b>", *timeline]
     for notice in recommendation.notices:
         lines.append(f"• {esc(notice)}")
     if context.assumptions:
         lines += ["", "<i>" + esc(" ".join(context.assumptions)) + "</i>"]
     return "\n".join(lines)
+
+
+def build_day_timeline(context: WorkoutNutritionContext) -> list[str]:
+    """RE9-002: a lightweight plan of the rest of the day.
+
+    Deterministic, derived from the workout phase, minutes-to/since workout and
+    hours-until-bedtime already on the context. Kept in the detail view so the
+    first screen stays answer-first (RE9-012).
+    """
+    steps: list[str] = ["עכשיו — הארוחה הבאה"]
+    phase = context.workout_phase
+    if phase in {WorkoutPhase.PRE_WORKOUT_IMMEDIATE, WorkoutPhase.DURING_WORKOUT} or (
+        context.minutes_until_workout is not None
+    ):
+        if context.minutes_until_workout:
+            steps.append(f"בעוד ~{context.minutes_until_workout} דקות — אימון")
+        else:
+            steps.append("בהמשך — אימון")
+        steps.append("אחרי האימון — ארוחת התאוששות עם חלבון")
+    hours = context.hours_until_bedtime
+    if hours is not None:
+        if hours <= 1.5:
+            steps.append("סמוך לשינה — לא מומלץ עוד ארוחה כבדה")
+        elif hours <= 3.5:
+            steps.append("לפני השינה — אפשר ארוחה קלה אחת אם צריך")
+        else:
+            steps.append("לפני השינה — נשאר מקום לעוד 1-2 ארוחות")
+        steps.append(f"עוד ~{hours:.0f} שעות עד השינה")
+    steps.append("סוף היום — סיכום יומי")
+    return [f"• {esc(step)}" for step in steps]
+
+
+@dataclass
+class RemainingSlotAllocation:
+    """One remaining meal slot for the rest of today (RE10-13).
+
+    ``label`` is a human phase description ("לפני אימון" / "אחרי אימון" /
+    "ארוחת לילה" / "ארוחה"), not a fixed plan-slot name — it is derived at
+    render time from the workout phase and position in the day, not stored.
+    """
+
+    label: str
+    time_hint: str | None
+    calories: int
+    protein: int
+    is_night_meal: bool = False
+
+
+# D9/E2: the last remaining slot before bedtime is always small and
+# protein-dominant (a slow protein source helps preserve muscle overnight in
+# a deficit) rather than an arbitrary share of whatever calories are left.
+_NIGHT_MEAL_CALORIES = 150
+_NIGHT_MEAL_MIN_PROTEIN = 12
+
+
+def build_remaining_slot_allocations(
+    context: WorkoutNutritionContext,
+    *,
+    slot_count: int | None = None,
+) -> list[RemainingSlotAllocation]:
+    """Split the remaining calorie/protein balance across the rest of today.
+
+    Reuses the SAME hard-cap principle as ``allocate_next_meal_budget``
+    (D9): the sum of every returned slot's calories never exceeds the
+    remaining daily balance. When the balance is at/under zero, all slots
+    collapse to the night-meal-sized floor (never a "budget" that implies
+    room that doesn't exist).
+
+    ``slot_count`` defaults to ``context.meals_remaining_estimate`` (the same
+    estimator next-meal recommendations already use), so "מצב היום" and "מה
+    לאכול עכשיו" never disagree about how many meals are left today.
+    """
+    nutrition = context.nutrition
+    remaining_cal = nutrition.calorie_balance
+    remaining_protein = max(0, nutrition.protein_balance or 0)
+    count = max(1, slot_count if slot_count is not None else context.meals_remaining_estimate)
+
+    if remaining_cal is None or remaining_cal <= 0:
+        # Nothing left to allocate — still show the night-meal floor if a
+        # real night slot exists, so the user sees a safe closing option
+        # rather than an empty section that reads as "nothing to plan".
+        floor = min(_NIGHT_MEAL_CALORIES, max(0, remaining_cal or 0))
+        return [
+            RemainingSlotAllocation(
+                label="ארוחת לילה", time_hint=None, calories=int(floor),
+                protein=_NIGHT_MEAL_MIN_PROTEIN if floor > 0 else 0, is_night_meal=True,
+            )
+        ] if count >= 1 else []
+
+    has_night_slot = count >= 2
+    night_calories = min(_NIGHT_MEAL_CALORIES, remaining_cal) if has_night_slot else 0
+    night_protein = _NIGHT_MEAL_MIN_PROTEIN if has_night_slot else 0
+    day_slot_count = count - 1 if has_night_slot else count
+    day_calories_pool = max(0, remaining_cal - night_calories)
+    day_protein_pool = max(0, remaining_protein - night_protein)
+
+    allocations: list[RemainingSlotAllocation] = []
+    per_slot_calories = day_calories_pool // day_slot_count if day_slot_count else 0
+    per_slot_protein = day_protein_pool // day_slot_count if day_slot_count else 0
+    allocated_calories = 0
+    allocated_protein = 0
+    for index in range(day_slot_count):
+        is_last_day_slot = index == day_slot_count - 1
+        cal = int(day_calories_pool - allocated_calories) if is_last_day_slot else int(per_slot_calories)
+        prot = int(day_protein_pool - allocated_protein) if is_last_day_slot else int(per_slot_protein)
+        allocated_calories += cal
+        allocated_protein += prot
+        allocations.append(
+            RemainingSlotAllocation(label="ארוחה", time_hint=None, calories=cal, protein=prot)
+        )
+
+    if has_night_slot:
+        allocations.append(
+            RemainingSlotAllocation(
+                label="ארוחת לילה", time_hint=None,
+                calories=int(night_calories), protein=int(night_protein), is_night_meal=True,
+            )
+        )
+
+    # Label the first one or two day slots by workout phase when relevant —
+    # this is what lets the render layer say "ארוחה לפני אימון" / "אחרי אימון"
+    # instead of a generic "ארוחה 1" (D10: derived at render time, the
+    # underlying nutrition-plan slot names are never mutated).
+    phase = context.workout_phase
+    if allocations and phase in {
+        WorkoutPhase.PRE_WORKOUT_EARLY, WorkoutPhase.PRE_WORKOUT_NEAR, WorkoutPhase.PRE_WORKOUT_IMMEDIATE,
+    }:
+        allocations[0].label = "ארוחה לפני אימון"
+        if len(allocations) > 1 and not allocations[1].is_night_meal:
+            allocations[1].label = "ארוחה אחרי אימון"
+    elif allocations and phase in {WorkoutPhase.DURING_WORKOUT, WorkoutPhase.POST_WORKOUT_IMMEDIATE, WorkoutPhase.POST_WORKOUT_LATER}:
+        allocations[0].label = "ארוחה אחרי אימון"
+
+    return allocations
 
 
 ACTIVE_RECOMMENDATION_FLOW = "next_meal_recommendation"
@@ -1579,6 +1934,34 @@ async def clear_active_recommendation(db: Any, user_id: int) -> None:
     await core_services.clear_flow_state(user_id, ACTIVE_RECOMMENDATION_FLOW)
 
 
+async def mark_active_recommendation_selection(
+    db: Any,
+    user_id: int,
+    option_number: int,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Remember which visible option the user is reviewing before save."""
+    from noam_coach.services import core as core_services
+
+    state = await get_active_recommendation_state(db, user_id, now=now)
+    if not state:
+        return
+    state["selected_option"] = option_number
+    state["review_started_at"] = (now or datetime.now(TZ)).astimezone(TZ).isoformat()
+    await core_services.set_flow_state(user_id, ACTIVE_RECOMMENDATION_FLOW, "active", state)
+
+
+def _selected_option_number(state: dict[str, Any] | None) -> int:
+    if not state:
+        return 1
+    try:
+        selected = int(state.get("selected_option") or 1)
+    except (TypeError, ValueError):
+        return 1
+    return max(1, selected)
+
+
 def classify_recommendation_correction(text: str) -> dict[str, Any]:
     """Interpret a free-text message relative to an active recommendation.
 
@@ -1610,10 +1993,95 @@ def classify_recommendation_correction(text: str) -> dict[str, Any]:
 
     if any(word in t for word in ("אין לי", "נגמר", "נגמרו", "אזל")):
         return {"kind": "unavailable_item", "item": text.strip()}
+    qty_match = re.search(r"([\w\u0590-\u05ff׳'\" -]{2,40}?)\s*(\d{1,4})\s*(?:גרם|ג׳|ג'|גר|g)\b", t)
+    if qty_match:
+        item = qty_match.group(1).strip(" ,.-")
+        grams = int(qty_match.group(2))
+        if 5 <= grams <= 1000:
+            return {"kind": "quantity_override", "item": item, "grams": grams}
+
+    if any(word in t for word in ("בלי", "ללא", "אל תשים", "תוריד")):
+        item = _extract_item_after_marker(text, ("בלי", "ללא", "אל תשים", "תוריד"))
+        return {"kind": "avoid_now", "item": item or text.strip()}
+
     if any(word in t for word in ("לא אוהב", "לא אוהבת", "שונא", "לא מתחבר")):
         return {"kind": "dislike_item", "item": text.strip()}
 
     return {"kind": "none"}
+
+
+def _extract_item_after_marker(text: str, markers: tuple[str, ...]) -> str:
+    for marker in markers:
+        index = text.find(marker)
+        if index >= 0:
+            tail = text[index + len(marker):].strip(" :,-.")
+            return re.split(r"\s+(?:ו|וגם|אבל|עם)\s+", tail, maxsplit=1)[0].strip()
+    return ""
+
+
+def _text_key(value: str) -> str:
+    return _free_text_preference_key(value).replace("׳", "'")
+
+
+def _option_mentions_item(option: MealOption, item: str) -> bool:
+    item_key = _text_key(item)
+    if not item_key:
+        return False
+    haystack = [_text_key(option.title), *(_text_key(part) for part in option.ingredients)]
+    haystack.extend(_text_key(ingredient.display_name) for ingredient in option.ingredient_details)
+    haystack.extend(_text_key(ingredient.food_id) for ingredient in option.ingredient_details)
+    return any(item_key in part or part in item_key for part in haystack if part)
+
+
+def _override_option_ingredient_quantity(option: MealOption, item: str, grams: int) -> MealOption:
+    item_key = _text_key(item)
+    updated: list[MealIngredient] = []
+    changed = False
+    for ingredient in option.ingredient_details:
+        names = (
+            _text_key(ingredient.display_name),
+            _text_key(ingredient.food_id),
+        )
+        if not changed and any(item_key in name or name in item_key for name in names if name):
+            updated.append(_with_quantity(ingredient, float(grams)))
+            changed = True
+        else:
+            updated.append(ingredient)
+    return MealOption(
+        title=option.title,
+        ingredients=[],
+        calories=0,
+        protein=0,
+        rationale=option.rationale,
+        substitutions=option.substitutions,
+        restriction_validated=option.restriction_validated,
+        ingredient_details=updated,
+    ) if changed else option
+
+
+def _replace_selected_option(
+    recommendation: NextMealRecommendation,
+    option_number: int,
+    option: MealOption,
+) -> NextMealRecommendation:
+    options = list(recommendation.options)
+    if 1 <= option_number <= len(options):
+        options[option_number - 1] = option
+    validation_events = [*recommendation.validation_events, "next_meal_selected_option_updated"]
+    decision_audit = evaluate_next_meal_decision(
+        recommendation.context,
+        option_count=len(options),
+        validation_events=validation_events,
+    )
+    return NextMealRecommendation(
+        context=recommendation.context,
+        budget=recommendation.budget,
+        options=options,
+        needs_workout_clarification=recommendation.needs_workout_clarification,
+        notices=recommendation.notices,
+        validation_events=validation_events,
+        decision_audit=decision_audit.to_dict(),
+    )
 
 
 async def handle_recommendation_correction(
@@ -1642,6 +2110,7 @@ async def handle_recommendation_correction(
 
     prefix = ""
     allow_overage = False
+    selected_option = _selected_option_number(state)
 
     if kind == "budget_correction":
         snapshot = await build_workout_nutrition_context(db, user_id, now=now)
@@ -1673,6 +2142,28 @@ async def handle_recommendation_correction(
         prefix = "התאמתי לאפשרויות מהירות להכנה."
     elif kind == "unavailable_item":
         prefix = "סימנתי שחסר לך מרכיב כרגע (זמני) והחלפתי את ההצעה."
+    elif kind == "avoid_now":
+        item = str(correction.get("item") or "").strip()
+        temp_context = await build_workout_nutrition_context(db, user_id, now=now)
+        temp_budget = allocate_next_meal_budget(temp_context)
+        temp_recommendation = NextMealRecommendation(
+            context=temp_context,
+            budget=temp_budget,
+            options=[],
+        )
+        await _record_temporary_avoid_item(db, user_id, item, temp_recommendation)
+        active_options = await get_active_recommendation_options(db, user_id, now=now)
+        if 1 <= selected_option <= len(active_options):
+            selected = active_options[selected_option - 1]
+            await _record_temporary_rejection(
+                db,
+                user_id,
+                _replace_selected_option(temp_recommendation, 1, selected),
+                option_fingerprint(selected),
+                now=now,
+                reason="avoid_now",
+            )
+        prefix = f"הסרתי את {esc(item)} מההצעה הנוכחית והכנתי חלופה בלי המרכיב הזה."
     elif kind == "dislike_item":
         # A standing dislike -> persist via the canonical preferences service.
         await record_food_preference_from_slots(
@@ -1681,6 +2172,30 @@ async def handle_recommendation_correction(
             text.strip(),
         )
         prefix = "שמרתי את ההעדפה הקבועה והחלפתי את ההצעה."
+    elif kind == "quantity_override":
+        active_options = await get_active_recommendation_options(db, user_id, now=now)
+        item = str(correction.get("item") or "").strip()
+        grams = int(correction.get("grams") or 0)
+        if 1 <= selected_option <= len(active_options) and grams > 0:
+            option = active_options[selected_option - 1]
+            updated = _override_option_ingredient_quantity(option, item, grams)
+            if updated is not option:
+                refreshed_context = await build_workout_nutrition_context(db, user_id, now=now)
+                refreshed_budget = allocate_next_meal_budget(refreshed_context)
+                refreshed = _replace_selected_option(
+                    NextMealRecommendation(
+                        context=refreshed_context,
+                        budget=refreshed_budget,
+                        options=active_options,
+                    ),
+                    selected_option,
+                    updated,
+                )
+                await remember_active_recommendation(db, user_id, refreshed, now=now)
+                await mark_active_recommendation_selection(db, user_id, selected_option, now=now)
+                await _log_event(db, user_id, "next_meal_quantity_text_updated", {"item": item, "grams": grams})
+                return f"עדכנתי את {esc(item)} ל-{grams} גרם וחישבתי מחדש.", refreshed
+        prefix = "לא מצאתי את המרכיב הזה באפשרות הנבחרת. אפשר לכתוב למשל: קוטג׳ 150 גרם."
 
     refreshed = await generate_next_meal_recommendation(
         db, user_id, now=now, allow_overage=allow_overage
@@ -1738,6 +2253,41 @@ async def save_chosen_meal(
     flags["next_meal_saved"] = saved
     await _save_daily_flags(db, user_id, local_day, flags)
     await _log_event(db, user_id, "next_meal_saved_as_meal", {"title": option.title, "calories": option.calories})
+    return True
+
+
+async def plan_chosen_meal(
+    db: Any,
+    user_id: int,
+    option: MealOption,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """RE9-019: record a chosen option as *planned* for later, not consumed.
+
+    Planned meals live in daily_flags['next_meal_planned'] and are surfaced by
+    the nutrition context as planned — they never reduce the consumed balance
+    until the user explicitly saves them as eaten. Idempotent per fingerprint.
+    """
+    current = (now or datetime.now(TZ)).astimezone(TZ)
+    fingerprint = option_fingerprint(option)
+    local_day = current.date().isoformat()
+    flags = await _daily_flags(db, user_id, local_day)
+    planned = flags.get("next_meal_planned")
+    if not isinstance(planned, list):
+        planned = []
+    if any(isinstance(m, dict) and m.get("fingerprint") == fingerprint for m in planned):
+        return False  # already planned -> no duplicate
+    planned.append({
+        "fingerprint": fingerprint,
+        "name": option.title,
+        "calories": int(option.calories),
+        "protein": int(option.protein),
+        "planned_at": current.isoformat(),
+    })
+    flags["next_meal_planned"] = planned
+    await _save_daily_flags(db, user_id, local_day, flags)
+    await _log_event(db, user_id, "next_meal_planned_for_later", {"title": option.title, "calories": option.calories})
     return True
 
 

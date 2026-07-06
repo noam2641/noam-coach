@@ -146,11 +146,54 @@ async def get_user_plan(user_id: int, code: str) -> dict[str, Any]:
     return plan
 
 
+async def _meal_safety_context(user_id: int | None) -> dict[str, Any] | None:
+    """RE10-15 / D5: fetch just the safety fields for the first-pass prompts.
+
+    Uses ``get_fact`` (not ``get_value``) so an unanswered allergy/restriction
+    question (a gap) is treated as "nothing to report" instead of leaking the
+    internal gap-dict into the AI request (same principle as RE10-2).
+    """
+    if user_id is None:
+        return None
+    allergy_fact = await user_model.get_fact(DB, user_id, "allergies")
+    diet_fact = await user_model.get_fact(DB, user_id, "diet_restrictions")
+    allergies = allergy_fact["value"] if allergy_fact and allergy_fact["kind"] != user_model.KIND_GAP else None
+    diet = diet_fact["value"] if diet_fact and diet_fact["kind"] != user_model.KIND_GAP else None
+    if not allergies and not diet:
+        return None
+    return {"allergies": allergies, "diet_restrictions": diet}
+
+
+def _apply_israeli_food_overrides(analysis: MealAnalysis) -> MealAnalysis:
+    """RE10-15: align macros to the curated Israeli-foods table on a confident match.
+
+    Only overrides when the AI-returned item name matches a known product —
+    a weak/no match leaves the AI's own estimate untouched (better a free-form
+    estimate than a wrong deterministic override).
+    """
+    import israeli_foods
+
+    for item in analysis.items:
+        match = israeli_foods.lookup(item.name)
+        if match is None:
+            continue
+        scaled = israeli_foods.scaled_macros(match, item.grams)
+        item.name = match.canonical_name
+        item.calories = scaled["calories"]
+        item.protein = scaled["protein"]
+        item.carbs = scaled["carbs"]
+        item.fat = scaled["fat"]
+    return analysis
+
+
 @runtime_bound(RUNTIME_NAMES)
-async def analyze_meal_image(image_bytes: bytes) -> MealAnalysis:
+async def analyze_meal_image(image_bytes: bytes, user_id: int | None = None) -> MealAnalysis:
     if not OPENAI_CLIENT:
         raise RuntimeError("OPENAI_API_KEY אינו מוגדר")
 
+    from noam_coach.services.meal_prompts import ISRAELI_LOCALE_BLOCK, safety_context_block
+
+    safety_context = await _meal_safety_context(user_id)
     encoded = base64.b64encode(image_bytes).decode("utf-8")
     response = await OPENAI_CLIENT.responses.parse(
         model=SETTINGS.openai_model,
@@ -169,7 +212,9 @@ async def analyze_meal_image(image_bytes: bytes) -> MealAnalysis:
                     "what you see in the photo — e.g. 'האם הסלט עם שמן זית או בלי?' "
                     "Never ask generic questions about food types clearly visible "
                     "in the image. Options must include concrete calorie deltas. "
-                    "Do not present estimates as medical advice."
+                    "Do not present estimates as medical advice.\n\n"
+                    + ISRAELI_LOCALE_BLOCK
+                    + safety_context_block(safety_context)
                 ),
             },
             {
@@ -191,15 +236,18 @@ async def analyze_meal_image(image_bytes: bytes) -> MealAnalysis:
     )
     if not response.output_parsed:
         raise RuntimeError("לא התקבל ניתוח מובנה")
-    return response.output_parsed
+    return _apply_israeli_food_overrides(response.output_parsed)
 
 
 @runtime_bound(RUNTIME_NAMES)
-async def analyze_meal_text(description: str) -> MealAnalysis:
+async def analyze_meal_text(description: str, user_id: int | None = None) -> MealAnalysis:
     """Estimate a meal from a text description only (no photo)."""
     if not OPENAI_CLIENT:
         raise RuntimeError("OPENAI_API_KEY אינו מוגדר")
 
+    from noam_coach.services.meal_prompts import ISRAELI_LOCALE_BLOCK, safety_context_block
+
+    safety_context = await _meal_safety_context(user_id)
     response = await OPENAI_CLIENT.responses.parse(
         model=SETTINGS.openai_model,
         input=[
@@ -216,7 +264,9 @@ async def analyze_meal_text(description: str) -> MealAnalysis:
                     "the calorie estimate (>15%). The question must reference what "
                     "the user described — e.g. if they said 'סלט' ask 'עם שמן זית "
                     "או בלי?' not 'סלט ירקות או סלט פסטה?'. Options must include "
-                    "concrete calorie deltas. Not medical advice."
+                    "concrete calorie deltas. Not medical advice.\n\n"
+                    + ISRAELI_LOCALE_BLOCK
+                    + safety_context_block(safety_context)
                 ),
             },
             {
@@ -228,7 +278,7 @@ async def analyze_meal_text(description: str) -> MealAnalysis:
     )
     if not response.output_parsed:
         raise RuntimeError("לא התקבל ניתוח מובנה")
-    return response.output_parsed
+    return _apply_israeli_food_overrides(response.output_parsed)
 
 
 _QUANTITY_RE = re.compile(
@@ -270,6 +320,8 @@ async def reanalyze_meal_with_text_and_image(
     if not OPENAI_CLIENT:
         raise RuntimeError("OPENAI_API_KEY אינו מוגדר")
 
+    from noam_coach.services.meal_prompts import ISRAELI_LOCALE_BLOCK
+
     image_bytes = Path(image_path).read_bytes()
     encoded = base64.b64encode(image_bytes).decode("utf-8")
 
@@ -310,6 +362,8 @@ async def reanalyze_meal_with_text_and_image(
                     "rejected identification. If the drink is genuinely a non-caloric "
                     "beverage, return it with its real (possibly zero) values and a clear name."
                     + locked_block
+                    + "\n\n"
+                    + ISRAELI_LOCALE_BLOCK
                 ),
             },
             {
@@ -350,6 +404,9 @@ async def reanalyze_meal_with_text_and_image(
     parsed = response.output_parsed
     parsed.question = None
     parsed.options = []
+    # RE10-15: align to the curated table BEFORE locking user-stated
+    # quantities, so an explicit user correction always wins over the table.
+    parsed = _apply_israeli_food_overrides(parsed)
     parsed = _enforce_user_quantities(parsed, correction_text)
     return parsed
 

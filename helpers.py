@@ -31,14 +31,14 @@ def _safe_html_block(text: str) -> str:
 
 
 def friendly_error(exc: Exception, context_label: str) -> str:
-    """Log the full exception and return a short, user-safe message + error id.
+    """Log the full exception and return a short, user-safe message.
 
-    Users never see stack traces, DB errors or file paths — only a friendly
-    line with an id they can quote for support.
+    Users never see stack traces, DB errors, file paths or internal ids. The
+    generated error id stays in logs only.
     """
     error_id = secrets.token_hex(3)
     LOGGER.error("[%s] %s failed: %r", error_id, context_label, exc)
-    return f"משהו השתבש כרגע 🙏 נסה שוב בעוד רגע. (קוד תקלה: {error_id})"
+    return "משהו השתבש כרגע. אפשר לנסות שוב, לחזור למסך הקודם או להמשיך מהמצב האחרון שנשמר."
 
 
 def today_bounds_utc() -> tuple[str, str]:

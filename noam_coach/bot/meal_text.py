@@ -105,6 +105,7 @@ from retention import (
 # ---------------------------------------------------------------------------
 
 from noam_coach.runtime_bind import runtime_bound
+from noam_coach.services.profile import get_user_plan, set_exercise_override
 from noam_coach.services.nutrition_context import (
     build_nutrition_ai_request,
     build_nutrition_context,
@@ -268,6 +269,113 @@ async def _handle_meal_correction_text(
         )
 
 
+def _format_rest_seconds(seconds: int) -> str:
+    minutes, remainder = divmod(max(0, int(seconds)), 60)
+    return f"{minutes}:{remainder:02d}"
+
+
+def _parse_rest_seconds(text: str) -> int | None:
+    normalized = text.strip().lower()
+    match = re.search(r"\b(\d{1,2}):([0-5]\d)\b", normalized)
+    if match:
+        return max(30, int(match.group(1)) * 60 + int(match.group(2)))
+    match = re.search(r"\b(\d{2,3})\s*(?:שניות|שניה|שנ׳|שנ'|sec|seconds?)\b", normalized)
+    if match:
+        return max(30, int(match.group(1)))
+    if any(variant in normalized for variant in ("דקה וחצי", "דקה חצי", "1.5 דקות", "1.5 דקה")):
+        return 90
+    match = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:דקות|דקה|mins?|minutes?)\b", normalized)
+    if match:
+        return max(30, int(round(float(match.group(1)) * 60)))
+    return None
+
+
+def _parse_workout_parameter_text(text: str) -> list[dict[str, Any]]:
+    normalized = text.strip().lower()
+    scope = "all" if any(marker in normalized for marker in ("כל התרגילים", "כולם", "לכולם", "all exercises")) else "current"
+    updates: list[dict[str, Any]] = []
+
+    if any(marker in normalized for marker in ("מנוחה", "rest")):
+        rest_seconds = _parse_rest_seconds(normalized)
+        if rest_seconds is not None:
+            updates.append({
+                "field": "rest",
+                "value": rest_seconds,
+                "scope": scope,
+                "label": f"מנוחה {_format_rest_seconds(rest_seconds)}",
+            })
+
+    match = re.search(r"(?:משקל|weight)\s*(\d+(?:\.\d+)?)", normalized)
+    if match:
+        weight = max(0.0, round(float(match.group(1)), 2))
+        updates.append({"field": "weight", "value": weight, "scope": "current", "label": f"משקל {weight:g} קג"})
+
+    match = re.search(r"\b(\d{1,2})\s*(?:סטים|סט|sets?)\b", normalized)
+    if match:
+        sets = max(1, int(match.group(1)))
+        updates.append({"field": "sets", "value": sets, "scope": scope, "label": f"{sets} סטים"})
+
+    match = re.search(r"\b(\d{1,2})\s*[-–]\s*(\d{1,2})\s*(?:חזרות|reps?)?\b", normalized)
+    if match:
+        rmin = max(1, int(match.group(1)))
+        rmax = max(rmin, int(match.group(2)))
+        updates.append({"field": "reps", "rmin": rmin, "rmax": rmax, "scope": scope, "label": f"{rmin}-{rmax} חזרות"})
+
+    return updates
+
+
+async def _handle_workout_parameter_text(
+    update: Update,
+    user_id: int,
+    flow: conversation.ActiveFlow,
+    text: str,
+) -> None:
+    payload = dict(flow.payload or {})
+    code = str(payload.get("code") or "")
+    exercise_index = int(payload.get("exercise_index") or 0)
+    if not code:
+        await conversation.clear_active_flow(DB, user_id)
+        await route_free_text(update, user_id)
+        return
+
+    updates = _parse_workout_parameter_text(text)
+    if not updates:
+        await update.effective_message.reply_text(
+            "לא זיהיתי שינוי לפרמטרי האימון. אפשר לכתוב למשל: מנוחה 1:30 לכל התרגילים, משקל 22.5, או 4 סטים.",
+            reply_markup=InlineKeyboardMarkup([
+                [button("⬅️ חזרה לאימון", f"workout:{code}")],
+                [button("❌ ביטול", "wparamtext:cancel")],
+            ]),
+        )
+        return
+
+    plan = await get_user_plan(user_id, code)
+    exercise_name = plan["exercises"][exercise_index]["name"] if 0 <= exercise_index < len(plan["exercises"]) else "התרגיל"
+    scope_label = "לכל התרגילים" if any(item.get("scope") == "all" for item in updates) else f"לתרגיל {exercise_name}"
+    summary = ", ".join(str(item["label"]) for item in updates)
+    await conversation.set_active_flow(
+        DB,
+        user_id,
+        conversation.FlowName.workout_parameter_edit,
+        step="preview",
+        payload={
+            "code": code,
+            "exercise_index": exercise_index,
+            "pending_updates": updates,
+            "summary": summary,
+            "scope_label": scope_label,
+        },
+    )
+    await update.effective_message.reply_text(
+        f"הבנתי: {summary} {scope_label}.\nלא שמרתי עדיין. לאשר את השינוי?",
+        reply_markup=InlineKeyboardMarkup([
+            [button("✅ אשר ושמור", "wparamtext:apply")],
+            [button("✏️ אכתוב תיקון אחר", f"editparams:{code}:{exercise_index}")],
+            [button("❌ ביטול", "wparamtext:cancel")],
+        ]),
+    )
+
+
 @runtime_bound(RUNTIME_NAMES)
 async def handle_text_message(
     update: Update,
@@ -347,6 +455,13 @@ async def handle_text_message(
             entity="plan_selection", source="router",
             properties={"text_preview": text[:60]},
         )
+
+    if decision.handler == "workout_parameter_flow":
+        flow = await conversation.get_active_flow(DB, user_id)
+        if flow.name == conversation.FlowName.workout_parameter_edit:
+            await _handle_workout_parameter_text(update, user_id, flow, text)
+            return
+        await conversation.clear_active_flow(DB, user_id)
 
     # re7 P1-13/14: when a next-meal recommendation is active, interpret a
     # correction ("אבל נשאר לי 269", "זה גדול מדי", "אין לי ביצים") against it

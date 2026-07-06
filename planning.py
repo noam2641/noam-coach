@@ -24,6 +24,12 @@ from exercise_plans import (
     weekday_he,
 )
 from helpers import utc_now
+from noam_coach.services.weekdays import (
+    WEEKDAY_SCHEMA_VERSION,
+    normalize_weekday,
+    sunday_first_order,
+    with_weekday_schema,
+)
 
 PlanType = Literal["nutrition", "workout", "unified"]
 
@@ -151,6 +157,7 @@ async def build_goal_proposal(db: Any, user_id: int) -> GoalProposal:
     goal = _fact_value(facts, "primary_goal", "fat_loss_muscle_retention")
     avg_steps = _fact_value(facts, "avg_steps")
     workouts = _fact_value(facts, "training_days_per_week")
+    timeframe = _fact_value(facts, "goal_timeframe_weeks")
     result = targets.compute_targets(
         float(weight),
         avg_steps=float(avg_steps) if avg_steps is not None else None,
@@ -161,6 +168,7 @@ async def build_goal_proposal(db: Any, user_id: int) -> GoalProposal:
         workouts_per_week=(float(workouts) if workouts is not None else None),
         goal_weight_kg=(float(_fact_value(facts, "goal_weight_kg")) if _fact_value(facts, "goal_weight_kg") is not None else None),
         body_fat_pct=(float(_fact_value(facts, "body_fat_pct")) if _fact_value(facts, "body_fat_pct") is not None else None),
+        goal_timeframe_weeks=(float(timeframe) if timeframe is not None else None),
     )
     confidence = 0.92 - 0.1 * len(result.missing_inputs or [])
     confidence = max(0.45, round(confidence, 2))
@@ -396,7 +404,7 @@ def _nutrition_candidate(
     for slot, time_text in zip(slots, times, strict=False):
         slot["time"] = time_text
     days = []
-    for weekday in range(7):
+    for weekday in sunday_first_order(range(7)):
         day_slots = copy.deepcopy(slots)
         if weekday in {4, 5}:  # Friday/Saturday: preserve social flexibility.
             day_slots[-1]["name"] = "ארוחה משפחתית/חברתית"
@@ -506,22 +514,47 @@ async def build_nutrition_candidates(db: Any, user_id: int) -> list[PlanCandidat
 
 
 def _parse_availability(value: Any) -> list[dict[str, Any]]:
+    def _normalized_slot(item: dict[str, Any]) -> dict[str, Any] | None:
+        normalized = normalize_weekday(item.get("weekday"), item.get("weekday_schema"))
+        if normalized.weekday is None:
+            return None
+        slot = dict(item)
+        slot["weekday"] = normalized.weekday
+        slot["weekday_schema"] = WEEKDAY_SCHEMA_VERSION
+        if normalized.needs_confirmation:
+            slot["needs_weekday_confirmation"] = True
+        return slot
+
     if isinstance(value, list):
-        return [item for item in value if isinstance(item, dict)]
+        return [
+            slot
+            for item in value
+            if isinstance(item, dict)
+            for slot in [_normalized_slot(item)]
+            if slot
+        ]
     if isinstance(value, dict):
         if isinstance(value.get("days"), list):
-            return [item for item in value["days"] if isinstance(item, dict)]
+            return [
+                slot
+                for item in value["days"]
+                if isinstance(item, dict)
+                for slot in [_normalized_slot(item)]
+                if slot
+            ]
         result = []
         for key, item in value.items():
             if isinstance(item, dict):
-                result.append({"weekday": int(key), **item})
+                slot = _normalized_slot({"weekday": key, **item})
+                if slot:
+                    result.append(slot)
         return result
     return []
 
 
 def _default_days(frequency: int) -> list[int]:
     spreads = {
-        1: [1],
+        1: [0],
         2: [0, 3],
         3: [0, 2, 4],
         4: [0, 1, 3, 5],
@@ -536,18 +569,24 @@ def _schedule_sessions(
     availability: list[dict[str, Any]],
     *,
     default_minutes: int,
+    default_start: str | None = None,
+    split_override: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     usable = [item for item in availability if item.get("available", True)]
     usable.sort(key=lambda item: int(item.get("weekday", 0)))
     assumed = len(usable) < frequency
     if assumed:
         selected = [
-            {"weekday": day, "start": None, "minutes": default_minutes}
+            with_weekday_schema({"weekday": day, "start": default_start, "minutes": default_minutes})
             for day in _default_days(frequency)
         ]
     else:
         selected = usable[:frequency]
-    split = SPLIT_BY_FREQUENCY[frequency]
+    # RE10-3 / E3: allow a strategy-specific split (e.g. Full-Body x3 for
+    # "consistency" at a 3-day frequency) instead of always the one fixed
+    # split per frequency — this is what actually differentiates the three
+    # workout-plan candidates beyond their marketing copy.
+    split = split_override if split_override is not None else SPLIT_BY_FREQUENCY[frequency]
     sessions = []
     for index, (slot, code) in enumerate(zip(selected, split, strict=True)):
         sessions.append(
@@ -555,7 +594,7 @@ def _schedule_sessions(
                 "index": index,
                 "weekday": int(slot.get("weekday", 0)),
                 "weekday_name": weekday_he(int(slot.get("weekday", 0))),
-                "time": slot.get("start") or slot.get("time"),
+                "time": slot.get("start") or slot.get("time") or default_start,
                 "minutes": int(slot.get("minutes") or default_minutes),
                 "code": code,
                 "name": PLANS[code]["name"],
@@ -563,6 +602,42 @@ def _schedule_sessions(
             }
         )
     return sessions, assumed
+
+
+# E3 (expert review): for a 3-day/week frequency, A/B/C trains legs only once
+# a week (shared with shoulders in session C) — a real programming weakness
+# for fat-loss / general-health goals where legs are the biggest calorie
+# driver. Full-Body x3 trains every major muscle group 3x/week instead, and
+# is the more evidence-based default for "consistency" (fewer decisions,
+# lower per-session fatigue, better adherence) and for beginners generally.
+_CONSISTENCY_SPLIT_OVERRIDES: dict[int, list[str]] = {
+    3: ["F", "F", "F"],
+}
+
+# E4: sets-per-exercise multiplier by strategy, bounded so consistency never
+# drops below a minimally-effective volume and performance never exceeds a
+# recoverable one for a non-advanced lifter (~6-20 sets/muscle/week at this
+# per-session set count and frequency).
+_STRATEGY_SET_DELTA: dict[str, int] = {
+    "consistency": -1,
+    "balanced": 0,
+    "performance": +1,
+}
+_MIN_SETS_PER_EXERCISE = 2
+_MAX_SETS_PER_EXERCISE = 5
+
+
+def _apply_strategy_volume(sessions: list[dict[str, Any]], strategy: str) -> None:
+    """Adjust sets-per-exercise by strategy (E4), bounded to a safe range."""
+    delta = _STRATEGY_SET_DELTA.get(strategy, 0)
+    if delta == 0:
+        return
+    for session in sessions:
+        for exercise_entry in session["exercises"]:
+            current = int(exercise_entry.get("sets", 3))
+            exercise_entry["sets"] = max(
+                _MIN_SETS_PER_EXERCISE, min(_MAX_SETS_PER_EXERCISE, current + delta)
+            )
 
 
 def workout_quality_issues(payload: dict[str, Any]) -> list[str]:
@@ -710,14 +785,35 @@ def _workout_candidate(
     tradeoffs: list[str],
     resolved_session_minutes: int | None = None,
     resolved_preferred_days: list[int] | None = None,
+    resolved_preferred_time: str | None = None,
 ) -> PlanCandidate:
     # REC-PROGRAM-04-01: Use resolved availability when provided
     minutes = resolved_session_minutes or int(_fact_value(facts, "session_minutes", 50) or 50)
     availability = _parse_availability(_fact_value(facts, "weekly_availability"))
     if resolved_preferred_days and not availability:
         # Synthesize availability slots from resolved preferred days
-        availability = [{"weekday": d, "available": True, "minutes": minutes} for d in resolved_preferred_days]
-    sessions, assumed = _schedule_sessions(frequency, availability, default_minutes=minutes)
+        availability = [
+            with_weekday_schema(
+                {
+                    "weekday": d,
+                    "available": True,
+                    "minutes": minutes,
+                    "start": resolved_preferred_time,
+                }
+            )
+            for d in resolved_preferred_days
+        ]
+    split_override = (
+        _CONSISTENCY_SPLIT_OVERRIDES.get(frequency) if strategy == "consistency" else None
+    )
+    sessions, assumed = _schedule_sessions(
+        frequency,
+        availability,
+        default_minutes=minutes,
+        default_start=resolved_preferred_time,
+        split_override=split_override,
+    )
+    _apply_strategy_volume(sessions, strategy)
     equipment_value = _fact_value(facts, "equipment")
     location = _fact_value(facts, "training_location")
     pain_value = _fact_value(facts, "active_pain")
@@ -791,15 +887,22 @@ async def build_workout_candidates(db: Any, user_id: int) -> list[PlanCandidate]
     from noam_coach.services.availability import resolve_availability
     avail = await resolve_availability(db, user_id)
     desired = max(MIN_FREQUENCY, min(MAX_FREQUENCY, avail.max_days_per_week))
-    experience = str(_fact_value(facts, "strength_experience", "beginner"))
-    consistency_freq = max(1, min(3, desired - 1 if desired > 2 else desired))
-    performance_freq = min(MAX_FREQUENCY, desired + 1)
-    if experience in {"beginner", "מתחיל", "none", "unknown"}:
-        performance_freq = desired
+    # D13: differentiate frequency itself where the user's declared
+    # availability allows it. The ceiling for "performance" is the number of
+    # confirmed available time slots (avail.preferred_days) when that is
+    # genuinely larger than the user's stated commitment level
+    # (avail.max_days_per_week) — e.g. someone who said "4 days a week" but
+    # confirmed 6 open slots has real, declared headroom to train more, never
+    # invented availability.
+    confirmed_days_available = len(avail.preferred_days) if avail.preferred_days else avail.max_days_per_week
+    performance_ceiling = max(avail.max_days_per_week, confirmed_days_available)
+    consistency_freq = max(MIN_FREQUENCY, desired - 1)
+    performance_freq = min(MAX_FREQUENCY, performance_ceiling, desired + 1)
     # REC-PROGRAM-04-01: Pass resolved availability to candidates
     _avail_kwargs = {
         "resolved_session_minutes": avail.session_minutes,
         "resolved_preferred_days": avail.preferred_days,
+        "resolved_preferred_time": avail.preferred_time,
     }
     return [
         _workout_candidate(
@@ -1080,7 +1183,7 @@ async def build_unified_week(db: Any, user_id: int) -> PlanCandidate:
         workout_days.setdefault(int(session["weekday"]), []).append(session)
 
     days: list[dict[str, Any]] = []
-    for weekday in range(7):
+    for weekday in sunday_first_order(range(7)):
         meals = copy.deepcopy(nutrition_days.get(weekday, {}).get("meals", []))
         sessions = copy.deepcopy(workout_days.get(weekday, []))
         if sessions and meals:
@@ -1092,12 +1195,25 @@ async def build_unified_week(db: Any, user_id: int) -> PlanCandidate:
                     "guidance": "ארוחה קלה 60–120 דקות לפני וחלבון לאחר האימון לפי התוכנית",
                 }
             )
+        # D12: a single chronologically-sorted view of the day, merging meals
+        # and workouts by "HH:MM" (a plain string sort is chronological for
+        # this fixed-width format). "meals"/"workouts" stay on the payload
+        # unchanged for backward compatibility with existing consumers/tests;
+        # "items" is what the renderer should use so a mid-day workout no
+        # longer always prints after every meal regardless of its own time.
+        items: list[dict[str, Any]] = [
+            {**meal, "type": "meal", "time": meal.get("time") or ""} for meal in meals
+        ] + [
+            {**session, "type": "workout", "time": session.get("time") or ""} for session in sessions
+        ]
+        items.sort(key=lambda item: (item["time"] == "", item["time"]))
         days.append(
             {
                 "weekday": weekday,
                 "weekday_name": weekday_he(weekday),
                 "meals": meals,
                 "workouts": sessions,
+                "items": items,
             }
         )
     candidate = PlanCandidate(

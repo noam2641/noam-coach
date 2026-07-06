@@ -86,6 +86,58 @@ async def test_mini_profile_returns_resolved_availability(
 
 
 @pytest.mark.asyncio
+async def test_operational_snapshot_surfaces_active_pain_session_and_load_decision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = Database(str(tmp_path / "mini-ops.db"))
+    await db.init()
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(1,'A',NULL,?)",
+        (utc_now(),),
+    )
+    await db.execute(
+        """
+        INSERT INTO medical_constraints(
+            user_id, kind, location, severity, status, note, affects, created_at
+        ) VALUES(1, 'pain', 'elbow', 2, 'active', 'reported during workout',
+                 '["exercise_selection"]', ?)
+        """,
+        (utc_now(),),
+    )
+    plan = {
+        "name": "Ops",
+        "exercises": [
+            {
+                "id": "one_arm_row",
+                "name": "חתירה ביד אחת",
+                "sets": 3,
+                "rmin": 8,
+                "rmax": 12,
+                "inc": 2.5,
+                "weight": 20,
+                "cues": ["דגש טכני"],
+            }
+        ],
+    }
+    await db.execute(
+        "INSERT INTO sessions(user_id, code, name, plan, status, exercise_index, set_number, started_at) "
+        "VALUES(1, 'T', 'Ops', ?, 'active', 0, 1, ?)",
+        (json.dumps(plan, ensure_ascii=False), utc_now()),
+    )
+    monkeypatch.setattr(coach_bot, "DB", db)
+    monkeypatch.setattr(mini_api, "DB", db)
+
+    snapshot = await mini_api._operational_snapshot(1)
+
+    assert snapshot["active_pain"][0]["region"] == "elbow"
+    assert snapshot["active_session"]["name"] == "Ops"
+    assert snapshot["latest_session"]["status"] == "active"
+    assert snapshot["current_load_decision"]["decision"] == "planned_load"
+    assert "active_pain:elbow" in snapshot["current_load_decision"]["signals"]
+
+
+@pytest.mark.asyncio
 async def test_mini_today_meals_returns_meals_logged_in_db(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

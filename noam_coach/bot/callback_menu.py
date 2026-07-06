@@ -305,6 +305,14 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
         )
         return True
 
+    if data == "nextmeal:refresh":
+        await _render_next_meal_screen(
+            query,
+            user_id,
+            prefix="רעננתי את ההצעות. אפשר לבחור אפשרות ואז לכתוב שינוי חופשי לפני שמירה.",
+        )
+        return True
+
     if data.startswith(("nextmeal:smaller:", "nextmeal:bigger:")):
         from noam_coach.services.next_meal import regenerate_with_size
 
@@ -357,7 +365,11 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
         return True
 
     if data.startswith("nextmeal:choose:"):
-        from noam_coach.services.next_meal import generate_next_meal_recommendation, get_active_recommendation_options
+        from noam_coach.services.next_meal import (
+            generate_next_meal_recommendation,
+            get_active_recommendation_options,
+            mark_active_recommendation_selection,
+        )
 
         try:
             option_number = int(data.rsplit(":", 1)[1])
@@ -373,18 +385,56 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
         impact = (
             f"\nאחרי הארוחה יישארו לך כ-{after_cal} קלוריות להיום." if after_cal is not None else ""
         )
+        await mark_active_recommendation_selection(DB, user_id, option_number)
         await safe_edit(
             query,
             (
                 f"<b>{esc(option.title)}</b>\n"
                 f"{esc(', '.join(option.ingredients))}\n"
                 f"כ-{option.calories} קל׳ | כ-{option.protein} גרם חלבון{impact}\n\n"
-                "רוצה שאשמור את זה כארוחה שאכלת?"
+                "רוצה לשנות משהו לפני השמירה?\n"
+                "אפשר לכתוב חופשי, למשל:\n"
+                "\"בלי טורטיה\"\n"
+                "\"קוטג׳ 100 גרם\"\n"
+                "\"יותר גדול\"\n"
+                "\"אין לי ביצים\"\n\n"
+                "רק אחרי אישור מפורש אשמור את זה כארוחה."
             ),
             InlineKeyboardMarkup([
-                [button("💾 שמור כארוחה", f"nextmeal:save:{option_number}")],
+                [button("🍽 אכלתי עכשיו", f"nextmeal:save:{option_number}")],
+                [button("📅 תכנן להמשך", f"nextmeal:plan:{option_number}")],
+                [button("🔄 הצעות אחרות", "nextmeal:refresh")],
                 [button("⬅️ חזרה להמלצה", "menu:nextmeal")],
             ]),
+        )
+        return True
+
+    if data.startswith("nextmeal:plan:"):
+        from noam_coach.services.next_meal import (
+            clear_active_recommendation,
+            generate_next_meal_recommendation,
+            get_active_recommendation_options,
+            plan_chosen_meal,
+        )
+
+        try:
+            option_number = int(data.rsplit(":", 1)[1])
+            recommendation = await generate_next_meal_recommendation(DB, user_id)
+            active_options = await get_active_recommendation_options(DB, user_id)
+            option = (active_options or recommendation.options)[option_number - 1]
+        except (TypeError, ValueError, IndexError):
+            await safe_edit(query, "לא מצאתי את האפשרות לתכנון.", home_keyboard())
+            return True
+        planned = await plan_chosen_meal(DB, user_id, option)
+        await clear_active_recommendation(DB, user_id)
+        note = (
+            "כבר תכננתי את זה להמשך היום." if not planned
+            else f"תכננתי את {esc(option.title)} להמשך היום 📅\nזה עדיין לא נספר כארוחה שאכלת."
+        )
+        await safe_edit(
+            query,
+            note,
+            InlineKeyboardMarkup([[button("📊 מצב היום", "menu:status"), button("🏠 תפריט", "menu:home")]]),
         )
         return True
 
@@ -486,6 +536,110 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
     if data.startswith("reconcile_no:"):
         await track_event(user_id, "reconcile_declined", key=data.split(":", 1)[1])
         await safe_edit(query, "בסדר גמור, לא אשנה כלום.", home_keyboard())
+        return True
+
+    if data == "health:activate":
+        from noam_coach.services.health_jobs import activate_imported_health_facts
+
+        activated = await activate_imported_health_facts(user_id)
+        await track_event(user_id, "health_facts_activated", count=activated)
+        if activated:
+            note = (
+                f"✅ הפעלתי {activated} נתונים מ-Apple Health.\n"
+                "מעכשיו הם משפיעים על התוכנית וההמלצות שלך."
+            )
+        else:
+            note = "לא נשארו נתונים שממתינים להפעלה — הכול כבר פעיל."
+        await safe_edit(query, note, home_keyboard())
+        return True
+
+    if data == "health:review":
+        from noam_coach.services.health_jobs import pending_import_facts
+
+        pending = await pending_import_facts(user_id)
+        if not pending:
+            await safe_edit(query, "אין כרגע נתונים שממתינים לתיקון.", home_keyboard())
+            return True
+        lines = ["<b>נתונים שזוהו וממתינים לאישור</b>", ""]
+        for row in pending[:8]:
+            label = user_model.display_label(str(row["key"]))
+            source = user_model.SOURCE_LABELS.get(row.get("source"), row.get("source") or "")
+            lines.append(f"• {esc(label)}" + (f" ({esc(source)})" if source else ""))
+        lines.append("")
+        lines.append("אפשר לתקן כל פרט דרך הפרופיל, או להפעיל את מה שזוהה.")
+        await safe_edit(
+            query,
+            "\n".join(lines),
+            InlineKeyboardMarkup([
+                [button("✅ הפעל את מה שזוהה", "health:activate")],
+                [button("👤 פרופיל", "menu:profile"), button("🏠 תפריט", "menu:home")],
+            ]),
+        )
+        return True
+
+    if data.startswith("health:confirm:") and ":trend:" in data:
+        # RE11: user picked one of the trend-proposal buttons (stay at N /
+        # go to M) for a Health-derived metric instead of accepting the raw
+        # detected value or typing a correction.
+        from noam_coach.services.health_jobs import ask_next_health_confirm_step, finish_health_confirm_wizard
+
+        _, _, key, _, value_text = data.split(":", 4)
+        try:
+            trend_value = float(value_text)
+        except ValueError:
+            await query.answer("ערך לא תקין", show_alert=True)
+            return True
+        if key == "workout_pattern":
+            current = await user_model.get_value(DB, user_id, key) or {}
+            updated = {**current, "weekly_frequency": trend_value} if isinstance(current, dict) else {
+                "weekly_frequency": trend_value
+            }
+            await user_model.set_fact(
+                DB, user_id, key, updated,
+                kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
+            )
+        await user_model.set_fact(
+            DB, user_id, "training_days_per_week", trend_value,
+            kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
+        )
+        await track_event(user_id, "health_wizard_trend_choice", key=key, value=trend_value)
+        if not await ask_next_health_confirm_step(query, user_id):
+            await finish_health_confirm_wizard(query, user_id)
+        return True
+
+    if data.startswith("health:confirm:"):
+        from noam_coach.services.health_jobs import ask_next_health_confirm_step, finish_health_confirm_wizard
+
+        key = data.split(":", 2)[2]
+        await user_model.confirm_fact(DB, user_id, key)
+        await track_event(user_id, "health_wizard_fact_confirmed", key=key)
+        if not await ask_next_health_confirm_step(query, user_id):
+            await finish_health_confirm_wizard(query, user_id)
+        return True
+
+    if data == "health:skip_item":
+        from noam_coach.services.health_jobs import (
+            HEALTH_CONFIRM_FLOW,
+            ask_next_health_confirm_step,
+            finish_health_confirm_wizard,
+        )
+        from noam_coach.bot.onboarding import get_flow_state, clear_pending
+
+        state = await get_flow_state(user_id, HEALTH_CONFIRM_FLOW)
+        if state and state.get("step"):
+            await user_model.invalidate_fact(DB, user_id, str(state["step"]))
+        await clear_pending(user_id)
+        if not await ask_next_health_confirm_step(query, user_id):
+            await finish_health_confirm_wizard(query, user_id)
+        return True
+
+    if data == "health:skip_wizard":
+        from noam_coach.services.health_jobs import finish_health_confirm_wizard
+        from noam_coach.bot.onboarding import clear_pending
+
+        await clear_pending(user_id)
+        await track_event(user_id, "health_wizard_skipped")
+        await finish_health_confirm_wizard(query, user_id)
         return True
 
     if data.startswith("confirm:"):
@@ -615,10 +769,12 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
         )
         return True
 
-    if data in ("menu:morning", "menu:nextmeal", "menu:evening"):
+    if data in ("menu:morning", "menu:today", "menu:nextmeal", "menu:evening"):
+        # "menu:today" is a legacy alias for "menu:morning" (old keyboards may
+        # still carry it) — both render the same daily menu screen.
         await safe_edit(query, "רגע, מכין לך… ⏳", None)
         try:
-            if data == "menu:morning":
+            if data in ("menu:morning", "menu:today"):
                 text = await build_morning_menu_text(user_id)
             elif data == "menu:nextmeal":
                 await _render_next_meal_screen(query, user_id)

@@ -1,6 +1,32 @@
 from __future__ import annotations
 
 import training_intelligence as ti
+from exercise_plans import PLANS
+
+
+def test_all_plan_and_alternative_exercises_have_catalog_profiles() -> None:
+    ids = {
+        exercise["id"]
+        for plan in PLANS.values()
+        for exercise in plan["exercises"]
+    }
+    ids.update(
+        alt["id"]
+        for plan in PLANS.values()
+        for exercise in plan["exercises"]
+        for alt in exercise.get("alts", [])
+    )
+
+    missing = sorted(ids - set(ti.CATALOG))
+    assert missing == []
+
+
+def test_catalog_joint_load_covers_major_training_groups() -> None:
+    assert {"knee", "hip", "back"} <= set(ti.CATALOG["squat"].joint_load)
+    assert {"hip", "back"} <= set(ti.CATALOG["rdl"].joint_load)
+    assert {"shoulder", "elbow"} <= set(ti.CATALOG["db_bench"].joint_load)
+    assert {"back", "elbow"} <= set(ti.CATALOG["cable_row"].joint_load)
+    assert {"elbow"} <= set(ti.CATALOG["db_curl"].joint_load)
 
 
 def test_knee_pain_replaces_knee_loaded_exercise() -> None:

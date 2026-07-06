@@ -106,7 +106,7 @@ from retention import (
 
 from noam_coach.runtime_bind import runtime_bound
 
-RUNTIME_NAMES = ('APP_VERSION', 'Any', 'CALLBACK_DEBOUNCE_SECONDS', 'CONFIRM_PENDING', 'ContextTypes', 'DB', 'EXERCISE_MUSCLES', 'Exception', 'GOAL_STATUS_PROPOSED', 'GOAL_STATUS_PROVISIONAL', 'InlineKeyboardButton', 'InlineKeyboardMarkup', 'KeyError', 'LOGGER', 'MealAnalysis', 'PENDING_QUESTION', 'Path', 'RIR_UNKNOWN', 'SESSION_SCOPED_ACTIONS', 'SETTINGS', 'TypeError', 'Update', 'ValueError', 'WebAppInfo', '_DEBOUNCE_PREFIXES', '_LAST_CALLBACK', '_StaleSetStep', '_duration_s', '_home_hint', '_is_duplicate_tap', '_plan_type_label', '_started', 'action', 'activate_goal_version_provisional', 'active_flow', 'active_session', 'actual_reps', 'actual_rir', 'actual_weight', 'aiosqlite', 'alt', 'alt_muscle', 'alternative', 'alternative_index', 'analysis', 'analyze_duplicate_candidate', 'apply_reconcile_proposal', 'approval_id', 'bool', 'build_daily_status', 'build_evening_summary_text', 'build_health_status_text', 'build_morning_menu_text', 'build_next_meal_text', 'build_now_action_text', 'build_weekly_summary_text', 'button', 'buttons', 'callback_flow_id', 'callback_version', 'cancel_rest_timer', 'candidate', 'center', 'changed', 'check_duplicate_meal', 'choices', 'chosen_reps', 'chosen_weight', 'claimed', 'clear_confirm_pending', 'clear_meal_fix', 'clear_pending', 'clear_split_state', 'code', 'command_profile_query', 'completed', 'conn', 'connection', 'constraint_id', 'context', 'conversation', 'create_approval', 'create_goal_version', 'create_meal_edit_approval', 'cur', 'current', 'cursor', 'cutoff', 'data', 'datetime', 'decide_approval', 'deleted', 'delta', 'delta_text', 'dict', 'done', 'draft', 'dup', 'duplicate_approval_id', 'edit_approval_id', 'ensure_user', 'enumerate', 'error_id', 'esc', 'event_log', 'ex', 'exc', 'exercise_index', 'exercise_index_text', 'exercise_picker_keyboard', 'existing', 'extra', 'extra_seconds', 'fetch_approval', 'fetch_goal', 'field', 'final_rir', 'first_reps', 'first_weight', 'flags', 'float', 'frequency', 'friendly_error', 'get_daily_flags', 'get_meal_fix', 'get_split_state', 'get_user_plan', 'getattr', 'goal', 'goal_id', 'gv_id', 'handle_checkin_callback', 'handle_flags_callback', 'handle_goal_callback', 'handle_meal_callback', 'handle_menu_callback', 'handle_onboarding_callback', 'handle_plan_callback', 'handle_session_action_callback', 'handle_workout_setup_callback', 'home_keyboard', 'index', 'int', 'is_allowed', 'is_current_session_step', 'is_partial', 'is_provisional', 'isinstance', 'item', 'item_index', 'item_index_text', 'job', 'jobs', 'json', 'k', 'kb', 'key', 'kind', 'label', 'labels', 'last', 'len', 'level', 'list', 'logged_sets', 'max', 'meal', 'meal_id', 'meal_id_text', 'min', 'mini_app_url', 'missing', 'missing_labels', 'more_keyboard', 'msg', 'new_grams', 'new_max', 'new_min', 'new_val', 'new_weight', 'note', 'notify_admin', 'now', 'nutrition', 'object', 'ok', 'old_grams', 'option', 'option_index', 'pain_location', 'part', 'parts', 'parts_v2', 'payload', 'persist_meal', 'plan', 'plan_id', 'plan_now', 'plan_type', 'planned_sets', 'planning', 'plans_keyboard', 'progress', 'quality', 'query', 'range', 'ratio', 'rc', 'readiness', 'recommend_load', 'refreshed', 'render_candidate_list', 'render_exercise_params', 'render_meal', 'render_profile_snapshot', 'render_quantity_editor', 'render_smart_plan_hub', 'render_unified_plan', 'render_workout_overview', 'reopened', 'replacement', 'reps', 'reps_value', 'rest', 'rest_job_name', 'result', 'round', 'route_decision', 'row', 'rows', 'safe_edit', 'save_medical_constraint', 'save_split_set', 'second_base', 'second_reps', 'second_weight', 'secrets', 'select_todays_workout_code', 'selected', 'send_weight_chart', 'session', 'session_action_arg', 'session_action_data', 'session_id', 'set', 'set_daily_flags', 'set_exercise_override', 'set_goal_weight', 'set_meal_fix', 'set_pending', 'set_split_state', 'severity', 'show_session', 'split_reps_keyboard', 'split_rir_keyboard', 'split_state', 'split_summary_line', 'split_weight_keyboard', 'start_rest_timer', 'status', 'status_line', 'step', 'str', 'sum', 'summary_line', 'suppress', 't', 'tail', 'target_change_note', 'text', 'time', 'total_reps', 'track_event', 'training_intelligence', 'try_save_set', 'tuple', 'undo_last_set', 'undone', 'update', 'update_rest_message', 'update_session_step', 'url', 'user_choice', 'user_id', 'user_model', 'utc_now', 'value', 'value_text', 'warn', 'weight', 'workout', 'workout_summary', 'write_audit')
+RUNTIME_NAMES = ('APP_VERSION', 'Any', 'CALLBACK_DEBOUNCE_SECONDS', 'CONFIRM_PENDING', 'ContextTypes', 'DB', 'EXERCISE_MUSCLES', 'Exception', 'GOAL_STATUS_PROPOSED', 'GOAL_STATUS_PROVISIONAL', 'InlineKeyboardButton', 'InlineKeyboardMarkup', 'KeyError', 'LOGGER', 'MealAnalysis', 'PENDING_QUESTION', 'Path', 'RIR_UNKNOWN', 'SESSION_SCOPED_ACTIONS', 'SETTINGS', 'TypeError', 'Update', 'ValueError', 'WebAppInfo', '_DEBOUNCE_PREFIXES', '_LAST_CALLBACK', '_StaleSetStep', '_duration_s', '_home_hint', '_is_duplicate_tap', '_plan_type_label', '_started', 'action', 'activate_goal_version_provisional', 'active_flow', 'active_session', 'actual_reps', 'actual_rir', 'actual_weight', 'aiosqlite', 'alt', 'alt_muscle', 'alternative', 'alternative_index', 'analysis', 'analyze_duplicate_candidate', 'apply_reconcile_proposal', 'approval_id', 'bool', 'build_daily_status', 'build_evening_summary_text', 'build_health_status_text', 'build_morning_menu_text', 'build_next_meal_text', 'build_now_action_text', 'build_weekly_summary_text', 'button', 'buttons', 'callback_flow_id', 'callback_version', 'cancel_rest_timer', 'candidate', 'center', 'changed', 'check_duplicate_meal', 'choices', 'chosen_reps', 'chosen_weight', 'claimed', 'clear_confirm_pending', 'clear_meal_fix', 'clear_pending', 'clear_split_state', 'code', 'command_profile_query', 'completed', 'conn', 'connection', 'constraint_id', 'context', 'conversation', 'create_approval', 'create_goal_version', 'create_meal_edit_approval', 'cur', 'current', 'cursor', 'cutoff', 'data', 'datetime', 'decide_approval', 'deleted', 'delta', 'delta_text', 'dict', 'done', 'draft', 'dup', 'duplicate_approval_id', 'edit_approval_id', 'ensure_user', 'enumerate', 'error_id', 'esc', 'event_log', 'ex', 'exc', 'exercise_index', 'exercise_index_text', 'exercise_picker_keyboard', 'existing', 'extra', 'extra_seconds', 'fetch_approval', 'fetch_goal', 'field', 'final_rir', 'first_reps', 'first_weight', 'flags', 'float', 'format_load_decision_details', 'frequency', 'friendly_error', 'get_daily_flags', 'get_meal_fix', 'get_split_state', 'get_user_plan', 'getattr', 'goal', 'goal_id', 'gv_id', 'handle_checkin_callback', 'handle_flags_callback', 'handle_goal_callback', 'handle_meal_callback', 'handle_menu_callback', 'handle_onboarding_callback', 'handle_plan_callback', 'handle_session_action_callback', 'handle_workout_setup_callback', 'home_keyboard', 'index', 'int', 'is_allowed', 'is_current_session_step', 'is_partial', 'is_provisional', 'isinstance', 'item', 'item_index', 'item_index_text', 'job', 'jobs', 'json', 'k', 'kb', 'key', 'kind', 'label', 'labels', 'last', 'len', 'level', 'list', 'logged_sets', 'max', 'meal', 'meal_id', 'meal_id_text', 'min', 'mini_app_url', 'missing', 'missing_labels', 'more_keyboard', 'msg', 'new_grams', 'new_max', 'new_min', 'new_val', 'new_weight', 'note', 'notify_admin', 'now', 'nutrition', 'object', 'ok', 'old_grams', 'option', 'option_index', 'pain_location', 'part', 'parts', 'parts_v2', 'payload', 'persist_meal', 'plan', 'plan_id', 'plan_now', 'plan_type', 'planned_sets', 'planning', 'plans_keyboard', 'progress', 'quality', 'query', 'range', 'ratio', 'rc', 'readiness', 'recommend_load', 'recommend_load_decision', 'refreshed', 'render_candidate_list', 'render_exercise_params', 'render_meal', 'render_profile_snapshot', 'render_quantity_editor', 'render_smart_plan_hub', 'render_unified_plan', 'render_workout_overview', 'reopened', 'replacement', 'reps', 'reps_value', 'rest', 'rest_job_name', 'result', 'round', 'route_decision', 'row', 'rows', 'safe_edit', 'save_medical_constraint', 'save_split_set', 'second_base', 'second_reps', 'second_weight', 'secrets', 'select_todays_workout_code', 'selected', 'send_weight_chart', 'session', 'session_action_arg', 'session_action_data', 'session_id', 'set', 'set_daily_flags', 'set_exercise_override', 'set_goal_weight', 'set_meal_fix', 'set_pending', 'set_split_state', 'severity', 'show_session', 'split_reps_keyboard', 'split_rir_keyboard', 'split_state', 'split_summary_line', 'split_weight_keyboard', 'start_rest_timer', 'status', 'status_line', 'step', 'str', 'sum', 'summary_line', 'suppress', 't', 'tail', 'target_change_note', 'text', 'time', 'total_reps', 'track_event', 'training_intelligence', 'try_save_set', 'tuple', 'undo_last_set', 'undone', 'update', 'update_rest_message', 'update_session_step', 'url', 'user_choice', 'user_id', 'user_model', 'utc_now', 'value', 'value_text', 'warn', 'weight', 'workout', 'workout_summary', 'write_audit')
 
 @runtime_bound(RUNTIME_NAMES)
 async def _handle_session_core_actions(
@@ -341,6 +341,46 @@ async def _handle_session_split_actions(
     return False
 
 @runtime_bound(RUNTIME_NAMES)
+async def _pain_safe_alternatives(
+    user_id: int, current: dict[str, Any], *, fallback_when_all_blocked: bool = True
+) -> list[dict[str, Any]]:
+    """Filter current["alts"] to ones that don't also load an active pain
+    region, so a substitution never trades one painful movement for another
+    just because they share the same target muscle (e.g. a row/pull-up is
+    not automatically a safe swap for elbow pain even though the target
+    muscle is back).
+
+    Alternatives with no CATALOG entry (most of the plan's hand-authored
+    alts, which use plan-only ids like "hack"/"hip_thrust") are always kept,
+    since there's no joint_load data to filter them by — this only narrows
+    the list, it never invents new exercises or drops everything.
+    """
+    alts = current.get("alts") or []
+    rows = await DB.fetch_all(
+        "SELECT * FROM medical_constraints WHERE user_id=? AND kind='pain'",
+        (user_id,),
+    )
+    if not rows:
+        return alts
+    pain_regions = set(training_intelligence.active_pain_regions(rows))
+    if not pain_regions:
+        return alts
+    safer = []
+    for alt in alts:
+        profile = training_intelligence.CATALOG.get(str(alt.get("id")))
+        if profile is not None and pain_regions.intersection(profile.joint_load):
+            continue
+        safer.append(alt)
+    if safer:
+        return safer
+    if fallback_when_all_blocked:
+        # Equipment-occupied is not a pain report; keep the older fallback
+        # there so the user still gets practical swaps when no pain is active.
+        return alts
+    return []
+
+
+@runtime_bound(RUNTIME_NAMES)
 async def _handle_session_adjustment_actions(
     query: Any,
     context: ContextTypes.DEFAULT_TYPE,
@@ -354,6 +394,17 @@ async def _handle_session_adjustment_actions(
     weight: float,
     reps: int,
 ) -> bool:
+    if action == "loadwhy":
+        decision = await recommend_load_decision(user_id, current)
+        await safe_edit(
+            query,
+            format_load_decision_details(decision),
+            InlineKeyboardMarkup(
+                [[button("↩️ חזרה לאימון", session_action_data("ready", session))]]
+            ),
+        )
+        return True
+
     if action == "different":
         step = max(0.5, float(current.get("inc", 2.5)))
         await safe_edit(
@@ -421,7 +472,7 @@ async def _handle_session_adjustment_actions(
             return True
         await safe_edit(
             query,
-            "כמה נשארו?",
+            "כמה חזרות הרגשת שנשארו? (RIR)",
             InlineKeyboardMarkup(
                 [
                     [
@@ -479,13 +530,20 @@ async def _handle_session_adjustment_actions(
         return True
 
     if action == "occupied":
+        safe_alts = await _pain_safe_alternatives(user_id, current)
+        # Keep each alt's ORIGINAL index into current["alts"] in the callback
+        # data — the "sub" handler looks alternatives up by that index, and
+        # safe_alts may be a filtered subset in a different order.
+        indexed_alts = [
+            (current["alts"].index(alt), alt) for alt in safe_alts[:3]
+        ]
         buttons = []
-        for index, alt in enumerate(current["alts"][:3]):
+        for position, (original_index, alt) in enumerate(indexed_alts, start=1):
             alt_muscle = EXERCISE_MUSCLES.get(alt["id"], current.get("muscle", ""))
-            label = f"{index + 1}. {alt['name']}"
+            label = f"{position}. {alt['name']}"
             if alt_muscle:
                 label += f" ({alt_muscle})"
-            buttons.append([button(label, session_action_data("sub", session, index))])
+            buttons.append([button(label, session_action_data("sub", session, original_index))])
         buttons.append([button("דלג", session_action_data("skip", session))])
         await safe_edit(query, "<b>שלוש חלופות</b>", InlineKeyboardMarkup(buttons))
         return True
@@ -684,10 +742,34 @@ async def _handle_session_safety_actions(
         except _StaleSetStep:
             await show_session(query, user_id, session_id)
             return True
+
+        # Mirror into the active_pain fact so future plan generation
+        # (planning.py -> training_intelligence.adapt_exercises) and
+        # recommend_load also see a pain reported mid-workout, not only pain
+        # reported during onboarding. Previously this only reached
+        # medical_constraints, so it never affected anything after this
+        # session ended.
+        existing_pain = await user_model.get_value(DB, user_id, "active_pain")
+        existing_location = ""
+        if isinstance(existing_pain, dict):
+            existing_location = str(existing_pain.get("location") or "")
+        elif isinstance(existing_pain, str):
+            existing_location = existing_pain
+        region_label = training_intelligence.pain_region_label(pain_location)
+        if region_label and region_label not in existing_location:
+            merged_location = f"{existing_location}, {region_label}".strip(", ")
+        else:
+            merged_location = existing_location or region_label
+        await user_model.set_fact(
+            DB, user_id, "active_pain", {"location": merged_location, "status": "active"},
+            kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
+        )
+
         if severity >= 3:
             await safe_edit(
                 query,
-                "<b>עוצרים את התרגיל.</b> כאב חד אינו מצב להמשך אתגר.",
+                "<b>כאב חד הוא סימן לעצור.</b> אל תמשיך את התרגיל עכשיו. "
+                "אם הכאב מתגבר, מופיעה נפיחות, הקרנה או מגבלה בתנועה — כדאי בדיקה מקצועית.",
                 InlineKeyboardMarkup(
                     [
                         [
@@ -704,8 +786,30 @@ async def _handle_session_safety_actions(
                 ),
             )
             return True
+        safe_alts = await _pain_safe_alternatives(
+            user_id,
+            current,
+            fallback_when_all_blocked=False,
+        )
+        indexed_alts = [
+            (current["alts"].index(alt), alt) for alt in safe_alts[:3]
+        ]
+        if not indexed_alts:
+            await safe_edit(
+                query,
+                "אין לי חלופה מספיק בטוחה לפי הכאב שדיווחת. עדיף לדלג על התרגיל או לסיים את האימון.",
+                InlineKeyboardMarkup(
+                    [
+                        [
+                            button("דלג", session_action_data("skip", session)),
+                            button("סיים", session_action_data("finish", session)),
+                        ]
+                    ]
+                ),
+            )
+            return True
         buttons = []
-        for index, alt in enumerate(current["alts"][:3]):
+        for original_index, alt in indexed_alts:
             alt_muscle = EXERCISE_MUSCLES.get(
                 alt["id"],
                 current.get("muscle", ""),
@@ -715,7 +819,7 @@ async def _handle_session_safety_actions(
                 [
                     button(
                         label,
-                        session_action_data("sub", session, index),
+                        session_action_data("sub", session, original_index),
                     )
                 ]
             )

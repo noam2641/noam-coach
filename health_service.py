@@ -16,6 +16,7 @@ import routine
 import user_model
 from config import SETTINGS, TZ
 from helpers import utc_now
+from noam_coach.services.weekdays import WEEKDAY_SCHEMA_VERSION
 
 HEALTH_BATCH_SIZE = 1000
 
@@ -93,17 +94,127 @@ async def save_routine_profile(user_id: int) -> dict[str, Any]:
     return payload
 
 
+# RE10-5: how far apart two HH:MM times must be (in minutes) before it is a
+# real, actionable discrepancy rather than measurement noise.
+_TIME_DISCREPANCY_THRESHOLD_MINUTES = 60
+# A weekly-frequency difference of at least this many sessions/week is real.
+_FREQUENCY_DISCREPANCY_THRESHOLD = 1.0
+
+
+def _minutes_since_midnight(hhmm: str | None) -> int | None:
+    if not hhmm:
+        return None
+    try:
+        hours, minutes = str(hhmm).split(":")[:2]
+        return int(hours) * 60 + int(minutes)
+    except (ValueError, TypeError):
+        return None
+
+
+def _time_gap_minutes(a: str | None, b: str | None) -> int | None:
+    """Circular difference (in minutes) between two HH:MM times, 0-720."""
+    minutes_a, minutes_b = _minutes_since_midnight(a), _minutes_since_midnight(b)
+    if minutes_a is None or minutes_b is None:
+        return None
+    diff = abs(minutes_a - minutes_b)
+    return min(diff, 1440 - diff)
+
+
+async def detect_routine_discrepancies(
+    user_id: int, measured_payload: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Compare the user's CONFIRMED reported routine facts against what was
+    just measured from a Health import (RE10-5).
+
+    Returns a list of discrepancies (empty if none / nothing reported yet to
+    compare against). Each item carries enough detail for a single yes/no
+    resolution screen: which fact, the reported value, the measured value,
+    and a ready-made Hebrew question.
+    """
+    discrepancies: list[dict[str, Any]] = []
+    measured_sleep = measured_payload.get("sleep") or {}
+    measured_workout = measured_payload.get("workout") or {}
+
+    reported_sleep = await user_model.get_fact(_current_db(), user_id, "sleep_schedule")
+    if (
+        reported_sleep
+        and reported_sleep.get("confirmed")
+        and reported_sleep.get("source") == user_model.SOURCE_USER
+        and measured_sleep.get("nights_sampled")
+    ):
+        reported_value = reported_sleep.get("value") or {}
+        for field_key, label in (("bedtime", "שעת שינה"), ("wake_time", "שעת קימה")):
+            reported_time = reported_value.get(field_key)
+            measured_time = measured_sleep.get(
+                "typical_bedtime" if field_key == "bedtime" else "typical_wake_time"
+            )
+            gap = _time_gap_minutes(reported_time, measured_time)
+            if gap is not None and gap >= _TIME_DISCREPANCY_THRESHOLD_MINUTES:
+                discrepancies.append({
+                    "fact_key": "sleep_schedule",
+                    "field": field_key,
+                    "label": label,
+                    "reported": reported_time,
+                    "measured": measured_time,
+                    "question": (
+                        f"דיווחת ש{label} שלך היא {reported_time}, אבל מהנתונים "
+                        f"נראה שבפועל זה בדרך כלל {measured_time}. במה להשתמש?"
+                    ),
+                })
+
+    reported_pattern = await user_model.get_fact(_current_db(), user_id, "training_days_per_week")
+    if (
+        reported_pattern
+        and reported_pattern.get("confirmed")
+        and reported_pattern.get("source") == user_model.SOURCE_USER
+        and measured_workout.get("sessions_sampled")
+    ):
+        try:
+            reported_freq = float(reported_pattern.get("value"))
+        except (TypeError, ValueError):
+            reported_freq = None
+        measured_freq = measured_workout.get("weekly_frequency")
+        if reported_freq is not None and measured_freq is not None:
+            if abs(reported_freq - float(measured_freq)) >= _FREQUENCY_DISCREPANCY_THRESHOLD:
+                discrepancies.append({
+                    "fact_key": "training_days_per_week",
+                    "field": "weekly_frequency",
+                    "label": "תדירות אימונים בשבוע",
+                    "reported": reported_freq,
+                    "measured": measured_freq,
+                    "question": (
+                        f"דיווחת על כ-{reported_freq:g} אימונים בשבוע, אבל מהנתונים "
+                        f"נראה שבפועל זה בדרך כלל כ-{measured_freq:g}. במה להשתמש?"
+                    ),
+                })
+
+    return discrepancies
+
+
 async def sync_routine_to_facts(user_id: int, payload: dict[str, Any]) -> None:
-    """Write learned routine into the user model as *estimates* (confirmed=0)."""
+    """Write learned routine into the user model as *estimates* (confirmed=0).
+
+    RE10-5: a fact the user explicitly reported and confirmed is never
+    silently overwritten by a Health-derived estimate when the two disagree
+    by more than a noise-level threshold — detect_routine_discrepancies must
+    be checked (and any real discrepancy resolved by the user) first. This
+    function still writes normally when there is no confirmed report to
+    conflict with, or when the values agree.
+    """
     sleep = payload.get("sleep") or {}
     workout = payload.get("workout") or {}
     eating = payload.get("eating") or {}
-    if sleep.get("nights_sampled"):
+
+    discrepancies = await detect_routine_discrepancies(user_id, payload)
+    conflicted_fact_keys = {item["fact_key"] for item in discrepancies}
+
+    if sleep.get("nights_sampled") and "sleep_schedule" not in conflicted_fact_keys:
         await user_model.set_fact(
             _current_db(), user_id, "sleep_schedule", sleep,
             kind=user_model.KIND_ESTIMATE, source=user_model.SOURCE_DERIVED,
         )
     if workout.get("sessions_sampled"):
+        workout = {**workout, "weekday_schema": workout.get("weekday_schema") or WEEKDAY_SCHEMA_VERSION}
         await user_model.set_fact(
             _current_db(), user_id, "workout_pattern", workout,
             kind=user_model.KIND_ESTIMATE, source=user_model.SOURCE_DERIVED,

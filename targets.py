@@ -41,6 +41,14 @@ DEFAULT_STEPS = 7000
 MIN_CALORIES = 1400
 MIN_PROTEIN = 90
 
+# E1 (expert review): a flat -450 kcal deficit is unsafe for a light person
+# (can exceed 25% of maintenance) and too gentle for a heavy one. When a goal
+# timeframe is known, the deficit is derived from the implied weekly rate
+# instead, clamped to a safe percentage of maintenance.
+MIN_DEFICIT_PCT_OF_MAINTENANCE = 0.10
+MAX_DEFICIT_PCT_OF_MAINTENANCE = 0.25
+KCAL_PER_KG_FAT = 7700
+
 
 @dataclass
 class Targets:
@@ -94,6 +102,7 @@ def compute_targets(
     workouts_per_week: float | None = None,
     goal_weight_kg: float | None = None,
     body_fat_pct: float | None = None,
+    goal_timeframe_weeks: float | None = None,
 ) -> Targets:
     """Compute daily calorie/protein/steps targets from the user's facts."""
     # Track which inputs were assumed BEFORE applying defaults.
@@ -123,7 +132,35 @@ def compute_targets(
         workout_bonus = min(150, workouts_per_week * per_session)
         maintenance += workout_bonus
 
+    # E1 (expert review, CODEX_MASTER_WORK_PLAN chapter 11): a flat -450 kcal
+    # deficit ignores maintenance — for a light person it can exceed 25% of
+    # maintenance (unsafe/unsustainable); for a heavy person it is too gentle.
+    # When a target weight AND timeframe are both known, derive the deficit
+    # from the implied weekly rate of change instead, clamped to a safe
+    # percentage of maintenance. Muscle-gain/strength surpluses use the same
+    # clamp (in the positive direction) so an aggressive bulk rate cannot
+    # produce an absurd surplus either.
     adjustment = GOAL_ADJUSTMENT.get(goal_type, 0)
+    rate_based_kg_per_week: float | None = None
+    if (
+        goal_weight_kg is not None
+        and goal_timeframe_weeks is not None
+        and goal_timeframe_weeks > 0
+        and goal_weight_kg != weight_kg
+    ):
+        rate_based_kg_per_week = (weight_kg - goal_weight_kg) / goal_timeframe_weeks
+        implied_daily_adjustment = -(rate_based_kg_per_week * KCAL_PER_KG_FAT) / 7
+        max_magnitude = maintenance * MAX_DEFICIT_PCT_OF_MAINTENANCE
+        min_magnitude = maintenance * MIN_DEFICIT_PCT_OF_MAINTENANCE
+        sign = 1 if implied_daily_adjustment >= 0 else -1
+        magnitude = abs(implied_daily_adjustment)
+        # Only enforce the safety floor when the goal actually calls for a
+        # deficit/surplus in that direction; a near-zero implied rate (e.g.
+        # the user is basically at their goal weight) should not be forced
+        # into an artificial 10% deficit.
+        if magnitude > 5:
+            magnitude = max(min_magnitude, min(max_magnitude, magnitude))
+            adjustment = sign * magnitude
     calories = max(MIN_CALORIES, round((maintenance + adjustment) / 10) * 10)
 
     protein_per_kg = GOAL_PROTEIN_PER_KG.get(goal_type, 1.8)
@@ -140,8 +177,14 @@ def compute_targets(
         min(220, round(protein_reference_weight * protein_per_kg / 5) * 5),
     )
 
-    # Steps target: nudge a little above current average, capped.
-    steps_target = int(min(12000, max(8000, round(steps / 500) * 500 + 500)))
+    # D1: nudge gently above the current average instead of jumping straight
+    # to an 8,000-step floor — a user averaging ~4,800 steps/day was getting a
+    # +67% overnight target, which is neither realistic nor sustainable.
+    # A ~12% increase (capped at +1,500/day) is a normal, achievable step-up;
+    # re-evaluate and raise again once the user is consistently hitting it.
+    nudged = steps * 1.12
+    nudged = min(nudged, steps + 1500)
+    steps_target = int(min(12000, max(6000, round(nudged / 500) * 500)))
 
     provisional = bool(missing)
 
@@ -162,6 +205,11 @@ def compute_targets(
             "protein_reference_weight": round(protein_reference_weight, 1),
             "goal_weight_kg": goal_weight_kg,
             "body_fat_pct": body_fat_pct,
+            "goal_timeframe_weeks": goal_timeframe_weeks,
+            "rate_based_kg_per_week": (
+                round(rate_based_kg_per_week, 2) if rate_based_kg_per_week is not None else None
+            ),
+            "daily_adjustment": round(adjustment),
             "assumed": {k: True for k in missing} if missing else {},
         },
         provisional=provisional,
@@ -183,6 +231,17 @@ def explain_targets(t: Targets) -> str:
         f"צעדים ביום ומטרה: {goal_he}. אחזקה מוערכת ~{t.maintenance:,} קל׳, "
         f"ומכאן יעד יומי של {t.calories:,} קל׳ ו-{t.protein} ג׳ חלבון."
     )
+    rate = b.get("rate_based_kg_per_week")
+    if rate is not None:
+        direction = "ירידה" if rate > 0 else "עלייה"
+        text += f" הקצב המשוער לפי היעד והזמן שבחרת: כ-{abs(rate):.2f} ק\"ג {direction} בשבוע."
+        body_weight = float(b.get("weight_kg") or 0)
+        aggressive_loss = rate > 1.0 or (rate > 0 and body_weight > 0 and rate / body_weight > 0.01)
+        if aggressive_loss:
+            text += (
+                " שים לב: זה קצב ירידה אגרסיבי. אפשר לבחור יעד מאוזן יותר כדי "
+                "לשמור על ביצועים, התאוששות ובריאות."
+            )
     if t.provisional:
         missing_he = ", ".join(user_model.display_label(k) for k in (t.missing_inputs or []))
         text += f"\n⚠️ יעד זמני — חסרים: {missing_he}. השלם כדי לדייק."

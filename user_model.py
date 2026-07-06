@@ -173,6 +173,12 @@ FACT_REGISTRY: dict[str, FactSpec] = {
         "reported",
         ("calorie_target", "rate_of_loss"),
     ),
+    "goal_timeframe_weeks": FactSpec(
+        "goal_timeframe_weeks",
+        "משך זמן ליעד",
+        "reported",
+        ("calorie_target", "rate_of_loss"),
+    ),
     "training_days_per_week": FactSpec(
         "training_days_per_week",
         "ימי אימון בשבוע",
@@ -392,6 +398,10 @@ FACT_REGISTRY: dict[str, FactSpec] = {
 # ---------------------------------------------------------------------------
 
 FACT_DISPLAY_LABELS: dict[str, str] = {
+    # Not a user_facts row — a planning prerequisite (an approved goal_versions
+    # record). Included here so any missing-prerequisite screen (RE10-8) can
+    # translate it like any other gap instead of leaking the raw key.
+    "active_goal": "יעד יומי מאושר",
     # Pattern / inferred fact IDs used in confirmation buttons
     "workout_pattern": "דפוס האימונים שלך",
     "sleep_schedule": "שעות השינה שלך",

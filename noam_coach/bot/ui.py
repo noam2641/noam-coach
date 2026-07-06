@@ -66,6 +66,7 @@ import reconcile
 import targets
 import training_intelligence
 import user_model
+from noam_coach.services import daily_state
 
 # --- Extracted modules (re-exported for backward compatibility) ---
 from config import (  # noqa: F401
@@ -142,6 +143,7 @@ SESSION_SCOPED_ACTIONS = frozenset(
         "reps",
         "rir",
         "occupied",
+        "loadwhy",
         "sub",
         "pain",
         "painloc",
@@ -342,7 +344,7 @@ def plans_keyboard() -> InlineKeyboardMarkup:
             [button("A — חזה", "workout:A"), button("B — גב", "workout:B")],
             [
                 button("C — כתפיים ורגליים", "workout:C"),
-                button("Full Body", "workout:F"),
+                button("אימון גוף מלא", "workout:F"),
             ],
             [button("⬅️ תפריט", "menu:home")],
         ]
@@ -393,34 +395,11 @@ def exercise_picker_keyboard(code: str) -> InlineKeyboardMarkup:
 
 @runtime_bound(RUNTIME_NAMES)
 def exercise_params_keyboard(code: str, exercise_index: int) -> InlineKeyboardMarkup:
-    exercise_data = PLANS[code]["exercises"][exercise_index]
-    inc = float(exercise_data.get("inc", 2.5))
     return InlineKeyboardMarkup(
         [
-            [
-                button(f"משקל -{inc:g}", f"param:{code}:{exercise_index}:weight:{-inc:g}"),
-                button(f"משקל +{inc:g}", f"param:{code}:{exercise_index}:weight:{inc:g}"),
-            ],
-            [
-                button("סטים -1", f"param:{code}:{exercise_index}:sets:-1"),
-                button("סטים +1", f"param:{code}:{exercise_index}:sets:1"),
-            ],
-            [
-                button("חזרות מינ׳ -1", f"param:{code}:{exercise_index}:rmin:-1"),
-                button("חזרות מינ׳ +1", f"param:{code}:{exercise_index}:rmin:1"),
-            ],
-            [
-                button("חזרות מקס׳ -1", f"param:{code}:{exercise_index}:rmax:-1"),
-                button("חזרות מקס׳ +1", f"param:{code}:{exercise_index}:rmax:1"),
-            ],
-            [
-                button("מנוחה -30ש׳", f"param:{code}:{exercise_index}:rest:-30"),
-                button("מנוחה +30ש׳", f"param:{code}:{exercise_index}:rest:30"),
-            ],
-            [
-                button("⬅️ כל התרגילים", f"editparams_menu:{code}"),
-                button("✅ התחל אימון", f"startworkout:{code}"),
-            ],
+            [button("✅ אישור", f"workout:{code}")],
+            [button("❌ ביטול", f"workout:{code}")],
+            [button("⬅️ חזרה", f"editparams_menu:{code}")],
         ]
     )
 
@@ -440,7 +419,7 @@ async def select_todays_workout_code(user_id: int) -> str | None:
     cycle = [s["code"] for s in sessions]
 
     # Which codes were already completed today? Don't offer those again.
-    start, end = today_bounds_utc()
+    start, end = daily_state.local_day_bounds_utc()
     done_today_rows = await DB.fetch_all(
         "SELECT DISTINCT code FROM sessions WHERE user_id=? "
         "AND status IN ('completed','partial') AND ended_at>=? AND ended_at<?",
@@ -506,11 +485,24 @@ async def render_workout_overview(
 
 @runtime_bound(RUNTIME_NAMES)
 async def constraint_banner(user_id: int) -> str:
-    """A short, non-diagnostic heads-up when active constraints exist."""
+    """A short, non-diagnostic heads-up when active constraints exist.
+
+    Pain locations are mapped through pain_region_label so a raw English
+    token from an in-workout report ("elbow") or Hebrew free text from
+    onboarding ("טניס אלכן") both render as one clean Hebrew word ("מרפק"),
+    instead of showing whatever mixed text was stored verbatim.
+    """
     constraints = await active_constraints(user_id)
     if not constraints:
         return ""
-    spots = [esc(c["location"]) for c in constraints if c.get("location")]
+    regions = training_intelligence.active_pain_regions(constraints)
+    if regions:
+        spots = [esc(region.label) for region in regions.values()]
+    else:
+        # No recognized region token (e.g. a medical_avoidance constraint,
+        # or free text that doesn't match any known region) — fall back to
+        # the raw location so the banner still says *something* concrete.
+        spots = [esc(c["location"]) for c in constraints if c.get("location")]
     where = f" ({', '.join(spots)})" if spots else ""
     return (
         f"⚠️ <b>שים לב</b>: רשומה אצלי מגבלה פעילה{where}. "
@@ -534,11 +526,24 @@ async def render_exercise_params(
         f"<b>עריכת פרמטרים</b>\n\n"
         f"תרגיל: <b>{exercise_data['name']}</b>\n"
         f"{muscle_line}\n"
-        f"משקל פתיחה: <b>{exercise_data['weight']:g} ק״ג</b>\n"
+        f"משקל מתוכנן: <b>{exercise_data['weight']:g} ק״ג</b>\n"
         f"סטים: <b>{exercise_data['sets']}</b>\n"
         f"טווח חזרות: <b>{exercise_data['rmin']}–{exercise_data['rmax']}</b>\n"
         f"מנוחה: <b>{exercise_data['rest'] // 60}:{exercise_data['rest'] % 60:02d}</b>\n"
-        f"מדרגת התקדמות: <b>{exercise_data['inc']:g}</b>"
+        f"מדרגת התקדמות: <b>{exercise_data['inc']:g}</b>\n\n"
+        "כתוב את השינוי, למשל:\n"
+        "\"משקל 22.5\"\n"
+        "\"4 סטים\"\n"
+        "\"8-12 חזרות\"\n"
+        "\"מנוחה 1:30\"\n"
+        "\"מנוחה 1:30 לכל התרגילים\""
+    )
+    await conversation.set_active_flow(
+        DB,
+        user_id,
+        conversation.FlowName.workout_parameter_edit,
+        step="awaiting_text",
+        payload={"code": code, "exercise_index": exercise_index},
     )
     await safe_edit(query, text, exercise_params_keyboard(code, exercise_index))
 

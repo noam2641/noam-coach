@@ -43,6 +43,7 @@ class FlowName(str, Enum):
     nutrition_plan_selection = "nutrition_plan_selection"
     workout_plan_selection = "workout_plan_selection"
     unified_plan_review = "unified_plan_review"
+    workout_parameter_edit = "workout_parameter_edit"
     workout_session = "workout_session"
     health_import = "health_import"
 
@@ -81,6 +82,7 @@ LONG_FLOWS = frozenset(
         FlowName.nutrition_plan_selection,
         FlowName.workout_plan_selection,
         FlowName.unified_plan_review,
+        FlowName.workout_parameter_edit,
         FlowName.workout_session,
     }
 )
@@ -426,6 +428,8 @@ class ConversationRouter:
             return RouteDecision("meal_flow", "consume", flow, "active meal flow owns the event")
         if flow.name == FlowName.workout_session:
             return RouteDecision("workout_flow", "consume", flow, "active workout owns the event")
+        if flow.name == FlowName.workout_parameter_edit:
+            return RouteDecision("workout_parameter_flow", "consume", flow, "active workout parameter edit owns the event")
         if flow.is_question:
             return RouteDecision("question_flow", "consume", flow, "active question owns the event")
         if flow.name in {

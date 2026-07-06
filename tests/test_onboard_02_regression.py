@@ -29,6 +29,24 @@ async def _make_db(tmp_path: Path) -> Database:
     return db
 
 
+def test_medication_pending_reply_does_not_overpromise_learning() -> None:
+    from noam_coach.bot import onboarding as onboarding_bot
+
+    src = Path(onboarding_bot.__file__).read_text(encoding="utf-8")
+    assert "ואלמד את ההשפעה" not in src
+    assert "זה יישמר ביומן שלך" in src
+    assert "נוכל להשוות מול תיאבון ואימונים" in src
+
+
+def test_pain_pending_reply_does_not_overpromise_replacement_and_has_safety_boundary() -> None:
+    from noam_coach.bot import onboarding as onboarding_bot
+
+    src = Path(onboarding_bot.__file__).read_text(encoding="utf-8")
+    assert "אסיר או אחליף תרגילים" not in src
+    assert "אנסה להסיר או להחליף תרגילים" in src
+    assert "כדאי בדיקה מקצועית" in src
+
+
 class FakeQuery:
     def __init__(self) -> None:
         self.messages: list[str] = []
@@ -93,11 +111,15 @@ class TestHealthImportOutcomeFields:
         assert outcome.import_completed == "2025-01-01T00:01:00Z"
 
     @pytest.mark.asyncio
-    async def test_followup_summary_lists_missing_and_approval_without_raw_keys(
+    async def test_followup_summary_lists_missing_without_raw_keys(
         self,
         tmp_path: Path,
         monkeypatch,
     ) -> None:
+        """RE10-4 (D15): the "דורש אישור" list moved into the per-fact wizard
+        (ask_next_health_confirm_step), shown BEFORE this summary now — so
+        _health_import_followup_text only lists what is still genuinely
+        missing, and must still never leak raw internal keys."""
         from noam_coach.services import health_jobs
 
         db = await _make_db(tmp_path)
@@ -114,7 +136,6 @@ class TestHealthImportOutcomeFields:
 
         text = await health_jobs._health_import_followup_text(1)
 
-        assert "דורש אישור" in text
         assert "עדיין חסר" in text
         assert "sleep_schedule" not in text
         assert "active_pain" not in text

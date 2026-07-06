@@ -58,6 +58,20 @@ def test_onboarding_questions_subset() -> None:
     assert "q_training_days" in ids
 
 
+def test_diet_and_allergy_questions_use_distinct_user_language() -> None:
+    allergy_q = questions.question_by_id("q_allergies")
+    diet_q = questions.question_by_id("q_diet_restrictions")
+    assert allergy_q is not None
+    assert diet_q is not None
+
+    assert "רגישות" in allergy_q.text
+    assert "אסורים" in allergy_q.text
+    assert allergy_q.options == [("אין אלרגיות/רגישויות", "none")]
+    assert "מעדיף לא לאכול" in diet_q.text
+    assert diet_q.fact_key == "diet_restrictions"
+    assert allergy_q.fact_key == "allergies"
+
+
 def test_all_questions_have_affects() -> None:
     for q in questions.ALL_QUESTIONS:
         assert q.affects, f"{q.id} has no affects"

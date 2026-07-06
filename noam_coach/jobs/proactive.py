@@ -66,6 +66,7 @@ import reconcile
 import targets
 import training_intelligence
 import user_model
+from noam_coach.services import daily_state
 
 # --- Extracted modules (re-exported for backward compatibility) ---
 from config import (  # noqa: F401
@@ -446,7 +447,7 @@ async def deliver_proactive_message(
     nutrition_sensitive = key in NUTRITION_DAY_QUALITY_KEYS
     start_utc = end_utc = None
     if nutrition_sensitive:
-        start_utc, end_utc = today_bounds_utc()
+        start_utc, end_utc = daily_state.local_day_bounds_utc()
     allowed, reason = await data_quality.can_send_proactive(
         DB,
         user_id,
@@ -491,29 +492,12 @@ async def deliver_proactive_message(
 
 @runtime_bound(RUNTIME_NAMES)
 async def today_consumed(user_id: int) -> tuple[float, float]:
-    start, end = today_bounds_utc()
-    row = await DB.fetch_one(
-        """
-        SELECT COALESCE(SUM(calories),0) AS c, COALESCE(SUM(protein),0) AS p
-        FROM meals WHERE user_id=? AND eaten_at>=? AND eaten_at<?
-        """,
-        (user_id, start, end),
-    )
-    return float(row["c"]), float(row["p"])
+    return await daily_state.consumed_totals(DB, user_id)
 
 
 @runtime_bound(RUNTIME_NAMES)
 async def today_meal_items(user_id: int) -> list[dict[str, Any]]:
-    start, end = today_bounds_utc()
-    return await DB.fetch_all(
-        """
-        SELECT mi.name, mi.grams, mi.calories, mi.protein
-        FROM meal_items mi
-        JOIN meals m ON m.id = mi.meal_id
-        WHERE m.user_id=? AND m.eaten_at>=? AND m.eaten_at<?
-        """,
-        (user_id, start, end),
-    )
+    return await daily_state.consumed_meal_items(DB, user_id)
 
 
 @runtime_bound(RUNTIME_NAMES)
@@ -523,23 +507,7 @@ async def workout_completed_today(user_id: int) -> bool:
     Distinct from "today is a usual training day" (a probabilistic guess) so
     callers don't conflate "already trained" with "tends to train".
     """
-    start, end = today_bounds_utc()
-    # In-bot completed/partial session today.
-    bot_done = await DB.fetch_one(
-        "SELECT 1 FROM sessions WHERE user_id=? "
-        "AND status IN ('completed','partial') AND ended_at>=? AND ended_at<? "
-        "LIMIT 1",
-        (user_id, start, end),
-    )
-    if bot_done:
-        return True
-    # A workout imported from Health for today (rare without a same-day import).
-    imported = await DB.fetch_one(
-        "SELECT 1 FROM health WHERE user_id=? AND sample_type='workout' "
-        "AND start_time>=? AND start_time<? LIMIT 1",
-        (user_id, start, end),
-    )
-    return imported is not None
+    return await daily_state.workout_completed_today(DB, user_id)
 
 
 @runtime_bound(RUNTIME_NAMES)

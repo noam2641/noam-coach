@@ -106,7 +106,7 @@ from retention import (
 
 from noam_coach.runtime_bind import runtime_bound
 
-RUNTIME_NAMES = ('APP_VERSION', 'Any', 'CALLBACK_DEBOUNCE_SECONDS', 'CONFIRM_PENDING', 'ContextTypes', 'DB', 'EXERCISE_MUSCLES', 'Exception', 'GOAL_STATUS_PROPOSED', 'GOAL_STATUS_PROVISIONAL', 'InlineKeyboardButton', 'InlineKeyboardMarkup', 'KeyError', 'LOGGER', 'MealAnalysis', 'PENDING_QUESTION', 'Path', 'RIR_UNKNOWN', 'SESSION_SCOPED_ACTIONS', 'SETTINGS', 'TypeError', 'Update', 'ValueError', 'WebAppInfo', '_DEBOUNCE_PREFIXES', '_LAST_CALLBACK', '_StaleSetStep', '_duration_s', '_home_hint', '_is_duplicate_tap', '_plan_type_label', '_started', 'action', 'activate_goal_version_provisional', 'active_flow', 'active_session', 'actual_reps', 'actual_rir', 'actual_weight', 'aiosqlite', 'alt', 'alt_muscle', 'alternative', 'alternative_index', 'analysis', 'analyze_duplicate_candidate', 'apply_reconcile_proposal', 'approval_id', 'bool', 'build_daily_status', 'build_evening_summary_text', 'build_health_status_text', 'build_morning_menu_text', 'build_next_meal_text', 'build_now_action_text', 'build_weekly_summary_text', 'button', 'buttons', 'callback_flow_id', 'callback_version', 'cancel_rest_timer', 'candidate', 'center', 'changed', 'check_duplicate_meal', 'choices', 'chosen_reps', 'chosen_weight', 'claimed', 'clear_confirm_pending', 'clear_meal_fix', 'clear_pending', 'clear_split_state', 'code', 'command_profile_query', 'completed', 'conn', 'connection', 'constraint_id', 'context', 'conversation', 'create_approval', 'create_goal_version', 'create_meal_edit_approval', 'cur', 'current', 'cursor', 'cutoff', 'data', 'datetime', 'decide_approval', 'deleted', 'delta', 'delta_text', 'dict', 'done', 'draft', 'dup', 'duplicate_approval_id', 'edit_approval_id', 'ensure_user', 'enumerate', 'error_id', 'esc', 'event_log', 'ex', 'exc', 'exercise_index', 'exercise_index_text', 'exercise_picker_keyboard', 'existing', 'extra', 'extra_seconds', 'fetch_approval', 'fetch_goal', 'field', 'final_rir', 'first_reps', 'first_weight', 'flags', 'float', 'frequency', 'friendly_error', 'get_daily_flags', 'get_meal_fix', 'get_split_state', 'get_user_plan', 'getattr', 'goal', 'goal_id', 'gv_id', 'handle_checkin_callback', 'handle_flags_callback', 'handle_goal_callback', 'handle_meal_callback', 'handle_menu_callback', 'handle_onboarding_callback', 'handle_plan_callback', 'handle_session_action_callback', 'handle_workout_setup_callback', 'home_keyboard', 'index', 'int', 'is_allowed', 'is_current_session_step', 'is_partial', 'is_provisional', 'isinstance', 'item', 'item_index', 'item_index_text', 'job', 'jobs', 'json', 'k', 'kb', 'key', 'kind', 'label', 'labels', 'last', 'len', 'level', 'list', 'logged_sets', 'max', 'meal', 'meal_id', 'meal_id_text', 'min', 'mini_app_url', 'missing', 'missing_labels', 'more_keyboard', 'msg', 'new_grams', 'new_max', 'new_min', 'new_val', 'new_weight', 'note', 'notify_admin', 'now', 'nutrition', 'object', 'ok', 'old_grams', 'option', 'option_index', 'pain_location', 'part', 'parts', 'parts_v2', 'payload', 'persist_meal', 'plan', 'plan_id', 'plan_now', 'plan_type', 'planned_sets', 'planning', 'plans_keyboard', 'progress', 'quality', 'query', 'range', 'ratio', 'rc', 'readiness', 'recommend_load', 'refreshed', 'render_candidate_list', 'render_exercise_params', 'render_meal', 'render_profile_snapshot', 'render_quantity_editor', 'render_smart_plan_hub', 'render_unified_plan', 'render_workout_overview', 'reopened', 'replacement', 'reps', 'reps_value', 'rest', 'rest_job_name', 'result', 'round', 'route_decision', 'row', 'rows', 'safe_edit', 'save_medical_constraint', 'save_split_set', 'second_base', 'second_reps', 'second_weight', 'secrets', 'select_todays_workout_code', 'selected', 'send_weight_chart', 'session', 'session_action_arg', 'session_action_data', 'session_id', 'set', 'set_daily_flags', 'set_exercise_override', 'set_goal_weight', 'set_meal_fix', 'set_pending', 'set_split_state', 'severity', 'show_session', 'split_reps_keyboard', 'split_rir_keyboard', 'split_state', 'split_summary_line', 'split_weight_keyboard', 'start_rest_timer', 'status', 'status_line', 'step', 'str', 'sum', 'summary_line', 'suppress', 't', 'tail', 'target_change_note', 'text', 'time', 'total_reps', 'track_event', 'training_intelligence', 'try_save_set', 'tuple', 'undo_last_set', 'undone', 'update', 'update_rest_message', 'update_session_step', 'url', 'user_choice', 'user_id', 'user_model', 'utc_now', 'value', 'value_text', 'warn', 'weight', 'workout', 'workout_summary', 'write_audit')
+RUNTIME_NAMES = ('APP_VERSION', 'Any', 'CALLBACK_DEBOUNCE_SECONDS', 'CONFIRM_PENDING', 'ContextTypes', 'DB', 'EXERCISE_MUSCLES', 'Exception', 'GOAL_STATUS_PROPOSED', 'GOAL_STATUS_PROVISIONAL', 'InlineKeyboardButton', 'InlineKeyboardMarkup', 'KeyError', 'LOGGER', 'MealAnalysis', 'OPENAI_CLIENT', 'PENDING_QUESTION', 'Path', 'RIR_UNKNOWN', 'SESSION_SCOPED_ACTIONS', 'SETTINGS', 'TypeError', 'Update', 'ValueError', 'WebAppInfo', '_DEBOUNCE_PREFIXES', '_LAST_CALLBACK', '_StaleSetStep', '_duration_s', '_home_hint', '_is_duplicate_tap', '_plan_type_label', '_started', 'action', 'activate_goal_version_provisional', 'active_flow', 'active_session', 'actual_reps', 'actual_rir', 'actual_weight', 'aiosqlite', 'alt', 'alt_muscle', 'alternative', 'alternative_index', 'analysis', 'analyze_duplicate_candidate', 'apply_reconcile_proposal', 'approval_id', 'bool', 'build_daily_status', 'build_evening_summary_text', 'build_health_status_text', 'build_morning_menu_text', 'build_next_meal_text', 'build_now_action_text', 'build_weekly_summary_text', 'button', 'buttons', 'callback_flow_id', 'callback_version', 'cancel_rest_timer', 'candidate', 'center', 'changed', 'check_duplicate_meal', 'choices', 'chosen_reps', 'chosen_weight', 'claimed', 'clear_confirm_pending', 'clear_meal_fix', 'clear_pending', 'clear_split_state', 'code', 'command_profile_query', 'completed', 'conn', 'connection', 'constraint_id', 'context', 'conversation', 'create_approval', 'create_goal_version', 'create_meal_edit_approval', 'cur', 'current', 'cursor', 'cutoff', 'data', 'datetime', 'decide_approval', 'deleted', 'delta', 'delta_text', 'dict', 'done', 'draft', 'dup', 'duplicate_approval_id', 'edit_approval_id', 'ensure_user', 'enumerate', 'error_id', 'esc', 'event_log', 'ex', 'exc', 'exercise_index', 'exercise_index_text', 'exercise_picker_keyboard', 'existing', 'extra', 'extra_seconds', 'fetch_approval', 'fetch_goal', 'field', 'final_rir', 'first_reps', 'first_weight', 'flags', 'float', 'frequency', 'friendly_error', 'get_daily_flags', 'get_meal_fix', 'get_split_state', 'get_user_plan', 'getattr', 'goal', 'goal_id', 'gv_id', 'handle_checkin_callback', 'handle_flags_callback', 'handle_goal_callback', 'handle_meal_callback', 'handle_menu_callback', 'handle_onboarding_callback', 'handle_plan_callback', 'handle_session_action_callback', 'handle_workout_setup_callback', 'home_keyboard', 'index', 'int', 'is_allowed', 'is_current_session_step', 'is_partial', 'is_provisional', 'isinstance', 'item', 'item_index', 'item_index_text', 'job', 'jobs', 'json', 'k', 'kb', 'key', 'kind', 'label', 'labels', 'last', 'len', 'level', 'list', 'logged_sets', 'max', 'meal', 'meal_id', 'meal_id_text', 'min', 'mini_app_url', 'missing', 'missing_labels', 'more_keyboard', 'msg', 'new_grams', 'new_max', 'new_min', 'new_val', 'new_weight', 'note', 'notify_admin', 'now', 'nutrition', 'object', 'ok', 'old_grams', 'option', 'option_index', 'pain_location', 'part', 'parts', 'parts_v2', 'payload', 'persist_meal', 'plan', 'plan_id', 'plan_now', 'plan_type', 'planned_sets', 'planning', 'plans_keyboard', 'progress', 'quality', 'query', 'range', 'ratio', 'rc', 'readiness', 'recommend_load', 'refreshed', 'render_candidate_list', 'render_exercise_params', 'render_meal', 'render_profile_snapshot', 'render_quantity_editor', 'render_smart_plan_hub', 'render_unified_plan', 'render_workout_overview', 'reopened', 'replacement', 'reps', 'reps_value', 'rest', 'rest_job_name', 'result', 'round', 'route_decision', 'row', 'rows', 'safe_edit', 'save_medical_constraint', 'save_split_set', 'second_base', 'second_reps', 'second_weight', 'secrets', 'select_todays_workout_code', 'selected', 'send_weight_chart', 'session', 'session_action_arg', 'session_action_data', 'session_id', 'set', 'set_daily_flags', 'set_exercise_override', 'set_goal_weight', 'set_meal_fix', 'set_pending', 'set_split_state', 'severity', 'show_session', 'split_reps_keyboard', 'split_rir_keyboard', 'split_state', 'split_summary_line', 'split_weight_keyboard', 'start_rest_timer', 'status', 'status_line', 'step', 'str', 'sum', 'summary_line', 'suppress', 't', 'tail', 'target_change_note', 'text', 'time', 'total_reps', 'track_event', 'training_intelligence', 'try_save_set', 'tuple', 'undo_last_set', 'undone', 'update', 'update_rest_message', 'update_session_step', 'url', 'user_choice', 'user_id', 'user_model', 'utc_now', 'value', 'value_text', 'warn', 'weight', 'workout', 'workout_summary', 'write_audit')
 
 PENDING_PLAN_ACTION_FLOW = "pending_plan_action"
 PENDING_PLAN_GENERATE_STEP = "generate_candidates"
@@ -141,15 +141,23 @@ async def _render_planning_blocked(
     missing = list(getattr(exc, "missing", None) or [])
     if remember and plan_type in {"nutrition", "workout"}:
         await _set_pending_plan_action(user_id, plan_type)
-    labels = [planning.FACT_LABELS.get(key, user_model.display_label(key)) for key in missing]
+    # RE10-8: translate every missing key through the same Hebrew label map
+    # used everywhere else — "active_goal" must never leak as a raw key.
+    labels = [planning.FACT_LABELS.get(key) or user_model.display_label(key) for key in missing]
     tail = f"\n\nחסר: {esc(', '.join(labels))}" if labels else ""
     rows = []
     if "active_goal" in missing:
-        rows.append([button("אשר יעד ואז נמשיך", "menu:goal")])
+        rows.append([button("🎯 אשר יעד ואז נמשיך", "menu:goal")])
+        remaining_missing = [key for key in missing if key != "active_goal"]
+        if remaining_missing and plan_type:
+            # RE10-8: when both a goal AND profile facts are missing, offer a
+            # single path that completes the facts too instead of forcing a
+            # second round-trip through this screen after the goal is approved.
+            rows.append([button("▶️ השלם גם את שאר הפרטים", f"planv2:complete_missing:{plan_type}")])
     else:
-        rows.append([button("השלם עכשיו", "planv2:complete_missing")])
-    rows.append([button("הצג מה חסר", "planv2:profile")])
-    rows.append([button("חזרה לתוכניות", "menu:smartplan")])
+        rows.append([button("▶️ השלם עכשיו", f"planv2:complete_missing:{plan_type}" if plan_type else "planv2:complete_missing")])
+    rows.append([button("👤 הצג מה חסר", "planv2:profile")])
+    rows.append([button("⬅️ חזרה לתוכניות", "menu:smartplan")])
     await safe_edit(
         query,
         f"<b>אי אפשר לבנות את התוכנית עדיין.</b>\n{esc(str(exc))}{tail}",
@@ -186,6 +194,85 @@ async def resume_pending_plan_action(query: Any, user_id: int) -> bool:
     except planning.PlanningBlockedError as exc:
         await _render_planning_blocked(query, user_id, exc, plan_type=plan_type, remember=True)
         return True
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def render_goal_proposal(query: Any, user_id: int) -> None:
+    """Render the goal proposal screen (RE10-9).
+
+    Called once the goal wizard (height/goal weight/timeframe) has nothing
+    left to ask — either because the user already had all the facts, or
+    because they just finished answering. D3: superseding any earlier
+    pending "goal" approval before creating a new one prevents dangling
+    approvals from stale re-renders of this screen (repeated menu:goal taps
+    used to each mint a new approval id).
+    """
+    await DB.execute(
+        "UPDATE approvals SET status='superseded' WHERE user_id=? AND kind='goal' AND status='pending'",
+        (user_id,),
+    )
+    goal = await fetch_goal(user_id)
+    payload = {
+        "calories": int(goal["calories"]),
+        "protein": int(goal["protein"]),
+        "steps": int(goal["steps"]),
+        "phase": goal.get("phase", "fat_loss_muscle_retention"),
+        "provisional": bool(goal.get("provisional")),
+        "explanation": goal.get("explanation", ""),
+    }
+    approval_id = await create_approval(user_id, "goal", payload)
+
+    # RE10-10: rephrase the (already-decided) numbers via AI for a warmer,
+    # more complete explanation than the fixed template. The persisted
+    # payload keeps the deterministic explanation as the source of truth;
+    # this only affects what is shown on screen, and always falls back to
+    # the deterministic text on any AI failure or number mismatch.
+    from noam_coach.services.goal_explainer import explain_targets_with_ai
+    from noam_coach.services.goals import compute_personal_targets
+
+    display_explanation = payload["explanation"]
+    computed = await compute_personal_targets(user_id)
+    if computed is not None:
+        display_explanation = await explain_targets_with_ai(
+            computed, openai_client=OPENAI_CLIENT, model=SETTINGS.openai_model
+        )
+
+    missing = goal.get("missing_inputs") or []
+    # RE10-9 / D2: "missing" here is the SOFT list (sex/age/height/avg_steps)
+    # that only affects precision, not the hard GOAL_REQUIRED_FACTS gate —
+    # label it as "for more precision" so it isn't confused with a blocker.
+    status_line = (
+        "⚠️ <b>יעד לפי הערכה חלקית</b> — לדיוק מלא נדרש עוד: "
+        + ", ".join(esc(user_model.display_label(item)) for item in missing)
+        if payload["provisional"]
+        else "✅ מחושב מהפרופיל שלך"
+    )
+    rows = [
+        [
+            button("✅ אשר יעד" if not payload["provisional"] else "⏳ השתמש זמנית", f"approve_goal:{approval_id}"),
+            button("❌ דחה", f"reject_goal:{approval_id}"),
+        ],
+        [button("✏️ כתוב יעד קלורי אחר", "goal:manual")],
+    ]
+    # RE10-9: the missing items are already spelled out in status_line above,
+    # so a redundant "מה חסר" button here would just repeat the same
+    # information — only offer it when there is nothing already shown.
+    if not missing:
+        rows.append([button("👤 הצג פרופיל מלא", "planv2:profile")])
+    rows.append([button("⬅️ תפריט", "menu:home")])
+    await safe_edit(
+        query,
+        (
+            "<b>הצעת יעד</b>\n\n"
+            f"קלוריות: <b>{payload['calories']:,}</b>\n"
+            f"חלבון: <b>{payload['protein']} גרם</b>\n"
+            f"צעדים: <b>{payload['steps']:,}</b>\n\n"
+            f"{status_line}\n\n"
+            f"<i>{esc(display_explanation)}</i>\n\n"
+            "היעד לא ישתנה בעתיד בלי אישור שלך."
+        ),
+        InlineKeyboardMarkup(rows),
+    )
 
 
 @runtime_bound(RUNTIME_NAMES)
@@ -269,49 +356,27 @@ async def _handle_workout_menu_actions(
         return True
 
     if data == "menu:goal":
-        goal = await fetch_goal(user_id)
-        payload = {
-            "calories": int(goal["calories"]),
-            "protein": int(goal["protein"]),
-            "steps": int(goal["steps"]),
-            "phase": goal.get("phase", "fat_loss_muscle_retention"),
-            "provisional": bool(goal.get("provisional")),
-            "explanation": goal.get("explanation", ""),
-        }
-        approval_id = await create_approval(user_id, "goal", payload)
-        missing = goal.get("missing_inputs") or []
-        status_line = (
-            "⚠️ <b>יעד זמני</b> — חסרים: "
-            + ", ".join(esc(user_model.display_label(item)) for item in missing)
-            if payload["provisional"]
-            else "✅ מחושב מהפרופיל שלך"
-        )
-        rows = []
-        if payload["provisional"]:
-            rows.append([button("👤 הצג מה חסר", "planv2:profile")])
-            rows.append([
-                button("⏳ השתמש זמנית", f"approve_goal:{approval_id}"),
-                button("❌ דחה", f"reject_goal:{approval_id}"),
-            ])
-        else:
-            rows.append([
-                button("✅ אשר כיעד פעיל", f"approve_goal:{approval_id}"),
-                button("❌ דחה", f"reject_goal:{approval_id}"),
-            ])
-        rows.append([button("⬅️ תפריט", "menu:home")])
+        from noam_coach.bot.onboarding import ask_next_goal_wizard_question
+
+        # RE10-9: complete the facts that make the proposal meaningful
+        # (height, goal weight, timeframe) with a guided Q&A BEFORE showing
+        # a provisional proposal that immediately says "⚠️ missing: height".
+        if await ask_next_goal_wizard_question(query, user_id):
+            return True
+        await render_goal_proposal(query, user_id)
+        return True
+
+    if data == "goal:manual":
+        # RE10-9: explicit button for a manual calorie override, instead of
+        # only being reachable by typing a bare number.
         await safe_edit(
             query,
-            (
-                "<b>הצעת יעד</b>\n\n"
-                f"קלוריות: <b>{payload['calories']:,}</b>\n"
-                f"חלבון: <b>{payload['protein']} גרם</b>\n"
-                f"צעדים: <b>{payload['steps']:,}</b>\n\n"
-                f"{status_line}\n\n"
-                f"<i>{esc(payload['explanation'])}</i>\n\n"
-                "היעד לא ישתנה בעתיד בלי אישור שלך."
-            ),
-            InlineKeyboardMarkup(rows),
+            "כתוב את יעד הקלוריות היומי שאתה רוצה (מספר, למשל 2100).",
+            InlineKeyboardMarkup([[button("⬅️ ביטול", "menu:goal")]]),
         )
+        from noam_coach.bot.onboarding import set_pending
+
+        await set_pending(user_id, "__manual_goal_calories__")
         return True
     return False
 
@@ -379,6 +444,73 @@ async def _handle_workout_parameter_actions(
     user_id: int,
     data: str,
 ) -> bool:
+    if data == "wparamtext:cancel":
+        flow = await conversation.get_active_flow(DB, user_id)
+        payload = flow.payload if flow.name == conversation.FlowName.workout_parameter_edit else {}
+        code = str(payload.get("code") or "A")
+        await conversation.clear_active_flow(DB, user_id)
+        await safe_edit(
+            query,
+            "ביטלתי את עריכת הפרמטרים. לא שמרתי שינוי.",
+            InlineKeyboardMarkup([[button("⬅️ חזרה לאימון", f"workout:{code}")]]),
+        )
+        return True
+
+    if data == "wparamtext:apply":
+        flow = await conversation.get_active_flow(DB, user_id)
+        if flow.name != conversation.FlowName.workout_parameter_edit:
+            await safe_edit(
+                query,
+                "העריכה כבר לא פעילה. פתחתי את מסך האימון מחדש.",
+                InlineKeyboardMarkup([[button("🏠 תפריט", "menu:home")]]),
+            )
+            return True
+        payload = dict(flow.payload or {})
+        code = str(payload.get("code") or "")
+        exercise_index = int(payload.get("exercise_index") or 0)
+        pending_updates = list(payload.get("pending_updates") or [])
+        if not code or not pending_updates:
+            await conversation.clear_active_flow(DB, user_id)
+            await safe_edit(
+                query,
+                "לא מצאתי שינוי שממתין לאישור. אפשר לפתוח עריכת פרמטרים מחדש.",
+                InlineKeyboardMarkup([[button("🏠 תפריט", "menu:home")]]),
+            )
+            return True
+        plan = await get_user_plan(user_id, code)
+        applied: list[str] = []
+        for update_item in pending_updates:
+            if not isinstance(update_item, dict):
+                continue
+            scope = str(update_item.get("scope") or "current")
+            indices = range(len(plan["exercises"])) if scope == "all" else [exercise_index]
+            field = str(update_item.get("field") or "")
+            for idx in indices:
+                if not 0 <= idx < len(plan["exercises"]):
+                    continue
+                if field == "reps":
+                    rmin = int(update_item.get("rmin") or plan["exercises"][idx]["rmin"])
+                    rmax = int(update_item.get("rmax") or plan["exercises"][idx]["rmax"])
+                    await set_exercise_override(user_id, code, idx, "rmin", rmin)
+                    await set_exercise_override(user_id, code, idx, "rmax", max(rmin, rmax))
+                elif field in {"weight", "sets", "rest"}:
+                    await set_exercise_override(user_id, code, idx, field, float(update_item["value"]))
+            label = str(update_item.get("label") or field)
+            if label:
+                applied.append(label)
+        await conversation.clear_active_flow(DB, user_id)
+        summary = ", ".join(applied) if applied else "השינוי"
+        scope_label = str(payload.get("scope_label") or "")
+        await safe_edit(
+            query,
+            f"שמרתי: {summary} {scope_label} ✅",
+            InlineKeyboardMarkup([
+                [button("⬅️ חזרה לאימון", f"workout:{code}")],
+                [button("✏️ ערוך עוד", f"editparams_menu:{code}")],
+            ]),
+        )
+        return True
+
     if data.startswith("editparams_menu:"):
         code = data.split(":", 1)[1]
         await safe_edit(
@@ -473,10 +605,13 @@ async def handle_plan_callback(query: Any, user_id: int, data: str) -> bool:
         await render_profile_snapshot(query, user_id)
         return True
 
-    if data == "planv2:complete_missing":
+    if data == "planv2:complete_missing" or data.startswith("planv2:complete_missing:"):
         from noam_coach.bot.onboarding import ask_next_plan_completion_question
 
-        await ask_next_plan_completion_question(query, user_id)
+        # RE10-6: carry which plan the user was trying to build so the
+        # completion questions prioritize that profile first.
+        plan_type = data.split(":", 2)[2] if data.count(":") >= 2 else None
+        await ask_next_plan_completion_question(query, user_id, plan_type)
         return True
 
     if data.startswith("planv2:generate:"):
@@ -485,7 +620,18 @@ async def handle_plan_callback(query: Any, user_id: int, data: str) -> bool:
             await query.answer("סוג תוכנית לא תקין", show_alert=True)
             return True
         readiness = await user_model.compute_readiness(DB, user_id, plan_type)
-        if not readiness["ready"]:
+        # RE10-8: a nutrition plan also requires an approved goal before it can
+        # be built (see build_nutrition_candidates). That prerequisite used to
+        # surface only on a second screen, after the user completed the facts
+        # below — show it here too so the FIRST screen already lists everything
+        # that blocks the plan.
+        needs_goal = plan_type == "nutrition" and await planning.active_goal(DB, user_id) is None
+        if needs_goal:
+            # Remember what the user was trying to build so approving the goal
+            # (menu:goal) can auto-resume generation, same as the old
+            # PlanningBlockedError(missing=["active_goal"]) path did.
+            await _set_pending_plan_action(user_id, plan_type)
+        if not readiness["ready"] or needs_goal:
             labels = [
                 user_model.FACT_REGISTRY[key].label
                 if key in user_model.FACT_REGISTRY
@@ -493,7 +639,9 @@ async def handle_plan_callback(query: Any, user_id: int, data: str) -> bool:
                 for key in readiness["missing"]
             ]
             # REC-ONBOARD-02-10: grouped missing info with direct completion
-            missing_display = readiness.get("missing_labels", labels)
+            missing_display = list(readiness.get("missing_labels", labels))
+            if needs_goal:
+                missing_display.append(user_model.display_label("active_goal"))
             lines_m = [f"<b>חסרים פרטים ליצירת תוכנית {user_model.display_label(plan_type)}:</b>", ""]
             lines_m.extend(f"• {esc(label)}" for label in missing_display)
             deferred = readiness.get("deferred", [])
@@ -501,11 +649,13 @@ async def handle_plan_callback(query: Any, user_id: int, data: str) -> bool:
                 lines_m.append("")
                 lines_m.append("<i>נדחו למילוי מאוחר:</i>")
                 lines_m.extend(f"• {esc(user_model.display_label(k))}" for k in deferred)
-            buttons_m = [
-                [button("▶️ השלם עכשיו", "planv2:complete_missing")],
-                [button("⏳ אשלים אחר כך", "menu:smartplan")],
-                [button("⬅️ חזרה לתוכניות", "menu:smartplan")],
-            ]
+            buttons_m = []
+            if needs_goal:
+                buttons_m.append([button("🎯 אשר יעד ואז נמשיך", "menu:goal")])
+            if not readiness["ready"]:
+                buttons_m.append([button("▶️ השלם עכשיו", f"planv2:complete_missing:{plan_type}")])
+            buttons_m.append([button("⏳ אשלים אחר כך", "menu:smartplan")])
+            buttons_m.append([button("⬅️ חזרה לתוכניות", "menu:smartplan")])
             await safe_edit(
                 query,
                 "\n".join(lines_m),
@@ -523,7 +673,14 @@ async def handle_plan_callback(query: Any, user_id: int, data: str) -> bool:
                 source="planner",
                 properties={"plan_type": plan_type, "count": 3},
             )
-            await render_candidate_list(query, user_id, plan_type)
+            if plan_type == "workout":
+                from noam_coach.bot.onboarding import render_workout_type_choice
+
+                # RE10-11: workouts go through the 3-step wizard (type ->
+                # structure -> exercises) instead of the flat 3-candidate list.
+                await render_workout_type_choice(query, user_id)
+            else:
+                await render_candidate_list(query, user_id, plan_type)
         except planning.PlanningBlockedError as exc:
             await _render_planning_blocked(query, user_id, exc, plan_type=plan_type, remember=True)
         except Exception as exc:  # noqa: BLE001
@@ -533,6 +690,28 @@ async def handle_plan_callback(query: Any, user_id: int, data: str) -> bool:
                 friendly_error(exc, "plan generation"),
                 InlineKeyboardMarkup([[button("⬅️ לתוכניות", "menu:smartplan")]]),
             )
+        return True
+
+    if data.startswith("planv2:wiz_type:"):
+        from noam_coach.bot.onboarding import render_workout_structure_choice
+
+        strategy = data.split(":", 2)[2].split(":")[0]  # strip trailing f.../v... suffix
+        await render_workout_structure_choice(query, user_id, strategy)
+        return True
+
+    if data.startswith("planv2:wiz_back_type:"):
+        from noam_coach.bot.onboarding import render_workout_type_choice
+
+        await render_workout_type_choice(query, user_id)
+        return True
+
+    if data.startswith("planv2:wiz_review:"):
+        from noam_coach.bot.onboarding import render_workout_exercise_review
+
+        raw_id = data.split(":", 2)[2].split(":")[0]
+        if not raw_id.isdigit():
+            return True
+        await render_workout_exercise_review(query, user_id, int(raw_id))
         return True
 
     if data.startswith("planv2:select:"):

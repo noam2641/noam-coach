@@ -92,6 +92,13 @@ from models import (  # noqa: F401
     ShortcutHealthPayload,
     WatchSetPayload,
 )
+from noam_coach.services.daily_coaching import (
+    calculate_daily_score,
+    choose_daily_mission,
+    format_daily_mission,
+    format_daily_score,
+)
+from noam_coach.services.meal_followup import planned_meal_followup
 from retention import cleanup_loop as cleanup_photos  # noqa: F401
 from retention import (
     cleanup_operational_data_once,  # noqa: F401
@@ -189,15 +196,9 @@ def _health_import_success_text(outcome: HealthImportOutcome) -> str:
     return "\n".join(lines)
 
 
-async def _health_import_followup_text(user_id: int) -> str:
-    readiness = await user_model.compute_all_readiness(DB, user_id)
-    missing_labels: list[str] = []
-    for profile_name in ("safety", "workout", "nutrition"):
-        for label in readiness.get(profile_name, {}).get("missing_labels", []):
-            if label not in missing_labels:
-                missing_labels.append(label)
-
-    rows = await DB.fetch_all(
+async def pending_import_facts(user_id: int) -> list[dict[str, Any]]:
+    """RE9-009: facts derived from a Health import that await explicit activation."""
+    return await DB.fetch_all(
         """
         SELECT key, source
         FROM user_facts
@@ -206,22 +207,240 @@ async def _health_import_followup_text(user_id: int) -> str:
           AND confirmed=0
           AND kind!='gap'
         ORDER BY updated_at DESC
-        LIMIT 6
         """,
         (user_id,),
     )
-    approval_labels = []
-    for row in rows:
-        label = user_model.display_label(str(row["key"]))
-        source = user_model.SOURCE_LABELS.get(row.get("source"), row.get("source") or "")
-        approval_labels.append(f"{label} ({source})" if source else label)
+
+
+def health_activation_keyboard(pending_count: int) -> InlineKeyboardMarkup | None:
+    """RE9-009: explicit confirm/correct/activate gate after a Health import.
+
+    Data is imported but not silently applied — the user sees the baseline and
+    decides. Returns None when there is nothing pending to activate.
+    """
+    if pending_count <= 0:
+        return None
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(f"✅ הפעל את מה שזוהה ({pending_count})", callback_data="health:activate")],
+            [InlineKeyboardButton("✏️ תקן לפני הפעלה", callback_data="health:review")],
+            [InlineKeyboardButton("⬅️ עדיין לא", callback_data="menu:home")],
+        ]
+    )
+
+
+async def activate_imported_health_facts(user_id: int) -> int:
+    """Confirm all pending imported facts so they become active. Returns count."""
+    pending = await pending_import_facts(user_id)
+    for row in pending:
+        await user_model.confirm_fact(DB, user_id, str(row["key"]))
+    if pending:
+        with suppress(Exception):
+            await write_audit(
+                user_id, "health_facts_activated", "health", None, count=len(pending),
+            )
+        with suppress(Exception):
+            await event_log.append_event(
+                DB, user_id, "health_facts_activated",
+                entity="health", source="user",
+                properties={"count": len(pending)},
+            )
+    return len(pending)
+
+
+# RE10-4: per-fact confirmation wizard shown right after a Health import,
+# replacing the old single "activate everything at once" gate. The order
+# matters: workout frequency first (feeds the day-selection step next),
+# then the days themselves, then typical time, then weight — mirroring the
+# order a coach would actually confirm data with a client.
+HEALTH_CONFIRM_FLOW = "health_confirm"
+_WIZARD_FACT_ORDER = ("workout_pattern", "weight_kg", "sleep_schedule")
+
+
+def _format_pending_fact_value(key: str, value: Any) -> str:
+    """Human-readable "what was detected" line for one pending fact (RE10-4)."""
+    if key == "workout_pattern" and isinstance(value, dict):
+        freq = value.get("weekly_frequency")
+        hour = value.get("typical_hour")
+        parts = []
+        if freq:
+            parts.append(f"~{freq:g} אימונים בשבוע")
+        if hour:
+            parts.append(f"בדרך כלל בסביבות {hour}")
+        return ", ".join(parts) or "דפוס אימונים"
+    if key == "sleep_schedule" and isinstance(value, dict):
+        bedtime = value.get("typical_bedtime") or value.get("bedtime")
+        wake = value.get("typical_wake_time") or value.get("wake_time")
+        if bedtime and wake:
+            return f"שינה {bedtime}–{wake}"
+        return "שגרת שינה"
+    if key == "weight_kg":
+        try:
+            return f'{float(value):.1f} ק"ג'
+        except (TypeError, ValueError):
+            return str(value)
+    return user_model.display_label(key)
+
+
+async def _next_wizard_fact(user_id: int) -> dict[str, Any] | None:
+    """Return the next unconfirmed imported fact to review, in wizard order."""
+    pending = await pending_import_facts(user_id)
+    pending_keys = {str(row["key"]) for row in pending}
+    for key in _WIZARD_FACT_ORDER:
+        if key in pending_keys:
+            fact = await user_model.get_fact(DB, user_id, key)
+            if fact is not None:
+                return fact
+    # Anything imported but not in the known wizard order still gets reviewed,
+    # just after the ordered ones, so nothing silently skips confirmation.
+    for row in pending:
+        if str(row["key"]) not in _WIZARD_FACT_ORDER:
+            fact = await user_model.get_fact(DB, user_id, str(row["key"]))
+            if fact is not None:
+                return fact
+    return None
+
+
+HEALTH_POST_WIZARD_FLOW = "health_post_wizard"
+
+
+async def ask_next_health_confirm_step(target: Any, user_id: int) -> bool:
+    """Ask the user to confirm the next pending imported fact.
+
+    RE11: the prompt itself accepts a typed correction directly (no separate
+    "ציין אחרת" tap first) — pending is set to the same key used by the old
+    edit flow from the start. "✅ אשר" remains as the one-tap fast path when
+    the detected value is already correct.
+
+    For workout_pattern specifically, if the recent Health data has drifted
+    from the long-run average by a meaningful amount, show a trend-aware
+    proposal (recent value + a recommended step-up) with structured choice
+    buttons instead of the plain confirm prompt — typing a number still
+    always works.
+
+    Returns False once nothing is left to review — the caller should then
+    show the final import summary (RE10-4 replaces the old bulk
+    health:activate gate with this step-by-step wizard).
+    """
+    from noam_coach.bot.onboarding import set_flow_state, clear_flow_state, set_pending
+
+    fact = await _next_wizard_fact(user_id)
+    if fact is None:
+        await clear_flow_state(user_id, HEALTH_CONFIRM_FLOW)
+        return False
+
+    key = fact["key"]
+    await set_flow_state(user_id, HEALTH_CONFIRM_FLOW, key, {})
+    await set_pending(user_id, f"__health_edit_{key}__")
+
+    if key == "workout_pattern" and isinstance(fact.get("value"), dict):
+        import routine
+
+        value = fact["value"]
+        pattern = routine.WorkoutPattern(
+            weekly_frequency=value.get("weekly_frequency"),
+            sessions_sampled=value.get("sessions_sampled", 0),
+            recent_weekly_frequency=value.get("recent_weekly_frequency"),
+            recent_sessions_sampled=value.get("recent_sessions_sampled", 0),
+        )
+        proposal = routine.build_frequency_trend_proposal(pattern)
+        if proposal is not None:
+            text = f"<b>אישור נתונים מהייבוא</b>\n\n{esc(proposal.message)}"
+            rows = [
+                [InlineKeyboardButton(label, callback_data=f"health:confirm:{key}:trend:{value:g}")]
+                for label, value in proposal.choices
+            ]
+            rows.append(
+                [InlineKeyboardButton("⏭️ דלג על שאר האישורים", callback_data="health:skip_wizard")]
+            )
+            keyboard = InlineKeyboardMarkup(rows)
+            if hasattr(target, "edit_message_text"):
+                await target.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+            else:
+                await target.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+            return True
+
+    display = _format_pending_fact_value(key, fact.get("value"))
+    label = user_model.display_label(key)
+    text = f"<b>אישור נתונים מהייבוא</b>\n\nזוהה: {esc(label)} — {esc(display)}\n\nלאשר, או לכתוב ערך אחר."
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ אשר", callback_data=f"health:confirm:{key}")],
+            [InlineKeyboardButton("⏭️ דלג על שאר האישורים", callback_data="health:skip_wizard")],
+        ]
+    )
+    if hasattr(target, "edit_message_text"):
+        await target.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+    else:
+        await target.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+    return True
+
+
+async def start_health_confirm_wizard(
+    message: Any, user_id: int, *, next_step: str, summary_text: str
+) -> None:
+    """Kick off the RE10-4 wizard right after import, before the summary.
+
+    ``next_step`` ("onboarding" | "reconciliation") is remembered so that
+    whichever handler ends the wizard (a confirm/edit reaching the end, or
+    "skip the rest") knows what used to run right after the old bulk gate —
+    finish_health_confirm_wizard performs that continuation. ``summary_text``
+    is the pre-rendered import summary (counts/date-range) to show once the
+    wizard completes — rendered once here since HealthImportOutcome itself
+    is not safely JSON-serializable for flow-state storage.
+    """
+    from noam_coach.bot.onboarding import set_flow_state
+
+    await set_flow_state(
+        user_id, HEALTH_POST_WIZARD_FLOW, next_step, {"summary_text": summary_text}
+    )
+    started = await ask_next_health_confirm_step(message, user_id)
+    if not started:
+        await finish_health_confirm_wizard(message, user_id)
+
+
+async def finish_health_confirm_wizard(target: Any, user_id: int) -> None:
+    """Show the final import summary + run the step that used to follow the
+    old bulk health:activate gate immediately (onboarding basics or
+    reconciliation), then clear the post-wizard continuation marker.
+    """
+    from noam_coach.bot.onboarding import get_flow_state, clear_flow_state, show_onboarding_basics
+
+    state = await get_flow_state(user_id, HEALTH_POST_WIZARD_FLOW)
+    payload = state or {}
+    next_step = payload.get("step") or "reconciliation"
+    summary_text = (payload.get("payload") or {}).get("summary_text", "")
+    await clear_flow_state(user_id, HEALTH_POST_WIZARD_FLOW)
+
+    followup = await _health_import_followup_text(user_id)
+    text = (summary_text + followup) if summary_text else ("<b>סיכום הייבוא</b>" + followup)
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ תפריט", callback_data="menu:home")]])
+    if hasattr(target, "edit_message_text"):
+        await target.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+    else:
+        await target.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+
+    message = getattr(target, "message", target)
+    if next_step == "onboarding":
+        await show_onboarding_basics(message, user_id)
+    else:
+        await run_post_import_reconciliation(message, user_id)
+
+
+async def _health_import_followup_text(user_id: int) -> str:
+    """RE10-4 / D15: the "דורש אישור" section moved into the per-fact wizard
+    (ask_next_health_confirm_step), shown BEFORE this summary now — so this
+    text only lists what is still genuinely missing, not what is pending
+    the wizard's own confirmation.
+    """
+    readiness = await user_model.compute_all_readiness(DB, user_id)
+    missing_labels: list[str] = []
+    for profile_name in ("safety", "workout", "nutrition"):
+        for label in readiness.get(profile_name, {}).get("missing_labels", []):
+            if label not in missing_labels:
+                missing_labels.append(label)
 
     lines = ["", "<b>מה עדיין צריך כדי להשלים תמונה מלאה?</b>"]
-    if approval_labels:
-        lines.append("<b>דורש אישור:</b>")
-        lines.extend(f"• {esc(label)}" for label in approval_labels)
-    else:
-        lines.append("• אין כרגע נתונים מיובאים שממתינים לאישור.")
 
     if missing_labels:
         lines.append("<b>עדיין חסר:</b>")
@@ -475,12 +694,6 @@ async def try_handle_local_health_path(
             if selection.from_directory
             else ""
         )
-        await progress.edit_text(
-            _health_import_success_text(outcome)
-            + await _health_import_followup_text(user_id)
-            + selected_note,
-            parse_mode=ParseMode.HTML,
-        )
         await event_log.append_event(
             DB,
             user_id,
@@ -500,10 +713,13 @@ async def try_handle_local_health_path(
             duplicates=outcome.duplicates,
             candidate_count=selection.candidate_count,
         )
-        if await onboarding.is_onboarding(DB, user_id):
-            await show_onboarding_basics(message, user_id)
-        else:
-            await run_post_import_reconciliation(message, user_id)
+        # RE10-4: per-fact confirmation wizard before the final summary.
+        next_step = "onboarding" if await onboarding.is_onboarding(DB, user_id) else "reconciliation"
+        await start_health_confirm_wizard(
+            progress, user_id,
+            next_step=next_step,
+            summary_text=_health_import_success_text(outcome) + selected_note,
+        )
     except LocalHealthPathError as exc:
         await track_event(user_id, "health_import_failed", source="local_path", kind="path")
         await event_log.append_event(
@@ -576,11 +792,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             max_bytes=max_bytes,
             audit_source="telegram_document",
         )
-        await progress.edit_text(
-            _health_import_success_text(outcome)
-            + await _health_import_followup_text(user_id),
-            parse_mode=ParseMode.HTML,
-        )
         await track_event(
             user_id,
             "health_import_completed",
@@ -588,10 +799,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             inserted=outcome.inserted,
             duplicates=outcome.duplicates,
         )
-        if await onboarding.is_onboarding(DB, user_id):
-            await show_onboarding_basics(message, user_id)
-        else:
-            await run_post_import_reconciliation(message, user_id)
+        # RE10-4: a per-fact confirmation wizard now runs BEFORE the final
+        # summary, replacing the old single "activate everything" gate.
+        next_step = "onboarding" if await onboarding.is_onboarding(DB, user_id) else "reconciliation"
+        await start_health_confirm_wizard(
+            progress, user_id,
+            next_step=next_step,
+            summary_text=_health_import_success_text(outcome),
+        )
     except Exception as exc:  # noqa: BLE001
         LOGGER.exception("Health import failed")
         await track_event(user_id, "health_import_failed", source="telegram_document")
@@ -655,10 +870,16 @@ async def apply_reconcile_proposal(user_id: int, action: str) -> str:
 
 
 @runtime_bound(RUNTIME_NAMES)
-async def send_to_user(context: CallbackContext, text: str) -> None:
+async def send_to_user(
+    context: CallbackContext,
+    text: str,
+    *,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
     await context.bot.send_message(
         chat_id=SETTINGS.telegram_allowed_user_id,
         text=text,
+        reply_markup=reply_markup,
         parse_mode=ParseMode.HTML,
     )
 
@@ -782,6 +1003,31 @@ async def job_calorie_watch(context: CallbackContext) -> None:
     """Send the single most valuable nutrition intervention for this moment."""
     user_id = SETTINGS.telegram_allowed_user_id
     ctx = await build_daily_context(user_id)
+    nutrition_context = await build_nutrition_context(
+        DB,
+        user_id,
+        "planned_meal_followup",
+        daily_ctx=ctx,
+    )
+    followup = planned_meal_followup(nutrition_context, now=ctx.now)
+    if followup:
+        async def send_planned_meal_followup() -> None:
+            await send_to_user(
+                context,
+                followup.text,
+                reply_markup=InlineKeyboardMarkup(
+                    [[button("🍽 מה לאכול עכשיו", "menu:nextmeal")]]
+                ),
+            )
+
+        await deliver_proactive_message(
+            context,
+            key=followup.key,
+            sender=send_planned_meal_followup,
+            priority=JOB_PRIORITY_COACHING,
+            retry_callback=job_calorie_watch,
+        )
+        return
     if ctx.calories_consumed <= 0:
         return
 
@@ -860,6 +1106,18 @@ async def job_motivation(context: CallbackContext) -> None:
         moment = "random"
         hint = ""
 
+    # RE9-036/037: enrich the hint with the live workout context via the unified
+    # Prompt Builder, so motivation is contextual and shares the same envelope.
+    with suppress(Exception):
+        from noam_coach.services.next_meal import build_workout_nutrition_context
+        from noam_coach.services.prompt_builder import build_workout_request
+
+        wctx = await build_workout_nutrition_context(DB, user_id, now=now)
+        request = build_workout_request(wctx, "Write a short motivational line")
+        label = request["context"].get("workout_label")
+        if label and moment == "pre_workout":
+            hint = f"{hint} ({label})"
+
     async def send_motivation() -> None:
         message = await recommendations.motivation_message(
             OPENAI_CLIENT,
@@ -894,6 +1152,67 @@ def _data_quality_disclaimer(ctx: "DailyContext") -> str:
 
 
 @runtime_bound(RUNTIME_NAMES)
+def _daily_coach_brief_lines(ctx: "DailyContext") -> list[str]:
+    workout_line = "אימון כבר תועד" if ctx.workout_completed else "אין אימון מתועד עדיין"
+    if ctx.workout_active:
+        workout_line = "אימון פעיל עכשיו"
+    elif ctx.usual_workout_time and (ctx.is_usual_workout_day or not ctx.workout_completed):
+        workout_line = f"אימון סביב {ctx.usual_workout_time}"
+    protein_action = (
+        "כדאי שהארוחה הבאה תתבסס על מקור חלבון איכותי."
+        if ctx.protein_remaining >= 35
+        else "נשאר מעט חלבון, אפשר להשלים אותו בארוחה קלה."
+    )
+    if ctx.calories_remaining <= 350:
+        calorie_action = "נשאר מעט תקציב קלורי, אז עדיף לבחור משהו קל ומדויק."
+    elif ctx.workout_completed or ctx.is_usual_workout_day:
+        calorie_action = "שמור חלק מהתקציב לארוחה סביב האימון."
+    else:
+        calorie_action = "אפשר לפזר את היתרה על שתי ארוחות רגועות."
+    lines = [
+        "<b>בוקר טוב נועם 👋</b>",
+        "<b>מצב היום</b>",
+        f"🔥 נשארו {ctx.calories_remaining:.0f} קלוריות",
+        f"🥩 נשארו {ctx.protein_remaining:.0f} גרם חלבון",
+        f"🏋️ {workout_line}",
+        "",
+        *format_daily_mission(choose_daily_mission(ctx)),
+        "",
+        "<b>מומלץ עכשיו</b>",
+        f"• {protein_action}",
+        f"• {calorie_action}",
+    ]
+    return lines
+
+
+@runtime_bound(RUNTIME_NAMES)
+def _evening_coach_review_lines(ctx: "DailyContext") -> list[str]:
+    calorie_delta = ctx.calorie_target - ctx.calories_consumed
+    protein_done = ctx.protein_consumed >= ctx.protein_target * 0.95
+    calorie_line = (
+        f"גרעון של {calorie_delta:.0f} קלוריות"
+        if calorie_delta >= 0
+        else f"חריגה של {abs(calorie_delta):.0f} קלוריות"
+    )
+    workout_line = "התאמנת" if ctx.workout_completed else "לא תועד אימון"
+    tomorrow = (
+        "מחר כדאי לפתוח עם חלבון מוקדם כדי לשמור על הקצב."
+        if not protein_done
+        else "מחר כדאי לשמור על אותו קצב חלבון."
+    )
+    return [
+        "<b>סיכום היום</b>",
+        f"{'✅' if protein_done else '🟡'} חלבון: {ctx.protein_consumed:.0f}/{ctx.protein_target:.0f} גרם",
+        f"{'✅' if calorie_delta >= 0 else '🟡'} {calorie_line}",
+        f"{'✅' if ctx.workout_completed else '🟡'} {workout_line}",
+        "",
+        *format_daily_score(calculate_daily_score(ctx)),
+        "",
+        f"<b>מחר מומלץ</b>\n• {tomorrow}",
+    ]
+
+
+@runtime_bound(RUNTIME_NAMES)
 async def build_morning_menu_text(user_id: int, ctx: "DailyContext | None" = None) -> str:
     if ctx is None:
         ctx = await build_daily_context(user_id)
@@ -916,9 +1235,16 @@ async def build_morning_menu_text(user_id: int, ctx: "DailyContext | None" = Non
         ctx.flags,
         nutrition_request["context"],
     )
-    text = format_morning_menu(menu)
+    text = "\n".join([*_daily_coach_brief_lines(ctx), "", format_morning_menu(menu)])
     if not ctx.flags:
         text += "\n\n<i>המלצה זו נבנתה לפי השגרה שלך, כי עדיין לא התקבל עדכון בוקר להיום.</i>"
+    # RE9-X2: if critical nutrition context is missing, say the recommendation
+    # is based on partial info instead of presenting a guess as certainty.
+    from noam_coach.services.decision_engine import context_completeness_gate
+
+    gate = context_completeness_gate("nutrition", nutrition_request["context_quality"])
+    if gate.based_on_partial_info and gate.tag():
+        text += f"\n\n<i>{esc(gate.tag())}</i>"
     text += _data_quality_disclaimer(ctx)
     return text
 
@@ -957,4 +1283,4 @@ async def build_evening_summary_text(user_id: int, ctx: "DailyContext | None" = 
         ctx.flags,
         nutrition_request["context"],
     )
-    return format_evening_summary(summary) + _data_quality_disclaimer(ctx)
+    return "\n".join([*_evening_coach_review_lines(ctx), "", format_evening_summary(summary)]) + _data_quality_disclaimer(ctx)

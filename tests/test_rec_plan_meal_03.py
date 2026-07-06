@@ -382,9 +382,14 @@ class TestRestrictionContradiction:
         import inspect
 
         from noam_coach.bot.meals import render_meal
+        from noam_coach.services.meal_validation import validate_meal_analysis_for_user
+
         source = inspect.getsource(render_meal)
+        validation_source = inspect.getsource(validate_meal_analysis_for_user)
         assert "restriction_warnings" in source
-        assert "diet_restrictions" in source
+        assert "validate_meal_analysis_for_user" in source
+        assert "diet_restrictions" in validation_source
+        assert "allergies" in validation_source
 
 
 # ---------------------------------------------------------------------------

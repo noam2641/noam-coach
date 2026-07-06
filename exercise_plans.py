@@ -7,6 +7,15 @@ from __future__ import annotations
 
 from typing import Any
 
+from noam_coach.services.weekdays import WEEKDAY_NAMES_HE as _WEEKDAY_NAMES_HE
+from noam_coach.services.weekdays import weekday_he as _weekday_he
+
+WEEKDAY_NAMES_HE = _WEEKDAY_NAMES_HE
+
+
+def weekday_he(idx: int) -> str:
+    return _weekday_he(idx)
+
 # Primary muscle per exercise id (used for the mind-muscle cue).
 EXERCISE_MUSCLES = {
     "bench": "חזה",
@@ -237,7 +246,7 @@ PLANS: dict[str, dict[str, Any]] = {
         ],
     },
     "F": {
-        "name": "אימון Full Body",
+        "name": "אימון גוף מלא",
         "exercises": [
             # Quad-dominant (knee flexion)
             exercise(
@@ -260,7 +269,7 @@ PLANS: dict[str, dict[str, Any]] = {
             # Hinge / posterior chain
             exercise(
                 "rdl",
-                "מתים רומני עם משקולות",
+                "דדליפט רומני עם משקולות",
                 3,
                 10,
                 12,
@@ -342,9 +351,6 @@ PLANS: dict[str, dict[str, Any]] = {
 OVERRIDE_FIELDS = {"weight", "sets", "rmin", "rmax", "rest"}
 
 
-WEEKDAY_NAMES_HE = ["שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון"]
-
-
 SPLIT_BY_FREQUENCY: dict[int, list[str]] = {
     1: ["F"],  # single full body session
     2: ["F", "F"],  # full body x2
@@ -355,7 +361,3 @@ SPLIT_BY_FREQUENCY: dict[int, list[str]] = {
 }
 MIN_FREQUENCY = 1
 MAX_FREQUENCY = 6
-
-
-def weekday_he(idx: int) -> str:
-    return WEEKDAY_NAMES_HE[idx % 7]

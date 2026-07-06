@@ -31,9 +31,11 @@ def test_static_files_exist_and_have_no_python_braces() -> None:
     assert "{{" not in js and "}}" not in js
     assert "saveProfile" in js and "loadDashboard" in js
     assert "loadTodayMeals" in js and "mealCard" in js
+    assert "renderOperations" in js
     assert "onclick=" not in js
     assert "escapeHtml" in js
     assert ".card" in css
+    assert ".ops-item" in css
 
 
 def test_template_has_no_inline_event_handlers() -> None:
@@ -41,6 +43,7 @@ def test_template_has_no_inline_event_handlers() -> None:
     assert "onclick=" not in html
     assert 'script-src \'self\'' in html
     assert 'id="todayMealsBox"' in html
+    assert 'id="operationsBox"' in html
 
 
 def test_static_route_serves_js_with_correct_type() -> None:

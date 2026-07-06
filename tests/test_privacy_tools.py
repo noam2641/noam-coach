@@ -8,6 +8,7 @@ from pathlib import Path
 import coach_bot
 from scripts.delete_user_data import delete_user
 from scripts.export_user_data import export_user
+from scripts.privacy_audit import scan_privacy_risks
 
 
 def test_export_and_delete_user_data(tmp_path: Path) -> None:
@@ -48,3 +49,20 @@ def test_export_and_delete_user_data(tmp_path: Path) -> None:
     assert connection.execute("SELECT COUNT(*) FROM meals").fetchone()[0] == 0
     connection.close()
     assert not image.exists()
+
+
+def test_privacy_audit_flags_sensitive_files_without_touching_them(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text("TOKEN=x", encoding="utf-8")
+    (tmp_path / "coach.db").write_bytes(b"sqlite")
+    (tmp_path / "Recording_20260705_1939.docx").write_bytes(b"doc")
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    (storage / "ignored.db").write_bytes(b"sqlite")
+
+    findings = scan_privacy_risks(tmp_path)
+
+    by_path = {finding.path: finding for finding in findings}
+    assert by_path[".env"].severity == "high"
+    assert by_path["coach.db"].severity == "high"
+    assert by_path["Recording_20260705_1939.docx"].severity == "review"
+    assert "storage/ignored.db" not in by_path
