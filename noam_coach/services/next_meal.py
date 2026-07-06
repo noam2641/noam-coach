@@ -63,6 +63,7 @@ class NutritionTotals:
     protein_overage: int
     goal_status: str
     goal_source: str
+    meals_logged_count: int = 0
 
 
 @dataclass
@@ -370,9 +371,10 @@ async def _nutrition_totals(
         goal_status = "default"
         goal_source = "settings_default"
 
+    today_meals = await _today_meals(db, user_id, now)
     consumed_calories = 0
     consumed_protein = 0
-    for row in await _today_meals(db, user_id, now):
+    for row in today_meals:
         calories = _safe_float(row.get("calories"))
         protein = _safe_float(row.get("protein"))
         if calories is not None and calories > 0:
@@ -394,6 +396,7 @@ async def _nutrition_totals(
             protein_overage=max(0, -int(protein_balance or 0)),
             goal_status=goal_status,
             goal_source=goal_source,
+            meals_logged_count=len(today_meals),
         ),
         goal,
     )
@@ -677,6 +680,7 @@ _LOW_REMAINING_THRESHOLD = 350
 # A budget cap is never allowed to fall below this floor unless there is a real
 # positive remaining balance smaller than it (then the balance is the cap).
 _MIN_MEAL_FLOOR = 120
+_NEAR_BEDTIME_HOURS = 2.5
 
 
 def allocate_next_meal_budget(
@@ -755,9 +759,28 @@ def allocate_next_meal_budget(
             allows_overage=False,
         )
 
-    # ---- Normal / workout phases ------------------------------------------
     base_cal = (remaining_cal / meals_left) if (remaining_cal and remaining_cal > 0) else 350
 
+    # ---- Close to sleep: never push a heavy "catch up" meal -----------------
+    if (
+        context.hours_until_bedtime is not None
+        and context.hours_until_bedtime <= _NEAR_BEDTIME_HOURS
+        and phase not in {WorkoutPhase.PRE_WORKOUT_IMMEDIATE, WorkoutPhase.DURING_WORKOUT}
+    ):
+        desired_max = _clamp_int(min(base_cal, 260), 150, 320)
+        return MealBudget(
+            calories_min=min(100, desired_max),
+            calories_max=_cap(desired_max, allow=allow_overage, reason=None),
+            protein_min=_clamp_int(min(base_protein, 22), 12, 28),
+            protein_max=_clamp_int(min(base_protein + 10, 35), 20, 38),
+            meal_size="near_bedtime_light",
+            rationale="קרוב לשינה עדיף להשאיר את הארוחה קטנה וקלה לעיכול, גם אם נשארה יתרה גדולה ליום.",
+            policy="near_bedtime",
+            remaining_calories=remaining_cal,
+            allows_overage=allow_overage,
+        )
+
+    # ---- Normal / workout phases ------------------------------------------
     if phase in {WorkoutPhase.PRE_WORKOUT_IMMEDIATE, WorkoutPhase.DURING_WORKOUT}:
         desired_max = _clamp_int(min(base_cal, 320), 180, 340)
         return MealBudget(
@@ -855,7 +878,7 @@ def _low_remaining_templates(budget: MealBudget) -> list[MealOption]:
 
 
 def _candidate_templates(phase: WorkoutPhase, budget: MealBudget) -> list[MealOption]:
-    if budget.policy in {"low_remaining", "at_or_over_target"}:
+    if budget.policy in {"low_remaining", "at_or_over_target", "near_bedtime"}:
         return _low_remaining_templates(budget)
     if phase in {WorkoutPhase.PRE_WORKOUT_IMMEDIATE, WorkoutPhase.DURING_WORKOUT}:
         return [
@@ -1304,6 +1327,8 @@ async def generate_next_meal_recommendation(
         notices.append(
             "נשארה לך יתרה גדולה, לכן בניתי ארוחה עיקרית גדולה יחסית. לא צריך להשלים את כל היתרה בבת אחת; אפשר להשאיר מקום לעוד ארוחה קטנה בהמשך."
         )
+    if budget.policy == "near_bedtime":
+        notices.append("קרוב לשינה, לכן לא כדאי לדחוף ארוחה כבדה גם אם נשארה יתרה גדולה.")
     if budget.allows_overage and budget.overage_reason:
         notices.append(
             f"ההמלצה חורגת מעט מהיתרה מסיבה ברורה: {budget.overage_reason}. "
@@ -1610,6 +1635,12 @@ def _remaining_headline(nutrition: NutritionTotals) -> str:
     prot = nutrition.protein_balance
     if cal is None:
         return "<b>מה לאכול עכשיו</b>"
+    if nutrition.meals_logged_count <= 0:
+        protein_part = f" ו-<b>{prot}</b> גרם חלבון" if prot is not None and prot > 0 else ""
+        return (
+            "עוד לא נרשמו ארוחות היום. "
+            f"זה יעד היום שלך לפתיחה: <b>{cal}</b> קלוריות{protein_part}."
+        )
     cal_part = (
         f"נשארו לך היום <b>{cal}</b> קלוריות"
         if cal >= 0
@@ -1651,6 +1682,27 @@ def _fit_score_label(option: MealOption) -> str:
     return f" | התאמה {score}%"
 
 
+def _goal_source_label(nutrition: NutritionTotals) -> str:
+    if nutrition.goal_status == "active":
+        return "יעד פעיל מאושר"
+    if nutrition.goal_status == "active_provisional":
+        return "יעד זמני"
+    if nutrition.goal_status == "default":
+        return "ברירת מחדל עד אישור יעד"
+    return "יעד לא מאושר"
+
+
+def _nutrition_status_line(nutrition: NutritionTotals) -> str:
+    meals = nutrition.meals_logged_count
+    if meals <= 0:
+        meals_text = "לא נרשמו ארוחות היום"
+    elif meals == 1:
+        meals_text = "נרשמה ארוחה אחת היום"
+    else:
+        meals_text = f"נרשמו {meals} ארוחות היום"
+    return f"<i>{esc(_goal_source_label(nutrition))}; {esc(meals_text)}.</i>"
+
+
 def format_next_meal_recommendation(recommendation: NextMealRecommendation) -> str:
     """Answer-first message (re7 P1-10): remaining + options first, short note,
     and the long explanation only via the 'why it fits' detail view."""
@@ -1662,15 +1714,17 @@ def format_next_meal_recommendation(recommendation: NextMealRecommendation) -> s
     elif nutrition.goal_status == "default":
         goal_note = " (ברירת מחדל עד לאישור יעד)"
 
-    lines = [_remaining_headline(nutrition) + goal_note, ""]
+    lines = [_remaining_headline(nutrition) + goal_note, _nutrition_status_line(nutrition), ""]
     for index, option in enumerate(recommendation.options, 1):
         star = " ⭐ מומלץ עבורך" if option.recommended else ""
         after = _after_meal_line(nutrition, option)
+        reason = option.recommended_reason or option.rationale or recommendation.budget.rationale
         lines += [
             f"<b>אפשרות {index}: {esc(option.title)}</b>{star}",
             f"{esc(', '.join(option.ingredients))}",
             f"כ-{option.calories} קל׳ | כ-{option.protein} גרם חלבון{_fit_score_label(option)}",
         ]
+        lines.append(f"<i>למה עכשיו: {esc(reason)}</i>")
         if after:
             lines.append(after)
         if option.recommended and option.recommended_reason:

@@ -137,6 +137,49 @@ async def _daily_flags(db: Database, now: datetime, flags: dict) -> None:
 
 
 @pytest.mark.asyncio
+async def test_next_meal_without_logged_meals_does_not_say_remaining(db: Database) -> None:
+    now = datetime.now(TZ).replace(hour=10, minute=0, second=0, microsecond=0)
+    await _add_user(db)
+    await _active_goal(db)
+    await _set_fact(db, 1, "sleep_schedule", {"bedtime": "23:00"})
+
+    rec = await generate_next_meal_recommendation(db, 1, now=now)
+    text = format_next_meal_recommendation(rec)
+
+    assert rec.context.nutrition.meals_logged_count == 0
+    assert "עוד לא נרשמו ארוחות היום" in text
+    assert "נשארו" not in text.splitlines()[0]
+
+
+@pytest.mark.asyncio
+async def test_next_meal_explains_each_option(db: Database) -> None:
+    now = datetime.now(TZ).replace(hour=14, minute=0, second=0, microsecond=0)
+    await _ready_user(db, now)
+
+    rec = await generate_next_meal_recommendation(db, 1, now=now)
+    text = format_next_meal_recommendation(rec)
+
+    assert "למה עכשיו:" in text
+    assert text.count("למה עכשיו:") == len(rec.options)
+    assert "נרשמה ארוחה אחת היום" in text
+
+
+@pytest.mark.asyncio
+async def test_next_meal_near_bedtime_stays_light_even_with_large_balance(db: Database) -> None:
+    now = datetime.now(TZ).replace(hour=22, minute=0, second=0, microsecond=0)
+    await _ready_user(db, now)
+
+    rec = await generate_next_meal_recommendation(db, 1, now=now)
+    text = format_next_meal_recommendation(rec)
+
+    assert rec.budget.policy == "near_bedtime"
+    assert rec.budget.calories_max <= 320
+    assert all(option.calories <= rec.budget.calories_max + 20 for option in rec.options)
+    assert any("שינה" in notice for notice in rec.notices)
+    assert "למה עכשיו:" in text
+
+
+@pytest.mark.asyncio
 async def test_rest_day_balances_are_signed_and_reasonable(db: Database) -> None:
     now = datetime.now(TZ).replace(hour=14, minute=0, second=0, microsecond=0)
     await _ready_user(db, now)
