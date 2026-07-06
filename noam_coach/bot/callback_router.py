@@ -111,6 +111,9 @@ RUNTIME_NAMES = ('APP_VERSION', 'Any', 'CALLBACK_DEBOUNCE_SECONDS', 'CONFIRM_PEN
 
 _LAST_CALLBACK: dict[tuple[int, str], float] = {}
 
+if "safe_answer_callback" not in RUNTIME_NAMES:
+    RUNTIME_NAMES = (*RUNTIME_NAMES, "safe_answer_callback")
+
 CALLBACK_DEBOUNCE_SECONDS = 1.2
 
 _DEBOUNCE_PREFIXES = (
@@ -157,7 +160,7 @@ async def handle_callback(
         return
 
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
     user_id = await ensure_user(update)
     data = query.data or ""
     route_decision = await conversation.ConversationRouter.route(
@@ -173,7 +176,7 @@ async def handle_callback(
         active_flow, callback_version, callback_flow_id
     ):
         # REC-ONBOARD-02-06: Better stale-callback recovery
-        await query.answer("הכפתורים בהודעה הישנה כבר לא פעילים", show_alert=False)
+        await safe_answer_callback(query, "הכפתורים בהודעה הישנה כבר לא פעילים", show_alert=False)
         await event_log.append_event(
             DB, user_id, "stale_callback_recovered",
             entity="callback", source="user",

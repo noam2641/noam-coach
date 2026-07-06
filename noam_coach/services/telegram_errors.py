@@ -20,6 +20,22 @@ TRANSIENT_CLASS_NAMES = {
     "WriteTimeout",
 }
 
+STALE_CALLBACK_MESSAGE_FRAGMENTS = (
+    "query is too old",
+    "query id is invalid",
+    "response timeout expired",
+)
+
+# NOTE: "message is not modified" is deliberately NOT listed — it means the
+# screen already shows this exact content (e.g. a double-tap), and falling
+# back to reply_text would send the user a duplicate message. safe_edit
+# silently ignores that case instead.
+STALE_EDIT_MESSAGE_FRAGMENTS = (
+    "message to edit not found",
+    "message can't be edited",
+    "message identifier is not specified",
+)
+
 
 @dataclass(frozen=True)
 class TelegramErrorDecision:
@@ -84,6 +100,18 @@ def is_transient_telegram_error(exc: BaseException | None) -> bool:
     return any(name in text for name in TRANSIENT_CLASS_NAMES)
 
 
+def is_stale_callback_error(exc: BaseException | None) -> bool:
+    """Return True for Telegram's expired callback-query ACK errors."""
+    text = repr(exc).lower()
+    return any(fragment in text for fragment in STALE_CALLBACK_MESSAGE_FRAGMENTS)
+
+
+def is_stale_edit_error(exc: BaseException | None) -> bool:
+    """Return True when a Telegram message can no longer be edited."""
+    text = repr(exc).lower()
+    return any(fragment in text for fragment in STALE_EDIT_MESSAGE_FRAGMENTS)
+
+
 def should_notify_admin(
     fingerprint: str,
     *,
@@ -105,15 +133,16 @@ def classify_telegram_error(
     update: Any = None,
 ) -> TelegramErrorDecision:
     transient = is_transient_telegram_error(exc)
+    stale_callback = is_stale_callback_error(exc)
     fingerprint = telegram_error_fingerprint(exc)
     has_user_update = getattr(update, "effective_message", None) is not None
-    if transient:
+    if transient or stale_callback:
         return TelegramErrorDecision(
             fingerprint=fingerprint,
             transient=True,
             log_level="debug" if shutting_down else "warning",
             notify_admin=False,
-            notify_user=False if shutting_down else has_user_update,
+            notify_user=False if (shutting_down or stale_callback) else has_user_update,
         )
     return TelegramErrorDecision(
         fingerprint=fingerprint,

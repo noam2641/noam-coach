@@ -3,12 +3,13 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from telegram.error import TimedOut
+from telegram.error import BadRequest, TimedOut
 
 import coach_bot
 from config import RUNTIME_STATE
 from noam_coach.app import runtime
 from noam_coach.bot import callback_router
+from noam_coach.bot.ui import safe_answer_callback, safe_edit
 from noam_coach.services import telegram_errors
 
 
@@ -121,6 +122,97 @@ def test_sensitive_values_are_redacted_from_telegram_error_text() -> None:
     assert "ABCDEFGHIJKLMNOPQRSTUVWXYZ" not in redacted
     assert "noam" not in redacted
     assert "<redacted" in redacted
+
+
+@pytest.mark.asyncio
+async def test_safe_answer_callback_ignores_stale_callback() -> None:
+    class StaleQuery:
+        async def answer(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+            raise BadRequest("Query is too old and response timeout expired or query id is invalid")
+
+    assert await safe_answer_callback(StaleQuery()) is False
+
+
+@pytest.mark.asyncio
+async def test_safe_answer_callback_reraises_non_stale_bad_request() -> None:
+    class BrokenQuery:
+        async def answer(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+            raise BadRequest("chat not found")
+
+    with pytest.raises(BadRequest):
+        await safe_answer_callback(BrokenQuery())
+
+
+@pytest.mark.asyncio
+async def test_safe_edit_replies_when_original_message_cannot_be_edited() -> None:
+    class ReplyMessage:
+        def __init__(self) -> None:
+            self.replies: list[dict[str, Any]] = []
+
+        async def reply_text(self, text: str, **kwargs: Any) -> None:
+            self.replies.append({"text": text, **kwargs})
+
+    class StaleEditQuery:
+        def __init__(self) -> None:
+            self.message = ReplyMessage()
+
+        async def edit_message_text(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+            raise BadRequest("Message to edit not found")
+
+    query = StaleEditQuery()
+
+    await safe_edit(query, "fresh screen", None)
+
+    assert query.message.replies
+    assert query.message.replies[0]["text"] == "fresh screen"
+
+
+@pytest.mark.asyncio
+async def test_safe_edit_does_not_duplicate_on_not_modified() -> None:
+    """A same-content edit (e.g. double-tap on the same button) must be
+    silently ignored — falling back to reply_text here would send the user
+    a duplicate message, which is exactly the bug users reported."""
+
+    class ReplyMessage:
+        def __init__(self) -> None:
+            self.replies: list[dict[str, Any]] = []
+
+        async def reply_text(self, text: str, **kwargs: Any) -> None:
+            self.replies.append({"text": text, **kwargs})
+
+    class NotModifiedQuery:
+        def __init__(self) -> None:
+            self.message = ReplyMessage()
+
+        async def edit_message_text(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+            raise BadRequest(
+                "Message is not modified: specified new message content and "
+                "reply markup are exactly the same"
+            )
+
+    query = NotModifiedQuery()
+
+    await safe_edit(query, "same screen", None)
+
+    assert query.message.replies == []  # no duplicate message
+
+
+def test_stale_callback_error_is_transient_without_user_notification() -> None:
+    class FakeUpdate:
+        effective_message = object()
+
+    decision = telegram_errors.classify_telegram_error(
+        BadRequest("Query is too old and response timeout expired or query id is invalid"),
+        update=FakeUpdate(),
+    )
+
+    assert decision.transient is True
+    assert decision.notify_user is False
+    assert decision.notify_admin is False
 
 
 @pytest.mark.asyncio

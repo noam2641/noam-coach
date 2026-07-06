@@ -105,6 +105,7 @@ from retention import (
 # ---------------------------------------------------------------------------
 
 from noam_coach.runtime_bind import runtime_bound
+from noam_coach.bot.ui import safe_answer_callback
 
 RUNTIME_NAMES = ('Any', 'DB', 'IndexError', 'ValueError', 'abs', 'action', 'bool', 'build_daily_context', 'coach_intelligence', 'ctx', 'data', 'esc', 'extra', 'flags', 'float', 'get_daily_flags', 'hh', 'hhmm', 'hour', 'int', 'kind', 'known_medications', 'last', 'latest_day', 'len', 'lines', 'med_name', 'meds', 'mini_app_url', 'mm', 'near', 'notes', 'parts', 'query', 'record_medication', 'save_medical_constraint', 'set_daily_flags', 'set_pending', 'str', 'url', 'user_id', 'value', 'when', 'window', 'x')
 
@@ -123,10 +124,10 @@ async def handle_checkin_callback(query: Any, user_id: int, data: str) -> None:
         try:
             med_name = meds[int(value)]
         except (ValueError, IndexError):
-            await query.answer("לא נמצא")
+            await safe_answer_callback(query, "לא נמצא")
             return
         await record_medication(user_id, med_name, source="user_button")
-        await query.answer("נרשם 💊")
+        await safe_answer_callback(query, "נרשם 💊")
         extra = (
             " ביום כזה התיאבון בדרך כלל יורד — אקל על הארוחות, אדגיש חלבון ואזכיר לשתות."
             if "ריטלין" in med_name or med_name.lower() == "ritalin"
@@ -141,7 +142,7 @@ async def handle_checkin_callback(query: Any, user_id: int, data: str) -> None:
     if kind == "sleep":
         flags["sleep_quality"] = value  # good | ok | bad
         await set_daily_flags(user_id, flags)
-        await query.answer("תודה")
+        await safe_answer_callback(query, "תודה")
         if value == "bad":
             await query.message.reply_text(
                 "רשמתי שישנת פחות טוב. לא אעלה משקלים אוטומטית היום, "
@@ -151,7 +152,7 @@ async def handle_checkin_callback(query: Any, user_id: int, data: str) -> None:
     if kind == "energy":
         flags["energy"] = value
         await set_daily_flags(user_id, flags)
-        await query.answer("נרשם")
+        await safe_answer_callback(query, "נרשם")
         return
     if kind == "state":
         if value == "pain":
@@ -169,12 +170,12 @@ async def handle_checkin_callback(query: Any, user_id: int, data: str) -> None:
         elif value == "fasting":
             flags["fasting"] = True
             await set_daily_flags(user_id, flags)
-            await query.answer("נרשם צום")
+            await safe_answer_callback(query, "נרשם צום")
             await query.message.reply_text("רשמתי שאתה בצום היום — אתזמן את ההמלצות בהתאם.")
         else:  # normal
             flags["state"] = "normal"
             await set_daily_flags(user_id, flags)
-            await query.answer("יום רגיל 👍")
+            await safe_answer_callback(query, "יום רגיל 👍")
         return
 
 

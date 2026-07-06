@@ -204,6 +204,7 @@ from noam_coach.bot.ui import (
     render_workout_overview,
     constraint_banner,
     render_exercise_params,
+    safe_answer_callback,
     safe_edit,
 )
 

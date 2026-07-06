@@ -106,6 +106,7 @@ from retention import (
 # ---------------------------------------------------------------------------
 
 from noam_coach.runtime_bind import runtime_bound
+from noam_coach.services.telegram_errors import is_stale_callback_error, is_stale_edit_error
 
 RUNTIME_NAMES = ('Any', 'BadRequest', 'DB', 'Exception', 'InlineKeyboardButton', 'InlineKeyboardMarkup', 'LOGGER', 'PLANS', 'ParseMode', 'SETTINGS', 'TZ', 'ValueError', '_is_valid_public_url', '_resolve_home_action', 'action', 'active_constraints', 'assignments_sql', 'banner', 'bool', 'button', 'c', 'candidate', 'changed', 'coach_intelligence', 'code', 'constraint_banner', 'constraints', 'consumed_cal', 'consumed_prot', 'cycle', 'data', 'datetime', 'dict', 'done_today', 'done_today_rows', 'end', 'enumerate', 'esc', 'exc', 'exercise_data', 'exercise_index', 'exercise_params_keyboard', 'extra', 'fatigue_banner', 'float', 'frozenset', 'get_user_plan', 'home_keyboard', 'home_keyboard_for_user', 'inc', 'index', 'int', 'keyboard', 'last', 'len', 'lines', 'list', 'muscle', 'muscle_line', 'muscle_tag', 'nxt', 'parameters', 'parts', 'plan', 'position', 'query', 'r', 'range', 'recommend_load', 'reps', 'rows', 's', 'safe_edit', 'session', 'sessions', 'spots', 'start', 'str', 'text', 'today_bounds_utc', 'today_consumed', 'today_wd', 'tuple', 'user_id', 'user_model', 'value', 'weight', 'where', 'workout_overview_keyboard')
 
@@ -570,5 +571,37 @@ async def safe_edit(
             parse_mode=ParseMode.HTML,
         )
     except BadRequest as exc:
+        if is_stale_edit_error(exc):
+            message = getattr(query, "message", None)
+            if message is not None and hasattr(message, "reply_text"):
+                with suppress(Exception):
+                    await message.reply_text(
+                        text,
+                        reply_markup=keyboard,
+                        parse_mode=ParseMode.HTML,
+                    )
+            return
         if "not modified" not in str(exc).lower():
             raise
+
+
+async def safe_answer_callback(
+    query: Any,
+    text: str | None = None,
+    *,
+    show_alert: bool = False,
+) -> bool:
+    """ACK a Telegram callback without failing stale-button flows.
+
+    Telegram rejects callback-query answers after a short TTL. Those errors are
+    expected when a user taps an old inline keyboard, so they should be logged
+    by the router at most, not shown as a Python failure to the user.
+    """
+    try:
+        await query.answer(text=text, show_alert=show_alert)
+        return True
+    except BadRequest as exc:
+        if is_stale_callback_error(exc):
+            LOGGER.info("Ignoring stale callback ACK: %s", exc)
+            return False
+        raise
