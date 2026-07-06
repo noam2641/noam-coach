@@ -645,9 +645,20 @@ def workout_quality_issues(payload: dict[str, Any]) -> list[str]:
     issues: list[str] = []
     if not sessions:
         return ["missing_sessions"]
+    try:
+        frequency = int(payload.get("frequency") or 0)
+    except (TypeError, ValueError):
+        frequency = 0
+    if frequency and len(sessions) != frequency:
+        issues.append("frequency_session_count_mismatch")
     seen_weekdays: set[int] = set()
     weekly_sets = 0
+    total_exercise_slots = 0
     for session_index, session in enumerate(sessions, 1):
+        if not str(session.get("code") or "").strip():
+            issues.append(f"session_{session_index}_missing_code")
+        if not str(session.get("name") or "").strip():
+            issues.append(f"session_{session_index}_missing_name")
         try:
             weekday = int(session.get("weekday"))
         except (TypeError, ValueError):
@@ -668,6 +679,7 @@ def workout_quality_issues(payload: dict[str, Any]) -> list[str]:
         if not exercises:
             issues.append(f"session_{session_index}_missing_exercises")
             continue
+        total_exercise_slots += len(exercises)
         seen_exercises: set[str] = set()
         session_sets = 0
         for exercise_index, exercise in enumerate(exercises, 1):
@@ -694,6 +706,8 @@ def workout_quality_issues(payload: dict[str, Any]) -> list[str]:
         weekly_sets += session_sets
     if weekly_sets > 120:
         issues.append("weekly_excessive_volume")
+    if total_exercise_slots <= 1:
+        issues.append("workout_plan_too_small")
     return sorted(set(issues))
 
 
@@ -710,6 +724,10 @@ def repair_workout_payload(payload: dict[str, Any], *, default_minutes: int = 45
     repaired = copy.deepcopy(payload)
     sessions = repaired.get("sessions") or []
     for session in sessions:
+        if not session.get("code"):
+            session["code"] = "custom"
+        if not session.get("name"):
+            session["name"] = "Workout"
         # Session time / duration.
         if not session.get("time"):
             session["time"] = "18:00"

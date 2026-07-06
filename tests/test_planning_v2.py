@@ -247,13 +247,56 @@ def test_repair_workout_payload_drops_duplicate_and_fixes_params() -> None:
     ids = [ex["id"] for ex in session["exercises"]]
     assert ids == ["bench"]                          # duplicate dropped
     assert session["exercises"][0]["sets"] <= 6      # sets clamped
-    assert not planning.workout_quality_issues(repaired)
+    issues = planning.workout_quality_issues(repaired)
+    assert "session_1_duplicate_exercise_bench" not in issues
+    assert "workout_plan_too_small" in issues
     # Original payload was not mutated.
     assert len(payload["sessions"][0]["exercises"]) == 2
 
 
+def test_workout_quality_rejects_single_exercise_disguised_as_plan() -> None:
+    payload = {
+        "frequency": 1,
+        "sessions": [
+            {
+                "code": "A",
+                "name": "Workout A",
+                "weekday": 0,
+                "time": "18:00",
+                "minutes": 45,
+                "exercises": [
+                    {"id": "leg_press", "name": "Leg Press", "sets": 3, "rmin": 8, "rmax": 12},
+                ],
+            }
+        ],
+    }
+
+    assert "workout_plan_too_small" in planning.workout_quality_issues(payload)
+
+
+def test_workout_quality_rejects_frequency_session_mismatch() -> None:
+    payload = {
+        "frequency": 4,
+        "sessions": [
+            {
+                "code": "A",
+                "name": "Workout A",
+                "weekday": 0,
+                "time": "18:00",
+                "minutes": 45,
+                "exercises": [
+                    {"id": "squat", "name": "Squat", "sets": 3, "rmin": 8, "rmax": 12},
+                    {"id": "bench", "name": "Bench", "sets": 3, "rmin": 8, "rmax": 12},
+                ],
+            }
+        ],
+    }
+
+    assert "frequency_session_count_mismatch" in planning.workout_quality_issues(payload)
+
+
 def test_repair_workout_candidates_never_emits_broken_candidate() -> None:
-    """A candidate with a duplicate exercise must not survive to the renderer."""
+    """A candidate that repairs down to one exercise must not survive to the renderer."""
     broken = planning.PlanCandidate(
         plan_type="workout",
         title="broken",
@@ -278,9 +321,7 @@ def test_repair_workout_candidates_never_emits_broken_candidate() -> None:
         },
     )
     result = planning._repair_workout_candidates([broken])
-    assert len(result) == 1
-    # No duplicate exercise reaches the output.
-    assert not planning.workout_quality_issues(result[0].payload)
+    assert result == []
 
 
 def test_repair_workout_candidates_drops_unrepairable() -> None:
