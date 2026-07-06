@@ -376,6 +376,150 @@ async def average_daily_steps(
 
 
 # ---------------------------------------------------------------------------
+# Training-week policy analysis (RE13)
+#
+# The strict rule (a week counts only when the watch was worn all 7 days) is
+# exact but can leave almost nothing for a real user who skips the watch one
+# day a week. The relaxed policy accepts weeks with at least
+# RELAXED_MIN_WORN_DAYS worn days and NORMALIZES the count (workouts seen on
+# worn days scaled to a 7-day week). Workouts landing on unworn days are
+# never silently counted — they are surfaced separately.
+# ---------------------------------------------------------------------------
+
+POLICY_STRICT = "strict_7_of_7"
+POLICY_RELAXED = "relaxed_5_of_7_normalized"
+POLICY_INSUFFICIENT = "insufficient"
+
+# A relaxed-valid week needs at least this many worn days out of 7.
+RELAXED_MIN_WORN_DAYS = 5
+# A policy is trustworthy enough to auto-apply only with this many weeks.
+MIN_POLICY_WEEKS = 3
+
+
+@dataclass(frozen=True)
+class WeekWearStats:
+    start: dt.date
+    end: dt.date
+    worn_days: int
+    workouts_on_worn_days: int
+    workouts_total: int
+
+    @property
+    def strict_valid(self) -> bool:
+        return self.worn_days == 7
+
+    @property
+    def relaxed_valid(self) -> bool:
+        return self.worn_days >= RELAXED_MIN_WORN_DAYS
+
+    @property
+    def normalized_workouts(self) -> float:
+        """Workouts on worn days scaled to a full week (2 in 5 days → 2.8)."""
+        if self.worn_days <= 0:
+            return 0.0
+        return self.workouts_on_worn_days * 7.0 / self.worn_days
+
+
+@dataclass(frozen=True)
+class TrainingWeekAnalysis:
+    weeks: list[WeekWearStats]
+    valid_weeks_strict: int
+    valid_weeks_relaxed: int
+    burned_weeks: int  # weeks unusable even under the relaxed policy
+    frequency_raw: float | None  # strict average (7/7 weeks only)
+    frequency_normalized: float | None  # relaxed normalized average
+    workouts_on_unworn_days: int
+    policy: str  # POLICY_STRICT / POLICY_RELAXED / POLICY_INSUFFICIENT
+
+
+async def analyze_training_weeks(
+    db: SupportsFetchAll,
+    user_id: int,
+    tz: ZoneInfo,
+    window_days: int = DEFAULT_WINDOW_DAYS,
+) -> TrainingWeekAnalysis | None:
+    """Per-week wear/workout stats + the policy the product should use.
+
+    Policy choice: prefer strict when at least MIN_POLICY_WEEKS full weeks
+    exist; otherwise fall back to relaxed when it has enough weeks; otherwise
+    the data is insufficient and the user should be asked directly.
+    Returns None when there is no wear evidence at all (legacy import) —
+    callers must then keep the pre-RE13 behavior.
+    """
+    wear_days = await load_wear_days(db, user_id, tz, window_days)
+    if wear_days is None:
+        return None
+
+    since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=window_days)).isoformat()
+    rows = await db.fetch_all(
+        """
+        SELECT start_time, value
+        FROM health
+        WHERE user_id=? AND sample_type='workout' AND start_time>=?
+        ORDER BY start_time
+        """,
+        (user_id, since),
+    )
+    workout_days: list[dt.date] = []
+    for row in rows:
+        start_raw = row.get("start_time")
+        if not start_raw:
+            continue
+        try:
+            workout_days.append(_to_local(str(start_raw), tz).date())
+        except ValueError:
+            continue
+
+    today_local = dt.datetime.now(tz).date()
+    window_start = today_local - dt.timedelta(days=window_days)
+    weeks: list[WeekWearStats] = []
+    for start, end in _complete_weeks(window_start, today_local):
+        days = [start + dt.timedelta(days=offset) for offset in range(7)]
+        worn = [day for day in days if day in wear_days]
+        in_week = [day for day in workout_days if start <= day <= end]
+        on_worn = sum(1 for day in in_week if day in wear_days)
+        weeks.append(
+            WeekWearStats(
+                start=start,
+                end=end,
+                worn_days=len(worn),
+                workouts_on_worn_days=on_worn,
+                workouts_total=len(in_week),
+            )
+        )
+
+    strict = [w for w in weeks if w.strict_valid]
+    relaxed = [w for w in weeks if w.relaxed_valid]
+    frequency_raw = (
+        round(statistics.fmean(w.workouts_total for w in strict), 1) if strict else None
+    )
+    frequency_normalized = (
+        round(statistics.fmean(w.normalized_workouts for w in relaxed), 1)
+        if relaxed
+        else None
+    )
+    if len(strict) >= MIN_POLICY_WEEKS:
+        policy = POLICY_STRICT
+    elif len(relaxed) >= MIN_POLICY_WEEKS:
+        policy = POLICY_RELAXED
+    else:
+        policy = POLICY_INSUFFICIENT
+
+    return TrainingWeekAnalysis(
+        weeks=weeks,
+        valid_weeks_strict=len(strict),
+        valid_weeks_relaxed=len(relaxed),
+        burned_weeks=len(weeks) - len(relaxed),
+        frequency_raw=frequency_raw,
+        frequency_normalized=frequency_normalized,
+        workouts_on_unworn_days=sum(
+            w.workouts_total - w.workouts_on_worn_days for w in weeks
+        ),
+        policy=policy,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Trend proposals — compare the long-run average against the recent window
 # and, when they meaningfully disagree, recommend based on the recent trend
 # rather than silently defaulting to whichever number was computed last.

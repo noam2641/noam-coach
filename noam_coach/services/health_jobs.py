@@ -361,18 +361,30 @@ def _format_pending_fact_value(key: str, value: Any) -> str:
     return user_model.display_label(key)
 
 
-def _wizard_step_prompt(step_id: str, fact: dict[str, Any]) -> tuple[str, str, str]:
+def _wizard_step_prompt(
+    step_id: str, fact: dict[str, Any], quality: dict[str, Any] | None = None
+) -> tuple[str, str, str]:
     """Build (detected_line, plan_scope, correction_hint) for one wizard step.
 
     All prompts share one format:
     "זוהה X. האם לאשר גם עבור <scope>? אם לא — ציין <hint>."
+
+    RE13: when a data-quality report is available, the prompt also explains
+    what the number is based on (how many weeks/days were counted and why),
+    so the user approves a value with known reliability, not a bare number.
     """
     key = wizard_step_fact_key(step_id)
     value = fact.get("value")
     if step_id == WIZARD_STEP_WORKOUT_FREQUENCY and isinstance(value, dict):
         freq = value.get("weekly_frequency")
         detected = f"זוהתה שגרת אימונים של כ-{float(freq):g} אימונים בשבוע"
-        if value.get("wear_filtered") and value.get("valid_weeks_sampled"):
+        wq = (quality or {}).get("workout_frequency") or {}
+        if wq.get("policy") == "strict_7_of_7" and wq.get("valid_weeks"):
+            detected += (
+                f".\nהחישוב מבוסס על {int(wq['valid_weeks'])} שבועות מלאים "
+                "עם נתוני שעון"
+            )
+        elif value.get("wear_filtered") and value.get("valid_weeks_sampled"):
             weeks_n = int(value["valid_weeks_sampled"])
             weeks_text = "שבוע אחד" if weeks_n == 1 else f"{weeks_n} שבועות"
             detected += f" (על בסיס {weeks_text} עם נתוני שעון מלאים)"
@@ -389,6 +401,30 @@ def _wizard_step_prompt(step_id: str, fact: dict[str, Any]) -> tuple[str, str, s
             f"זוהתה שעת אימון טיפוסית סביב {value.get('typical_hour')}",
             "תוכנית האימונים",
             "שעה רצויה (למשל: 18:30)",
+        )
+    if key == "avg_steps":
+        sq = (quality or {}).get("steps") or {}
+        if sq.get("days_used"):
+            display = user_model.display_value(key, value)
+            detected = f"זוהה ממוצע צעדים יומי: {display}"
+            if sq.get("explanation_he"):
+                detected += f".\n{sq['explanation_he']}"
+            if sq.get("warning_he"):
+                detected += f"\n{sq['warning_he']}"
+            return (
+                detected.rstrip("."),
+                "התוכנית וההמלצות",
+                _WIZARD_EDIT_HINTS.get(key, "ערך אחר"),
+            )
+    if key == "sleep_schedule" and isinstance(value, dict):
+        nights = value.get("nights_sampled")
+        detected = f"זוהה {user_model.display_label(key)}: {_format_pending_fact_value(key, value)}"
+        if nights is not None and 0 < int(nights) < 10:
+            detected += f".\nמבוסס על {int(nights)} לילות בלבד — אמינות בינונית"
+        return (
+            detected,
+            "התוכנית וההמלצות",
+            _WIZARD_EDIT_HINTS.get(key, "ערך אחר"),
         )
     label = user_model.display_label(key)
     display = _format_pending_fact_value(key, value)
@@ -460,6 +496,31 @@ async def _next_wizard_step(
 HEALTH_POST_WIZARD_FLOW = "health_post_wizard"
 
 
+async def _wizard_quality_report(user_id: int) -> dict[str, Any] | None:
+    """Data-quality report for wizard prompts; never breaks the wizard."""
+    with suppress(Exception):
+        from noam_coach.services.health_quality import build_health_quality_report
+
+        return await build_health_quality_report(
+            DB, user_id, TZ, SETTINGS.routine_window_days
+        )
+    return None
+
+
+async def _send_wizard_screen(
+    target: Any, text: str, keyboard: InlineKeyboardMarkup
+) -> None:
+    if hasattr(target, "edit_message_text"):
+        await target.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+    else:
+        await target.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+
+
+_SKIP_WIZARD_BUTTON_ROW = [
+    InlineKeyboardButton("⏭️ דלג על שאר האישורים", callback_data="health:skip_wizard")
+]
+
+
 async def ask_next_health_confirm_step(
     target: Any, user_id: int, *, ack_text: str | None = None
 ) -> bool:
@@ -495,11 +556,41 @@ async def ask_next_health_confirm_step(
     await set_flow_state(user_id, HEALTH_CONFIRM_FLOW, step_id, {"done": done})
     await set_pending(user_id, f"__health_edit_{step_id}__")
 
+    quality = await _wizard_quality_report(user_id)
+
     prefix = f"{ack_text}\n\n" if ack_text else ""
+    # RE13: a stale export changes what every number means — warn once, on
+    # the very first wizard screen, before any value is approved.
+    if quality and not done and not ack_text:
+        stale_warning = (quality.get("freshness") or {}).get("warning_he")
+        if stale_warning:
+            prefix += f"⚠️ {esc(stale_warning)}\n\n"
     header = f"{prefix}<b>אישור נתונים מהייבוא</b>\n\n"
 
     if step_id == WIZARD_STEP_WORKOUT_FREQUENCY and isinstance(fact.get("value"), dict):
         import routine
+
+        key = wizard_step_fact_key(step_id)
+        wq = (quality or {}).get("workout_frequency") or {}
+
+        # RE13: with too few usable weeks there is no trustworthy number to
+        # approve — ask the user directly instead of dressing a guess up as
+        # a detected routine.
+        if wq.get("policy") == routine.POLICY_INSUFFICIENT:
+            text = (
+                f"{header}"
+                f"{esc(wq.get('warning_he') or 'אין מספיק שבועות עם נתוני שעון כדי לזהות שגרת אימונים אמינה.')}\n"
+                "כמה אימונים בשבוע תרצה לתכנן? בחר או כתוב מספר."
+            )
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(str(n), callback_data=f"health:confirm:{key}:trend:{n}")
+                    for n in (2, 3, 4)
+                ],
+                _SKIP_WIZARD_BUTTON_ROW,
+            ])
+            await _send_wizard_screen(target, text, keyboard)
+            return True
 
         value = fact["value"]
         pattern = routine.WorkoutPattern(
@@ -510,23 +601,61 @@ async def ask_next_health_confirm_step(
         )
         proposal = routine.build_frequency_trend_proposal(pattern)
         if proposal is not None:
-            key = wizard_step_fact_key(step_id)
             text = f"{header}{esc(proposal.message)}"
             rows = [
                 [InlineKeyboardButton(label, callback_data=f"health:confirm:{key}:trend:{choice:g}")]
                 for label, choice in proposal.choices
             ]
-            rows.append(
-                [InlineKeyboardButton("⏭️ דלג על שאר האישורים", callback_data="health:skip_wizard")]
-            )
-            keyboard = InlineKeyboardMarkup(rows)
-            if hasattr(target, "edit_message_text"):
-                await target.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
-            else:
-                await target.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+            rows.append(_SKIP_WIZARD_BUTTON_ROW)
+            await _send_wizard_screen(target, text, InlineKeyboardMarkup(rows))
             return True
 
-    detected, scope, hint = _wizard_step_prompt(step_id, fact)
+        # RE13: relaxed policy — the shown value is the NORMALIZED estimate
+        # (weeks with ≥5 worn days scaled to 7), so approving must apply that
+        # exact number, not the strict raw value stored in the pattern.
+        if wq.get("policy") == routine.POLICY_RELAXED and wq.get("frequency") is not None:
+            approved = max(1, min(7, round(float(wq["frequency"]))))
+            text = (
+                f"{header}"
+                f"{esc(f'זוהתה הערכה של כ-{approved} אימונים בשבוע.')}\n"
+                f"{esc(wq.get('warning_he') or '')}\n"
+                "זה מספיק להערכה ראשונית, אבל כדאי לאשר ידנית.\n"
+                "האם לאשר גם עבור תוכנית האימונים?\n"
+                "אם לא — ציין כמות אימונים רצויה בשבוע."
+            )
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    f"✅ אשר {approved} בשבוע",
+                    callback_data=f"health:confirm:{key}:trend:{approved}",
+                )],
+                _SKIP_WIZARD_BUTTON_ROW,
+            ])
+            await _send_wizard_screen(target, text, keyboard)
+            return True
+
+    # RE13: a sleep schedule detected from too few nights is an anecdote,
+    # not a routine — never offer it as a regular confirmation.
+    if step_id == "sleep_schedule" and isinstance(fact.get("value"), dict):
+        from noam_coach.services.health_quality import (
+            SLEEP_MIN_NIGHTS_FOR_CONFIRMATION,
+        )
+
+        nights = fact["value"].get("nights_sampled")
+        if nights is not None and int(nights) < SLEEP_MIN_NIGHTS_FOR_CONFIRMATION:
+            text = (
+                f"{header}"
+                f"{esc(f'זוהתה שינה רק ב-{int(nights)} לילות, ולכן זה לא מספיק כדי לקבוע שגרת שינה.')}\n"
+                "אפשר לכתוב ידנית שעת שינה וקימה ממוצעת (למשל: 23:00-07:00), "
+                "או להמשיך בלי."
+            )
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⏭️ השאר ריק והמשך", callback_data="health:skip_item")],
+                _SKIP_WIZARD_BUTTON_ROW,
+            ])
+            await _send_wizard_screen(target, text, keyboard)
+            return True
+
+    detected, scope, hint = _wizard_step_prompt(step_id, fact, quality)
     text = (
         f"{header}{esc(detected)}.\n"
         f"האם לאשר גם עבור {esc(scope)}?\n"
@@ -535,13 +664,10 @@ async def ask_next_health_confirm_step(
     keyboard = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("✅ אשר", callback_data=f"health:confirm:{step_id}")],
-            [InlineKeyboardButton("⏭️ דלג על שאר האישורים", callback_data="health:skip_wizard")],
+            _SKIP_WIZARD_BUTTON_ROW,
         ]
     )
-    if hasattr(target, "edit_message_text"):
-        await target.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
-    else:
-        await target.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+    await _send_wizard_screen(target, text, keyboard)
     return True
 
 
@@ -767,7 +893,20 @@ async def finish_health_confirm_wizard(
     await clear_flow_state(user_id, HEALTH_POST_WIZARD_FLOW)
 
     followup = await _health_import_followup_text(user_id)
-    text = (summary_text + followup) if summary_text else ("<b>סיכום הייבוא</b>" + followup)
+    # RE13: close the wizard with a short data-quality summary — what was
+    # counted, what was left out and whether a fresher export is needed.
+    quality_section = ""
+    with suppress(Exception):
+        report = await _wizard_quality_report(user_id)
+        if report and (report.get("freshness") or {}).get("latest_sample_date"):
+            from noam_coach.services.health_quality import quality_summary_lines_he
+
+            quality_section = "\n\n" + "\n".join(quality_summary_lines_he(report))
+    text = (
+        (summary_text + quality_section + followup)
+        if summary_text
+        else ("<b>סיכום הייבוא</b>" + quality_section + followup)
+    )
     if ack_text:
         text = f"{ack_text}\n\n{text}"
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ תפריט", callback_data="menu:home")]])
