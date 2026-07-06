@@ -725,7 +725,9 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
             await safe_edit(query, f'רשמתי יעד משקל של {value:g} ק"ג ✅', home_keyboard())
         return True
 
-    if data == "menu:home":
+    if data in ("menu:home", "menu:more"):
+        # RE14: one single menu. "menu:more" is a legacy callback from old
+        # messages — it renders the same unified home menu.
         await conversation.clear_all_flows(DB, user_id)
         PENDING_QUESTION.pop(user_id, None)
         CONFIRM_PENDING.pop(user_id, None)
@@ -736,10 +738,6 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
             "<b>המאמן האישי שלך</b>\n\n" + await _home_hint(user_id),
             await home_keyboard_for_user(user_id),
         )
-        return True
-
-    if data == "menu:more":
-        await safe_edit(query, "<b>עוד פעולות והגדרות</b>", more_keyboard())
         return True
 
     if data == "menu:about":
@@ -757,7 +755,7 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
                 "פנה למפעיל הבוט.\n\n"
                 f"גרסה: {esc(APP_VERSION)}"
             ),
-            InlineKeyboardMarkup([[button("⬅️ חזרה", "menu:more")], [button("🏠 תפריט ראשי", "menu:home")]]),
+            InlineKeyboardMarkup([[button("⬅️ תפריט", "menu:home")]]),
         )
         return True
 

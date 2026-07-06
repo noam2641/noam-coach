@@ -210,8 +210,9 @@ async def update_session_step(
 
 @runtime_bound(RUNTIME_NAMES)
 def home_keyboard() -> InlineKeyboardMarkup:
-    # Daily-use actions only — settings / rare actions live under "עוד" so the
-    # home screen stays a clear, flat set of common choices (P1).
+    # RE14: ONE menu only. The old split (compact home + a separate "עוד"
+    # screen) confused users with two different menus — everything now lives
+    # on a single screen: daily actions first, settings/rare actions below.
     rows = [
         [
             button("🍽️ תפריט להיום", "menu:morning"),
@@ -227,9 +228,21 @@ def home_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             button("📝 עדכון בוקר", "menu:flags"),
-            button("➕ עוד", "menu:more"),
+            button("👤 הפרופיל שלי", "menu:profile"),
+        ],
+        [
+            button("🎯 יעד", "menu:goal"),
+            button("📈 גרף", "menu:chart"),
+        ],
+        [
+            button("🗓️ שבועי", "menu:weekly"),
+            button("⌚ Apple Health", "menu:health"),
         ],
     ]
+    bottom = [button("ℹ️ אודות ופרטיות", "menu:about")]
+    if _is_valid_public_url(SETTINGS.public_base_url or ""):
+        bottom.insert(0, button("📱 Mini App", "menu:app"))
+    rows.append(bottom)
     return InlineKeyboardMarkup(rows)
 
 
@@ -324,17 +337,13 @@ async def home_keyboard_for_user(user_id: int) -> InlineKeyboardMarkup:
 
 @runtime_bound(RUNTIME_NAMES)
 def more_keyboard() -> InlineKeyboardMarkup:
-    # Settings and less-frequent actions, grouped away from daily use.
-    rows = [
-        [button("👤 הפרופיל שלי", "menu:profile"), button("🎯 יעד", "menu:goal")],
-        [button("📈 גרף", "menu:chart"), button("🗓️ שבועי", "menu:weekly")],
-        [button("⌚ Apple Health", "menu:health")],
-    ]
-    if _is_valid_public_url(SETTINGS.public_base_url or ""):
-        rows.append([button("📱 Mini App", "menu:app")])
-    rows.append([button("ℹ️ אודות ופרטיות", "menu:about")])
-    rows.append([button("⬅️ חזרה לתפריט הראשי", "menu:home")])
-    return InlineKeyboardMarkup(rows)
+    """Deprecated (RE14): there is one single menu now.
+
+    Kept only so old messages whose buttons still carry ``menu:more`` (and
+    any legacy caller) render the same unified menu instead of a second
+    menu type.
+    """
+    return home_keyboard()
 
 
 @runtime_bound(RUNTIME_NAMES)

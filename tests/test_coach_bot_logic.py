@@ -114,18 +114,19 @@ def test_session_action_arg_missing_raises() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_home_keyboard_is_compact_with_more() -> None:
+def test_home_keyboard_is_the_single_unified_menu() -> None:
+    """RE14: there is exactly ONE menu — no secondary "עוד" screen."""
     kb = coach_bot.home_keyboard()
     flat = [btn for row in kb.inline_keyboard for btn in row]
-    labels = {btn.text for btn in flat}
     callbacks = {btn.callback_data for btn in flat}
-    # Home is now compact (daily-use only) with rare actions behind "עוד".
-    assert len(kb.inline_keyboard) == 4
-    assert "menu:more" in callbacks
-    # Rare/settings actions moved OUT of the home screen.
-    assert "menu:goal" not in callbacks
-    assert "menu:health" not in callbacks
-    assert any("עוד" in label for label in labels)
+    # Daily actions and settings/rare actions all live on the same screen.
+    assert {
+        "menu:morning", "menu:nextmeal", "menu:workout", "menu:smartplan",
+        "menu:status", "menu:evening", "menu:flags", "menu:profile",
+        "menu:goal", "menu:chart", "menu:weekly", "menu:health", "menu:about",
+    } <= callbacks
+    # No second menu type anymore.
+    assert "menu:more" not in callbacks
 
 
 @pytest.mark.asyncio
@@ -161,7 +162,7 @@ async def test_home_keyboard_for_user_includes_next_action_button(
         "home_keyboard_for_user must add a button for the next_best_action callback"
     )
     # The static home buttons must still be present.
-    assert "menu:more" in all_callbacks
+    assert "menu:profile" in all_callbacks
     assert "menu:morning" in all_callbacks
 
 
@@ -212,11 +213,15 @@ async def test_home_keyboard_for_user_falls_back_on_error(
     assert len(kb.inline_keyboard) == len(static_kb.inline_keyboard)
 
 
-def test_more_keyboard_holds_rare_actions() -> None:
+def test_more_keyboard_is_alias_of_the_single_menu() -> None:
+    """RE14: more_keyboard is kept only for old messages — same unified menu."""
     kb = coach_bot.more_keyboard()
-    callbacks = {btn.callback_data for row in kb.inline_keyboard for btn in row}
-    assert {"menu:goal", "menu:chart", "menu:weekly", "menu:health", "menu:about"} <= callbacks
-    assert "menu:home" in callbacks
+    home = coach_bot.home_keyboard()
+    assert [
+        [(btn.text, btn.callback_data) for btn in row] for row in kb.inline_keyboard
+    ] == [
+        [(btn.text, btn.callback_data) for btn in row] for row in home.inline_keyboard
+    ]
 
 
 def test_plans_keyboard_has_all_plans() -> None:
