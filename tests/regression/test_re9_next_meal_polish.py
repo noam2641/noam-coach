@@ -109,3 +109,23 @@ async def test_re9_plan_for_later_is_planned_not_consumed(tmp_path: Path) -> Non
 
     # Planning the same option again is idempotent.
     assert await plan_chosen_meal(db, 1, option) is False
+
+
+@pytest.mark.asyncio
+async def test_recommended_option_is_not_counted_until_saved_or_planned(
+    tmp_path: Path,
+) -> None:
+    """TASK-04: generating a recommendation is purely a read — it must not
+    write a meals row or change today's consumed/planned totals on its own.
+    Only an explicit save (persist_meal) or plan (plan_chosen_meal) does.
+    """
+    db = await _db(tmp_path)
+    rec = await generate_next_meal_recommendation(db, 1)
+    assert rec.options
+
+    row = await db.fetch_one("SELECT COUNT(*) AS c FROM meals WHERE user_id=1")
+    assert int(row["c"]) == 0
+
+    ctx = await build_nutrition_context(db, 1, "test", now=datetime.now(timezone.utc))
+    assert ctx.consumed_calories == 0
+    assert ctx.planned_meals == []
