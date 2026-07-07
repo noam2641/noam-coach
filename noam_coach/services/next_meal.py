@@ -1682,6 +1682,21 @@ def _fit_score_label(option: MealOption) -> str:
     return f" | התאמה {score}%"
 
 
+def meal_size_label_he(calories: Any) -> str:
+    """Rough size label so the user knows at a glance whether an option is a
+    light bite or a full meal (Codex audit: show light/medium/large per
+    option, not just macros)."""
+    try:
+        value = float(calories)
+    except (TypeError, ValueError):
+        return ""
+    if value <= 300:
+        return "קלה"
+    if value <= 550:
+        return "בינונית"
+    return "גדולה"
+
+
 def _goal_source_label(nutrition: NutritionTotals) -> str:
     if nutrition.goal_status == "active":
         return "יעד פעיל מאושר"
@@ -1722,7 +1737,8 @@ def format_next_meal_recommendation(recommendation: NextMealRecommendation) -> s
         lines += [
             f"<b>אפשרות {index}: {esc(option.title)}</b>{star}",
             f"{esc(', '.join(option.ingredients))}",
-            f"כ-{option.calories} קל׳ | כ-{option.protein} גרם חלבון{_fit_score_label(option)}",
+            f"כ-{option.calories} קל׳ | כ-{option.protein} גרם חלבון | "
+            f"ארוחה {meal_size_label_he(option.calories)}{_fit_score_label(option)}",
         ]
         lines.append(f"<i>למה עכשיו: {esc(reason)}</i>")
         if after:
