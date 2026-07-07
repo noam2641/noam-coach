@@ -184,10 +184,16 @@ async def compute_basics_extras(user_id: int) -> dict[str, Any]:
         "ORDER BY start_time",
         (user_id, since),
     )
-    if len(pts) >= 2:
+    # Codex audit: two readings are not a trend — require at least 3 and say
+    # how many measurements the trend is based on.
+    if len(pts) >= 3:
         delta = float(pts[-1]["value"]) - float(pts[0]["value"])
         direction = "ירידה" if delta < 0 else "עלייה"
-        extras["weight_trend_90d"] = f'{direction} של {abs(delta):.1f} ק"ג'
+        extras["weight_trend_90d"] = (
+            f'{direction} של {abs(delta):.1f} ק"ג (על בסיס {len(pts)} מדידות)'
+        )
+    elif len(pts) == 2:
+        extras["weight_trend_90d"] = "עדיין אין מגמה מהימנה (רק 2 מדידות)"
 
     sleep = await DB.fetch_one(
         "SELECT AVG(value) AS v FROM health WHERE user_id=? AND sample_type='sleep_session'",
