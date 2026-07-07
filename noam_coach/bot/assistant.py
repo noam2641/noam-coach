@@ -263,33 +263,61 @@ async def _handle_redundant_question_challenge(ctx: FreeTextContext) -> bool:
     return True
 
 
+async def _reply_next_meal_recommendation(
+    message: Any,
+    user_id: int,
+    *,
+    recommendation: Any | None = None,
+    prefix: str = "",
+    back_buttons: list[tuple[str, str]] | None = None,
+    record_served: bool = True,
+) -> Any:
+    from noam_coach.services.next_meal import (
+        format_next_meal_recommendation,
+        generate_next_meal_recommendation,
+        next_meal_action_rows,
+        record_next_meal_served,
+        remember_active_recommendation,
+    )
+
+    if recommendation is None:
+        await message.chat.send_action("typing")
+        recommendation = await generate_next_meal_recommendation(DB, user_id)
+    keyboard_rows = [
+        [button(label, callback_data) for label, callback_data in row]
+        for row in next_meal_action_rows(recommendation)
+    ]
+    if back_buttons:
+        keyboard_rows.append([button(label, callback_data) for label, callback_data in back_buttons])
+    body = format_next_meal_recommendation(recommendation)
+    if prefix:
+        body = f"{prefix}\n\n{body}"
+    sent = await message.reply_text(
+        body,
+        reply_markup=InlineKeyboardMarkup(keyboard_rows),
+        parse_mode=ParseMode.HTML,
+    )
+    if record_served:
+        await record_next_meal_served(DB, user_id, recommendation)
+    await remember_active_recommendation(
+        DB,
+        user_id,
+        recommendation,
+        message_id=getattr(sent, "message_id", None),
+    )
+    return recommendation
+
+
 @runtime_bound(RUNTIME_NAMES)
 async def _handle_status_text_action(ctx: FreeTextContext) -> bool:
     if ctx.action == "next_meal":
-        from noam_coach.services.next_meal import (
-            format_next_meal_recommendation,
-            generate_next_meal_recommendation,
-            next_meal_action_rows,
-            record_next_meal_served,
-            remember_active_recommendation,
-        )
-
-        await ctx.message.chat.send_action("typing")
-        recommendation = await generate_next_meal_recommendation(DB, ctx.user_id)
-        keyboard_rows = [
-            [button(label, callback_data) for label, callback_data in row]
-            for row in next_meal_action_rows(recommendation)
-        ]
-        keyboard_rows.append([button("⬅️ חזרה למצב היום", "menu:status"), button("🏠 תפריט", "menu:home")])
-        sent = await ctx.message.reply_text(
-            format_next_meal_recommendation(recommendation),
-            reply_markup=InlineKeyboardMarkup(keyboard_rows),
-            parse_mode=ParseMode.HTML,
-        )
-        await record_next_meal_served(DB, ctx.user_id, recommendation)
-        await remember_active_recommendation(
-            DB, ctx.user_id, recommendation,
-            message_id=getattr(sent, "message_id", None),
+        await _reply_next_meal_recommendation(
+            ctx.message,
+            ctx.user_id,
+            back_buttons=[
+                ("⬅️ חזרה למצב היום", "menu:status"),
+                ("🏠 תפריט", "menu:home"),
+            ],
         )
         return True
 
@@ -629,41 +657,23 @@ async def route_free_text(update: Update, user_id: int) -> None:
         return
 
     if "מה לאכול עכשיו" in text:
-        from noam_coach.services.next_meal import (
-            format_next_meal_recommendation,
-            generate_next_meal_recommendation,
-            next_meal_action_rows,
-            record_next_meal_served,
-            remember_active_recommendation,
-        )
-
-        await message.chat.send_action("typing")
-        recommendation = await generate_next_meal_recommendation(DB, user_id)
-        keyboard_rows = [
-            [button(label, callback_data) for label, callback_data in row]
-            for row in next_meal_action_rows(recommendation)
-        ]
-        keyboard_rows.append([button("📊 מצב היום", "menu:status"), button("🏠 תפריט", "menu:home")])
         prefix = ""
         if "למה" in text or "אין" in text:
-            prefix = "הנה כפתור והמלצה ל״מה לאכול עכשיו״. זה שייך לתזונה, לא לאימון.\n\n"
-        sent = await message.reply_text(
-            prefix + format_next_meal_recommendation(recommendation),
-            reply_markup=InlineKeyboardMarkup(keyboard_rows),
-            parse_mode=ParseMode.HTML,
-        )
-        await record_next_meal_served(DB, user_id, recommendation)
-        await remember_active_recommendation(
-            DB, user_id, recommendation, message_id=getattr(sent, "message_id", None)
+            prefix = "הנה כפתור והמלצה ל״מה לאכול עכשיו״. זה שייך לתזונה, לא לאימון."
+        await _reply_next_meal_recommendation(
+            message,
+            user_id,
+            prefix=prefix,
+            back_buttons=[
+                ("📊 מצב היום", "menu:status"),
+                ("🏠 תפריט", "menu:home"),
+            ],
         )
         return
 
     from noam_coach.services.next_meal import (
-        format_next_meal_recommendation,
         get_active_recommendation_state,
         handle_recommendation_correction,
-        next_meal_action_rows,
-        remember_active_recommendation,
     )
 
     active_recommendation = await get_active_recommendation_state(DB, user_id)
@@ -671,21 +681,16 @@ async def route_free_text(update: Update, user_id: int) -> None:
         correction = await handle_recommendation_correction(DB, user_id, text)
         if correction is not None:
             prefix, recommendation = correction
-            keyboard_rows = [
-                [button(label, callback_data) for label, callback_data in row]
-                for row in next_meal_action_rows(recommendation)
-            ]
-            keyboard_rows.append([button("📊 מצב היום", "menu:status"), button("🏠 תפריט", "menu:home")])
-            body = format_next_meal_recommendation(recommendation)
-            if prefix:
-                body = f"{prefix}\n\n{body}"
-            sent = await message.reply_text(
-                body,
-                reply_markup=InlineKeyboardMarkup(keyboard_rows),
-                parse_mode=ParseMode.HTML,
-            )
-            await remember_active_recommendation(
-                DB, user_id, recommendation, message_id=getattr(sent, "message_id", None)
+            await _reply_next_meal_recommendation(
+                message,
+                user_id,
+                recommendation=recommendation,
+                prefix=prefix,
+                back_buttons=[
+                    ("📊 מצב היום", "menu:status"),
+                    ("🏠 תפריט", "menu:home"),
+                ],
+                record_served=False,
             )
             return
 
