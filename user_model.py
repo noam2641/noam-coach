@@ -1018,6 +1018,34 @@ async def record_gap(
     )
 
 
+async def record_skip(db: SupportsDB, user_id: int, key: str) -> None:
+    """Mark a question as explicitly skipped by the user (TASK-02).
+
+    A plain gap (never asked, or deferred during onboarding) stays eligible
+    to be asked again; a skip is a deliberate "not now" and must not be
+    re-surfaced by the normal question loop. is_skipped_gap() below is the
+    one place that distinguishes the two.
+    """
+    await set_fact(
+        db,
+        user_id,
+        key,
+        {"missing": True, "skipped": True},
+        kind=KIND_GAP,
+        source=SOURCE_USER,
+        confidence=0.0,
+        affects=(FACT_REGISTRY[key].affects if key in FACT_REGISTRY else ()),
+    )
+
+
+def is_skipped_gap(fact: dict[str, Any] | None) -> bool:
+    """True when a gap fact was a deliberate user skip, not a plain unknown."""
+    if fact is None or fact.get("kind") != KIND_GAP:
+        return False
+    value = fact.get("value")
+    return isinstance(value, dict) and bool(value.get("skipped"))
+
+
 def _hydrate(row: dict[str, Any]) -> dict[str, Any]:
     out = dict(row)
     out["value"] = json.loads(row["value"]) if row.get("value") else None

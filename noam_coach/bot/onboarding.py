@@ -1050,7 +1050,11 @@ async def handle_onboarding_callback(query: Any, user_id: int, data: str) -> Non
             _index_int = int(index_str)
         except ValueError:
             _index_int = -1
-        if question and index_str != "skip" and 0 <= _index_int < len(question.options):
+        if question and index_str == "skip":
+            # TASK-02: a skip is a deliberate "not now" — record it so the
+            # question loop does not surface the same question again.
+            await user_model.record_skip(DB, user_id, question.fact_key)
+        elif question and 0 <= _index_int < len(question.options):
             _label, value = question.options[_index_int]
             await questions.record_answer(DB, user_id, question, value)
             needs_follow_up = await handle_safety_answer(query, user_id, question, value)

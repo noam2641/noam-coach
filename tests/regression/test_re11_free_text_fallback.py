@@ -176,3 +176,42 @@ async def test_none_button_still_works_for_pain(
     fact = await user_model.get_fact(db, 1, "active_pain")
     assert fact is not None
     assert fact["value"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_skip_callback_marks_question_as_skipped_not_reasked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TASK-02: tapping "דלג" on a question must not leave a plain gap that
+    gets asked again on the very next question loop — it's a deliberate skip.
+    """
+    db = await _make_db(tmp_path)
+    _patch_db(monkeypatch, db)
+
+    class FakeTarget:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+            self.reply_markups: list[Any] = []
+            self.message = FakeMessage()
+
+        async def edit_message_text(self, text: str, reply_markup: Any = None, parse_mode: str | None = None) -> None:
+            del parse_mode
+            self.messages.append(text)
+            self.reply_markups.append(reply_markup)
+
+        async def answer(self, text: str | None = None, show_alert: bool = False) -> None:
+            del text, show_alert
+
+    await onboarding_bot.set_pending(1, "q_allergies")
+    target = FakeTarget()
+    await onboarding_bot.handle_onboarding_callback(target, 1, "qa:q_allergies:skip")
+
+    fact = await user_model.get_fact(db, 1, "allergies")
+    assert fact is not None
+    assert user_model.is_skipped_gap(fact)
+
+    result = await questions.next_question(
+        db, 1, context={"planning_nutrition": True},
+        pool=[questions.question_by_id("q_allergies")],
+    )
+    assert result is None

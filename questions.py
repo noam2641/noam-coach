@@ -369,6 +369,41 @@ LIFESTYLE_QUESTIONS: list[Question] = [
 
 ALL_QUESTIONS = SAFETY_QUESTIONS + PLAN_QUESTIONS + JIT_QUESTIONS + LIFESTYLE_QUESTIONS
 
+# TASK-02: question domain, keyed by fact_key. Used by get_next_missing_question
+# so a caller can ask "what's the next missing nutrition question" without
+# ever surfacing a training/goals/profile question by accident. HealthKit
+# data arrives through the import pipeline rather than Q&A, so no question
+# currently belongs to that domain — it's still a valid, empty selector.
+QUESTION_DOMAINS = ("nutrition", "training", "healthkit", "goals", "profile")
+
+_FACT_KEY_DOMAIN: dict[str, str] = {
+    "active_pain": "training",
+    "medical_avoidance": "training",
+    "sex": "profile",
+    "age": "profile",
+    "height_cm": "profile",
+    "primary_goal": "goals",
+    "goal_weight_kg": "goals",
+    "goal_timeframe_weeks": "goals",
+    "training_days_per_week": "training",
+    "session_minutes": "training",
+    "training_location": "training",
+    "strength_experience": "training",
+    "weekly_availability": "training",
+    "equipment": "training",
+    "diet_restrictions": "nutrition",
+    "allergies": "nutrition",
+    "meal_structure_preference": "nutrition",
+    "cooking_capacity": "nutrition",
+    "main_barrier": "profile",
+    "coaching_style": "profile",
+    "daily_routine_summary": "profile",
+}
+
+
+def question_domain(question: Question) -> str:
+    return _FACT_KEY_DOMAIN.get(question.fact_key, "profile")
+
 # Minimal onboarding pool: the few questions truly needed before first value.
 # One safety question (pain/limitation) + primary goal + weekly frequency.
 # Everything else (location, equipment, experience, diet) is recorded as a gap
@@ -407,8 +442,12 @@ async def _is_relevant(
     # is still relevant — ask_next_question will show confirmation UI instead of
     # re-asking from scratch.
     existing = await user_model.get_fact(db, user_id, q.fact_key)
-    if existing is None or existing["kind"] == user_model.KIND_GAP:
+    if existing is None:
         return True
+    if existing["kind"] == user_model.KIND_GAP:
+        # TASK-02: a deliberate skip must not be re-asked on every loop —
+        # unlike a plain deferred gap, which stays eligible.
+        return not user_model.is_skipped_gap(existing)
     if not existing.get("confirmed"):
         return True  # needs user confirmation
     return False
@@ -433,6 +472,26 @@ async def next_question(
     if not candidates:
         return None
     return max(candidates, key=lambda q: q.priority())
+
+
+async def get_next_missing_question(
+    db: user_model.SupportsDB,
+    user_id: int,
+    *,
+    domain: str,
+    context: dict[str, Any] | None = None,
+) -> Question | None:
+    """Return the next relevant question for a single domain (TASK-02).
+
+    Unlike ``next_question`` with a hand-picked pool, this always scopes to
+    one of ``QUESTION_DOMAINS`` so a nutrition-only or training-only caller
+    can never be handed a question from a different domain — no separate
+    "don't mix flows" bookkeeping needed at the call site.
+    """
+    if domain not in QUESTION_DOMAINS:
+        raise ValueError(f"unknown question domain: {domain!r}")
+    pool = [q for q in ALL_QUESTIONS if question_domain(q) == domain]
+    return await next_question(db, user_id, context, pool=pool)
 
 
 async def pending_safety_questions(db: user_model.SupportsDB, user_id: int) -> list[Question]:

@@ -203,3 +203,77 @@ async def test_next_question_respects_when_filter(tmp_path: Path) -> None:
     # With the flag, it should appear
     q = await questions.next_question(db, 1, context={"planning_nutrition": True}, pool=[diet_q])
     assert q is not None
+
+
+# ---------------------------------------------------------------------------
+# TASK-02 — skip tracking + get_next_missing_question(domain=...)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_record_skip_is_not_reasked(tmp_path: Path) -> None:
+    db = coach_bot.Database(str(tmp_path / "coach.db"))
+    await db.init()
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(1,'A',NULL,?)",
+        (coach_bot.utc_now(),),
+    )
+    q = questions.question_by_id("q_allergies")
+    assert q is not None
+
+    await user_model.record_skip(db, 1, q.fact_key)
+    fact = await user_model.get_fact(db, 1, q.fact_key)
+    assert user_model.is_skipped_gap(fact)
+
+    result = await questions.next_question(
+        db, 1, context={"planning_nutrition": True}, pool=[q]
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_plain_gap_is_still_asked_unlike_a_skip(tmp_path: Path) -> None:
+    db = coach_bot.Database(str(tmp_path / "coach.db"))
+    await db.init()
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(1,'A',NULL,?)",
+        (coach_bot.utc_now(),),
+    )
+    q = questions.question_by_id("q_allergies")
+    assert q is not None
+
+    await user_model.record_gap(db, 1, q.fact_key, why_matters="בטיחות תזונתית")
+    result = await questions.next_question(
+        db, 1, context={"planning_nutrition": True}, pool=[q]
+    )
+    assert result is not None
+    assert result.id == q.id
+
+
+@pytest.mark.asyncio
+async def test_get_next_missing_question_stays_within_domain(tmp_path: Path) -> None:
+    db = coach_bot.Database(str(tmp_path / "coach.db"))
+    await db.init()
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(1,'A',NULL,?)",
+        (coach_bot.utc_now(),),
+    )
+    q = await questions.get_next_missing_question(
+        db, 1, domain="nutrition", context={"planning_nutrition": True}
+    )
+    assert q is not None
+    assert questions.question_domain(q) == "nutrition"
+
+    q_training = await questions.get_next_missing_question(db, 1, domain="training")
+    assert q_training is not None
+    assert questions.question_domain(q_training) == "training"
+
+
+def test_get_next_missing_question_rejects_unknown_domain() -> None:
+    async def _call() -> None:
+        await questions.get_next_missing_question(None, 1, domain="not_a_domain")
+
+    with pytest.raises(ValueError, match="unknown question domain"):
+        import asyncio
+
+        asyncio.run(_call())
