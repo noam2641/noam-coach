@@ -106,7 +106,7 @@ from retention import (
 
 from noam_coach.runtime_bind import runtime_bound
 from noam_coach.bot.ui import safe_answer_callback
-from noam_coach.services.weekdays import sunday_first_key
+from noam_coach.services.weekdays import sunday_first_key, weekday_labels_he
 
 RUNTIME_NAMES = ('Any', 'CONFIRM_PENDING', 'ContextTypes', 'DB', 'Exception', 'InlineKeyboardMarkup', 'LOGGER', 'MAX_FREQUENCY', 'MIN_FREQUENCY', 'PENDING_QUESTION', 'PLANS', 'ParseMode', 'PlanConstraint', 'SETTINGS', 'SPLIT_BY_FREQUENCY', 'TypeError', 'Update', 'ValueError', '_CANCEL_WORDS', '_ENUM_DISPLAY_MAP', '_as_float', '_format_candidate', '_format_fact_value', '_parse_dietary_answer', '_plan_type_label', '_re', '_safe_cb', 'a_parts', 'abs', 'active_constraints', 'affects', 'allergies', 'allowed', 'applied', 'apply_basics_fix', 'ask_deferred_for_plan', 'ask_next_question', 'assumptions', 'at', 'block', 'bool', 'build_profile_text', 'build_weekly_plan', 'button', 'c', 'callback', 'candidate', 'candidates', 'chosen_days', 'clear_flow_state', 'clear_meal_fix', 'clear_pending', 'compute_basics_extras', 'confirm', 'confirm_routine_facts', 'confirmation_text', 'constraint_id', 'constraint_text', 'constraints', 'context_pending_fix', 'conversation', 'ctx', 'current', 'd', 'data', 'dataclass', 'datetime', 'day', 'days', 'days_source', 'default_spread', 'deferred', 'delta', 'detail', 'detected_days', 'dict', 'diet', 'direction', 'discard_unconfirmed_routine_facts', 'display', 'display_val', 'ensure_user', 'enumerate', 'esc', 'event_log', 'exc', 'existing', 'existing_a', 'existing_r', 'exp_labels', 'experience', 'extract_daily_routine', 'extraction', 'extras', 'fact', 'facts', 'finish_onboarding', 'first_item', 'float', 'flow', 'flow_name', 'food_item', 'format_constraints_summary', 'format_routine_confirmation', 'format_weekly_plan', 'freq', 'frequency', 'gap', 'gaps', 'gather_plan_constraints', 'get_flow_state', 'goal', 'goal_labels', 'group', 'handle_safety_answer', 'hard', 'hasattr', 'head', 'home_keyboard', 'hour', 'i', 'icon', 'index', 'index_str', 'int', 'is_allowed', 'isinstance', 'item', 'items', 'json', 'k', 'key', 'keyboard', 'kind', 'kind_label', 'label', 'latest_bf', 'latest_weight', 'len', 'lines', 'list', 'load_routine_profile', 'loc', 'loc_labels', 'location', 'mapping', 'mark', 'match', 'max', 'mc', 'meal', 'medical', 'message', 'min', 'mins', 'missing', 'missing_labels', 'name', 'needs_follow_up', 'new_val', 'note', 'num', 'nutrition', 'onboarding', 'onboarding_frequency_keyboard', 'onboarding_open_keyboard', 'out', 'parsed_items', 'parts', 'payload', 'pct', 'pending', 'plan', 'plan_constraints', 'plan_type', 'planning', 'prefix', 'profile', 'progress', 'prompt', 'pts', 'q', 'qid', 'query', 'question', 'question_names', 'questions', 'r', 'range', 'rationale', 're', 'readable', 'readiness', 'record_medication', 'restriction_type', 'result', 'rng', 'round', 'row', 'rows', 's', 'safe_edit', 'save_medical_constraint', 'save_routine_extraction', 'score', 'session', 'session_min', 'sessions', 'set_flow_state', 'set_pending', 'severity', 'show_onboarding_patterns', 'since', 'sleep', 'snapshot', 'soft', 'sorted', 'source', 'spec', 'split', 'stage', 'start_onboarding', 'str', 'suggestions', 'suppress', 'suspend', 'target', 'text', 'time_text', 'timedelta', 'timezone', 'title', 'track_event', 'tradeoffs', 'tuple', 'type_label', 'type_labels', 'understood', 'unified', 'update', 'user', 'user_id', 'user_model', 'utc_now', 'v', 'value', 'view', 'weekday_he', 'when', 'why', 'wk', 'workout', 'workout_window', 'write_audit')
 
@@ -952,6 +952,7 @@ async def handle_onboarding_callback(query: Any, user_id: int, data: str) -> Non
                 "sensitivity": "רגישות",
             }
             type_label = type_labels.get(restriction_type, restriction_type)
+            await _mark_no_allergies_if_missing(user_id)
             await safe_edit(
                 query,
                 f"רשמתי: {esc(food_item)} — {esc(type_label)} ✅",
@@ -1174,6 +1175,25 @@ async def _existing_list_value(user_id: int, key: str) -> list[str]:
     if not value or not isinstance(value, str):
         return []
     return [p.strip() for p in value.split(",") if p.strip()]
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def _mark_no_allergies_if_missing(user_id: int) -> bool:
+    """Close the allergy question when a typed food was classified as non-allergy."""
+    fact = await user_model.get_fact(DB, user_id, "allergies")
+    if fact is not None and fact.get("kind") != user_model.KIND_GAP:
+        return False
+    await user_model.set_fact(
+        DB,
+        user_id,
+        "allergies",
+        "none",
+        kind=user_model.KIND_FACT,
+        source=user_model.SOURCE_USER,
+        confirmed=True,
+        affects=("menu_planning", "safety"),
+    )
+    return True
 
 
 @runtime_bound(RUNTIME_NAMES)
@@ -2092,7 +2112,8 @@ async def render_plan_builder(query: Any, user_id: int) -> None:
         lines.append("")
 
     if days:
-        lines.append(f"לפי השעון אתה מתאמן בדרך כלל בימים {', '.join(weekday_he(d) for d in days)}.")
+        day_labels = ", ".join(weekday_labels_he(days))
+        lines.append(f"לפי השעון אתה מתאמן בדרך כלל בימים {day_labels}.")
         if hour:
             lines[-1] = lines[-1][:-1] + f" סביב {hour}."
     if freq is not None and freq > 0:
@@ -2252,6 +2273,17 @@ def format_weekly_plan(plan: dict[str, Any]) -> str:
 
 
 _CANCEL_WORDS = {"ביטול", "בטל", "עזוב", "תעזוב", "לא משנה", "skip", "cancel", "דלג"}
+
+
+def _diet_type_keyboard(food_item: str) -> InlineKeyboardMarkup:
+    safe_item = _safe_cb(food_item)
+    return InlineKeyboardMarkup([
+        [button("🚫 מעדיף להימנע", f"qa:diet_type:preference:{safe_item}")],
+        [button("🤢 גורם לי לאי־נוחות", f"qa:diet_type:intolerance:{safe_item}")],
+        [button("⚠️ רגישות", f"qa:diet_type:sensitivity:{safe_item}")],
+        [button("🆘 אלרגיה מאובחנת", f"qa:diet_type:allergy:{safe_item}")],
+        [button("❌ לא התכוונתי להימנע", f"qa:diet_type:cancel:{safe_item}")],
+    ])
 
 
 @runtime_bound(RUNTIME_NAMES)
@@ -2451,6 +2483,9 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
     if pending == "__manual_goal_calories__":
         import re as _re
 
+        if questions.looks_like_time_range(text):
+            await message.reply_text("זה נראה כמו טווח שעות. כרגע ביקשתי יעד קלורי יומי, למשל 2100.")
+            return True
         match = _re.search(r"\d+(?:\.\d+)?", text)
         if not match:
             await message.reply_text("כתוב מספר קלוריות, למשל 2100.")
@@ -2591,13 +2626,7 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
                 await clear_pending(user_id)
                 await message.reply_text(
                     f"איך להתייחס ל{esc(first_item)}?",
-                    reply_markup=InlineKeyboardMarkup([
-                        [button("🚫 מעדיף להימנע", f"qa:diet_type:preference:{_safe_cb(first_item)}")],
-                        [button("🤢 גורם לי לאי־נוחות", f"qa:diet_type:intolerance:{_safe_cb(first_item)}")],
-                        [button("⚠️ רגישות", f"qa:diet_type:sensitivity:{_safe_cb(first_item)}")],
-                        [button("🆘 אלרגיה מאובחנת", f"qa:diet_type:allergy:{_safe_cb(first_item)}")],
-                        [button("❌ לא התכוונתי להימנע", f"qa:diet_type:cancel:{_safe_cb(first_item)}")],
-                    ]),
+                    reply_markup=_diet_type_keyboard(first_item),
                     parse_mode=ParseMode.HTML,
                 )
                 return True
@@ -2671,13 +2700,7 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
                 await clear_pending(user_id)
                 await message.reply_text(
                     f"איך להתייחס ל{esc(first_item)}?",
-                    reply_markup=InlineKeyboardMarkup([
-                        [button("🚫 מעדיף להימנע", f"qa:diet_type:preference:{_safe_cb(first_item)}")],
-                        [button("🤢 גורם לי לאי־נוחות", f"qa:diet_type:intolerance:{_safe_cb(first_item)}")],
-                        [button("⚠️ רגישות", f"qa:diet_type:sensitivity:{_safe_cb(first_item)}")],
-                        [button("🆘 אלרגיה מאובחנת", f"qa:diet_type:allergy:{_safe_cb(first_item)}")],
-                        [button("❌ לא התכוונתי להימנע", f"qa:diet_type:cancel:{_safe_cb(first_item)}")],
-                    ]),
+                    reply_markup=_diet_type_keyboard(first_item),
                     parse_mode=ParseMode.HTML,
                 )
                 return True

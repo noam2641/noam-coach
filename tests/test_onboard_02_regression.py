@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 import coach_bot
+import conversation
 import health_import
 import health_service
 import onboarding
@@ -16,6 +17,7 @@ import user_model
 from conversation import extract_flow_id, extract_version
 from db import Database
 from helpers import utc_now
+from noam_coach.bot import onboarding as onboarding_bot
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -70,6 +72,126 @@ class FakeQuery:
 
 # ── REC-ONBOARD-02-01: Structured import result ─────────────────────────
 
+class FakeMessage:
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.replies: list[str] = []
+        self.reply_markups: list[Any] = []
+
+    async def reply_text(
+        self,
+        text: str,
+        reply_markup: Any = None,
+        parse_mode: str | None = None,
+    ) -> None:
+        del parse_mode
+        self.replies.append(text)
+        self.reply_markups.append(reply_markup)
+
+
+class FakeUpdate:
+    def __init__(self, text: str) -> None:
+        self.effective_message = FakeMessage(text)
+
+
+@pytest.mark.asyncio
+async def test_manual_calorie_goal_rejects_time_range_without_saving(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = await _make_db(tmp_path)
+    monkeypatch.setattr(onboarding_bot, "DB", db)
+    monkeypatch.setattr(coach_bot, "DB", db)
+    await conversation.set_active_flow(
+        db,
+        1,
+        conversation.FlowName.onboarding_question,
+        step="__manual_goal_calories__",
+    )
+
+    update = FakeUpdate("00:20-06:50")
+    handled = await onboarding_bot.handle_onboarding_text(update, 1)
+
+    assert handled is True
+    assert update.effective_message.replies
+    assert "טווח שעות" in update.effective_message.replies[-1]
+    assert "יעד קלורי" in update.effective_message.replies[-1]
+    flow = await conversation.get_active_flow(db, 1)
+    assert flow.step == "__manual_goal_calories__"
+
+
+@pytest.mark.asyncio
+async def test_non_allergy_diet_classification_closes_missing_allergy_question(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def _false(*args: Any, **kwargs: Any) -> bool:
+        return False
+
+    async def _noop(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    db = await _make_db(tmp_path)
+    monkeypatch.setattr(onboarding_bot, "DB", db)
+    monkeypatch.setattr(coach_bot, "DB", db)
+    monkeypatch.setattr(onboarding_bot, "continue_after_plan_completion_answer", _false)
+    monkeypatch.setattr(onboarding_bot, "ask_next_question", _false)
+    monkeypatch.setattr(onboarding_bot, "finish_onboarding", _noop)
+    await user_model.record_gap(db, 1, "allergies", why_matters="safety")
+    await user_model.set_fact(
+        db,
+        1,
+        "diet_restrictions",
+        "nuts",
+        kind=user_model.KIND_FACT,
+        source=user_model.SOURCE_USER,
+        confirmed=True,
+    )
+
+    query = FakeQuery()
+    await onboarding_bot.handle_onboarding_callback(query, 1, "qa:diet_type:sensitivity:nuts")
+
+    allergies = await user_model.get_fact(db, 1, "allergies")
+    restrictions = await user_model.get_fact(db, 1, "diet_restrictions")
+    assert allergies is not None
+    assert allergies["value"] == "none"
+    assert allergies["confirmed"] == 1
+    assert restrictions is not None
+    assert restrictions["value"] == "nuts"
+
+
+@pytest.mark.asyncio
+async def test_non_allergy_diet_classification_keeps_existing_allergies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def _false(*args: Any, **kwargs: Any) -> bool:
+        return False
+
+    async def _noop(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    db = await _make_db(tmp_path)
+    monkeypatch.setattr(onboarding_bot, "DB", db)
+    monkeypatch.setattr(coach_bot, "DB", db)
+    monkeypatch.setattr(onboarding_bot, "continue_after_plan_completion_answer", _false)
+    monkeypatch.setattr(onboarding_bot, "ask_next_question", _false)
+    monkeypatch.setattr(onboarding_bot, "finish_onboarding", _noop)
+    await user_model.set_fact(
+        db,
+        1,
+        "allergies",
+        "peanuts",
+        kind=user_model.KIND_FACT,
+        source=user_model.SOURCE_USER,
+        confirmed=True,
+    )
+
+    query = FakeQuery()
+    await onboarding_bot.handle_onboarding_callback(query, 1, "qa:diet_type:intolerance:nuts")
+
+    allergies = await user_model.get_fact(db, 1, "allergies")
+    assert allergies is not None
+    assert allergies["value"] == "peanuts"
+
+
 class TestImportSummaryFields:
     def test_summary_has_weight_and_activity_fields(self) -> None:
         s = health_import.ImportSummary()
@@ -112,6 +234,7 @@ class TestHealthImportOutcomeFields:
 
     def test_old_health_import_success_text_warns_without_error(self) -> None:
         import datetime as dt
+
         from noam_coach.services import health_jobs
         from noam_coach.services.health_jobs import HealthImportOutcome
 

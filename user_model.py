@@ -974,22 +974,7 @@ async def get_value(db: SupportsDB, user_id: int, key: str, default: Any = None)
 
 def is_fact_fresh(fact: dict[str, Any] | None, key: str) -> bool:
     """Check if a fact is still within its expiry window (if one is defined)."""
-    if fact is None:
-        return False
-    spec = FACT_REGISTRY.get(key)
-    if not spec or spec.expires_after_days is None:
-        return True
-    updated = fact.get("updated_at", "")
-    if not updated:
-        return True
-    try:
-        ts = dt.datetime.fromisoformat(updated)
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=dt.timezone.utc)
-        age = dt.datetime.now(dt.timezone.utc) - ts
-        return age.days < spec.expires_after_days
-    except (ValueError, TypeError):
-        return True
+    return fact_is_fresh(key, fact)
 
 
 async def stale_facts(db: SupportsDB, user_id: int) -> list[str]:
@@ -1094,6 +1079,22 @@ def _audit_freshness(key: str, fact: dict[str, Any] | None) -> str:
     return "fresh" if fact_is_fresh(key, fact) else "stale"
 
 
+def _audit_source_kind(fact: dict[str, Any] | None) -> str:
+    if fact is None:
+        return "unknown"
+    source = fact.get("source")
+    kind = fact.get("kind")
+    if source == SOURCE_APPLE_HEALTH:
+        return "apple_health"
+    if source == SOURCE_USER:
+        return "user"
+    if source == SOURCE_DERIVED or kind == KIND_ESTIMATE:
+        return "inferred"
+    if source == SOURCE_SYSTEM:
+        return "default"
+    return "unknown"
+
+
 async def build_profile_audit(
     db: SupportsDB,
     user_id: int,
@@ -1113,6 +1114,7 @@ async def build_profile_audit(
         fact = await get_fact(db, user_id, key)
         spec = FACT_REGISTRY.get(key)
         value = fact.get("value") if fact else None
+        confirmation_status = fact_confirmation_status(fact, key)
         rows.append(
             {
                 "field_name": key,
@@ -1120,9 +1122,11 @@ async def build_profile_audit(
                 "value": value,
                 "display_value": display_value(key, value) if fact else None,
                 "source": fact.get("source", "unknown") if fact else "unknown",
+                "source_kind": _audit_source_kind(fact),
                 "confidence": float(fact.get("confidence", 0.0)) if fact else 0.0,
                 "confidence_label": confidence_label(float(fact.get("confidence", 0.0))) if fact else "נמוכה",
                 "approved": bool(fact.get("confirmed")) if fact else False,
+                "approved_status": confirmation_status,
                 "freshness": _audit_freshness(key, fact),
                 "last_updated": fact.get("updated_at") if fact else None,
                 "kind": fact.get("kind", KIND_GAP) if fact else KIND_GAP,

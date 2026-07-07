@@ -180,10 +180,14 @@ async def test_build_profile_audit_marks_source_confirmation_and_action(tmp_path
     by_key = {row["field_name"]: row for row in rows}
 
     assert by_key["weight_kg"]["source"] == user_model.SOURCE_APPLE_HEALTH
+    assert by_key["weight_kg"]["source_kind"] == "apple_health"
     assert by_key["weight_kg"]["approved"] is False
+    assert by_key["weight_kg"]["approved_status"] == user_model.CONFIRM_STALE
     assert by_key["weight_kg"]["freshness"] == "stale"
     assert by_key["weight_kg"]["action_required"] == "refresh_health"
     assert by_key["height_cm"]["value"] is None
+    assert by_key["height_cm"]["source_kind"] == "unknown"
+    assert by_key["height_cm"]["approved_status"] == "missing"
     assert by_key["height_cm"]["action_required"] == "ask_user"
 
 
