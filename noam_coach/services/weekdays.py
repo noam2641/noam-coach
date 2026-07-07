@@ -67,6 +67,23 @@ def monday_first_to_sunday_first(index: int) -> int:
     return (int(index) + 1) % 7
 
 
+def weekday_labels_he(
+    indices: "list[int] | set[int] | tuple[int, ...]",
+    schema: Any = WEEKDAY_SCHEMA_VERSION,
+) -> list[str]:
+    """Hebrew day names for weekday indices, normalized and in Israeli order.
+
+    The single owner of "indices → ראשון, שלישי, חמישי" so every screen
+    handles legacy sunday-first schemas the same way.
+    """
+    normalized = {
+        result.weekday
+        for raw in indices
+        if (result := normalize_weekday(raw, schema)).weekday is not None
+    }
+    return [weekday_he(day) for day in sunday_first_order(normalized)]
+
+
 def normalize_weekday(value: Any, schema: Any = WEEKDAY_SCHEMA_VERSION) -> NormalizedWeekday:
     try:
         raw = int(value)

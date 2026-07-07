@@ -118,6 +118,7 @@ from noam_coach.services.local_health_path import (
     looks_like_local_health_path,
     resolve_local_health_export,
 )
+from noam_coach.services.health_quality import export_freshness_status
 from noam_coach.services.nutrition_context import (
     build_nutrition_ai_request,
     build_nutrition_context,
@@ -125,8 +126,7 @@ from noam_coach.services.nutrition_context import (
 from noam_coach.services.weekdays import (
     WEEKDAY_SCHEMA_VERSION,
     normalize_weekday,
-    sunday_first_order,
-    weekday_he,
+    weekday_labels_he,
     with_weekday_schema,
 )
 
@@ -150,19 +150,14 @@ class HealthImportOutcome:
 
 
 def _health_import_staleness_warning(max_date: Any, *, today: datetime | None = None) -> str:
-    if not max_date:
+    freshness = export_freshness_status(max_date, now=today, tz=TZ)
+    if freshness["parse_error"] or not freshness["is_stale"]:
         return ""
-    try:
-        newest = datetime.fromisoformat(str(max_date)).date()
-    except ValueError:
-        return ""
-    current = (today or datetime.now(TZ)).date()
-    days_old = max(0, (current - newest).days)
-    if days_old <= 7:
-        return ""
+    newest = freshness["latest_sample_date"]
+    days_old = freshness["days_old"]
     return (
         "⚠️ הקובץ יובא בהצלחה, אבל הנתונים אינם טריים: "
-        f"הרשומה האחרונה היא מ-{newest.isoformat()} "
+        f"הרשומה האחרונה היא מ-{newest} "
         f"({days_old} ימים אחורה). כדי לדייק את השבוע האחרון צריך ZIP חדש."
     )
 
@@ -342,7 +337,10 @@ def _workout_days_indices(value: dict[str, Any]) -> list[int]:
 
 def _workout_days_labels(value: dict[str, Any]) -> list[str]:
     """Hebrew day names for the detected training days, in Israeli order."""
-    return [weekday_he(d) for d in sunday_first_order(_workout_days_indices(value))]
+    return weekday_labels_he(
+        value.get("common_weekdays") or [],
+        value.get("weekday_schema") or WEEKDAY_SCHEMA_VERSION,
+    )
 
 
 def _format_pending_fact_value(key: str, value: Any) -> str:
@@ -533,7 +531,9 @@ async def _send_wizard_screen(
     target: Any, text: str, keyboard: InlineKeyboardMarkup
 ) -> None:
     if hasattr(target, "edit_message_text"):
-        await target.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+        from noam_coach.bot.ui import safe_edit
+
+        await safe_edit(target, text, keyboard)
     else:
         await target.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
 
@@ -835,7 +835,7 @@ async def apply_health_wizard_text_edit(
         }
         await user_model.set_fact(DB, user_id, key, updated, kind=kind, source=source)
         await _mark_wizard_substep_done(user_id, step_id, updated)
-        labels = [weekday_he(d) for d in sunday_first_order(indices)]
+        labels = weekday_labels_he(indices)
         return True, f"עודכן: ימי אימון — {', '.join(labels)} ✅"
 
     if step_id == WIZARD_STEP_WORKOUT_HOUR:
@@ -940,10 +940,7 @@ async def finish_health_confirm_wizard(
     if ack_text:
         text = f"{ack_text}\n\n{text}"
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ תפריט", callback_data="menu:home")]])
-    if hasattr(target, "edit_message_text"):
-        await target.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
-    else:
-        await target.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+    await _send_wizard_screen(target, text, keyboard)
 
     message = getattr(target, "message", target)
     if next_step == "onboarding":

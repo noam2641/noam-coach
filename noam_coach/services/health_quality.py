@@ -42,10 +42,56 @@ SLEEP_NIGHTS_FOR_HIGH_CONFIDENCE = 10
 STEPS_DAYS_FOR_HIGH_CONFIDENCE = 15
 STEPS_DAYS_FOR_MEDIUM_CONFIDENCE = 7
 
-# Export freshness (days since the newest sample in the DB).
+# Export freshness (days since the newest sample in the DB): fresh up to
+# FRESHNESS_OK_DAYS, stale above it, very stale above FRESHNESS_VERY_STALE_DAYS.
 FRESHNESS_OK_DAYS = 7
-FRESHNESS_STALE_DAYS = 14
 FRESHNESS_VERY_STALE_DAYS = 30
+
+
+def export_freshness_status(
+    newest_raw: Any,
+    *,
+    now: dt.datetime | dt.date | None = None,
+    tz: ZoneInfo | None = None,
+) -> dict[str, Any]:
+    """Normalize the newest Health sample date into the shared freshness policy."""
+    if not newest_raw:
+        return {
+            "latest_sample_date": None,
+            "days_old": None,
+            "is_stale": True,
+            "is_very_stale": False,
+            "parse_error": False,
+        }
+    tz = tz or ZoneInfo("Asia/Jerusalem")
+    try:
+        newest = dt.datetime.fromisoformat(str(newest_raw))
+        if newest.tzinfo is None:
+            newest = newest.replace(tzinfo=dt.timezone.utc)
+    except ValueError:
+        return {
+            "latest_sample_date": None,
+            "days_old": None,
+            "is_stale": True,
+            "is_very_stale": False,
+            "parse_error": True,
+        }
+
+    current = now or dt.datetime.now(tz)
+    current_date = (
+        current
+        if isinstance(current, dt.date) and not isinstance(current, dt.datetime)
+        else current.astimezone(tz).date()
+    )
+    newest_date = newest.astimezone(tz).date()
+    days_old = max(0, (current_date - newest_date).days)
+    return {
+        "latest_sample_date": newest_date.isoformat(),
+        "days_old": days_old,
+        "is_stale": days_old > FRESHNESS_OK_DAYS,
+        "is_very_stale": days_old > FRESHNESS_VERY_STALE_DAYS,
+        "parse_error": False,
+    }
 
 
 def confidence_label_he(confidence: str) -> str:
@@ -200,6 +246,7 @@ async def _freshness_section(db: Any, user_id: int, tz: ZoneInfo) -> dict[str, A
         (user_id,),
     )
     newest_raw = rows[0].get("newest") if rows else None
+    freshness = export_freshness_status(newest_raw, tz=tz)
     if not newest_raw:
         return {
             "latest_sample_date": None,
@@ -207,26 +254,22 @@ async def _freshness_section(db: Any, user_id: int, tz: ZoneInfo) -> dict[str, A
             "is_stale": True,
             "warning_he": "אין נתוני Apple Health במאגר.",
         }
-    try:
-        newest = dt.datetime.fromisoformat(str(newest_raw))
-        if newest.tzinfo is None:
-            newest = newest.replace(tzinfo=dt.timezone.utc)
-    except ValueError:
+    if freshness["parse_error"]:
         return {
             "latest_sample_date": None,
             "days_old": None,
             "is_stale": True,
             "warning_he": "לא ניתן לקבוע את תאריך הנתונים האחרון.",
         }
-    newest_date = newest.astimezone(tz).date()
-    days_old = max(0, (dt.datetime.now(tz).date() - newest_date).days)
-    if days_old > FRESHNESS_VERY_STALE_DAYS:
+    newest_date = dt.date.fromisoformat(freshness["latest_sample_date"])
+    days_old = freshness["days_old"]
+    if freshness["is_very_stale"]:
         warning = (
             f"קובץ הבריאות מסתיים ב-{newest_date.isoformat()} — לפני "
             f"{days_old} ימים. הנתונים ישנים מאוד, וההערכות עלולות לא "
             "לשקף את המצב הנוכחי. מומלץ מאוד לייצא ZIP חדש מהאייפון."
         )
-    elif days_old > FRESHNESS_OK_DAYS:
+    elif freshness["is_stale"]:
         warning = (
             f"שים לב: קובץ הבריאות האחרון מסתיים ב-{newest_date.isoformat()}, "
             "ולכן השבועות האחרונים לא נכנסו לחישוב. מומלץ לייצא ZIP חדש "
@@ -237,7 +280,7 @@ async def _freshness_section(db: Any, user_id: int, tz: ZoneInfo) -> dict[str, A
     return {
         "latest_sample_date": newest_date.isoformat(),
         "days_old": days_old,
-        "is_stale": days_old > FRESHNESS_OK_DAYS,
+        "is_stale": freshness["is_stale"],
         "warning_he": warning,
     }
 

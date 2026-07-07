@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from telegram.error import BadRequest
 
 import coach_bot
 import user_model
@@ -51,6 +52,12 @@ class FakeTarget:
 
     async def answer(self, text: str | None = None, show_alert: bool = False) -> None:
         del text, show_alert
+
+
+class StaleEditTarget(FakeTarget):
+    async def edit_message_text(self, text: str, reply_markup: Any = None, parse_mode: str | None = None) -> None:
+        del text, reply_markup, parse_mode
+        raise BadRequest("Message to edit not found")
 
 
 async def _make_db(tmp_path: Path) -> Database:
@@ -96,6 +103,23 @@ async def test_wizard_walks_facts_in_documented_order(tmp_path: Path, monkeypatc
     started = await health_jobs.ask_next_health_confirm_step(target, 1)
     assert started is True
     assert "אימונים בשבוע" in target.messages[-1]  # workout_pattern first
+
+
+@pytest.mark.asyncio
+async def test_wizard_sends_new_message_when_edit_target_is_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = await _make_db(tmp_path)
+    _patch_db(monkeypatch, db)
+    await _seed_pending_import(db)
+
+    target = StaleEditTarget()
+    started = await health_jobs.ask_next_health_confirm_step(target, 1)
+
+    assert started is True
+    assert target.messages == []
+    assert target.message.texts
+    assert "3" in target.message.texts[-1]
 
 
 @pytest.mark.asyncio

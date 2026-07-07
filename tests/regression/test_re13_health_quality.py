@@ -250,6 +250,21 @@ def test_sleep_twelve_nights_normal() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_export_freshness_status_is_shared_policy() -> None:
+    now = dt.datetime(2026, 7, 7, 12, 0, tzinfo=TZ)
+
+    fresh = health_quality.export_freshness_status("2026-06-30", now=now, tz=TZ)
+    assert fresh["latest_sample_date"] == "2026-06-30"
+    assert fresh["days_old"] == 7
+    assert fresh["is_stale"] is False
+    assert fresh["is_very_stale"] is False
+
+    stale = health_quality.export_freshness_status("2026-06-29", now=now, tz=TZ)
+    assert stale["days_old"] == 8
+    assert stale["is_stale"] is True
+    assert stale["is_very_stale"] is False
+
+
 @pytest.mark.asyncio
 async def test_fresh_export_has_no_warning() -> None:
     report = await health_quality.build_health_quality_report(
