@@ -518,11 +518,19 @@ async def clear_flow_state(user_id: int, flow: str) -> None:
 
 @runtime_bound(RUNTIME_NAMES)
 def _plan_completion_profile_order(plan_type: str | None) -> tuple[str, ...]:
-    """Order readiness profiles so the plan the user actually asked for is
-    completed first (RE10-6). ``safety`` always stays reachable — it never
-    blocks the requested plan's questions, but it is still asked afterwards
-    if still missing, since it protects exercise selection for any plan.
+    """Restrict plan-completion questions to the profile the user asked for.
+
+    TASK-01: a nutrition completion must never drift into workout questions
+    (and vice versa) — each flow only asks about its own domain. ``workout``
+    additionally pulls in ``safety`` (pain/medical limitations directly gate
+    exercise selection); ``nutrition`` does not, since safety facts don't
+    change a menu. With no specific plan_type, fall back to asking about
+    everything (legacy behavior for callers that don't scope the flow).
     """
+    if plan_type == "nutrition":
+        return ("nutrition",)
+    if plan_type == "workout":
+        return ("workout", "safety")
     if plan_type in PLAN_COMPLETION_PROFILES:
         rest = [p for p in PLAN_COMPLETION_PROFILES if p != plan_type]
         return (plan_type, *rest)

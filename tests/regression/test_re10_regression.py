@@ -230,6 +230,28 @@ async def test_plan_completion_prioritizes_requested_workout_profile(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_nutrition_completion_stops_instead_of_asking_workout_questions(
+    tmp_path: Path,
+) -> None:
+    """TASK-01: once nutrition facts are all filled, a nutrition-scoped
+    completion must report "done" (None) rather than surfacing a workout
+    question like session_minutes/training_location/equipment.
+    """
+    db = await _make_db(tmp_path)
+    coach_bot.DB.path = db.path
+    for key in (
+        "weight_kg", "primary_goal", "sex", "age",
+        "diet_restrictions", "allergies",
+    ):
+        await user_model.set_fact(
+            db, 1, key, "placeholder",
+            kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
+        )
+    question = await bot_onboarding.first_missing_plan_question(1, "nutrition")
+    assert question is None
+
+
+@pytest.mark.asyncio
 async def test_plan_completion_defaults_to_workout_first_without_plan_type(tmp_path: Path) -> None:
     """No plan_type given: preserves the original (workout-first) tuple order."""
     await _make_user_missing_workout_and_nutrition_facts(tmp_path)
@@ -239,9 +261,15 @@ async def test_plan_completion_defaults_to_workout_first_without_plan_type(tmp_p
 
 
 def test_plan_completion_profile_order_prioritizes_given_type() -> None:
+    # TASK-01: a nutrition completion must stay confined to nutrition facts —
+    # it never drifts into workout questions once nutrition is satisfied.
     order = bot_onboarding._plan_completion_profile_order("nutrition")
-    assert order[0] == "nutrition"
-    assert set(order) == set(bot_onboarding.PLAN_COMPLETION_PROFILES)
+    assert order == ("nutrition",)
+
+    # A workout completion may still ask safety questions (pain/medical
+    # limitations directly gate exercise selection).
+    order_workout = bot_onboarding._plan_completion_profile_order("workout")
+    assert order_workout == ("workout", "safety")
 
     order_unknown = bot_onboarding._plan_completion_profile_order("something_else")
     assert order_unknown == bot_onboarding.PLAN_COMPLETION_PROFILES
