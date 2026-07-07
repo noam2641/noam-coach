@@ -307,6 +307,11 @@ async def on_error(
         if decision.notify_user:
             with suppress(Exception):
                 await update.effective_message.reply_text(
-                    "לא הצלחתי להשלים את הפעולה. הנתונים שלך נשמרו — רק התצוגה נכשלה. "
-                    "אפשר לנסות שוב או לחזור למסך הקודם."
+                    "המסך הזה כבר לא עדכני. רענן אותו ואמשיך מאותה נקודה.",
+                    reply_markup=InlineKeyboardMarkup(
+                        [
+                            [InlineKeyboardButton("🔄 רענן מסך", callback_data="menu:status")],
+                            [InlineKeyboardButton("🏠 חזור לתפריט", callback_data="menu:home")],
+                        ]
+                    ),
                 )

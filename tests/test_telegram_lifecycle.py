@@ -41,9 +41,11 @@ class FakeContext:
 class FakeMessage:
     def __init__(self) -> None:
         self.replies: list[str] = []
+        self.reply_markups: list[Any] = []
 
-    async def reply_text(self, text: str) -> None:
+    async def reply_text(self, text: str, reply_markup: Any = None) -> None:
         self.replies.append(text)
+        self.reply_markups.append(reply_markup)
 
 
 @pytest.mark.asyncio
@@ -95,6 +97,12 @@ async def test_user_error_message_does_not_expose_error_id(
     reply = update.effective_message.replies[0]
     assert "קוד תקלה" not in reply
     assert "error" not in reply.lower()
+    assert "כבר לא עדכני" in reply
+
+    keyboard = update.effective_message.reply_markups[0]
+    labels = [button.text for row in keyboard.inline_keyboard for button in row]
+    assert any("רענן" in label for label in labels)
+    assert any("תפריט" in label for label in labels)
 
 
 def test_admin_notifications_are_deduplicated_by_fingerprint() -> None:
