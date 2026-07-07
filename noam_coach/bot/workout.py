@@ -242,6 +242,71 @@ async def build_daily_status(user_id: int) -> str:
     return "\n".join(lines)
 
 
+_WORKOUT_STATUS_LINE_BY_PHASE = {
+    "pre_workout_early": "יש אימון מתוכנן היום, עדיין לפני.",
+    "pre_workout_near": "יש אימון מתוכנן היום, עדיין לפני.",
+    "pre_workout_immediate": "יש אימון מתוכנן היום, עדיין לפני.",
+    "during_workout": "האימון של היום פעיל כרגע.",
+    "post_workout_immediate": "האימון של היום דווח.",
+    "post_workout_later": "האימון של היום דווח.",
+    "workout_completed_earlier": "האימון של היום דווח.",
+    "workout_planned_time_passed": "היה אימון מתוכנן היום שעדיין לא דווח.",
+    "workout_status_unknown": "היה אימון מתוכנן היום שעדיין לא דווח.",
+}
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def render_post_meal_confirmation_day_status(user_id: int, totals: dict[str, float]) -> str:
+    """TASK-14: short status shown right after a meal is confirmed.
+
+    Deliberately NOT build_daily_status (the long "מצב היום" summary), a menu,
+    or a next-meal recommendation — just: saved-confirmation, the meal's own
+    macros, today's running totals/remaining budget, current time, and what's
+    left of the day (remaining meal slots + workout status).
+    """
+    from noam_coach.services.next_meal import build_remaining_slot_allocations, build_workout_nutrition_context
+    from noam_coach.services.nutrition_context import build_nutrition_context
+
+    context = await build_nutrition_context(DB, user_id, "post_meal_status")
+
+    lines = ["נשמר ✅", "הארוחה נוספה ליומן:"]
+    lines.append(f"≈{totals['calories']:.0f} קלוריות | ≈{totals['protein']:.0f} גרם חלבון")
+    lines.append("")
+
+    now_label = context.current_local_time[11:16] if len(context.current_local_time) >= 16 else context.current_local_time
+    lines.append(f"מצב היום עכשיו — {now_label}")
+    lines.append(
+        f"נאכל עד עכשיו: {context.consumed_calories:.0f} קלוריות | "
+        f"{context.consumed_protein:.0f} גרם חלבון"
+    )
+    if context.remaining_calories is not None and context.remaining_protein is not None:
+        lines.append(
+            f"נשאר להיום: {context.remaining_calories:.0f} קלוריות | "
+            f"{context.remaining_protein:.0f} גרם חלבון"
+        )
+
+    try:
+        workout_context = await build_workout_nutrition_context(DB, user_id)
+    except Exception:  # noqa: BLE001 - this short screen must still render on failure
+        workout_context = None
+
+    upcoming: list[str] = []
+    if workout_context is not None:
+        for allocation in build_remaining_slot_allocations(workout_context):
+            time_part = f"{allocation.time_hint} — " if allocation.time_hint else ""
+            upcoming.append(f"{time_part}{esc(allocation.label)}")
+        status_line = _WORKOUT_STATUS_LINE_BY_PHASE.get(workout_context.workout_phase.value)
+        if status_line:
+            upcoming.append(status_line)
+
+    if upcoming:
+        lines.append("")
+        lines.append("המשך היום:")
+        lines.extend(upcoming)
+
+    return "\n".join(lines)
+
+
 @runtime_bound(RUNTIME_NAMES)
 async def _exercise_pain_warning_line(user_id: int, current: dict[str, Any]) -> str:
     """A specific, per-exercise warning when this exercise loads a region the

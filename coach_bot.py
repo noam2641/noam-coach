@@ -275,6 +275,7 @@ from noam_coach.bot.onboarding import (
 from noam_coach.bot.workout import (
     today_meals,
     build_daily_status,
+    render_post_meal_confirmation_day_status,
     show_session,
     save_set,
     undo_last_set,

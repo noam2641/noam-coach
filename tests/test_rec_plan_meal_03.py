@@ -405,11 +405,16 @@ class TestMealSaveConfirmation:
         import inspect
 
         from noam_coach.bot.callback_meals import _handle_meal_decision_actions
+        from noam_coach.bot.workout import render_post_meal_confirmation_day_status
         source = inspect.getsource(_handle_meal_decision_actions)
-        # Must show meal-specific confirmation (not just generic "saved")
-        assert "נשמר ✅" in source or "נרשם ✅" in source
-        # Must have undo button
-        assert "undo_meal" in source
+        # TASK-14: the meal-specific "נשמר ✅" confirmation now lives inside the
+        # short post-meal day-status renderer, not inline in the callback.
+        assert "render_post_meal_confirmation_day_status" in source
+        assert "נשמר ✅" in inspect.getsource(render_post_meal_confirmation_day_status)
+        # Editing is still reachable (routes to the full edit/reject screen,
+        # which offers undo/reject) even though the short screen itself only
+        # shows the 4 TASK-14 buttons.
+        assert "editmeal" in source
 
     def test_auto_save_has_undo(self) -> None:
         import inspect
@@ -417,6 +422,20 @@ class TestMealSaveConfirmation:
         from noam_coach.bot.meals import auto_save_meal
         source = inspect.getsource(auto_save_meal)
         assert "undo_meal" in source
+
+    def test_approve_meal_shows_exactly_the_task14_four_buttons(self) -> None:
+        """TASK-14: the post-save screen offers exactly these 4 actions —
+        מה לאכול עכשיו / סמן אימון / ערוך ארוחה / מצב היום — no undo, no menu,
+        no extra buttons on this particular screen.
+        """
+        import inspect
+
+        from noam_coach.bot.callback_meals import _handle_meal_decision_actions
+        source = inspect.getsource(_handle_meal_decision_actions)
+        assert source.count('"menu:nextmeal"') == 2  # approve_meal + force_approve_meal
+        assert source.count('"menu:workout"') == 2
+        assert source.count('f"editmeal:{meal_id}"') == 2
+        assert source.count('"menu:status"') == 2
 
 
 # ---------------------------------------------------------------------------
