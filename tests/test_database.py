@@ -119,9 +119,10 @@ async def test_database_initialization_is_idempotent(tmp_path: Path) -> None:
     await db.init()
     await db.init()
     rows = await db.fetch_all("SELECT version FROM schema_migrations ORDER BY version")
-    # RE10-2 added migration 10 (clean_polluted_gap_values); bump the expected
-    # range whenever a new schema migration is registered in db.SCHEMA_MIGRATIONS.
-    assert [row["version"] for row in rows] == list(range(1, 11))
+    # Migration 11 (meal_status_column) was added for the consumed/planned/
+    # recommended split; bump the expected range whenever a new schema
+    # migration is registered in db.SCHEMA_MIGRATIONS.
+    assert [row["version"] for row in rows] == list(range(1, 12))
 
 
 @pytest.mark.asyncio

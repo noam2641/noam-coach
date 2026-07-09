@@ -26,12 +26,15 @@ async def consumed_totals(
     now: datetime | None = None,
 ) -> tuple[float, float]:
     start, end = local_day_bounds_utc(now)
+    # Only consumed meals count toward daily totals (TASK-04): a planned or
+    # recommended row must never reduce the calorie/protein balance.
     row = await db.fetch_one(
         """
         SELECT COALESCE(SUM(calories),0) AS calories,
                COALESCE(SUM(protein),0) AS protein
         FROM meals
         WHERE user_id=? AND eaten_at>=? AND eaten_at<?
+          AND COALESCE(status, 'consumed')='consumed'
         """,
         (user_id, start, end),
     )
@@ -52,6 +55,7 @@ async def consumed_meals(
         SELECT id, name, calories, protein, carbs, fat, confidence, eaten_at
         FROM meals
         WHERE user_id=? AND eaten_at>=? AND eaten_at<?
+          AND COALESCE(status, 'consumed')='consumed'
         ORDER BY eaten_at {direction}, id {direction}
         """,
         (user_id, start, end),
@@ -71,6 +75,7 @@ async def consumed_meal_items(
         FROM meal_items mi
         JOIN meals m ON m.id = mi.meal_id
         WHERE m.user_id=? AND m.eaten_at>=? AND m.eaten_at<?
+          AND COALESCE(m.status, 'consumed')='consumed'
         """,
         (user_id, start, end),
     )

@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS meals(
     approval_id TEXT UNIQUE,
     eaten_at TEXT NOT NULL,
     created_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'consumed',
     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
     FOREIGN KEY(approval_id) REFERENCES approvals(id) ON DELETE SET NULL
 );
@@ -562,6 +563,7 @@ SCHEMA_MIGRATIONS: tuple[tuple[int, str], ...] = (
     (8, "meal_origin"),
     (9, "single_active_goal_version"),
     (10, "clean_polluted_gap_values"),
+    (11, "meal_status_column"),
 )
 
 FK_MIGRATION_TABLES: tuple[str, ...] = (
@@ -1210,6 +1212,21 @@ async def _migration_clean_polluted_gap_values(db: Database) -> None:
         await _record_migration(connection, 10, "clean_polluted_gap_values")
 
 
+async def _migration_meal_status_column(db: Database) -> None:
+    """Migration 11: add meals.status so consumed/planned/recommended stay
+    distinct (TASK-04/PATCH-10). Existing rows are real logged meals, so they
+    default to 'consumed' — only 'consumed' rows count toward daily totals.
+    """
+    async with db.transaction() as connection:
+        cursor = await connection.execute("PRAGMA table_info(meals)")
+        present = {row["name"] for row in await cursor.fetchall()}
+        if "status" not in present:
+            await connection.execute(
+                "ALTER TABLE meals ADD COLUMN status TEXT NOT NULL DEFAULT 'consumed'"
+            )
+        await _record_migration(connection, 11, "meal_status_column")
+
+
 async def run_migrations(
     db: Database,
     *,
@@ -1248,6 +1265,8 @@ async def run_migrations(
             await _migration_single_active_goal_version(db)
         elif version == 10:
             await _migration_clean_polluted_gap_values(db)
+        elif version == 11:
+            await _migration_meal_status_column(db)
         else:
             raise RuntimeError(f"Unknown schema migration {version}")
         LOGGER.info("Applied schema migration %s: %s", version, name)
