@@ -41,6 +41,13 @@ export*.zip
 !tests/fixtures/
 !tests/fixtures/*.zip
 
-# Temporary files
+# QA screen recordings / personal capture (keep local, never commit)
+*.docx
+Recording_*
+
+# Temporary files / generated logs
 pytest_full.log
-PROJECT_STATE.md
+compileall.log
+ruff.log
+eval.log
+*.tmp
