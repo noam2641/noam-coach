@@ -290,21 +290,67 @@ async def render_post_meal_confirmation_day_status(user_id: int, totals: dict[st
     except Exception:  # noqa: BLE001 - this short screen must still render on failure
         workout_context = None
 
-    upcoming: list[str] = []
+    # TASK-22: replace the generic "המשך היום: ארוחה" line with a real
+    # chronological timeline for the rest of the day — approximate time, meal
+    # role, and calorie/protein allocation per remaining meal, plus the
+    # workout event (at its day-specific time) and a valid sleep event. The
+    # allocations are recomputed from the CURRENT remaining budget on every
+    # call, so each approved meal shrinks the plan.
+    timeline: list[str] = []
     if workout_context is not None:
+        # A future workout appears in the timeline at its scheduled time; a
+        # completed/uncertain one is surfaced via the status line, not as a
+        # future event.
+        workout_event: str | None = None
+        if (
+            workout_context.workout_phase.value.startswith("pre_workout")
+            and workout_context.planned_workout_start
+        ):
+            workout_event = f"🏋️ {esc(workout_context.planned_workout_start)} אימון"
+
         for allocation in build_remaining_slot_allocations(workout_context):
-            time_part = f"{allocation.time_hint} — " if allocation.time_hint else ""
-            upcoming.append(f"{time_part}{esc(allocation.label)}")
+            time_part = f"{esc(allocation.time_hint)} · " if allocation.time_hint else ""
+            timeline.append(
+                f"🍽️ {time_part}{esc(allocation.label)}: "
+                f"כ-{allocation.calories} קל׳ | כ-{allocation.protein} ג׳ חלבון"
+            )
+        if workout_event:
+            timeline.insert(0, workout_event)
+
         status_line = _WORKOUT_STATUS_LINE_BY_PHASE.get(workout_context.workout_phase.value)
         if status_line:
-            upcoming.append(status_line)
+            timeline.append(status_line)
 
-    if upcoming:
+        # Only show a concrete bedtime when the sleep time is actually known /
+        # confirmed — never present an unconfirmed inference as fact.
+        if (
+            workout_context.sleep_reference in {"confirmed_fact", "routine_profile"}
+            and workout_context.hours_until_bedtime is not None
+            and workout_context.hours_until_bedtime > 0
+        ):
+            bedtime = _bedtime_clock(context.current_local_time, workout_context.hours_until_bedtime)
+            if bedtime:
+                timeline.append(f"😴 {esc(bedtime)} שינה")
+
+    if timeline:
         lines.append("")
         lines.append("המשך היום:")
-        lines.extend(upcoming)
+        lines.extend(timeline)
 
     return "\n".join(lines)
+
+
+def _bedtime_clock(current_local_time: str, hours_until_bedtime: float) -> str | None:
+    """Return an approximate HH:MM bedtime from the current local time plus the
+    hours-until-bedtime estimate (TASK-22 timeline sleep event)."""
+    from datetime import datetime, timedelta
+
+    try:
+        now = datetime.fromisoformat(current_local_time)
+    except (TypeError, ValueError):
+        return None
+    bedtime = now + timedelta(hours=hours_until_bedtime)
+    return bedtime.strftime("%H:%M")
 
 
 @runtime_bound(RUNTIME_NAMES)

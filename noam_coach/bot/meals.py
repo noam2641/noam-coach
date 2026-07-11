@@ -643,8 +643,11 @@ async def render_meal(target: Any, user_id: int, approval_id: str, refine_count:
         restriction_warnings.append(f"{icon} {esc(issue.message)}")
 
     def _item_line(index: int, item: "FoodItem") -> str:
+        # TASK-22: meal components are not an ordered sequence — use a plain
+        # bullet, not database-style "1." / "2." numbering.
+        del index
         line = (
-            f"• {index + 1}. {esc(item.name)} — {item.grams:g} גרם | "
+            f"• {esc(item.name)} — {item.grams:g} גרם | "
             f"{item.calories:.0f} קל׳ | {item.protein:.0f} חלבון"
         )
         if item.confidence < 0.6:
@@ -703,7 +706,8 @@ async def render_meal(target: Any, user_id: int, approval_id: str, refine_count:
             ]
             for index, option in enumerate(analysis.options[:4])
         ]
-        option_rows.append([button("✍️ תיאור נוסף", f"fixmeal:{approval_id}")])
+        # TASK-22: no dedicated "correct by text" button — the user can just
+        # write a correction directly while this meal is awaiting approval.
         if validation.blocked:
             text += "\n\n<b>אי אפשר לשמור עד שמתקנים את זה.</b>"
             option_rows.append([button("❌ דחה", f"reject_meal:{approval_id}")])
@@ -729,21 +733,20 @@ async def render_meal(target: Any, user_id: int, approval_id: str, refine_count:
             text += "\n\n<b>אי אפשר לשמור עד שמתקנים את זה.</b>"
             keyboard = InlineKeyboardMarkup(
                 [
-                    [button("✍️ תקן במלל", f"fixmeal:{approval_id}")],
                     [button("❌ דחה", f"reject_meal:{approval_id}")],
                 ]
             )
         else:
+            # TASK-22: focused actions — Save / edit quantities / cancel. The
+            # dedicated "correct by text" button is gone; the user writes any
+            # correction directly while the meal is awaiting approval.
             keyboard = InlineKeyboardMarkup(
                 [
                     [
                         button("✅ שמור", f"approve_meal:{approval_id}"),
                         button("⚖️ ערוך כמויות", f"editqtymenu:{approval_id}"),
                     ],
-                    [
-                        button("✍️ תקן במלל", f"fixmeal:{approval_id}"),
-                        button("❌ דחה", f"reject_meal:{approval_id}"),
-                    ],
+                    [button("❌ דחה", f"reject_meal:{approval_id}")],
                 ]
             )
 
