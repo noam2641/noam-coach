@@ -212,3 +212,61 @@ async def test_goal_manual_button_leads_to_confirm_goal_cal(
 
     handled_text = await onboarding_bot.handle_onboarding_text(FakeUpdate(), 1)
     assert handled_text is True
+
+
+async def _goal_screen_text_and_buttons(
+    db: Database, monkeypatch: pytest.MonkeyPatch, *, weight: float, goal_weight: float, weeks: int
+) -> tuple[str, list[str]]:
+    monkeypatch.setattr(coach_bot, "DB", db)
+    monkeypatch.setattr(onboarding_bot, "DB", db)
+    monkeypatch.setattr(core_services, "DB", db)
+    monkeypatch.setattr(callback_plans_bot, "DB", db)
+    monkeypatch.setattr(coach_bot, "OPENAI_CLIENT", None)
+    for key, value in {
+        "weight_kg": weight, "primary_goal": "fat_loss_muscle_retention",
+        "sex": "male", "age": 32, "height_cm": 178,
+        "goal_weight_kg": goal_weight, "goal_timeframe_weeks": weeks,
+    }.items():
+        await _set(db, key, value)
+    # Persist + activate a goal so fetch_goal returns the computed target.
+    import planning
+
+    proposal = await planning.build_goal_proposal(db, 1)
+    goal_id = await planning.persist_goal_proposal(db, 1, proposal)
+    await planning.activate_goal(db, 1, goal_id)
+
+    target = FakeTarget()
+    await callback_plans_bot.handle_workout_setup_callback(target, None, 1, "menu:goal")
+    text = target.messages[-1]
+    labels = [btn.text for row in target.reply_markups[-1].inline_keyboard for btn in row]
+    callbacks = [btn.callback_data for row in target.reply_markups[-1].inline_keyboard for btn in row]
+    return text, callbacks
+
+
+@pytest.mark.asyncio
+async def test_infeasible_goal_shows_warning_and_decision_buttons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TASK-18: a heavy user with an aggressive 3-month target gets a feasibility
+    warning and explicit decision options (extend timeline / change target)."""
+    db = await _make_db(tmp_path)
+    text, callbacks = await _goal_screen_text_and_buttons(
+        db, monkeypatch, weight=101.8, goal_weight=83.0, weeks=13
+    )
+    assert "כנראה לא יושג" in text
+    assert "onb:edit:goal_timeframe_weeks" in callbacks
+    assert "onb:edit:goal_weight_kg" in callbacks
+
+
+@pytest.mark.asyncio
+async def test_feasible_goal_has_no_extra_decision_buttons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A gentle, achievable target does not add the timeline/target decision
+    buttons and does not warn that the deadline is unreachable."""
+    db = await _make_db(tmp_path)
+    text, callbacks = await _goal_screen_text_and_buttons(
+        db, monkeypatch, weight=90.0, goal_weight=87.0, weeks=16
+    )
+    assert "כנראה לא יושג" not in text
+    assert "onb:edit:goal_timeframe_weeks" not in callbacks

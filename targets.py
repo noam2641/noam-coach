@@ -246,3 +246,111 @@ def explain_targets(t: Targets) -> str:
         missing_he = ", ".join(user_model.display_label(k) for k in (t.missing_inputs or []))
         text += f"\n⚠️ יעד זמני — חסרים: {missing_he}. השלם כדי לדייק."
     return text
+
+
+@dataclass
+class GoalFeasibility:
+    """TASK-18: whether the proposed calorie target can reach the requested
+    goal weight within the requested timeline.
+
+    All values are estimates.  ``applicable`` is False when there is no
+    weight-change goal + timeline to validate against (nothing to check).
+    """
+    applicable: bool
+    feasible: bool
+    implied_daily_deficit: int            # maintenance - intake (positive = deficit)
+    actual_weekly_rate_kg: float          # kg/week the target actually produces
+    requested_weekly_rate_kg: float       # kg/week the requested goal+timeline demands
+    projected_weight_at_deadline_kg: float
+    realistic_weeks_for_target: int | None
+    message: str = ""
+
+
+# A calorie target "achieves" the requested goal when its projected weight at
+# the deadline is within this tolerance of the requested target weight.
+_FEASIBILITY_TOLERANCE_KG = 1.5
+
+
+def assess_goal_feasibility(t: Targets) -> GoalFeasibility:
+    """Validate the calorie target against the requested goal weight + timeline.
+
+    The daily target is clamped to a safe percentage of maintenance in
+    ``compute_targets``.  When the requested rate exceeds that clamp, the target
+    will *not* reach the goal by the deadline — this surfaces that gap instead
+    of presenting the clamped target as if it met the requested timeline.
+    Everything is deterministic and framed as an estimate.
+    """
+    b = t.basis
+    weight = b.get("weight_kg")
+    goal_weight = b.get("goal_weight_kg")
+    weeks = b.get("goal_timeframe_weeks")
+    if (
+        weight is None
+        or goal_weight is None
+        or weeks is None
+        or float(weeks) <= 0
+        or float(goal_weight) == float(weight)
+    ):
+        return GoalFeasibility(
+            applicable=False,
+            feasible=True,
+            implied_daily_deficit=0,
+            actual_weekly_rate_kg=0.0,
+            requested_weekly_rate_kg=0.0,
+            projected_weight_at_deadline_kg=float(weight) if weight is not None else 0.0,
+            realistic_weeks_for_target=None,
+        )
+
+    weight = float(weight)
+    goal_weight = float(goal_weight)
+    weeks = float(weeks)
+    is_loss = goal_weight < weight
+
+    # The target the user will actually eat produces this deficit/surplus.
+    implied_daily = t.maintenance - t.calories  # +deficit when eating below TDEE
+    actual_weekly_rate = implied_daily * 7 / KCAL_PER_KG_FAT  # kg/week lost (loss = +)
+    requested_weekly_rate = (weight - goal_weight) / weeks     # loss = +
+
+    # Projected weight if the user follows the (clamped) target for the window.
+    projected = weight - actual_weekly_rate * weeks
+
+    total_change_needed = abs(weight - goal_weight)
+    realistic_weeks: int | None = None
+    if abs(actual_weekly_rate) > 1e-3 and (actual_weekly_rate > 0) == is_loss:
+        realistic_weeks = max(1, round(total_change_needed / abs(actual_weekly_rate)))
+
+    feasible = abs(projected - goal_weight) <= _FEASIBILITY_TOLERANCE_KG
+
+    direction = "ירידה" if is_loss else "עלייה"
+    if feasible:
+        message = (
+            f"בקצב המשוער של כ-{abs(actual_weekly_rate):.2f} ק\"ג {direction} בשבוע, "
+            f"היעד של {goal_weight:g} ק\"ג צפוי להיות בהישג יד בערך בתוך הזמן שבחרת. "
+            "מדובר בהערכה שתתעדכן לפי המגמה בפועל."
+        )
+    else:
+        projected_change = abs(weight - projected)
+        message = (
+            f"לפי ההערכה הנוכחית, {t.calories:,} קל׳ ביום יוצרים "
+            f"{'גירעון' if is_loss else 'עודף'} של כ-{abs(implied_daily):,} קל׳ ביום. "
+            f"בקצב הזה היעד של {goal_weight:g} ק\"ג בתוך הזמן שבחרת כנראה לא יושג — "
+            f"הצפי הוא כ-{projected_change:.1f} ק\"ג {direction} בתקופה (כ-{projected:.1f} ק\"ג), "
+            + (
+                f"ולהגעה ליעד בקצב בטוח נדרשות כ-{realistic_weeks} שבועות. "
+                if realistic_weeks is not None
+                else ""
+            )
+            + "אפשר לשמור על היעד הבטוח ולהאריך את הזמן, לעדכן את משקל היעד, "
+            "או לחזור ולערוך את היעד. כל המספרים הם הערכה."
+        )
+
+    return GoalFeasibility(
+        applicable=True,
+        feasible=feasible,
+        implied_daily_deficit=int(round(implied_daily)),
+        actual_weekly_rate_kg=round(actual_weekly_rate, 2),
+        requested_weekly_rate_kg=round(requested_weekly_rate, 2),
+        projected_weight_at_deadline_kg=round(projected, 1),
+        realistic_weeks_for_target=realistic_weeks,
+        message=message,
+    )

@@ -296,10 +296,18 @@ async def render_goal_proposal(query: Any, user_id: int) -> None:
 
     display_explanation = payload["explanation"]
     computed = await compute_personal_targets(user_id)
+    feasibility = None
     if computed is not None:
         display_explanation = await explain_targets_with_ai(
             computed, openai_client=OPENAI_CLIENT, model=SETTINGS.openai_model
         )
+        # TASK-18: before presenting the calorie target as goal-compatible,
+        # validate it against the requested goal weight + timeline.  When the
+        # (safety-clamped) target cannot reach the goal by the deadline, say so
+        # and offer explicit decisions instead of implying it will.
+        import targets as targets_mod
+
+        feasibility = targets_mod.assess_goal_feasibility(computed)
 
     missing = goal.get("missing_inputs") or []
     # RE10-9 / D2: "missing" here is the SOFT list (sex/age/height/avg_steps)
@@ -318,6 +326,21 @@ async def render_goal_proposal(query: Any, user_id: int) -> None:
         ],
         [button("✏️ כתוב יעד קלורי אחר", "goal:manual")],
     ]
+    # TASK-18: when the target does not align with the requested timeline, give
+    # the user explicit choices — extend the timeline, change the target weight,
+    # or review the goal — rather than only the approve/reject pair.
+    feasibility_block = ""
+    if feasibility is not None and feasibility.applicable:
+        icon = "✅" if feasibility.feasible else "⚠️"
+        feasibility_block = f"\n\n{icon} <i>{esc(feasibility.message)}</i>"
+        if not feasibility.feasible:
+            rows.insert(
+                1,
+                [
+                    button("⏳ להאריך את הזמן", "onb:edit:goal_timeframe_weeks"),
+                    button("🎯 לשנות משקל יעד", "onb:edit:goal_weight_kg"),
+                ],
+            )
     # RE10-9: the missing items are already spelled out in status_line above,
     # so a redundant "מה חסר" button here would just repeat the same
     # information — only offer it when there is nothing already shown.
@@ -331,7 +354,8 @@ async def render_goal_proposal(query: Any, user_id: int) -> None:
             f"קלוריות: <b>{payload['calories']:,}</b>\n"
             f"חלבון: <b>{payload['protein']} גרם</b>\n"
             f"צעדים: <b>{payload['steps']:,}</b>\n\n"
-            f"{status_line}\n\n"
+            f"{status_line}"
+            f"{feasibility_block}\n\n"
             f"<i>{esc(display_explanation)}</i>\n\n"
             "היעד לא ישתנה בעתיד בלי אישור שלך."
         ),
