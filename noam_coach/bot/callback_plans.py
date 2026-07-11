@@ -243,14 +243,15 @@ async def resume_pending_plan_action(query: Any, user_id: int) -> bool:
         return False
     await safe_edit(query, "ממשיך מאיפה שעצרנו ובונה את ההצעות...", None)
     try:
-        await planning.generate_candidates(DB, user_id, plan_type)  # type: ignore[arg-type]
+        generated = await planning.generate_candidates(DB, user_id, plan_type)  # type: ignore[arg-type]
         await event_log.append_event(
             DB,
             user_id,
             "PLAN_CANDIDATES_GENERATED",
             entity="plan",
             source="planner",
-            properties={"plan_type": plan_type, "count": 3, "resumed": True},
+            # TASK-19: real count, not a hardcoded 3.
+            properties={"plan_type": plan_type, "count": len(generated or []), "resumed": True},
         )
         await _clear_pending_plan_action(user_id)
         await render_candidate_list(query, user_id, plan_type)
@@ -762,14 +763,16 @@ async def handle_plan_callback(query: Any, user_id: int, data: str) -> bool:
             return True
         await safe_edit(query, "בונה שלוש חלופות ובודק אותן מול המגבלות שלך… ⏳", None)
         try:
-            await planning.generate_candidates(DB, user_id, plan_type)  # type: ignore[arg-type]
+            generated = await planning.generate_candidates(DB, user_id, plan_type)  # type: ignore[arg-type]
             await event_log.append_event(
                 DB,
                 user_id,
                 "PLAN_CANDIDATES_GENERATED",
                 entity="plan",
                 source="planner",
-                properties={"plan_type": plan_type, "count": 3},
+                # TASK-19: report the real number of generated candidates, not a
+                # hardcoded 3, so the event log never overstates the count.
+                properties={"plan_type": plan_type, "count": len(generated or [])},
             )
             if plan_type == "workout":
                 from noam_coach.bot.onboarding import render_workout_type_choice

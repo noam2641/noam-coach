@@ -1858,16 +1858,46 @@ async def render_smart_plan_hub(target: Any, user_id: int) -> None:
 # Reuses the existing 3-candidate generation (planning.generate_candidates)
 # and the existing single-plan activation (planv2:select) — the wizard only
 # changes what the user sees at each step, not the underlying data model.
+# TASK-19: the canonical supported workout-strategy registry.  Step 1 of the
+# wizard (type selection) is built from THIS set — never from however many
+# candidate rows currently happen to exist in the database — so all three
+# supported strategies are always selectable regardless of candidate storage
+# state.  The user's primary_goal only decides which one gets the ⭐ badge.
 _STRATEGY_LABELS: dict[str, str] = {
     "consistency": "מקסימום עקביות",
     "balanced": "מאוזנת",
     "performance": "ביצועים",
 }
 
+# Canonical ordered list of supported strategies for the type wizard.
+_SUPPORTED_WORKOUT_STRATEGIES: tuple[str, ...] = ("consistency", "balanced", "performance")
+
+_STRATEGY_WHY: dict[str, str] = {
+    "consistency": "פשוט לביצוע ולשמירה על שגרה — עומס מתון וקל להתמדה",
+    "balanced": "חלוקה מאוזנת של עומס והתאוששות על פני השבוע",
+    "performance": "יותר נפח ודגש התקדמות לכל קבוצת שריר",
+}
+
+# Which strategy is highlighted as recommended for each primary goal.  This only
+# adds the ⭐ badge; it never removes the other choices.
+_STRATEGY_RECOMMENDATION_FOR_GOAL: dict[str, str] = {
+    "fat_loss_muscle_retention": "consistency",
+    "fat_loss": "consistency",
+    "general_fitness": "consistency",
+    "muscle_gain": "performance",
+    "strength": "performance",
+    "general_health": "balanced",
+}
+
 
 @runtime_bound(RUNTIME_NAMES)
 async def render_workout_type_choice(target: Any, user_id: int) -> None:
-    """Wizard step A (RE10-11): choose a workout TYPE before seeing structure."""
+    """Wizard step A (RE10-11 / TASK-19): choose a workout TYPE before structure.
+
+    The type list is built from the canonical supported strategy set, not from
+    stored candidate rows, so all three strategies are always offered even when
+    candidate generation/retrieval yields fewer rows.
+    """
     candidates = await planning.list_plan_candidates(DB, user_id, "workout")  # type: ignore[arg-type]
     if not candidates:
         await safe_edit(
@@ -1876,7 +1906,13 @@ async def render_workout_type_choice(target: Any, user_id: int) -> None:
             InlineKeyboardMarkup([[button("⬅️ לתוכניות", "menu:smartplan")]]),
         )
         return
-    recommended_id = int(candidates[0]["id"]) if candidates else None
+
+    # Per-strategy candidate data (rationale/tradeoffs) enriches the description
+    # when it exists, but does NOT gate which strategies are shown.
+    by_strategy = {str(c.get("strategy") or ""): c for c in candidates}
+
+    primary_goal = str(await user_model.get_value(DB, user_id, "primary_goal") or "")
+    recommended = _STRATEGY_RECOMMENDATION_FOR_GOAL.get(primary_goal, "balanced")
 
     flow = await conversation.get_active_flow(DB, user_id)
     if flow.name != conversation.FlowName.workout_plan_selection:
@@ -1890,16 +1926,18 @@ async def render_workout_type_choice(target: Any, user_id: int) -> None:
 
     lines = ["<b>שלב 1 מתוך 3 — איזה סוג תוכנית אימונים?</b>", ""]
     rows = []
-    for candidate in candidates:
-        strategy = str(candidate.get("strategy") or "")
-        label = _STRATEGY_LABELS.get(strategy, candidate.get("title", strategy))
-        is_recommended = int(candidate.get("id") or 0) == recommended_id
-        badge = " (⭐ מומלץ)" if is_recommended else ""
+    for strategy in _SUPPORTED_WORKOUT_STRATEGIES:
+        label = _STRATEGY_LABELS[strategy]
+        is_recommended = strategy == recommended
+        badge = " (⭐ מומלץ עבורך)" if is_recommended else ""
         lines.append(f"<b>{esc(label)}{badge}</b>")
-        rationale = candidate.get("rationale") or []
-        tradeoffs = candidate.get("tradeoffs") or []
+        candidate = by_strategy.get(strategy)
+        rationale = (candidate or {}).get("rationale") or []
+        tradeoffs = (candidate or {}).get("tradeoffs") or []
         if rationale:
             lines.append("✓ " + " · ".join(esc(str(item)) for item in rationale[:2]))
+        else:
+            lines.append("✓ " + esc(_STRATEGY_WHY[strategy]))
         if tradeoffs:
             lines.append("△ " + " · ".join(esc(str(item)) for item in tradeoffs[:1]))
         lines.append("")
@@ -1917,6 +1955,18 @@ async def render_workout_structure_choice(target: Any, user_id: int, strategy: s
     """Wizard step B (RE10-11): show the chosen type's day/session structure."""
     candidates = await planning.list_plan_candidates(DB, user_id, "workout")  # type: ignore[arg-type]
     candidate = next((c for c in candidates if c.get("strategy") == strategy), None)
+    if candidate is None:
+        # TASK-19: the type screen offers every supported strategy, so the user
+        # may pick one whose candidate row is not currently stored (e.g. it was
+        # superseded after an earlier selection). Regenerate the full candidate
+        # set — generate_candidates always produces all three strategies — and
+        # retry, instead of silently bouncing back to the type screen.
+        try:
+            await planning.generate_candidates(DB, user_id, "workout")
+            candidates = await planning.list_plan_candidates(DB, user_id, "workout")  # type: ignore[arg-type]
+            candidate = next((c for c in candidates if c.get("strategy") == strategy), None)
+        except planning.PlanningBlockedError:
+            candidate = None
     if candidate is None:
         await render_workout_type_choice(target, user_id)
         return
