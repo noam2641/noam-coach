@@ -400,8 +400,14 @@ async def fetch_goal(user_id: int) -> dict[str, Any]:
 def format_morning_menu(menu: recommendations.MorningMenu) -> str:
     lines = [f"<b>{esc(menu.headline)}</b>", ""]
     for meal in menu.meals:
+        # TASK-20: don't repeat the time.  When the meal name already carries the
+        # time hint (e.g. an AI menu that names a meal "ארוחה 1 - 08:00" and also
+        # sets time_hint="08:00"), show the name only instead of "… (08:00)".
+        time_hint = (meal.time_hint or "").strip()
+        show_hint = bool(time_hint) and time_hint not in meal.name
+        suffix = f" ({esc(time_hint)})" if show_hint else ""
         lines.append(
-            f"• <b>{esc(meal.name)}</b> ({esc(meal.time_hint)}) — "
+            f"• <b>{esc(meal.name)}</b>{suffix} — "
             f"{meal.calories:.0f} קל׳, {meal.protein:.0f} ג׳ חלבון"
         )
         if meal.note:

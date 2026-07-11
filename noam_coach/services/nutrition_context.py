@@ -91,6 +91,10 @@ class NutritionContext:
     generated_at: str
     timezone: str
     current_local_time: str
+    # TASK-20: "weekday" | "friday" | "saturday" so menu generation can adapt
+    # naturally to the user's week (which begins on Sunday) — Friday/Saturday
+    # are generally treated differently from workdays.
+    day_type: str
     calorie_target: int | None
     protein_target: int | None
     carbs_target: int | None
@@ -228,6 +232,20 @@ async def _reported_meals(db: Any, user_id: int, local_now: datetime | None = No
         )
         for row in rows
     ]
+
+
+def _day_type(local_now: datetime) -> str:
+    """TASK-20: classify today so the menu can adapt to the Israeli week.
+
+    Python weekday(): Mon=0 … Fri=4, Sat=5, Sun=6.  Friday and Saturday are the
+    Israeli weekend and are generally treated differently from workdays.
+    """
+    weekday = local_weekday(local_now)
+    if weekday == 4:
+        return "friday"
+    if weekday == 5:
+        return "saturday"
+    return "weekday"
 
 
 def _today_plan(active_plan: dict[str, Any] | None, local_now: datetime) -> dict[str, Any] | None:
@@ -381,6 +399,7 @@ async def build_nutrition_context(
         generated_at=utc_now(),
         timezone=str(getattr(TZ, "key", "Asia/Jerusalem")),
         current_local_time=local_now.isoformat(),
+        day_type=_day_type(local_now),
         calorie_target=calorie_target,
         protein_target=protein_target,
         carbs_target=_target_from_goal(goal, "carbs", "default_carbs"),

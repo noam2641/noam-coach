@@ -262,7 +262,19 @@ async def morning_menu(
                         "goal. Distribute calories across the user's typical meal "
                         "times. Keep it varied day to day. If a flag like Ritalin "
                         "is present, account for reduced appetite (lighter, "
-                        "protein-dense, fewer forced meals). No medical advice."
+                        "protein-dense, fewer forced meals). No medical advice.\n"
+                        # TASK-20: build the menu around the user's ACTUAL day.
+                        "Optimize for real-life adherence, not only nutrition: "
+                        "prefer practical, realistic meals for each time of day "
+                        "(don't force grilled chicken breast at 08:00 unless the "
+                        "user's history clearly supports it). Breakfast is OPTIONAL "
+                        "— if the food-routine context suggests breakfast is often "
+                        "skipped, redistribute those calories instead of forcing an "
+                        "early meal. Use the 'day_type' field: on 'friday'/"
+                        "'saturday' (the Israeli weekend) adapt naturally to a "
+                        "different rhythm than a workday. Respect the food "
+                        "environment (cooking availability, restaurants, takeaway, "
+                        "quick meals) when choosing meals."
                     ),
                 },
                 {
