@@ -273,10 +273,15 @@ HEALTH_CONFIRM_FLOW = "health_confirm"
 WIZARD_STEP_WORKOUT_FREQUENCY = "workout_pattern.frequency"
 WIZARD_STEP_WORKOUT_DAYS = "workout_pattern.days"
 WIZARD_STEP_WORKOUT_HOUR = "workout_pattern.hour"
+# TASK-2: a representative typical workout duration inferred from the imported
+# workout records is confirmed here, so the later "כמה דקות יש לך לאימון" plan
+# question is skipped when session_minutes is already confirmed.
+WIZARD_STEP_WORKOUT_DURATION = "workout_pattern.duration"
 _WORKOUT_SUBSTEPS = (
     WIZARD_STEP_WORKOUT_FREQUENCY,
     WIZARD_STEP_WORKOUT_DAYS,
     WIZARD_STEP_WORKOUT_HOUR,
+    WIZARD_STEP_WORKOUT_DURATION,
 )
 _WIZARD_STEP_ORDER = (*_WORKOUT_SUBSTEPS, "weight_kg", "sleep_schedule")
 
@@ -301,6 +306,7 @@ _WIZARD_EXCLUDED_KEYS = frozenset(
 _WORKOUT_SUBSTEP_EDIT_HINTS: dict[str, str] = {
     WIZARD_STEP_WORKOUT_FREQUENCY: "כמה אימונים בשבוע (למשל: 3)",
     WIZARD_STEP_WORKOUT_HOUR: "שעת אימון מועדפת (למשל: 18:30)",
+    WIZARD_STEP_WORKOUT_DURATION: "משך אימון טיפוסי בדקות (למשל: 55)",
 }
 
 # What to type when the detected value is wrong — per fact key.
@@ -330,6 +336,10 @@ def _workout_substep_applicable(step_id: str, value: Any) -> bool:
         return bool(value.get("common_weekdays"))
     if step_id == WIZARD_STEP_WORKOUT_HOUR:
         return bool(value.get("typical_hour"))
+    if step_id == WIZARD_STEP_WORKOUT_DURATION:
+        # Only offer the duration confirmation when the import actually inferred
+        # a representative duration from the workout records.
+        return value.get("avg_duration_minutes") is not None
     return True
 
 
@@ -519,6 +529,13 @@ def _wizard_step_prompt(
             f"זוהתה שעת אימון טיפוסית סביב {value.get('typical_hour')}",
             "תוכנית האימונים",
             "שעה רצויה (למשל: 18:30)",
+        )
+    if step_id == WIZARD_STEP_WORKOUT_DURATION and isinstance(value, dict):
+        minutes = int(round(float(value.get("avg_duration_minutes") or 0)))
+        return (
+            f"משך אימון טיפוסי: כ־{minutes} דקות",
+            "תוכנית האימונים",
+            "משך אימון טיפוסי בדקות (למשל: 55)",
         )
     if key == "avg_steps":
         sq = (quality or {}).get("steps") or {}
@@ -1144,6 +1161,15 @@ async def confirm_health_wizard_step(user_id: int, step_id: str) -> str:
                 confirmed=True,
             )
             ack = f"✅ אושר: ימי אימון — {', '.join(_workout_days_labels(value))}"
+        elif step_id == WIZARD_STEP_WORKOUT_DURATION:
+            minutes = int(round(float(value.get("avg_duration_minutes") or 0)))
+            minutes = max(10, min(180, minutes))
+            await user_model.set_fact(
+                DB, user_id, "session_minutes", minutes,
+                kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
+                confirmed=True,
+            )
+            ack = f"✅ אושר: משך אימון טיפוסי — כ־{minutes} דקות"
         else:  # WIZARD_STEP_WORKOUT_HOUR
             hour = str(value.get("typical_hour"))
             await user_model.set_fact(
@@ -1336,6 +1362,22 @@ async def apply_health_wizard_text_edit(
         await user_model.set_fact(DB, user_id, key, updated, kind=kind, source=source)
         await _mark_wizard_substep_done(user_id, step_id, updated)
         return True, f"עודכן: שעת אימון {hhmm} ✅"
+
+    if step_id == WIZARD_STEP_WORKOUT_DURATION:
+        match = re.search(r"\d+", text)
+        if not match:
+            return False, "כתוב משך אימון בדקות, למשל: 55."
+        minutes = max(10, min(180, int(match.group(0))))
+        # TASK-2: a manual correction is persisted as the confirmed planning
+        # preference (session_minutes) so the later duration question is skipped.
+        await user_model.set_fact(
+            DB, user_id, "session_minutes", minutes,
+            kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
+        )
+        updated = {**current, "avg_duration_minutes": float(minutes)}
+        await user_model.set_fact(DB, user_id, key, updated, kind=kind, source=source)
+        await _mark_wizard_substep_done(user_id, step_id, updated)
+        return True, f"עודכן: משך אימון טיפוסי — כ־{minutes} דקות ✅"
 
     if key == "avg_steps":
         match = re.search(r"\d[\d,]*", text)
