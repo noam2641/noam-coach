@@ -118,6 +118,16 @@ from noam_coach.services.meal_validation import (
 RUNTIME_NAMES = ('Any', 'ContextTypes', 'DB', 'Exception', 'FoodItem', 'InlineKeyboardButton', 'InlineKeyboardMarkup', 'LOGGER', 'MealAnalysis', 'ParseMode', 'Path', 'SETTINGS', 'Update', 'ValueError', '_AlreadyDecided', '_dt', '_item_line', 'abs', 'allergies_val', 'analysis', 'analyze_meal_image', 'any', 'approval', 'approval_id', 'asyncio', 'auto_save_meal', 'bool', 'button', 'bytes', 'cal', 'caption', 'clear_meal_fix', 'conn', 'conversation', 'count', 'create_approval', 'cur', 'cursor', 'cutoff', 'data_quality', 'datetime', 'decide_approval', 'dict', 'diet_restrictions', 'diff', 'duplicate_approval_id', 'duplicate_id', 'edit_meal_id', 'edited_existing', 'ensure_user', 'enumerate', 'esc', 'event_log', 'exc', 'fetch_approval', 'file_unique_id', 'float', 'folder', 'friendly_error', 'handed_off', 'hasattr', 'high', 'home_keyboard', 'i', 'image_bytes', 'image_path', 'index', 'int', 'is_allowed', 'item', 'item_count', 'item_index', 'item_name_lower', 'items', 'json', 'keyboard', 'line', 'list', 'low', 'macro_cal', 'macro_diff', 'max', 'meal', 'meal_id', 'meal_intelligence', 'message', 'now', 'option', 'option_rows', 'path', 'payload', 'pending_dup', 'persist_meal', 'photo_obj', 'progress', 'query', 'range', 'reanalyze_meal_with_text_and_image', 'recent', 'refine_count', 'refine_hint', 'render_meal', 'report', 'restriction', 'restriction_block', 'restriction_lower', 'restriction_warnings', 'restricted_items', 'row', 'rows', 'safe_edit', 'saved_dup', 'secrets', 'set_meal_fix', 'should_auto_approve', 'str', 'suppress', 'target', 'telegram_file', 'telegram_file_unique_id', 'text', 'timedelta', 'timezone', 'totals', 'update', 'user_id', 'user_model', 'utc_now', 'write_audit')
 
 
+async def _meal_analysis_context(user_id: int, purpose: str, request: str) -> dict[str, Any] | None:
+    """Build the one canonical nutrition context used by meal analysis paths."""
+    with suppress(Exception):
+        return build_nutrition_ai_request(
+            await build_nutrition_context(DB, user_id, purpose),
+            request,
+        )["context"]
+    return None
+
+
 @runtime_bound(RUNTIME_NAMES)
 async def create_meal_edit_approval(user_id: int, meal_id: int) -> str | None:
     """Create a new editable approval from an already-saved meal."""
@@ -181,20 +191,23 @@ async def analyze_duplicate_candidate(
         return
     image_bytes = await asyncio.to_thread(Path(image_path).read_bytes)
     caption = str(payload.get("caption") or "").strip()
+    nutrition_payload = await _meal_analysis_context(
+        user_id,
+        "meal_photo_caption" if caption else "meal_photo",
+        "Analyze duplicate meal photo with user caption" if caption else "Analyze duplicate meal photo",
+    )
     if caption:
-        nutrition_payload: dict[str, Any] | None = None
-        with suppress(Exception):
-            nutrition_payload = build_nutrition_ai_request(
-                await build_nutrition_context(DB, user_id, "meal_photo_caption"),
-                "Analyze duplicate meal photo with user caption",
-            )["context"]
         analysis = await reanalyze_meal_with_text_and_image(
             image_path=image_path,
             correction_text=caption,
             nutrition_context=nutrition_payload,
         )
     else:
-        analysis = await analyze_meal_image(image_bytes, user_id=user_id)
+        analysis = await analyze_meal_image(
+            image_bytes,
+            user_id=user_id,
+            nutrition_context=nutrition_payload,
+        )
     approval_id = await create_approval(
         user_id,
         "meal",
@@ -293,13 +306,12 @@ async def handle_photo(
             )
             return
 
+        nutrition_payload = await _meal_analysis_context(
+            user_id,
+            "meal_photo_caption" if caption else "meal_photo",
+            "Analyze meal photo with user caption" if caption else "Analyze meal photo",
+        )
         if caption:
-            nutrition_payload: dict[str, Any] | None = None
-            with suppress(Exception):
-                nutrition_payload = build_nutrition_ai_request(
-                    await build_nutrition_context(DB, user_id, "meal_photo_caption"),
-                    "Analyze meal photo with user caption",
-                )["context"]
             analysis = await reanalyze_meal_with_text_and_image(
                 image_path=str(path),
                 correction_text=caption,
@@ -307,7 +319,11 @@ async def handle_photo(
             )
             analysis.notes = (analysis.notes + [f"תיאור מהמשתמש: {caption}"])[-10:]
         else:
-            analysis = await analyze_meal_image(image_bytes, user_id=user_id)
+            analysis = await analyze_meal_image(
+                image_bytes,
+                user_id=user_id,
+                nutrition_context=nutrition_payload,
+            )
         if not analysis.is_meaningful():
             await progress.edit_text("לא זוהתה ארוחה (אין מזון או ערכים תזונתיים). נסה תמונה ברורה יותר.")
             return

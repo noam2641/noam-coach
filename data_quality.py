@@ -53,6 +53,45 @@ def assess_meal(analysis: MealAnalysis) -> QualityReport:
             )
         )
 
+    important_low_items = [
+        item.name
+        for item in analysis.items
+        if item.confidence < 0.75 and (item.calories >= 120 or item.fat >= 8)
+    ]
+    if important_low_items:
+        score -= min(0.2, len(important_low_items) * 0.08)
+        issues.append(
+            QualityIssue(
+                "low_confidence_important_item",
+                "warning",
+                "רכיב משמעותי עם ודאות נמוכה: " + ", ".join(important_low_items[:4]),
+            )
+        )
+
+    complexity = len(analysis.items)
+    if complexity >= 6:
+        score -= 0.12
+        issues.append(
+            QualityIssue(
+                "high_complexity_meal",
+                "warning",
+                "ארוחה מורכבת דורשת בדיקה לפני שמירה אוטומטית",
+            )
+        )
+
+    if any(
+        token in item.name.casefold()
+        for item in analysis.items
+        for token in ("שמן", "רוטב", "טחינה", "מיונז", "חמאה", "oil", "sauce", "dressing")
+    ):
+        issues.append(
+            QualityIssue(
+                "calorie_dense_component_present",
+                "info",
+                "זוהה רכיב קלורי צפוף; מומלץ לוודא כמות",
+            )
+        )
+
     macro_kcal = totals["protein"] * 4 + totals["carbs"] * 4 + totals["fat"] * 9
     kcal = totals["calories"]
     macro_delta_pct = 0.0
@@ -60,10 +99,11 @@ def assess_meal(analysis: MealAnalysis) -> QualityReport:
         macro_delta_pct = abs(kcal - macro_kcal) / max(kcal, macro_kcal)
         if macro_delta_pct > 0.25:
             score -= 0.25
+            severity = "critical" if macro_delta_pct > 0.35 else "warning"
             issues.append(
                 QualityIssue(
                     "macro_calorie_mismatch",
-                    "warning",
+                    severity,
                     f"פער של {macro_delta_pct:.0%} בין הקלוריות לסכום המאקרו",
                 )
             )
@@ -82,7 +122,13 @@ def assess_meal(analysis: MealAnalysis) -> QualityReport:
         score=score,
         usable=usable,
         issues=issues,
-        metrics={**totals, "macro_kcal": round(macro_kcal, 1), "macro_delta_pct": macro_delta_pct},
+        metrics={
+            **totals,
+            "macro_kcal": round(macro_kcal, 1),
+            "macro_delta_pct": macro_delta_pct,
+            "meal_complexity": complexity,
+            "important_low_confidence_items": important_low_items,
+        },
     )
 
 

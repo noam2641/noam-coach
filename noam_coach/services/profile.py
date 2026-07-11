@@ -187,7 +187,11 @@ def _apply_israeli_food_overrides(analysis: MealAnalysis) -> MealAnalysis:
 
 
 @runtime_bound(RUNTIME_NAMES)
-async def analyze_meal_image(image_bytes: bytes, user_id: int | None = None) -> MealAnalysis:
+async def analyze_meal_image(
+    image_bytes: bytes,
+    user_id: int | None = None,
+    nutrition_context: dict[str, Any] | None = None,
+) -> MealAnalysis:
     if not OPENAI_CLIENT:
         raise RuntimeError("OPENAI_API_KEY אינו מוגדר")
 
@@ -195,7 +199,13 @@ async def analyze_meal_image(image_bytes: bytes, user_id: int | None = None) -> 
     from noam_coach.services.learned_foods import learned_foods_prompt_block
 
     safety_context = await _meal_safety_context(user_id)
-    learned_context = await learned_foods_prompt_block(DB, user_id)
+    learned_user_id = user_id
+    if isinstance(nutrition_context, dict):
+        try:
+            learned_user_id = int(nutrition_context.get("user_id") or 0) or user_id
+        except (TypeError, ValueError):
+            learned_user_id = user_id
+    learned_context = await learned_foods_prompt_block(DB, learned_user_id)
     encoded = base64.b64encode(image_bytes).decode("utf-8")
     response = await OPENAI_CLIENT.responses.parse(
         model=SETTINGS.openai_model,
@@ -214,10 +224,22 @@ async def analyze_meal_image(image_bytes: bytes, user_id: int | None = None) -> 
                     "what you see in the photo — e.g. 'האם הסלט עם שמן זית או בלי?' "
                     "Never ask generic questions about food types clearly visible "
                     "in the image. Options must include concrete calorie deltas. "
+                    "Use learned foods only as supporting recognition evidence; never add foods "
+                    "that are not supported by the current image. "
                     "Do not present estimates as medical advice.\n\n"
                     + ISRAELI_LOCALE_BLOCK
                     + safety_context_block(safety_context)
                     + learned_context
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Structured nutrition context for this user and day:\n"
+                    f"{json.dumps(nutrition_context or {}, ensure_ascii=False)}\n\n"
+                    "Evidence precedence: hard allergies/restrictions, explicit current user text, "
+                    "deterministic known-food data, approved learned history, image inference, "
+                    "then generic estimates. Do not count planned meals as eaten."
                 ),
             },
             {
@@ -375,7 +397,9 @@ async def reanalyze_meal_with_text_and_image(
                     "re-identify it from the image (e.g. a soft drink / iced tea / water). "
                     "Do NOT invent a nonsense name like 'X ללא אלכוהול' and do NOT keep the "
                     "rejected identification. If the drink is genuinely a non-caloric "
-                    "beverage, return it with its real (possibly zero) values and a clear name."
+                    "beverage, return it with its real (possibly zero) values and a clear name. "
+                    "8. Learned foods are calibration only; never restore or add foods that are not "
+                    "supported by the current image/text and the user's locked corrections."
                     + locked_block
                     + "\n\n"
                     + ISRAELI_LOCALE_BLOCK

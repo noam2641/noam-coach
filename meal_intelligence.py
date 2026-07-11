@@ -53,6 +53,9 @@ def parse_locked_quantities(text: str) -> list[LockedQuantity]:
             grams = float(match.group("grams").replace(",", "."))
             food = match.group("food").strip(" -–—:()")
             food = re.sub(r"\s+", " ", food)
+            food = re.sub(r"\b(?:היה|הייתה|היו)\b", " ", food).strip()
+            if len(food) > 2 and food.startswith("ה"):
+                food = food[1:]
             if not food or grams <= 0 or grams > 5000:
                 continue
             key = (food.casefold(), grams)
@@ -276,6 +279,56 @@ def _parse_replacement_corrections(text: str) -> list[MealCorrection]:
 
 
 # Pattern: "ה<item> <method>" or "<item> <method>"
+_SCALE_WHOLE_PATTERNS: list[tuple[re.Pattern[str], float]] = [
+    (re.compile(r"(?:^|\s)(?:הכל|כולה|כל\s+הארוחה)\s+כפול(?:ה)?(?:\s|$)", re.IGNORECASE), 2.0),
+    (re.compile(r"(?:^|\s)(?:פי\s*)?2x(?:\s|$)", re.IGNORECASE), 2.0),
+    (re.compile(r"(?:^|\s)x2(?:\s|$)", re.IGNORECASE), 2.0),
+    (re.compile(r"(?:^|\s)פי\s*2(?:\s|$)", re.IGNORECASE), 2.0),
+    (re.compile(r"(?:^|\s)(?:פי\s*)?3x(?:\s|$)", re.IGNORECASE), 3.0),
+    (re.compile(r"(?:^|\s)x3(?:\s|$)", re.IGNORECASE), 3.0),
+    (re.compile(r"(?:^|\s)פי\s*3(?:\s|$)", re.IGNORECASE), 3.0),
+    (re.compile(r"(?:^|\s)(?:חצי|חצי\s+מנה)(?:\s|$)", re.IGNORECASE), 0.5),
+]
+
+_SCALE_ITEM_PATTERNS: list[tuple[re.Pattern[str], float]] = [
+    (re.compile(r"חצי\s+מ(?:ה|ן)(?P<item>[\u0590-\u05FF][\u0590-\u05FF\s]{1,30})", re.IGNORECASE), 0.5),
+    (re.compile(r"(?P<item>[\u0590-\u05FF][\u0590-\u05FF\s]{1,30})\s+חצי", re.IGNORECASE), 0.5),
+    (re.compile(r"(?P<item>[\u0590-\u05FF][\u0590-\u05FF\s]{1,30})\s+כפול(?:ה)?", re.IGNORECASE), 2.0),
+]
+
+
+def _parse_scale_corrections(text: str) -> list[MealCorrection]:
+    """Extract relative portion corrections such as "חצי מהאורז" or "x3"."""
+    normalized = text.strip()
+    for pattern, factor in _SCALE_ITEM_PATTERNS:
+        match = pattern.search(normalized)
+        if match is None:
+            continue
+        item_hint = match.group("item").strip(" -:.,")
+        if item_hint in {"הכל", "כולה", "כל הארוחה"}:
+            break
+        if item_hint:
+            return [
+                MealCorrection(
+                    kind="scale",
+                    item_hint=item_hint,
+                    value=str(factor),
+                    original_text=text,
+                )
+            ]
+    for pattern, factor in _SCALE_WHOLE_PATTERNS:
+        if pattern.search(normalized):
+            return [
+                MealCorrection(
+                    kind="scale",
+                    item_hint="",
+                    value=str(factor),
+                    original_text=text,
+                )
+            ]
+    return []
+
+
 _PREP_ITEM_PATTERNS = [
     re.compile(
         r"(?:ה)?(?P<item>[\u0590-\u05FF]+)\s+(?:עשוי\s+ב?|הוא\s+)?(?P<method>[\u0590-\u05FF\s]+)",
@@ -322,6 +375,11 @@ def parse_meal_correction(text: str) -> list[MealCorrection]:
     if replacement_corrections:
         corrections.extend(replacement_corrections)
         return corrections  # replacement is unambiguous; skip further parsing
+
+    scale_corrections = _parse_scale_corrections(text)
+    if scale_corrections:
+        corrections.extend(scale_corrections)
+        return corrections
 
     # --- Preparation corrections ---
     for pattern in _PREP_ITEM_PATTERNS:
@@ -604,6 +662,54 @@ def apply_item_replacement_correction(
     if note not in analysis.notes:
         analysis.notes.append(note)
 
+    return analysis
+
+
+def apply_scale_correction(
+    analysis: MealAnalysis,
+    correction: MealCorrection,
+) -> MealAnalysis:
+    """Apply a relative quantity correction to one item or the whole meal."""
+    if correction.kind != "scale":
+        return analysis
+    try:
+        factor = float(correction.value)
+    except (TypeError, ValueError):
+        return analysis
+    if factor <= 0 or factor > 10:
+        return analysis
+
+    targets = analysis.items
+    if correction.item_hint:
+        candidates = sorted(
+            analysis.items,
+            key=lambda item: _similarity(correction.item_hint, item.name),
+            reverse=True,
+        )
+        if not candidates:
+            return analysis
+        best = candidates[0]
+        hint_tokens = _tokens(correction.item_hint)
+        name_contains_hint = any(t in _tokens(best.name) for t in hint_tokens)
+        if _similarity(correction.item_hint, best.name) < 0.15 and not name_contains_hint:
+            note = f"פריט לא נמצא לשינוי כמות: {correction.item_hint}"
+            if note not in analysis.notes:
+                analysis.notes.append(note)
+            return analysis
+        targets = [best]
+
+    for item in targets:
+        item.grams = round(item.grams * factor, 1)
+        item.calories = round(item.calories * factor, 1)
+        item.protein = round(item.protein * factor, 1)
+        item.carbs = round(item.carbs * factor, 1)
+        item.fat = round(item.fat * factor, 1)
+        item.confidence = max(float(item.confidence), 0.9)
+
+    scope = correction.item_hint or "כל הארוחה"
+    note = f"כמות עודכנה: {scope} x{factor:g}"
+    if note not in analysis.notes:
+        analysis.notes.append(note)
     return analysis
 
 

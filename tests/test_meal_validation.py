@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 import coach_bot
+import data_quality
 import user_model
 from db import Database
 from helpers import utc_now
@@ -40,6 +41,53 @@ def test_meal_validation_blocks_allergy_conflict() -> None:
 
     assert result.blocked is True
     assert result.issues[0].code == "restricted_food_block"
+
+
+def test_macro_inconsistency_blocks_quality_auto_approval() -> None:
+    analysis = MealAnalysis(
+        meal_name="bad macros",
+        confidence=0.95,
+        items=[
+            FoodItem(
+                name="protein item",
+                grams=100,
+                calories=100,
+                protein=80,
+                carbs=0,
+                fat=0,
+                confidence=0.95,
+            )
+        ],
+    )
+
+    report = data_quality.assess_meal(analysis)
+
+    assert report.usable is False
+    assert any(issue.code == "macro_calorie_mismatch" for issue in report.issues)
+
+
+def test_high_complexity_meal_is_flagged_for_review() -> None:
+    analysis = MealAnalysis(
+        meal_name="complex plate",
+        confidence=0.95,
+        items=[
+            FoodItem(
+                name=f"item {index}",
+                grams=50,
+                calories=60,
+                protein=4,
+                carbs=8,
+                fat=2,
+                confidence=0.9,
+            )
+            for index in range(6)
+        ],
+    )
+
+    report = data_quality.assess_meal(analysis)
+
+    assert any(issue.code == "high_complexity_meal" for issue in report.issues)
+    assert report.score < analysis.confidence
 
 
 @pytest.mark.asyncio

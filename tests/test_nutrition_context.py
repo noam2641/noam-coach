@@ -259,3 +259,26 @@ async def test_meal_reanalysis_passes_nutrition_context_to_ai(
         and "tree_nuts" in message["content"]
         for message in messages
     )
+
+
+@pytest.mark.asyncio
+async def test_initial_meal_image_passes_nutrition_context_to_ai(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _MealClient()
+    monkeypatch.setattr(coach_bot, "OPENAI_CLIENT", client)
+    monkeypatch.setattr(profile_service, "OPENAI_CLIENT", client)
+
+    await profile_service.analyze_meal_image(
+        b"fake-image",
+        nutrition_context={"remaining_calories": 900, "allergies": ["tree_nuts"]},
+    )
+
+    messages = client.responses.inputs[0]["input"]
+    assert any(
+        isinstance(message.get("content"), str)
+        and "Structured nutrition context" in message["content"]
+        and "tree_nuts" in message["content"]
+        and "remaining_calories" in message["content"]
+        for message in messages
+    )

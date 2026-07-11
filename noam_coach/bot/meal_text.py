@@ -151,6 +151,7 @@ async def _handle_meal_correction_text(
         removal_corrections = [c for c in corrections if c.kind == "remove"]
         prep_corrections = [c for c in corrections if c.kind == "preparation"]
         qty_corrections = [c for c in corrections if c.kind == "quantity"]
+        scale_corrections = [c for c in corrections if c.kind == "scale"]
 
         used_deterministic = False
         corrected_analysis = original_analysis
@@ -179,6 +180,13 @@ async def _handle_meal_correction_text(
                     corrected_analysis, locked,
                 )
                 used_deterministic = True
+
+        if scale_corrections:
+            for sc in scale_corrections:
+                corrected_analysis = meal_intelligence.apply_scale_correction(
+                    corrected_analysis, sc,
+                )
+            used_deterministic = True
 
         replace_corrections = [c for c in corrections if c.kind == "replace"]
 
