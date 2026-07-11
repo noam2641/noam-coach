@@ -120,8 +120,11 @@ async def test_basics_screen_shows_profile_audit_statuses(
 
     assert "אישור נתוני בסיס" in text
     assert "דורש אישור" in text
-    assert "Apple Health" in text
     assert "חסר" in text
+    # TASK-1: source/confidence metadata is internal and must not be exposed.
+    assert "Apple Health" not in text
+    assert "מקור:" not in text
+    assert "אמינות:" not in text
 
 
 @pytest.mark.asyncio

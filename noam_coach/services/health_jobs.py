@@ -1407,7 +1407,7 @@ async def finish_health_confirm_wizard(
     ``ack_text`` echoes the last approval above the summary so the user sees
     what was just confirmed even on the final step.
     """
-    from noam_coach.bot.onboarding import get_flow_state, clear_flow_state, show_onboarding_basics
+    from noam_coach.bot.onboarding import get_flow_state, clear_flow_state
     from noam_coach.bot.ui import home_keyboard_for_user
 
     state = await get_flow_state(user_id, HEALTH_POST_WIZARD_FLOW)
@@ -1428,9 +1428,15 @@ async def finish_health_confirm_wizard(
     await _send_wizard_screen(target, text, keyboard)
 
     message = getattr(target, "message", target)
-    if next_step == "onboarding":
-        await show_onboarding_basics(message, user_id)
-    else:
+    # TASK-1: the new post-import summary above already shows the confirmed
+    # planning data and ends with the reduced "🎯 השלם את התוכנית שלי" menu, so
+    # for the onboarding path we must NOT trigger the legacy base-data
+    # confirmation sequence (show_onboarding_basics: "אישור נתוני בסיס" /
+    # "זיהיתי מהנתונים שיובאו" / "✅ הכול נכון" with מקור/אמינות) — it duplicated
+    # weight/body-fat/base data and exposed obsolete source/confidence metadata.
+    # The reconciliation path stays: it surfaces one actionable reported-vs-actual
+    # insight and is not a duplicate confirmation.
+    if next_step != "onboarding":
         await run_post_import_reconciliation(message, user_id)
 
 

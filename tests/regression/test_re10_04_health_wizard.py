@@ -419,9 +419,12 @@ async def test_skip_item_defers_only_current_question(
 
 
 @pytest.mark.asyncio
-async def test_finish_wizard_runs_onboarding_when_requested(
+async def test_finish_wizard_does_not_run_legacy_onboarding_basics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """TASK-1: the new post-import summary + reduced menu is terminal on the
+    onboarding path; the legacy base-data confirmation (show_onboarding_basics)
+    must NOT run afterwards (it duplicated weight/body-fat/base data)."""
     db = await _make_db(tmp_path)
     _patch_db(monkeypatch, db)
 
@@ -435,7 +438,7 @@ async def test_finish_wizard_runs_onboarding_when_requested(
     await core_services.set_flow_state(1, health_jobs.HEALTH_POST_WIZARD_FLOW, "onboarding", {"summary_text": "x"})
     target = FakeTarget()
     await health_jobs.finish_health_confirm_wizard(target, 1)
-    assert calls == ["onboarding"]
+    assert calls == []
 
 
 @pytest.mark.asyncio

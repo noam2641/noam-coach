@@ -252,6 +252,11 @@ def _profile_audit_lines(rows: list[dict[str, Any]]) -> list[str]:
         user_model.SOURCE_SYSTEM: "מערכת",
         "unknown": "לא ידוע",
     }
+    # TASK-1: source/confidence ("מקור"/"אמינות") are internal metadata and must
+    # not be exposed in normal user-facing confirmation UX. ``source_labels`` and
+    # the underlying audit rows are still available to application logic; only the
+    # rendered line drops the internal fields.
+    del source_labels
     lines = ["", "<b>אישור נתוני בסיס</b>"]
     for row in rows:
         action = str(row.get("action_required") or "none")
@@ -260,10 +265,8 @@ def _profile_audit_lines(rows: list[dict[str, Any]]) -> list[str]:
             continue
         label = esc(str(row.get("label") or row.get("field_name") or ""))
         display = esc(str(value)) if value is not None else "חסר"
-        source = source_labels.get(str(row.get("source") or "unknown"), str(row.get("source") or "לא ידוע"))
-        confidence = esc(str(row.get("confidence_label") or ""))
         status = esc(_profile_audit_status_he(row))
-        lines.append(f"• {label}: <b>{display}</b> · {status} · מקור: {esc(source)} · אמינות: {confidence}")
+        lines.append(f"• {label}: <b>{display}</b> · {status}")
     if len(lines) == 2:
         return []
     lines.append("")
