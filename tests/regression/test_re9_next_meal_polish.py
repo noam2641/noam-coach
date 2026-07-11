@@ -69,7 +69,8 @@ async def test_re9_exactly_one_recommended_option_with_reason(tmp_path: Path) ->
     assert recommended[0].recommended_reason
     text = format_next_meal_recommendation(rec)
     assert "למה עכשיו" in text
-    assert "התאמה" in text
+    # TASK-8: no internal match-percentage scoring in user-facing UX.
+    assert "התאמה" not in text
 
 
 @pytest.mark.asyncio

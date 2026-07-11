@@ -1203,7 +1203,8 @@ def _score_option(
     cal_mid = (budget.calories_min + budget.calories_max) / 2 or 1
     cal_gap = abs(option.calories - cal_mid) / cal_mid
     cal_fit = max(0.0, 1.0 - cal_gap)
-    reasons.append((cal_fit * 0.3, "הכי מתאים לתקציב הקלורי"))
+    # TASK-8: practical reasoning, not mechanical "best fit for the budget".
+    reasons.append((cal_fit * 0.3, "מתאים לכמות שנשארה לך להיום"))
 
     # Timing: pre/post-workout phases favour the templates built for them; the
     # candidate pool is already phase-specific, so this is a small steady bonus.
@@ -1870,6 +1871,56 @@ def _remaining_day_timeline_lines(context: WorkoutNutritionContext) -> list[str]
     return lines
 
 
+# TASK-8: side vegetables whose exact gram weight is not nutritionally important
+# — combined without grams instead of "מלפפון 100 גרם, עגבנייה 120 גרם".
+_LIGHT_SIDE_VEG = (
+    "מלפפון", "עגבנייה", "עגבניה", "חסה", "גזר", "פלפל", "בצל", "ירקות",
+    "סלט", "עלים", "רוקט", "כרוב", "צנונית",
+)
+
+
+_DISPLAY_QUANTITY_SUFFIX_RE = re.compile(
+    r"\s*\d+(?:\.\d+)?\s*(?:גרם|גר['׳]?|מ[\"״׳']?ל|מל)\s*$"
+)
+
+
+def _strip_display_quantity(text: str) -> str:
+    """Remove a trailing "<n> גרם/מ״ל" quantity from an ingredient string, for
+    natural display only (distinct from the fingerprint _strip_quantity)."""
+    return _DISPLAY_QUANTITY_SUFFIX_RE.sub("", str(text)).strip()
+
+
+def _natural_ingredients(option: "MealOption") -> str:
+    """TASK-8: render food naturally. Keep the quantity on the main item(s) but
+    combine light side vegetables without exposing their exact gram weights.
+
+    e.g. "150 גרם קוטג' 5% + מלפפון ועגבנייה" instead of
+    "קוטג' 5% 150 גרם, מלפפון 100 גרם, עגבנייה 120 גרם".
+    """
+    items = list(option.ingredients or [])
+    if not items:
+        return ""
+    mains: list[str] = []
+    sides: list[str] = []
+    for item in items:
+        base = _strip_display_quantity(item)
+        if any(veg in base for veg in _LIGHT_SIDE_VEG):
+            sides.append(base)
+        else:
+            mains.append(str(item).strip())
+    parts: list[str] = []
+    if mains:
+        parts.append(", ".join(mains))
+    if sides:
+        # Deduplicate while preserving order.
+        seen: set[str] = set()
+        uniq = [s for s in sides if not (s in seen or seen.add(s))]
+        parts.append(" ו".join(uniq) if len(uniq) > 1 else uniq[0])
+    if not mains and sides:
+        return parts[0]
+    return " + ".join(parts)
+
+
 def format_next_meal_recommendation(recommendation: NextMealRecommendation) -> str:
     """Answer-first message (re7 P1-10): remaining + options first, short note,
     and the long explanation only via the 'why it fits' detail view."""
@@ -1902,11 +1953,13 @@ def format_next_meal_recommendation(recommendation: NextMealRecommendation) -> s
     for option in recommendation.options:
         after = _after_meal_line(nutrition, option)
         reason = option.recommended_reason or option.rationale or recommendation.budget.rationale
+        # TASK-8: no internal scoring / match percentages in user-facing UX;
+        # render the food naturally (combine items, no exact side-veg grams).
         lines += [
             f"<b>{esc(option.title)}</b>",
-            f"{esc(', '.join(option.ingredients))}",
+            f"{esc(_natural_ingredients(option))}",
             f"כ-{option.calories} קל׳ | כ-{option.protein} גרם חלבון | "
-            f"ארוחה {meal_size_label_he(option.calories)}{_fit_score_label(option)}",
+            f"ארוחה {meal_size_label_he(option.calories)}",
         ]
         lines.append(f"<i>למה עכשיו: {esc(reason)}</i>")
         if after:
