@@ -781,6 +781,47 @@ async def test_stale_relaxed_frequency_prompt_is_short_and_has_no_manual_button(
 
 
 @pytest.mark.asyncio
+async def test_stale_relaxed_frequency_accepts_plain_text_number(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = await _make_db(tmp_path)
+    _patch_db(monkeypatch, db)
+    await user_model.set_fact(
+        db, 1, "workout_pattern", {"weekly_frequency": 2.0, "typical_hour": "18:30"},
+        kind=user_model.KIND_ESTIMATE, source=user_model.SOURCE_DERIVED, confirmed=False,
+    )
+
+    async def fake_quality(user_id: int) -> dict[str, Any]:
+        del user_id
+        return {
+            "freshness": {"is_stale": True, "latest_sample_date": "2026-06-16"},
+            "workout_frequency": {"policy": routine.POLICY_RELAXED, "frequency": 2.0},
+        }
+
+    monkeypatch.setattr(health_jobs, "_wizard_quality_report", fake_quality)
+
+    target = FakeTarget()
+    await health_jobs.ask_next_health_confirm_step(target, 1)
+    assert onboarding_bot.PENDING_QUESTION[1] == (
+        f"__health_edit_{health_jobs.WIZARD_STEP_WORKOUT_FREQUENCY}__"
+    )
+
+    class TextMessage(FakeMessage):
+        text = "3"
+
+    class FakeUpdate:
+        effective_message = TextMessage()
+
+    handled = await onboarding_bot.handle_onboarding_text(FakeUpdate(), 1)
+    assert handled is True
+
+    training_days = await user_model.get_fact(db, 1, "training_days_per_week")
+    assert training_days["value"] == 3
+    assert training_days["confirmed"] is True
+    assert any("עודכן: 3 אימונים בשבוע" in text for text in FakeUpdate.effective_message.texts)
+
+
+@pytest.mark.asyncio
 async def test_two_night_sleep_is_not_offered_for_confirmation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
