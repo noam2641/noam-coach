@@ -1857,21 +1857,10 @@ async def render_smart_plan_hub(target: Any, user_id: int) -> None:
 # Reuses the existing 3-candidate generation (planning.generate_candidates)
 # and the existing single-plan activation (planv2:select) — the wizard only
 # changes what the user sees at each step, not the underlying data model.
-_STRATEGY_RECOMMENDATION_FOR_GOAL: dict[str, str] = {
-    "fat_loss_muscle_retention": "consistency",
-    "muscle_gain": "performance",
-    "strength": "performance",
-    "general_health": "balanced",
-}
 _STRATEGY_LABELS: dict[str, str] = {
     "consistency": "מקסימום עקביות",
     "balanced": "מאוזנת",
     "performance": "ביצועים",
-}
-_STRATEGY_WHY: dict[str, str] = {
-    "consistency": "פחות ימים, קל יותר להתמיד — טוב לירידה במשקל ולשמירה על שגרה.",
-    "balanced": "איזון בין נפח להתאוששות — טוב לבריאות וכושר כללי.",
-    "performance": "יותר נפח והזדמנויות להתקדם — טוב לבניית מסה או כוח.",
 }
 
 
@@ -1886,8 +1875,7 @@ async def render_workout_type_choice(target: Any, user_id: int) -> None:
             InlineKeyboardMarkup([[button("⬅️ לתוכניות", "menu:smartplan")]]),
         )
         return
-    primary_goal = str(await user_model.get_value(DB, user_id, "primary_goal") or "")
-    recommended = _STRATEGY_RECOMMENDATION_FOR_GOAL.get(primary_goal)
+    recommended_id = int(candidates[0]["id"]) if candidates else None
 
     flow = await conversation.get_active_flow(DB, user_id)
     if flow.name != conversation.FlowName.workout_plan_selection:
@@ -1904,16 +1892,20 @@ async def render_workout_type_choice(target: Any, user_id: int) -> None:
     for candidate in candidates:
         strategy = str(candidate.get("strategy") or "")
         label = _STRATEGY_LABELS.get(strategy, candidate.get("title", strategy))
-        why = _STRATEGY_WHY.get(strategy, "")
-        badge = " (מומלץ עבורך)" if strategy == recommended else ""
+        is_recommended = int(candidate.get("id") or 0) == recommended_id
+        badge = " (⭐ מומלץ)" if is_recommended else ""
         lines.append(f"<b>{esc(label)}{badge}</b>")
-        if why:
-            lines.append(f"<i>{esc(why)}</i>")
+        rationale = candidate.get("rationale") or []
+        tradeoffs = candidate.get("tradeoffs") or []
+        if rationale:
+            lines.append("✓ " + " · ".join(esc(str(item)) for item in rationale[:2]))
+        if tradeoffs:
+            lines.append("△ " + " · ".join(esc(str(item)) for item in tradeoffs[:1]))
         lines.append("")
         callback = conversation.encode_callback(
             "planv2", "wiz_type", strategy, version=flow.version, flow_id=flow.flow_id,
         )
-        button_label = f"{label}{' ⭐' if strategy == recommended else ''}"
+        button_label = f"{label}{' ⭐' if is_recommended else ''}"
         rows.append([button(button_label, callback)])
     rows.append([button("⬅️ לתוכניות", "menu:smartplan")])
     await safe_edit(target, "\n".join(lines), InlineKeyboardMarkup(rows))

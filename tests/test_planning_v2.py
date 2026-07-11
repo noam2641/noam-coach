@@ -154,6 +154,51 @@ async def test_workout_candidates_differ_in_frequency_and_content(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_workout_candidate_ranking_uses_duration_experience_and_limitations(tmp_path: Path) -> None:
+    db = await _ready_db(tmp_path)
+    await user_model.set_fact(db, 1, "session_minutes", 35, source=user_model.SOURCE_USER, confirmed=True)
+    await user_model.set_fact(db, 1, "strength_experience", "beginner", source=user_model.SOURCE_USER, confirmed=True)
+    await user_model.set_fact(db, 1, "active_pain", "knee pain", source=user_model.SOURCE_USER, confirmed=True)
+    await user_model.set_fact(db, 1, "equipment", "limited dumbbells", source=user_model.SOURCE_USER, confirmed=True)
+
+    workout = await planning.generate_candidates(db, 1, "workout")
+    ranked = sorted(workout, key=lambda candidate: candidate.score, reverse=True)
+
+    assert ranked[0].strategy == "consistency"
+    performance = next(candidate for candidate in workout if candidate.strategy == "performance")
+    assert any("35" in item for item in performance.tradeoffs)
+    assert any("כאב" in item or "מגבלה" in item for item in performance.tradeoffs)
+
+
+@pytest.mark.asyncio
+async def test_workout_candidate_ranking_prefers_performance_for_advanced_muscle_gain(tmp_path: Path) -> None:
+    db = await _ready_db(tmp_path)
+    await user_model.set_fact(db, 1, "primary_goal", "muscle_gain", source=user_model.SOURCE_USER, confirmed=True)
+    await user_model.set_fact(db, 1, "session_minutes", 70, source=user_model.SOURCE_USER, confirmed=True)
+    await user_model.set_fact(db, 1, "strength_experience", "advanced", source=user_model.SOURCE_USER, confirmed=True)
+
+    workout = await planning.generate_candidates(db, 1, "workout")
+    ranked = sorted(workout, key=lambda candidate: candidate.score, reverse=True)
+
+    assert ranked[0].strategy == "performance"
+    assert any("70" in item for item in ranked[0].rationale)
+
+
+@pytest.mark.asyncio
+async def test_four_day_workout_rationale_does_not_claim_fewer_days(tmp_path: Path) -> None:
+    db = await _ready_db(tmp_path)
+    await user_model.set_fact(db, 1, "training_days_per_week", 4, source=user_model.SOURCE_USER, confirmed=True)
+
+    workout = await planning.generate_candidates(db, 1, "workout")
+    consistency = next(candidate for candidate in workout if candidate.strategy == "consistency")
+    text = " ".join(consistency.rationale + consistency.tradeoffs)
+
+    assert consistency.payload["frequency"] == 4
+    assert "פחות אימונים" not in text
+    assert "4" in text
+
+
+@pytest.mark.asyncio
 async def test_consistency_uses_full_body_and_keeps_all_days(tmp_path: Path) -> None:
     """E3 / TASK-07: the consistency candidate uses varied Full-Body sessions
     (a real weakness of a 3-day A/B/C is training legs only once) AND keeps

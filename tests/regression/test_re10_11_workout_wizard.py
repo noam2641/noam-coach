@@ -25,6 +25,12 @@ from noam_coach.bot import callback_plans as callback_plans_bot
 from noam_coach.bot import onboarding as onboarding_bot
 from noam_coach.services import core as core_services
 
+_STRATEGY_LABELS_FOR_TEST = {
+    "consistency": "מקסימום עקביות",
+    "balanced": "מאוזנת",
+    "performance": "ביצועים",
+}
+
 
 class FakeTarget:
     def __init__(self) -> None:
@@ -111,7 +117,11 @@ async def test_fat_loss_goal_recommends_consistency(tmp_path: Path, monkeypatch:
     target = FakeTarget()
     await onboarding_bot.render_workout_type_choice(target, 1)
     labels = _button_labels(target.reply_markups[-1])
+    starred = [label for label in labels if "⭐" in label]
+    assert len(starred) == 1
     assert any("מקסימום עקביות" in label and "⭐" in label for label in labels)
+    top = (await planning.list_plan_candidates(db, 1, "workout"))[0]
+    assert _STRATEGY_LABELS_FOR_TEST[top["strategy"]] in starred[0]
 
 
 @pytest.mark.asyncio

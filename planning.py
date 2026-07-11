@@ -984,6 +984,111 @@ def _workout_candidate(
     )
 
 
+def _has_limitation(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    return text not in {"none", "no", "null", "אין", "ללא", "אין מגבלות"}
+
+
+def _is_limited_equipment(value: Any, location: Any) -> bool:
+    text = f"{value or ''} {location or ''}".lower()
+    if not text.strip():
+        return True
+    limited_tokens = ("home", "bodyweight", "dumbbell", "limited", "בית", "משקולות יד", "ללא ציוד")
+    full_tokens = ("full_gym", "gym", "חדר כושר", "מלא")
+    return any(token in text for token in limited_tokens) and not any(token in text for token in full_tokens)
+
+
+def _workout_strategy_score(
+    strategy: str,
+    facts: dict[str, dict[str, Any]],
+    *,
+    minutes: int,
+    frequency: int,
+) -> tuple[float, list[str], list[str], list[str]]:
+    """Score a compatible workout structure from confirmed planning facts."""
+    goal = str(_fact_value(facts, "primary_goal", "") or "")
+    experience = str(_fact_value(facts, "strength_experience", "beginner") or "beginner").lower()
+    location = _fact_value(facts, "training_location")
+    equipment = _fact_value(facts, "equipment")
+    limitations = _fact_value(facts, "training_limitations") or _fact_value(facts, "active_pain")
+    limited_equipment = _is_limited_equipment(equipment, location)
+    has_limitation = _has_limitation(limitations)
+
+    scores = {
+        "consistency": 0.84,
+        "balanced": 0.86,
+        "performance": 0.80,
+    }
+    rationale: dict[str, list[str]] = {
+        "consistency": [f"שומר על כל {frequency} ימי האימון המאושרים עם עומס פשוט יותר"],
+        "balanced": [f"תואם את {frequency} ימי האימון המאושרים ומחלק עומס/התאוששות באופן מאוזן"],
+        "performance": [f"תואם את {frequency} ימי האימון המאושרים עם יותר נפח ודגש התקדמות"],
+    }
+    tradeoffs: dict[str, list[str]] = {
+        "consistency": ["פחות התמחות לכל קבוצת שריר בכל אימון"],
+        "balanced": ["דורש לעמוד ברוב חלונות האימון כדי לשמור על איזון השבוע"],
+        "performance": ["דורש יותר התאוששות ודיוק בביצוע"],
+    }
+    fit_reasons: list[str] = []
+
+    if goal in {"fat_loss_muscle_retention", "fat_loss", "general_fitness"}:
+        scores["consistency"] += 0.08
+        scores["balanced"] += 0.03
+        rationale["consistency"].append("מתאים לשימור שגרה ושריפת אנרגיה בלי להעמיס מדי")
+        fit_reasons.append("goal_prefers_adherence")
+    elif goal in {"muscle_gain", "strength"}:
+        scores["performance"] += 0.12
+        scores["balanced"] += 0.02
+        rationale["performance"].append("המטרה דורשת יותר הזדמנויות לנפח/עומס מתקדם")
+        fit_reasons.append("goal_prefers_progression")
+    elif goal == "general_health":
+        scores["balanced"] += 0.07
+        fit_reasons.append("goal_prefers_balance")
+
+    if minutes < 45:
+        scores["consistency"] += 0.07
+        scores["performance"] -= 0.08
+        rationale["consistency"].append(f"מתאים לחלונות קצרים של {minutes} דקות")
+        tradeoffs["performance"].append(f"פחות מתאים ל-{minutes} דקות כי הנפח צפוף יותר")
+        fit_reasons.append("short_sessions")
+    elif minutes >= 60:
+        scores["performance"] += 0.05
+        scores["balanced"] += 0.03
+        rationale["performance"].append(f"יש מספיק זמן לאימון של {minutes} דקות")
+        fit_reasons.append("long_sessions")
+
+    if experience in {"beginner", "novice", "מתחיל"}:
+        scores["consistency"] += 0.06
+        scores["performance"] -= 0.08
+        rationale["consistency"].append("מתאים יותר לשלב שבו הטכניקה וההתמדה קודמות לנפח")
+        fit_reasons.append("beginner")
+    elif experience in {"advanced", "expert", "מתקדם"}:
+        scores["performance"] += 0.06
+        rationale["performance"].append("מתאים למתאמן מתקדם שיכול להתאושש מנפח גבוה יותר")
+        fit_reasons.append("advanced")
+
+    if has_limitation:
+        scores["performance"] -= 0.08
+        scores["consistency"] += 0.04
+        tradeoffs["performance"].append("פחות מתאים כשיש כאב/מגבלה פעילה")
+        fit_reasons.append("limitations")
+    if limited_equipment:
+        scores["performance"] -= 0.05
+        scores["consistency"] += 0.03
+        tradeoffs["performance"].append("דורש ציוד וגיוון גבוהים יותר")
+        fit_reasons.append("limited_equipment")
+
+    score = round(max(0.0, min(1.0, scores.get(strategy, 0.75))), 2)
+    return (
+        score,
+        rationale.get(strategy, []),
+        tradeoffs.get(strategy, []),
+        fit_reasons,
+    )
+
+
 async def build_workout_candidates(db: Any, user_id: int) -> list[PlanCandidate]:
     await _require_readiness(db, user_id, "workout")
     await _require_readiness(db, user_id, "safety")
@@ -1015,15 +1120,28 @@ async def build_workout_candidates(db: Any, user_id: int) -> list[PlanCandidate]
         "resolved_preferred_days": avail.preferred_days,
         "resolved_preferred_time": avail.preferred_time,
     }
+    strategy_inputs = {
+        strategy: _workout_strategy_score(
+            strategy,
+            facts,
+            minutes=avail.session_minutes,
+            frequency=frequency,
+        )
+        for strategy, frequency in {
+            "consistency": consistency_freq,
+            "balanced": desired,
+            "performance": performance_freq,
+        }.items()
+    }
     return [
         _workout_candidate(
             ("Full Body מותאם" if desired >= 4 else "מקסימום עקביות"),
             "consistency",
             consistency_freq,
             facts,
-            score=0.9,
-            rationale=["פחות אימונים", "גרסאות קצרות מובנות", "סיכוי גבוה להתמדה"],
-            tradeoffs=["נפח שבועי מתון יותר", "פחות התמחות בכל קבוצת שריר"],
+            score=strategy_inputs["consistency"][0],
+            rationale=strategy_inputs["consistency"][1],
+            tradeoffs=strategy_inputs["consistency"][2],
             **_avail_kwargs,
         ),
         _workout_candidate(
@@ -1031,9 +1149,9 @@ async def build_workout_candidates(db: Any, user_id: int) -> list[PlanCandidate]
             "balanced",
             desired,
             facts,
-            score=0.92,
-            rationale=["תואמת את התדירות שביקשת", "איזון בין נפח להתאוששות", "שומרת חלופות למכשיר תפוס"],
-            tradeoffs=["דורשת לעמוד ברוב חלונות האימון"],
+            score=strategy_inputs["balanced"][0],
+            rationale=strategy_inputs["balanced"][1],
+            tradeoffs=strategy_inputs["balanced"][2],
             **_avail_kwargs,
         ),
         _workout_candidate(
@@ -1041,9 +1159,9 @@ async def build_workout_candidates(db: Any, user_id: int) -> list[PlanCandidate]
             "performance",
             performance_freq,
             facts,
-            score=0.82 if performance_freq > desired else 0.86,
-            rationale=["יותר הזדמנויות לתרגול ולהתקדמות", "נפח גבוה יותר למשתמש מתאים"],
-            tradeoffs=["דורשת יותר זמן והתאוששות", "פחות מתאימה לשבוע עמוס"],
+            score=strategy_inputs["performance"][0],
+            rationale=strategy_inputs["performance"][1],
+            tradeoffs=strategy_inputs["performance"][2],
             **_avail_kwargs,
         ),
     ]
