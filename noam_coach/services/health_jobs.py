@@ -126,13 +126,14 @@ from noam_coach.services.nutrition_context import (
 )
 from noam_coach.services.weekdays import (
     WEEKDAY_SCHEMA_VERSION,
+    local_weekday,
     normalize_weekday,
     sunday_first_order,
     weekday_labels_he,
     with_weekday_schema,
 )
 
-RUNTIME_NAMES = ('Any', 'CallbackContext', 'ContextTypes', 'DB', 'Exception', 'InlineKeyboardButton', 'InlineKeyboardMarkup', 'JOB_PRIORITY_COACHING', 'JOB_PRIORITY_HIGH', 'JOB_PRIORITY_LOW', 'JOB_PRIORITY_SCHEDULED', 'LOGGER', 'OPENAI_CLIENT', 'ParseMode', 'Path', 'RuntimeError', 'SETTINGS', 'TZ', 'Update', 'ValueError', '_ctx_has_workout', '_data_quality_disclaimer', 'abs', 'action', 'actual_bytes', 'any', 'asyncio', 'at', 'bool', 'build_daily_context', 'build_evening_summary_text', 'build_morning_menu_text', 'build_next_meal_text', 'button', 'context', 'conversation', 'ctx', 'current_flow', 'datetime', 'deliver_proactive_message', 'document', 'duplicates', 'ensure_user', 'enumerate', 'esc', 'exc', 'extract_dir', 'fasting_negated', 'flags', 'float', 'folder', 'format_evening_summary', 'format_morning_menu', 'format_next_meals', 'fraction_used', 'friendly_error', 'get_daily_flags', 'health_import', 'hh', 'hhmm', 'hint', 'hour', 'idx', 'inserted', 'insights', 'int', 'is_allowed', 'items', 'job_calorie_watch', 'job_evening', 'job_morning', 'job_motivation', 'keyboard', 'known_medications', 'learned', 'learned_block', 'lines', 'list', 'load_routine_profile', 'local_day_str', 'lowered', 'max_bytes', 'med', 'meds', 'menu', 'message', 'mm', 'moment', 'morning_checkin_keyboard', 'name', 'near', 'notify_admin', 'now', 'onboarding', 'parse_to_rows', 'profile', 'progress', 'random', 're', 'recommendations', 'reconcile', 'resumed', 'ritalin_negated', 'route_decision', 'rows', 'run_post_import_reconciliation', 'save_routine_profile', 'saved_path', 'secrets', 'send_checkin', 'send_menu', 'send_motivation', 'send_nudge', 'send_overpace', 'send_summary', 'send_to_user', 'sent', 'set_daily_flags', 'show_onboarding_basics', 'shutil', 'sleep', 'snack_hours', 'str', 'suffix', 'suggestion', 'summary', 'suppress', 'sync_health_measurements_to_facts', 'target', 'target_cal', 'telegram_file', 'text', 'today_meal_items', 'top', 'track_event', 'tuple', 'update', 'upsert_health_rows', 'user_id', 'user_model', 'value', 'weekly', 'window', 'workout', 'workout_hour', 'write_audit', 'x', 'xml_path')
+RUNTIME_NAMES = ('Any', 'CallbackContext', 'ContextTypes', 'DB', 'Exception', 'InlineKeyboardButton', 'InlineKeyboardMarkup', 'JOB_PRIORITY_COACHING', 'JOB_PRIORITY_HIGH', 'JOB_PRIORITY_LOW', 'JOB_PRIORITY_SCHEDULED', 'LOGGER', 'OPENAI_CLIENT', 'ParseMode', 'Path', 'RuntimeError', 'SETTINGS', 'TZ', 'Update', 'ValueError', '_ctx_has_workout', '_data_quality_disclaimer', 'abs', 'action', 'actual_bytes', 'any', 'asyncio', 'at', 'bool', 'build_daily_context', 'build_evening_summary_text', 'build_morning_briefing_text', 'build_morning_menu_text', 'build_next_meal_text', 'button', 'context', 'conversation', 'ctx', 'current_flow', 'datetime', 'deliver_proactive_message', 'document', 'duplicates', 'ensure_user', 'enumerate', 'esc', 'exc', 'extract_dir', 'fasting_negated', 'flags', 'float', 'folder', 'format_evening_summary', 'format_morning_menu', 'format_next_meals', 'fraction_used', 'friendly_error', 'get_daily_flags', 'health_import', 'hh', 'hhmm', 'hint', 'hour', 'idx', 'inserted', 'insights', 'int', 'is_allowed', 'items', 'job_calorie_watch', 'job_evening', 'job_morning', 'job_motivation', 'keyboard', 'known_medications', 'learned', 'learned_block', 'lines', 'list', 'load_routine_profile', 'local_day_str', 'lowered', 'max_bytes', 'med', 'meds', 'menu', 'message', 'mm', 'moment', 'morning_checkin_keyboard', 'name', 'near', 'notify_admin', 'now', 'onboarding', 'parse_to_rows', 'profile', 'progress', 'random', 're', 'recommendations', 'reconcile', 'resumed', 'ritalin_negated', 'route_decision', 'rows', 'run_post_import_reconciliation', 'save_routine_profile', 'saved_path', 'secrets', 'send_checkin', 'send_menu', 'send_motivation', 'send_nudge', 'send_overpace', 'send_summary', 'send_to_user', 'sent', 'set_daily_flags', 'show_onboarding_basics', 'shutil', 'sleep', 'snack_hours', 'str', 'suffix', 'suggestion', 'summary', 'suppress', 'sync_health_measurements_to_facts', 'target', 'target_cal', 'telegram_file', 'text', 'today_meal_items', 'top', 'track_event', 'tuple', 'update', 'upsert_health_rows', 'user_id', 'user_model', 'value', 'weekly', 'window', 'workout', 'workout_hour', 'write_audit', 'x', 'xml_path')
 
 
 @dataclass(frozen=True)
@@ -2432,6 +2433,81 @@ async def build_morning_menu_text(user_id: int, ctx: "DailyContext | None" = Non
             strategy=(active_plan or {}).get("strategy"),
             source="build_morning_menu_text",
         )
+    return text
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def _todays_workout_time(user_id: int, now: datetime) -> str | None:
+    """Resolve today's day-specific workout time from the active workout plan.
+
+    TASK-16/14: the morning briefing must show the *actual* time for today's
+    weekday (e.g. a Friday morning slot), not one global typical hour.  Falls
+    back to ``None`` when the plan has no session for today.
+    """
+    with suppress(Exception):
+        plan = await planning.get_active_plan(DB, user_id, "workout")
+        sessions = ((plan or {}).get("payload") or {}).get("sessions") or []
+        today = local_weekday(now)
+        candidates = [s for s in sessions if int(s.get("weekday", -1)) == today]
+        if candidates:
+            chosen = sorted(candidates, key=lambda s: str(s.get("time") or "23:59"))[0]
+            value = str(chosen.get("time") or "").strip()[:5]
+            if value and value[2:3] == ":":
+                return value
+    return None
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def build_morning_briefing_text(user_id: int, ctx: "DailyContext | None" = None) -> str:
+    """Return the short morning-update briefing (TASK-16).
+
+    ``menu:morning`` (☀️ עדכון בוקר) is a short current-day briefing — NOT the
+    full pinnable daily menu (``menu:daily_menu`` → ``build_morning_menu_text``).
+    It summarises today's weekday, remaining calorie/protein budget, today's
+    workout status using the day-specific workout time, one or two immediate
+    priorities, and points the user to the focused next action.  It never
+    re-sends the full active menu.
+    """
+    if ctx is None:
+        ctx = await build_daily_context(user_id)
+
+    weekday_label = weekday_labels_he([local_weekday(ctx.now)])
+    workout_time = await _todays_workout_time(user_id, ctx.now)
+    is_workout_day = ctx.is_usual_workout_day or bool(workout_time)
+
+    # Resolve an explicit workout status line + the immediate priority.
+    if ctx.workout_completed:
+        workout_line = "🏋️ האימון של היום כבר תועד כבוצע"
+        priority = "המשך היום מתמקד בהתאוששות ובהשלמת חלבון."
+    elif ctx.workout_active:
+        workout_line = "🏋️ אימון פעיל עכשיו"
+        priority = "אחרי האימון כדאי להשלים חלבון ופחמימה."
+    elif is_workout_day and workout_time:
+        morning_workout = int(workout_time[:2]) < 12
+        workout_line = f"🏋️ מתוכנן היום אימון בשעה {workout_time}"
+        if morning_workout:
+            priority = "לפני אימון בוקר עדיף משהו קל לעיכול; ראה 'מה לאכול עכשיו'."
+        else:
+            priority = "האימון מאוחר יותר — אכול מאוזן ושמור מספיק קלוריות וחלבון לסביבת האימון."
+    elif is_workout_day:
+        workout_line = "🏋️ יום אימון (השעה עדיין לא נקבעה)"
+        priority = "כשתדע מתי האימון, בנה סביבו את הארוחות; בינתיים אכול מאוזן."
+    else:
+        workout_line = "🌿 היום ללא אימון מתוכנן"
+        priority = "התמקד בחלבון, בתקציב הקלורי ובפעילות כללית לאורך היום."
+
+    lines = [
+        f"<b>☀️ עדכון בוקר — {esc(weekday_label)}</b>",
+        "",
+        f"🔥 נשארו {ctx.calories_remaining:.0f} קל׳ מתוך {ctx.calorie_target:.0f}",
+        f"🥩 נשארו {ctx.protein_remaining:.0f} ג׳ חלבון מתוך {ctx.protein_target:.0f}",
+        workout_line,
+        "",
+        "<b>עדיפות עכשיו</b>",
+        f"• {priority}",
+    ]
+    text = "\n".join(lines)
+    text += _data_quality_disclaimer(ctx)
     return text
 
 

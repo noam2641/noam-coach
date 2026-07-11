@@ -58,38 +58,55 @@ class _FakeQuery:
         del text, show_alert
 
 
-def test_free_text_help_keyboard_uses_menu_morning_not_menu_today() -> None:
-    """The '📋 תפריט היום' button in the free-text help keyboard must emit
-    "menu:morning" — the callback that is actually handled — not the
-    orphaned "menu:today"."""
+def test_free_text_help_keyboard_uses_daily_menu_not_menu_today() -> None:
+    """The '📋 תפריט היום' button in the free-text help keyboard must emit the
+    full daily-menu callback "menu:daily_menu" — not the orphaned "menu:today"
+    and not "menu:morning" (which is now the short morning briefing, TASK-16)."""
     from noam_coach.bot import assistant as assistant_bot
 
     src = Path(assistant_bot.__file__).read_text(encoding="utf-8")
-    assert '"📋 תפריט היום", "menu:morning"' in src
+    assert '"📋 תפריט היום", "menu:daily_menu"' in src
     assert '"📋 תפריט היום", "menu:today"' not in src
+    assert '"📋 תפריט היום", "menu:morning"' not in src
 
 
 @pytest.mark.asyncio
-async def test_menu_morning_is_handled(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_build_morning_menu_text(_user_id: int) -> str:
-        return "התפריט של היום"
+async def test_menu_morning_renders_short_briefing_not_full_menu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TASK-16: "menu:morning" (☀️ עדכון בוקר) must render the dedicated short
+    briefing (build_morning_briefing_text) and must NOT call the full daily
+    menu builder (build_morning_menu_text)."""
 
-    # callback_menu.py reads this name via the runtime_bound facade sync,
-    # which copies it from coach_bot before each call — patch the source.
-    monkeypatch.setattr(coach_bot, "build_morning_menu_text", fake_build_morning_menu_text)
+    async def fake_briefing(_user_id: int, _ctx: Any = None) -> str:
+        return "עדכון בוקר קצר"
+
+    async def fail_full_menu(_user_id: int, _ctx: Any = None) -> str:
+        raise AssertionError("menu:morning must not render the full daily menu")
+
+    monkeypatch.setattr(coach_bot, "build_morning_briefing_text", fake_briefing)
+    monkeypatch.setattr(coach_bot, "build_morning_menu_text", fail_full_menu)
     query = _FakeQuery()
     handled = await callback_menu_bot.handle_menu_callback(query, 1, "menu:morning")
     assert handled is True
-    assert query.messages[-1] == "התפריט של היום"
+    assert query.messages[-1] == "עדכון בוקר קצר"
+    # Focused next-action buttons, not a full menu keyboard.
+    labels = [
+        btn.text
+        for row in (query.reply_markups[-1].inline_keyboard if query.reply_markups[-1] else [])
+        for btn in row
+    ]
+    assert any("מה לאכול עכשיו" in label for label in labels)
+    assert any("מצב היום" in label for label in labels)
 
 
 @pytest.mark.asyncio
-async def test_menu_today_is_handled_as_legacy_alias_for_menu_morning(
+async def test_menu_today_is_legacy_alias_for_full_daily_menu(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A stale keyboard already on-screen in an existing chat may still send
-    "menu:today". It must render the same daily menu as "menu:morning", not
-    silently do nothing."""
+    """A stale keyboard already on-screen may still send "menu:today". It must
+    render the full daily menu (same as menu:daily_menu), not the briefing and
+    not a silent no-op."""
     async def fake_build_morning_menu_text(_user_id: int) -> str:
         return "התפריט של היום"
 

@@ -664,7 +664,7 @@ async def _send_free_text_help(ctx: FreeTextContext) -> None:
         '"מה לאכול עכשיו" / "המשקל שלי 89" / "כואבת לי הברך"',
         InlineKeyboardMarkup(
             [
-                [button("📋 תפריט היום", "menu:morning"), button("🏋️ אימון", "menu:workout")],
+                [button("📋 תפריט היום", "menu:daily_menu"), button("🏋️ אימון", "menu:workout")],
                 [button("📊 סיכום יומי", "menu:status"), button("📅 תוכנית", "menu:plan")],
                 [button("👤 פרופיל", "menu:profile"), button("📈 שבועי", "menu:weekly")],
             ]

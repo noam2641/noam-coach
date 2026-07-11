@@ -68,12 +68,15 @@ def test_task04_task14_meal_state_and_short_post_meal_status_are_connected() -> 
 
 def test_task05_task06_daily_menu_has_one_canonical_route_and_standalone_text() -> None:
     menu = src("noam_coach/bot/callback_menu.py")
-    assert '("menu:morning", "menu:today", "menu:daily_menu", "menu:refresh_daily_menu"' in menu
+    # TASK-16: menu:morning is now the short briefing branch; the full daily
+    # menu is served by menu:today / menu:daily_menu / menu:refresh_daily_menu.
+    assert '("menu:today", "menu:daily_menu", "menu:refresh_daily_menu"' in menu
     assert "build_morning_menu_text" in menu
+    assert "build_morning_briefing_text" in menu
     assert "menu:replace_daily_meal" in menu
     ui = src("noam_coach/bot/ui.py")
     assert "menu:daily_menu" in ui
-    assert "menu:morning" in ui  # backward compatibility for older tests/buttons
+    assert "menu:morning" in ui  # ☀️ עדכון בוקר — short briefing button
     runtime = src("noam_coach/app/runtime.py")
     health_jobs = src("noam_coach/services/health_jobs.py")
     daily_menu_state = src("noam_coach/services/daily_menu_state.py")
