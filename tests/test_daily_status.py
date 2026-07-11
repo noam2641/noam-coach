@@ -41,9 +41,8 @@ async def test_daily_status_lists_meals_and_completeness(tmp_path, monkeypatch) 
     )
     text = await coach_bot.build_daily_status(1)
     assert "ביצים" in text  # the composing meal is listed
-    assert "דווחו" in text  # meal-count line present
-    # The total is explicitly framed as "reported only", not a complete day.
-    assert "שדווחו בלבד" in text
+    # TASK-13: logged meals appear under the concise "נאכל היום" section.
+    assert "נאכל היום" in text
 
 
 @pytest.mark.asyncio

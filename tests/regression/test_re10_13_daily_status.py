@@ -84,19 +84,27 @@ async def test_shows_remaining_calories_and_protein(tmp_path: Path, monkeypatch:
     await _log_meal(db, "ארוחת צהריים", 400, 30)
 
     text = await coach_bot.build_daily_status(1)
-    assert "נשארו לך היום" in text
+    # TASK-13: remaining shown once under a "נשאר" heading.
+    assert "נשאר" in text
     assert "1700" in text or "1,700" in text  # 2100 - 400
     assert "165" in text  # 195 - 30
+    # No duplicate "remaining" heading blocks.
+    assert text.count("<b>נשאר:</b>") == 1
 
 
 @pytest.mark.asyncio
-async def test_shows_hours_until_sleep(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_daily_status_has_concise_sections(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # TASK-13: concise dashboard sections, no internal explanations.
     db = await _db_with_user(tmp_path, monkeypatch)
     await _approve_goal(db)
     await _log_meal(db, "ארוחה", 300, 20)
 
     text = await coach_bot.build_daily_status(1)
-    assert "עד שינה" in text
+    assert "מצב היום" in text
+    assert "נאכל היום" in text
+    # No internal engine explanation text.
+    assert "הקלוריות והחלבון לפי היתרה שנותרה" not in text
+    assert "מקור היעד" not in text
 
 
 @pytest.mark.asyncio
@@ -118,7 +126,8 @@ async def test_remaining_slots_section_respects_hard_cap(tmp_path: Path, monkeyp
     await _log_meal(db, "ארוחת בוקר", 300, 20)
 
     text = await coach_bot.build_daily_status(1)
-    assert "ארוחות עד סוף היום" in text
+    # TASK-13: the rest-of-day plan lives under "המשך היום".
+    assert "המשך היום" in text
 
 
 @pytest.mark.asyncio
@@ -130,9 +139,9 @@ async def test_meal_list_still_shown_and_framed_as_reported_only(
     await _log_meal(db, "פסטה", 500, 15)
 
     text = await coach_bot.build_daily_status(1)
+    # TASK-13: logged meals appear concisely under "נאכל היום".
     assert "פסטה" in text
-    assert "דווחו" in text
-    assert "שדווחו בלבד" in text
+    assert "נאכל היום" in text
 
 
 @pytest.mark.asyncio
@@ -147,11 +156,14 @@ async def test_goal_source_is_explicit_without_meals(
 
 
 @pytest.mark.asyncio
-async def test_goal_source_shows_user_approved_with_meals(
+async def test_daily_status_with_meals_has_no_internal_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # TASK-13: the with-meals dashboard does not expose internal goal-source
+    # metadata; it is a clean status view.
     db = await _db_with_user(tmp_path, monkeypatch)
     await _approve_goal(db)
     await _log_meal(db, "ביצים", 300, 20)
     text = await coach_bot.build_daily_status(1)
-    assert "מקור היעד: יעד שאישרת" in text
+    assert "מקור היעד" not in text
+    assert "מצב היום" in text

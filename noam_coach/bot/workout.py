@@ -168,76 +168,76 @@ async def build_daily_status(user_id: int) -> str:
     context = await build_nutrition_context(DB, user_id, "daily_status")
     workout_context = await build_workout_nutrition_context(DB, user_id)
 
+    # TASK-13: a concise dashboard — current state, what happened, next action.
+    # Remaining calories/protein appear exactly ONCE; no duplicate workout
+    # status, no duplicate next-meal planning sections, no internal engine text.
+    goal_note = " <i>(יעד זמני)</i>" if provisional else ""
+
+    # 1) State — consumed / target / remaining, once.
+    now_label = context.current_local_time[11:16] if len(context.current_local_time) >= 16 else ""
+    lines[0] = f"<b>📊 מצב היום</b>{(' — ' + now_label) if now_label else ''}"
+    lines.append(
+        f"{context.consumed_calories:.0f} / {goal['calories']} קל׳{goal_note}"
+    )
+    lines.append(f"{context.consumed_protein:.0f} / {goal['protein']} ג׳ חלבון")
     cal_remaining = context.remaining_calories
     prot_remaining = context.remaining_protein
-    goal_note = " <i>(יעד זמני — עוד לא אושר)</i>" if provisional else ""
-
-    if cal_remaining is None:
-        cal_line = "לא ניתן לחשב יתרה (אין יעד פעיל)."
-    elif cal_remaining >= 0:
-        cal_line = f"נשארו לך היום <b>{cal_remaining:.0f}</b> קלוריות"
-    else:
-        cal_line = f"חריגה של <b>{abs(cal_remaining):.0f}</b> קלוריות מעל היעד"
-
-    if prot_remaining is not None:
-        if prot_remaining >= 0:
-            cal_line += f" ו-<b>{prot_remaining:.0f}</b> גרם חלבון{goal_note}."
+    if cal_remaining is not None and prot_remaining is not None:
+        lines.append("")
+        lines.append("<b>נשאר:</b>")
+        if cal_remaining >= 0:
+            lines.append(f"{cal_remaining:.0f} קל׳")
         else:
-            cal_line += f", וחריגה של <b>{abs(prot_remaining):.0f}</b> גרם חלבון מעל היעד{goal_note}."
-    else:
-        cal_line += f"{goal_note}."
+            lines.append(f"חריגה של {abs(cal_remaining):.0f} קל׳")
+        if prot_remaining >= 0:
+            lines.append(f"{prot_remaining:.0f} ג׳ חלבון")
+        else:
+            lines.append(f"חריגה של {abs(prot_remaining):.0f} ג׳ חלבון")
 
-    lines.append(cal_line)
-    lines.append(f"<i>{_goal_source_line(goal)}</i>")
-
-    if context.hours_until_sleep is not None:
-        bedtime_line = f"עד שינה נשאר כ-{context.hours_until_sleep:.1f} שעות."
-        lines.append(bedtime_line)
-
-    # RE10-13: "planned workout that has not been reported" gets a single,
-    # explicit assumption line — never silently assumed without saying so.
-    workout_assumed_pre = (
-        workout_context.workout_source == "active_workout_plan"
-        and workout_context.workout_phase.value.startswith("pre_workout")
-    )
-    if workout_assumed_pre:
-        lines.append("תוכנן אימון היום שעדיין לא דווח — אניח שאתה לפני אימון.")
-
+    # 2) What happened — logged meals, concisely.
     lines.append("")
-    lines.append(f"דווחו <b>{meal_count}</b> ארוחות היום:")
-    lines.extend(
-        f"• {esc(m['name'])} — {float(m['calories']):.0f} קק\"ל, {float(m['protein']):.0f}ג׳ חלבון"
-        for m in meals
-    )
-    lines.append("<i>הסכום שדווחו בלבד — ייתכן שאכלת עוד.</i>")
+    lines.append("<b>🍽️ נאכל היום</b>")
+    for m in meals:
+        lines.append(f"• {esc(m['name'])}")
+        lines.append(f"{float(m['calories']):.0f} קל׳ | {float(m['protein']):.0f} ג׳ חלבון")
+
+    # 3) Rest of the day — only meaningful chronological next events, without a
+    # duplicated macro block or internal explanation.
+    from noam_coach.services.next_meal import _hhmm_from_iso
 
     allocations = build_remaining_slot_allocations(workout_context)
-    if allocations:
+    timeline: list[tuple[str, str]] = []
+    phase = workout_context.workout_phase.value
+    if phase.startswith("pre_workout") or (
+        phase == "rest_day" and workout_context.minutes_until_workout not in (None, 0)
+    ):
+        wk = _hhmm_from_iso(workout_context.planned_workout_start)
+        if wk:
+            timeline.append((wk, f"🏋️ {esc(wk)} אימון"))
+    for allocation in allocations:
+        time_hint = allocation.time_hint or ""
+        prefix = f"{esc(time_hint)} · " if time_hint else ""
+        timeline.append((
+            time_hint or "99:99",
+            f"🍽️ {prefix}{esc(allocation.label)} — כ-{allocation.calories} קל׳ | כ-{allocation.protein} ג׳ חלבון",
+        ))
+    if timeline:
+        timeline.sort(key=lambda item: item[0])
         lines.append("")
-        lines.append("<b>ארוחות עד סוף היום:</b>")
-        for allocation in allocations:
-            if allocation.is_night_meal:
-                lines.append(f"{esc(allocation.label)} — כ-{allocation.calories} קל'")
-            else:
-                lines.append(
-                    f"{esc(allocation.label)} — כ-{allocation.calories} קל' | כ-{allocation.protein} גרם חלבון"
-                )
-        lines.append("<i>(הקלוריות והחלבון לפי היתרה שנותרה, ומתעדכנים ככל שמדווחים ארוחות)</i>")
+        lines.append("<b>⏱️ המשך היום</b>")
+        lines.extend(text for _t, text in timeline)
 
+    # 4) One actionable recommendation — the immediate meal title + macros only,
+    # not the full next-meal screen (which repeats state/timeline).
     try:
         recommendation = await generate_next_meal_recommendation(DB, user_id)
     except Exception:  # noqa: BLE001 - the day summary must render even if the recommender fails
         recommendation = None
     if recommendation is not None and recommendation.options:
-        from noam_coach.services.next_meal import format_next_meal_recommendation
-
+        option = recommendation.options[0]
         lines.append("")
-        lines.append("<b>הארוחה הבאה שלך:</b>")
-        lines.append(format_next_meal_recommendation(recommendation))
-
-    if provisional:
-        lines.append("")
-        lines.append("<i>היעד זמני כי עדיין חסר אישור סופי — אפשר לאשר דרך \"יעדים\".</i>")
+        lines.append("<b>🍽️ מומלץ עכשיו</b>")
+        lines.append(f"{esc(option.title)} — כ-{option.calories} קל׳ | כ-{option.protein} ג׳ חלבון")
 
     return "\n".join(lines)
 
@@ -304,10 +304,16 @@ async def render_post_meal_confirmation_day_status(user_id: int, totals: dict[st
     events: list[tuple[str, str]] = []
     status_line: str | None = None
     if workout_context is not None:
-        # A future workout appears in the timeline at its scheduled time; a
-        # completed/uncertain one is surfaced via the status line, not as a
-        # future event.
-        if workout_context.workout_phase.value.startswith("pre_workout"):
+        # A future workout appears in the timeline at its scheduled time, even
+        # when it is many hours away (so it is not the immediate meal context);
+        # a completed/uncertain one is surfaced via the status line, not as a
+        # future event. TASK-11/12.
+        phase = workout_context.workout_phase.value
+        future_workout = (
+            phase.startswith("pre_workout")
+            or (phase == "rest_day" and workout_context.minutes_until_workout not in (None, 0))
+        )
+        if future_workout:
             workout_hhmm = _hhmm_from_iso(workout_context.planned_workout_start)
             if workout_hhmm:
                 events.append((workout_hhmm, f"🏋️ {esc(workout_hhmm)} אימון"))
