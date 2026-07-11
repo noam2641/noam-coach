@@ -25,16 +25,11 @@ ROOT = Path(__file__).resolve().parents[1]
 ALLOWED_FILES = (
     "README.md",
     "CHANGELOG.md",
-    "MANIFEST.md",
-    "IMPLEMENTATION_STATUS.md",
-    "PROJECT_STATE.md",
-    "VALIDATION_REPORT.md",
-    "CLAUDE_AUDIT_RE7_COMMIT_678A160.md",
-    "CODEX_AUDIT_AFTER_CLAUDE_678A160.md",
     "ENVIRONMENT_VARIABLES.md",
     "SECURITY.md",
-    "REBUILD_REPORT.md",
-    "PROJECT_TREE.txt",
+    # MANIFEST.md, IMPLEMENTATION_STATUS.md, PROJECT_STATE.md, VALIDATION_REPORT.md,
+    # REBUILD_REPORT.md, PROJECT_TREE.txt and the CLAUDE/CODEX audit reports moved
+    # under docs/ (audits/, reports/, archive/) and ship via the docs/ directory.
     "VERSION",
     "Makefile",
     "pyproject.toml",
@@ -71,6 +66,7 @@ FORBIDDEN_GLOBS = (
     "*.pyc", "*.pyo", "*.log", "*.zip", "*.mht",
     ".env", ".env.*",
     "*.png", "*.jpg", "*.jpeg", "*.gif", "*.mp4", "*.mov",
+    "*.docx",  # personal QA screen recordings must never ship
 )
 
 # A path is dropped if any of its parts is one of these.
