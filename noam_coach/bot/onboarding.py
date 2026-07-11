@@ -639,6 +639,10 @@ async def ask_next_plan_completion_question(
                 await render_goal_proposal(target, user_id)
                 return True
         await clear_flow_state(user_id, PLAN_COMPLETION_FLOW)
+        from noam_coach.bot.callback_plans import resume_pending_plan_action
+
+        if await resume_pending_plan_action(target, user_id):
+            return True
         await render_plan_completion_done(target, user_id, plan_type)
         return False
     await set_flow_state(

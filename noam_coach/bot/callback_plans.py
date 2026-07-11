@@ -111,16 +111,34 @@ RUNTIME_NAMES = ('APP_VERSION', 'Any', 'CALLBACK_DEBOUNCE_SECONDS', 'CONFIRM_PEN
 
 PENDING_PLAN_ACTION_FLOW = "pending_plan_action"
 PENDING_PLAN_GENERATE_STEP = "generate_candidates"
+PENDING_CALLBACK_STEP = "callback"
 
 
 async def _set_pending_plan_action(user_id: int, plan_type: str) -> None:
     from noam_coach.bot.onboarding import set_flow_state
 
+    callback_data = f"planv2:generate:{plan_type}"
     await set_flow_state(
         user_id,
         PENDING_PLAN_ACTION_FLOW,
         PENDING_PLAN_GENERATE_STEP,
-        {"plan_type": plan_type},
+        {"plan_type": plan_type, "callback_data": callback_data},
+    )
+
+
+async def set_pending_callback_action(
+    user_id: int,
+    callback_data: str,
+    *,
+    plan_type: str | None = None,
+) -> None:
+    from noam_coach.bot.onboarding import set_flow_state
+
+    await set_flow_state(
+        user_id,
+        PENDING_PLAN_ACTION_FLOW,
+        PENDING_CALLBACK_STEP,
+        {"callback_data": callback_data, "plan_type": plan_type},
     )
 
 
@@ -128,6 +146,35 @@ async def _clear_pending_plan_action(user_id: int) -> None:
     from noam_coach.bot.onboarding import clear_flow_state
 
     await clear_flow_state(user_id, PENDING_PLAN_ACTION_FLOW)
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def render_prerequisite_completion_prompt(
+    query: Any,
+    user_id: int,
+    *,
+    callback_data: str,
+    plan_type: str | None,
+    missing: list[str],
+    title: str,
+) -> None:
+    await set_pending_callback_action(user_id, callback_data, plan_type=plan_type)
+    missing_display = [
+        planning.FACT_LABELS.get(key)
+        or user_model.display_label(key)
+        or str(key)
+        for key in missing
+    ]
+    lines = [f"<b>{esc(title)}</b>"]
+    if missing_display:
+        lines.append("")
+        lines.extend(f"• {esc(label)}" for label in missing_display)
+    rows = [
+        [button("▶️ השלם עכשיו", f"planv2:complete_missing:{plan_type}" if plan_type else "planv2:complete_missing")],
+        [button("⏳ אשלים אחר כך", "menu:smartplan")],
+        [button("⬅️ חזרה לתוכניות", "menu:smartplan")],
+    ]
+    await safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
 @runtime_bound(RUNTIME_NAMES)
@@ -162,10 +209,35 @@ async def resume_pending_plan_action(query: Any, user_id: int) -> bool:
     from noam_coach.bot.onboarding import get_flow_state
 
     state = await get_flow_state(user_id, PENDING_PLAN_ACTION_FLOW)
-    if not state or state.get("step") != PENDING_PLAN_GENERATE_STEP:
+    if not state or state.get("step") not in {PENDING_PLAN_GENERATE_STEP, PENDING_CALLBACK_STEP}:
         return False
     payload = state.get("payload") or {}
     plan_type = str(payload.get("plan_type") or "")
+    callback_data = str(payload.get("callback_data") or "")
+    original_updated_at = state.get("updated_at")
+    if not callback_data and plan_type in {"nutrition", "workout"}:
+        callback_data = f"planv2:generate:{plan_type}"
+
+    if callback_data in {"menu:daily_menu", "menu:refresh_daily_menu", "menu:nextmeal"}:
+        await safe_edit(query, "ממשיך מאיפה שעצרנו...", None)
+        from noam_coach.bot.callback_menu import handle_menu_callback
+
+        handled = await handle_menu_callback(query, user_id, callback_data)
+        if handled:
+            current = await get_flow_state(user_id, PENDING_PLAN_ACTION_FLOW)
+            current_payload = (current or {}).get("payload") or {}
+            if (
+                current
+                and current.get("step") == PENDING_CALLBACK_STEP
+                and current.get("updated_at") != original_updated_at
+                and current_payload.get("callback_data") == callback_data
+            ):
+                return True
+            await _clear_pending_plan_action(user_id)
+        return handled
+
+    if callback_data.startswith("planv2:generate:"):
+        plan_type = callback_data.split(":", 2)[2]
     if plan_type not in {"nutrition", "workout"}:
         await _clear_pending_plan_action(user_id)
         return False
@@ -597,6 +669,7 @@ async def handle_plan_callback(query: Any, user_id: int, data: str) -> bool:
             get_flow_state as get_plan_flow_state,
         )
 
+        await _clear_pending_plan_action(user_id)
         plan_flow = await get_plan_flow_state(user_id, PLAN_COMPLETION_FLOW)
         if plan_flow:
             await clear_plan_flow_state(user_id, PLAN_COMPLETION_FLOW)

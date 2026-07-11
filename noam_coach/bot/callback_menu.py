@@ -790,6 +790,24 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
         return True
 
     if data in ("menu:morning", "menu:today", "menu:daily_menu", "menu:refresh_daily_menu", "menu:nextmeal", "menu:evening"):
+        if data in {"menu:daily_menu", "menu:refresh_daily_menu", "menu:nextmeal"}:
+            readiness = await user_model.compute_readiness(DB, user_id, "nutrition")
+            needs_goal = await planning.active_goal(DB, user_id) is None
+            if not readiness["ready"] or needs_goal:
+                missing = list(readiness.get("missing", []))
+                if needs_goal and "active_goal" not in missing:
+                    missing.append("active_goal")
+                from noam_coach.bot.callback_plans import render_prerequisite_completion_prompt
+
+                await render_prerequisite_completion_prompt(
+                    query,
+                    user_id,
+                    callback_data=data,
+                    plan_type="nutrition",
+                    missing=missing,
+                    title="חסרים פרטים כדי להמשיך לתזונה האישית",
+                )
+                return True
         # "menu:today" is a legacy alias for "menu:morning" (old keyboards may
         # still carry it) — both render the same daily menu screen.
         await safe_edit(query, "רגע, מכין לך… ⏳", None)

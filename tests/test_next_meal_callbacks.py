@@ -53,6 +53,22 @@ async def _make_ready_db(tmp_path: Path) -> Database:
         source=user_model.SOURCE_USER,
         confirmed=True,
     )
+    for key, value in {
+        "primary_goal": "fat_loss_muscle_retention",
+        "weight_kg": 80,
+        "sex": "male",
+        "age": 30,
+        "diet_restrictions": "none",
+        "allergies": "none",
+    }.items():
+        await user_model.set_fact(
+            db,
+            1,
+            key,
+            value,
+            source=user_model.SOURCE_USER,
+            confirmed=True,
+        )
     return db
 
 

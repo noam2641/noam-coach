@@ -92,6 +92,16 @@ async def _nutrition_ready_without_daily_goal(db: Database) -> None:
         await _set(db, key, value)
 
 
+async def _insert_active_goal(db: Database) -> None:
+    await db.execute(
+        """
+        INSERT INTO goal_versions(user_id, calories, protein, steps, phase, status, source, created_at)
+        VALUES(1, 2100, 150, 8000, 'fat_loss_muscle_retention', 'active', 'test', ?)
+        """,
+        (utc_now(),),
+    )
+
+
 @pytest.mark.asyncio
 async def test_plan_menu_clears_completion_flow_without_name_error(
     tmp_path: Path,
@@ -117,12 +127,18 @@ async def test_plan_menu_clears_completion_flow_without_name_error(
         "sex",
         {"fact_key": "sex"},
     )
+    await callback_plans_bot.set_pending_callback_action(
+        1,
+        "menu:nextmeal",
+        plan_type="nutrition",
+    )
 
     handled = await callback_plans_bot.handle_plan_callback(FakeTarget(), 1, "menu:smartplan")
 
     assert handled is True
     assert rendered == [1]
     assert await core_services.get_flow_state(1, onboarding_bot.PLAN_COMPLETION_FLOW) is None
+    assert await core_services.get_flow_state(1, callback_plans_bot.PENDING_PLAN_ACTION_FLOW) is None
 
 
 @pytest.mark.asyncio
@@ -283,6 +299,108 @@ async def test_resume_pending_plan_action_generates_and_clears_state(
     assert resumed is True
     assert generated == ["nutrition"]
     assert rendered == ["nutrition"]
+    assert await core_services.get_flow_state(1, callback_plans_bot.PENDING_PLAN_ACTION_FLOW) is None
+
+
+@pytest.mark.asyncio
+async def test_next_meal_gate_preserves_original_callback_action(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = await _make_db(tmp_path)
+    monkeypatch.setattr(coach_bot, "DB", db)
+    monkeypatch.setattr(onboarding_bot, "DB", db)
+    monkeypatch.setattr(core_services, "DB", db)
+    monkeypatch.setattr(callback_menu_bot, "DB", db)
+    monkeypatch.setattr(callback_plans_bot, "DB", db)
+
+    target = FakeTarget()
+    handled = await callback_menu_bot.handle_menu_callback(target, 1, "menu:nextmeal")
+
+    assert handled is True
+    state = await core_services.get_flow_state(1, callback_plans_bot.PENDING_PLAN_ACTION_FLOW)
+    assert state is not None
+    assert state["step"] == callback_plans_bot.PENDING_CALLBACK_STEP
+    assert state["payload"]["callback_data"] == "menu:nextmeal"
+    assert state["payload"]["plan_type"] == "nutrition"
+    callbacks = [btn.callback_data for row in target.reply_markups[-1].inline_keyboard for btn in row]
+    assert "planv2:complete_missing:nutrition" in callbacks
+
+
+@pytest.mark.asyncio
+async def test_resume_pending_next_meal_callback_renders_action_and_clears_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = await _make_db(tmp_path)
+    monkeypatch.setattr(coach_bot, "DB", db)
+    monkeypatch.setattr(onboarding_bot, "DB", db)
+    monkeypatch.setattr(core_services, "DB", db)
+    monkeypatch.setattr(callback_menu_bot, "DB", db)
+    monkeypatch.setattr(callback_plans_bot, "DB", db)
+    await _nutrition_ready_without_daily_goal(db)
+    await _insert_active_goal(db)
+    await callback_plans_bot.set_pending_callback_action(
+        1,
+        "menu:nextmeal",
+        plan_type="nutrition",
+    )
+    rendered: list[int] = []
+
+    async def fake_next_meal(query: Any, user_id: int, **_kwargs: Any) -> None:
+        rendered.append(user_id)
+        await query.edit_message_text("NEXT_MEAL")
+
+    monkeypatch.setattr(callback_menu_bot, "_render_next_meal_screen", fake_next_meal)
+
+    target = FakeTarget()
+    resumed = await callback_plans_bot.resume_pending_plan_action(target, 1)
+
+    assert resumed is True
+    assert rendered == [1]
+    assert target.messages[-1] == "NEXT_MEAL"
+    assert await core_services.get_flow_state(1, callback_plans_bot.PENDING_PLAN_ACTION_FLOW) is None
+
+
+@pytest.mark.asyncio
+async def test_plan_completion_finish_resumes_pending_callback_without_done_menu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = await _make_db(tmp_path)
+    monkeypatch.setattr(coach_bot, "DB", db)
+    monkeypatch.setattr(onboarding_bot, "DB", db)
+    monkeypatch.setattr(core_services, "DB", db)
+    monkeypatch.setattr(callback_menu_bot, "DB", db)
+    monkeypatch.setattr(callback_plans_bot, "DB", db)
+    await _nutrition_ready_without_daily_goal(db)
+    await _insert_active_goal(db)
+    await core_services.set_flow_state(
+        1,
+        onboarding_bot.PLAN_COMPLETION_FLOW,
+        "q_allergies",
+        {"plan_type": "nutrition", "return_to": "menu:smartplan"},
+    )
+    await callback_plans_bot.set_pending_callback_action(
+        1,
+        "menu:nextmeal",
+        plan_type="nutrition",
+    )
+    rendered: list[int] = []
+
+    async def fake_next_meal(query: Any, user_id: int, **_kwargs: Any) -> None:
+        rendered.append(user_id)
+        await query.edit_message_text("NEXT_MEAL")
+
+    monkeypatch.setattr(callback_menu_bot, "_render_next_meal_screen", fake_next_meal)
+
+    target = FakeTarget()
+    continued = await onboarding_bot.continue_after_plan_completion_answer(target, 1)
+
+    assert continued is True
+    assert rendered == [1]
+    assert target.messages[-1] == "NEXT_MEAL"
+    assert await core_services.get_flow_state(1, onboarding_bot.PLAN_COMPLETION_FLOW) is None
     assert await core_services.get_flow_state(1, callback_plans_bot.PENDING_PLAN_ACTION_FLOW) is None
 
 
