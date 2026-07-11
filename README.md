@@ -202,7 +202,7 @@ Evaluation cases נמצאים ב־`evaluations/core_cases.jsonl`. ניתן לה�
 
 ## פרטיות ואבטחה
 
-- אין להעלות `.env`, DB, תמונות או גיבויים ל־Git.
+- אין להעלות `.env`, DB, תמונות, גיבויים, ייצוא Apple Health (`HealthKit.zip`/`export*.zip`) או הקלטות QA (`*.docx`, `Recording_*`) ל־Git. `.gitignore` חוסם את כולם.
 - `MINI_APP_SECRET` ו־Telegram token חייבים להיות שונים. `HEALTHKIT_API_TOKEN` נדרש רק אם מפעילים מחדש סנכרון שוטף.
 - במצב production כתובת Mini App חייבת להיות HTTPS.
 - הנתונים הרפואיים אינם משמשים לאבחון.
@@ -217,13 +217,14 @@ Evaluation cases נמצאים ב־`evaluations/core_cases.jsonl`. ניתן לה�
 
 ראו גם:
 
-- `IMPLEMENTATION_STATUS.md`
-- `VALIDATION_REPORT.md`
+- `docs/MASTER_TASKS.md` — **מקור האמת הקנוני** למשימות 1–22, backlog פתוח וסעיפי המשך.
 - `ENVIRONMENT_VARIABLES.md`
 - `docs/PRODUCT_ROADMAP.md`
 - `docs/IOS_WATCH_IMPLEMENTATION.md`
-- `docs/ARCHITECTURE.md`
-- `REBUILD_REPORT.md`
+- `docs/ARCHITECTURE.md` · `docs/MANIFEST.md`
+- `docs/reports/` — דוחות patch/verification/status (למשל `IMPLEMENTATION_STATUS.md`, `VALIDATION_REPORT.md`, `REBUILD_REPORT.md`).
+- `docs/audits/` — דוחות audit (Claude/Codex).
+- `docs/archive/` — מפרטים גולמיים, תוכניות עבודה ו-handoffs היסטוריים.
 
 ## ייבוא Apple Health מנתיב מקומי
 
