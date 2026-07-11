@@ -774,9 +774,40 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
         return True
 
     if data == "menu:food":
+        # TASK-21: offer the two clearly-separate logging methods.
         await safe_edit(
             query,
-            "שלח תמונת אוכל או כתוב מה אכלת, ואנתח את הארוחה לפני שמירה.",
+            "איך תרצה לרשום את הארוחה?",
+            InlineKeyboardMarkup([
+                [button("📷 צילום ארוחה", "menu:food_photo")],
+                [button("✍️ הוספת אוכל בטקסט", "menu:food_text")],
+                [button("⬅️ תפריט", "menu:home")],
+            ]),
+        )
+        return True
+
+    if data == "menu:food_photo":
+        await safe_edit(
+            query,
+            "שלח תמונת אוכל ואנתח את הארוחה לפני שמירה.",
+            InlineKeyboardMarkup([[button("⬅️ תפריט", "menu:home")]]),
+        )
+        return True
+
+    if data == "menu:food_text":
+        # TASK-21: start the dedicated manual food-entry flow. The next free-text
+        # message is analyzed through the normal meal pipeline.
+        from noam_coach.bot.onboarding import set_pending
+
+        await set_pending(user_id, "__manual_meal__")
+        await safe_edit(
+            query,
+            "✍️ כתוב מה אכלת בשפה חופשית, ואערוך הערכה לפני שמירה.\n\n"
+            "דוגמאות:\n"
+            "• 3 קציצות, קצת אורז וסלט\n"
+            "• טוסט עם גבינה וקפה\n"
+            "• יוגורט חלבון ובננה\n\n"
+            "לא צריך לדעת כמויות מדויקות או קלוריות — פשוט מה שאכלת.",
             InlineKeyboardMarkup([[button("⬅️ תפריט", "menu:home")]]),
         )
         return True

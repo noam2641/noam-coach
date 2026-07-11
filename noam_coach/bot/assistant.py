@@ -861,8 +861,15 @@ async def record_dietary_preference(
 
 
 @runtime_bound(RUNTIME_NAMES)
-async def log_meal_from_text(message: Any, user_id: int, text: str) -> None:
-    """Log a meal described in text only (no photo) via the AI analyzer."""
+async def log_meal_from_text(
+    message: Any, user_id: int, text: str, *, source: str = "text"
+) -> None:
+    """Log a meal described in text only (no photo) via the AI analyzer.
+
+    ``source`` is stored on the approval so the meal's origin (e.g.
+    "manual_text" for the dedicated manual-entry action) is identifiable
+    downstream while still flowing through the normal meal pipeline.
+    """
     if OPENAI_CLIENT is None:
         await message.reply_text("כדי לנתח ארוחה מטקסט צריך מפתח OpenAI. אפשר לשלוח תמונה במקום.")
         return
@@ -879,9 +886,19 @@ async def log_meal_from_text(message: Any, user_id: int, text: str) -> None:
         approval_id = await create_approval(
             user_id,
             "meal",
-            {"analysis": analysis.model_dump(), "image": None, "eaten_at": utc_now()},
+            {
+                "analysis": analysis.model_dump(),
+                "image": None,
+                "source": source,
+                "eaten_at": utc_now(),
+            },
         )
         await render_meal(progress, user_id, approval_id)
+        # Enable the cumulative free-text correction path (fixmeal) for the
+        # manually-entered meal, exactly like the photo flow does.
+        from noam_coach.bot.meals import set_meal_fix
+
+        await set_meal_fix(user_id, approval_id, 0)
     except Exception as exc:  # noqa: BLE001
         LOGGER.exception("text meal log failed")
         await progress.edit_text(friendly_error(exc, "text meal log"))

@@ -2568,6 +2568,18 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
         await message.reply_text("בוטל. אפשר להמשיך כרגיל.")
         return True
 
+    if pending == "__manual_meal__":
+        # TASK-21: dedicated manual food-entry action. The first free-text
+        # message describes the meal; it is analyzed through the SAME canonical
+        # pipeline as a photo (log_meal_from_text → analyze_meal_text →
+        # create_approval → render_meal), so approval/persistence/learning and
+        # the cumulative fixmeal correction path are all reused.
+        await clear_pending(user_id)
+        from noam_coach.bot.assistant import log_meal_from_text
+
+        await log_meal_from_text(message, user_id, text, source="manual_text")
+        return True
+
     if pending.startswith("__profile_edit_") and pending.endswith("__"):
         # RE10-14: free-text edit for a profile field with no dedicated
         # question (currently only weight_kg).
