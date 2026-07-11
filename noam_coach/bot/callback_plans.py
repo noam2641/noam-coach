@@ -827,8 +827,8 @@ async def handle_plan_callback(query: Any, user_id: int, data: str) -> bool:
         rows = [[button("⬅️ לתוכניות", "menu:smartplan")]]
         extra = ""
         if nutrition and workout:
-            rows.insert(0, [button("📅 בנה תוכנית שבועית מאוחדת", "planv2:unify")])
-            extra = "\n\nשתי התוכניות נבחרו — אפשר עכשיו לחבר אותן לשבוע אחד."
+            rows.insert(0, [button("🗓️ השבוע שלי", "planv2:my_week")])
+            extra = "\n\nשתי התוכניות נבחרו — אפשר עכשיו לראות את השבוע המאוחד שלך."
         await safe_edit(
             query,
             f"<b>{esc(selected['title'])}</b> נבחרה כתוכנית {_plan_type_label(selected['plan_type'])} הראשית ✅{extra}",
@@ -857,18 +857,31 @@ async def handle_plan_callback(query: Any, user_id: int, data: str) -> bool:
                 )
         return True
 
-    if data == "planv2:unify":
-        await safe_edit(query, "מחבר את התזונה, האימונים והשעות לשבוע אחד… ⏳", None)
+    # TASK-17: one weekly-plan action.  "planv2:my_week" shows the current week
+    # when it is still valid, builds it when missing, and rebuilds it only when
+    # the underlying nutrition/workout plans changed.  "planv2:unify" and
+    # "planv2:show:unified" remain as backward-compatible aliases for any stale
+    # keyboard still on-screen.
+    if data in ("planv2:my_week", "planv2:unify", "planv2:show:unified"):
         try:
-            candidate = await planning.build_unified_week(DB, user_id)
-            await event_log.append_event(
-                DB,
-                user_id,
-                "UNIFIED_PLAN_CREATED",
-                entity="plan",
-                entity_id=candidate.id,
-                source="planner",
-            )
+            existing = await planning.get_active_plan(DB, user_id, "unified")
+            nutrition = await planning.get_active_plan(DB, user_id, "nutrition")
+            workout = await planning.get_active_plan(DB, user_id, "workout")
+            if planning.unified_week_is_current(existing, nutrition, workout):
+                # Valid week already exists — display it without regenerating.
+                await render_unified_plan(query, user_id)
+                return True
+            await safe_edit(query, "מחבר את התזונה, האימונים והשעות לשבוע אחד… ⏳", None)
+            candidate, rebuilt = await planning.get_or_build_unified_week(DB, user_id)
+            if rebuilt:
+                await event_log.append_event(
+                    DB,
+                    user_id,
+                    "UNIFIED_PLAN_CREATED",
+                    entity="plan",
+                    entity_id=candidate.id,
+                    source="planner",
+                )
             await render_unified_plan(query, user_id)
         except planning.PlanningBlockedError as exc:
             await _render_planning_blocked(query, user_id, exc)
@@ -878,10 +891,6 @@ async def handle_plan_callback(query: Any, user_id: int, data: str) -> bool:
                 friendly_error(exc, "unified plan"),
                 InlineKeyboardMarkup([[button("⬅️ לתוכניות", "menu:smartplan")]]),
             )
-        return True
-
-    if data == "planv2:show:unified":
-        await render_unified_plan(query, user_id)
         return True
 
     if data == "plan:recommend":

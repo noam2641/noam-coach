@@ -66,7 +66,8 @@ def test_daily_menu_edit_free_text_requires_active_menu_for_loose_requests() -> 
 def test_nutrition_strategy_selection_sends_standalone_daily_menu() -> None:
     src = (ROOT / "noam_coach/bot/callback_plans.py").read_text(encoding="utf-8")
     select_block = src.split('if data.startswith("planv2:select:"):', 1)[1]
-    select_block = select_block.split('if data == "planv2:unify":', 1)[0]
+    # TASK-17 merged the unify/show handlers into a single planv2:my_week block.
+    select_block = select_block.split('if data in ("planv2:my_week"', 1)[0]
     assert 'selected["plan_type"] == "nutrition"' in select_block
     assert "build_morning_menu_text(user_id)" in select_block
     assert "query.message.reply_text" in select_block

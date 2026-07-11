@@ -1513,6 +1513,64 @@ async def build_unified_week(db: Any, user_id: int) -> PlanCandidate:
     return candidate
 
 
+def unified_week_is_current(
+    unified: dict[str, Any] | None,
+    nutrition: dict[str, Any] | None,
+    workout: dict[str, Any] | None,
+) -> bool:
+    """TASK-17: a stored unified week is still valid iff it was built from the
+    plans that are currently active.
+
+    The unified payload embeds the ``nutrition_plan_id`` / ``workout_plan_id``
+    it was generated from.  Any relevant planning change — a new nutrition
+    strategy, a different workout structure, day-specific workout times, or a
+    recomputed calorie/protein target — re-activates the underlying plan with a
+    NEW plan id, so the embedded ids stop matching and the week must rebuild.
+    Unrelated activity (e.g. logging a meal) never re-activates a plan, so the
+    week stays valid.
+    """
+    if not unified or not nutrition or not workout:
+        return False
+    payload = unified.get("payload") or {}
+    return (
+        payload.get("nutrition_plan_id") == nutrition.get("id")
+        and payload.get("workout_plan_id") == workout.get("id")
+    )
+
+
+async def get_or_build_unified_week(db: Any, user_id: int) -> tuple[PlanCandidate, bool]:
+    """Return the current unified week, building it only when needed (TASK-17).
+
+    Returns ``(candidate, rebuilt)``.  When a valid unified week already exists
+    for the currently active nutrition + workout plans it is returned as-is
+    (``rebuilt=False``) with no regeneration; otherwise it is (re)built and
+    activated (``rebuilt=True``).
+    """
+    nutrition = await get_active_plan(db, user_id, "nutrition")
+    workout = await get_active_plan(db, user_id, "workout")
+    if not nutrition or not workout:
+        raise ValueError("יש לבחור תוכנית תזונה ותוכנית אימונים לפני יצירת שבוע מאוחד")
+    unified = await get_active_plan(db, user_id, "unified")
+    if unified_week_is_current(unified, nutrition, workout):
+        return _decode_plan_to_candidate(unified), False
+    return await build_unified_week(db, user_id), True
+
+
+def _decode_plan_to_candidate(plan: dict[str, Any]) -> PlanCandidate:
+    candidate = PlanCandidate(
+        plan_type=plan.get("plan_type", "unified"),
+        title=plan.get("title", "התוכנית השבועית שלי"),
+        strategy=plan.get("strategy", "selected_combination"),
+        score=float(plan.get("fit_score", 0.0) or 0.0),
+        rationale=list(plan.get("rationale", []) or []),
+        tradeoffs=list(plan.get("tradeoffs", []) or []),
+        assumptions=list(plan.get("assumptions", []) or []),
+        payload=plan.get("payload", {}) or {},
+    )
+    candidate.id = plan.get("id")
+    return candidate
+
+
 async def adherence_snapshot(db: Any, user_id: int, start_utc: str, end_utc: str) -> dict[str, Any]:
     goal = await active_goal(db, user_id)
     meals = await db.fetch_all(

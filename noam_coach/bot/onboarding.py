@@ -1840,10 +1840,11 @@ async def render_smart_plan_hub(target: Any, user_id: int) -> None:
         [button("🥗 צור 3 הצעות תזונה", "planv2:generate:nutrition")],
         [button("🏋️ צור 3 הצעות אימון", "planv2:generate:workout")],
     ]
+    # TASK-17: one user-facing weekly action.  "🗓️ השבוע שלי" shows the current
+    # week if valid, builds it if missing, and rebuilds it only when the
+    # underlying nutrition/workout plans changed.
     if nutrition and workout:
-        rows.append([button("📅 בנה שבוע מאוחד", "planv2:unify")])
-    if unified:
-        rows.append([button("👁️ הצג את השבוע", "planv2:show:unified")])
+        rows.append([button("🗓️ השבוע שלי", "planv2:my_week")])
     rows.append([button("👤 כך הבנתי אותך", "planv2:profile")])
     rows.append([button("⬅️ תפריט", "menu:home")])
     keyboard = InlineKeyboardMarkup(rows)
