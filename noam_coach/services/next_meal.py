@@ -485,6 +485,13 @@ def _planned_session_for_today(workout_plan: dict[str, Any] | None, now: datetim
     return sorted(candidates, key=lambda item: str(item.get("time") or "23:59"))[0]
 
 
+# TASK-12: a realistic pre-workout meal window. A workout many hours away
+# (e.g. 19:09 while it is 00:49 — ~18h) must NOT make the current meal a
+# pre-workout meal. Beyond this window the meal context is a normal day/rest
+# context; the workout still appears later in the chronological timeline.
+_PRE_WORKOUT_WINDOW_MIN = 300  # 5 hours
+
+
 def _phase_from_times(now: datetime, start: datetime, end: datetime) -> tuple[WorkoutPhase, int | None, int | None]:
     if now < start:
         minutes_until = int((start - now).total_seconds() // 60)
@@ -492,7 +499,11 @@ def _phase_from_times(now: datetime, start: datetime, end: datetime) -> tuple[Wo
             return WorkoutPhase.PRE_WORKOUT_IMMEDIATE, minutes_until, None
         if minutes_until <= 120:
             return WorkoutPhase.PRE_WORKOUT_NEAR, minutes_until, None
-        return WorkoutPhase.PRE_WORKOUT_EARLY, minutes_until, None
+        if minutes_until <= _PRE_WORKOUT_WINDOW_MIN:
+            return WorkoutPhase.PRE_WORKOUT_EARLY, minutes_until, None
+        # Workout is later today but outside the pre-workout meal window: treat
+        # the current meal context as a normal day (not pre-workout).
+        return WorkoutPhase.REST_DAY, minutes_until, None
     if start <= now <= end:
         return WorkoutPhase.WORKOUT_STATUS_UNKNOWN, None, None
     return WorkoutPhase.WORKOUT_PLANNED_TIME_PASSED, None, int((now - end).total_seconds() // 60)
@@ -993,10 +1004,22 @@ def _matches_free_text_preference(
     ingredients: list[str],
     restrictions: list[DietaryRestriction],
 ) -> bool:
+    # TASK-12: explicit avoidances are HARD exclusions for a food the bot is
+    # proposing — "טורטייה" must block "טורטיית חלבון" via substring matching,
+    # not merely warn. Preferences and unavailable items are matched the same
+    # way so a proposed meal never contains a disliked/avoided food.
     disliked = [
-        _free_text_preference_key(restriction.canonical_id or restriction.user_label)
+        _free_text_preference_key(restriction.user_label or restriction.canonical_id)
         for restriction in restrictions
-        if restriction.restriction_type in {"preference", "unavailable"}
+        if restriction.restriction_type in {"preference", "unavailable", "avoidance"}
+    ]
+    # Also include the canonical id form so both the raw label ("טורטייה") and
+    # the normalized id can match.
+    disliked += [
+        _free_text_preference_key(restriction.canonical_id)
+        for restriction in restrictions
+        if restriction.restriction_type in {"preference", "unavailable", "avoidance"}
+        and restriction.canonical_id
     ]
     if not disliked:
         return False
@@ -1004,7 +1027,31 @@ def _matches_free_text_preference(
     for dislike in disliked:
         if not dislike:
             continue
-        if any(dislike in ingredient or ingredient in dislike for ingredient in ingredient_keys):
+        if any(_food_word_matches(dislike, ingredient) for ingredient in ingredient_keys):
+            return True
+    return False
+
+
+def _hebrew_stem(word: str) -> str:
+    """Drop a trailing Hebrew feminine/construct marker so morphological
+    variants of the same food match (e.g. "טורטייה" ~ "טורטיית") — TASK-12."""
+    word = word.strip()
+    if len(word) >= 4 and word[-1] in "התיהםןות":
+        return word[:-1]
+    return word
+
+
+def _food_word_matches(disliked: str, ingredient_text: str) -> bool:
+    """True when a disliked/avoided food word appears in an ingredient text,
+    tolerant of Hebrew construct/plural endings (טורטייה → טורטיית חלבון)."""
+    if disliked in ingredient_text or ingredient_text in disliked:
+        return True
+    dstem = _hebrew_stem(disliked)
+    if len(dstem) < 3:
+        return False
+    for token in ingredient_text.split():
+        tstem = _hebrew_stem(token)
+        if dstem == tstem or token.startswith(dstem) or dstem.startswith(tstem) and len(tstem) >= 3:
             return True
     return False
 
