@@ -278,6 +278,14 @@ FACT_REGISTRY: dict[str, FactSpec] = {
         "reported",
         ("menu_planning",),
     ),
+    "food_environment_context": FactSpec(
+        "food_environment_context",
+        "סביבת אוכל יומיומית",
+        "reported",
+        ("menu_planning", "meal_timing", "shopping"),
+        required_for=("nutrition",),
+        expires_after_days=180,
+    ),
     "weekly_availability": FactSpec(
         "weekly_availability",
         "זמינות שבועית",
@@ -554,7 +562,7 @@ READINESS_PROFILES = {
         label="תזונה",
         required=(
             "primary_goal", "weight_kg", "sex", "age",
-            "diet_restrictions", "allergies",
+            "diet_restrictions", "allergies", "food_environment_context",
         ),
         optional=(
             "height_cm", "body_fat_pct", "cooking_capacity", "meal_break_info",

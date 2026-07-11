@@ -24,6 +24,10 @@ from exercise_plans import (
     weekday_he,
 )
 from helpers import utc_now
+from noam_coach.services.food_environment import (
+    normalize_food_environment_context,
+    personal_fit_signals,
+)
 from noam_coach.services.weekdays import (
     WEEKDAY_SCHEMA_VERSION,
     normalize_weekday,
@@ -472,14 +476,12 @@ async def build_nutrition_candidates(db: Any, user_id: int) -> list[PlanCandidat
     )
     canonical_ids = {r.canonical_id for r in typed_restrictions}
 
-    cooking = str(_fact_value(facts, "cooking_capacity", "unknown"))
+    food_environment = normalize_food_environment_context(_fact_value(facts, "food_environment_context", {}))
+    food_signals = personal_fit_signals(food_environment)
     has_breaks = _fact_value(facts, "meal_break_info") is not None
     assumptions: list[str] = []
     if not restrictions:
         assumptions.append("לא דווחו מגבלות תזונתיות")
-    if cooking == "unknown":
-        assumptions.append("יכולת הבישול טרם אושרה")
-
     common = {
         "calories": int(goal["calories"]),
         "protein": int(goal["protein"]),
@@ -488,28 +490,55 @@ async def build_nutrition_candidates(db: Any, user_id: int) -> list[PlanCandidat
         "canonical_ids": canonical_ids,
         "assumptions": assumptions,
     }
+    structured_score = 0.9 if food_signals["prep_friendly"] and has_breaks else 0.78 if food_signals["prep_friendly"] else 0.7
+    structured_rationale = [
+        "פחות החלטות במהלך היום",
+        "חלוקת חלבון עקבית",
+    ]
+    if food_signals["prep_friendly"]:
+        structured_rationale.append("מתאימה להכנה מראש לפי סביבת האוכל שאישרת")
+
+    flexible_score = 0.94 if food_signals["restaurant_or_delivery"] or food_signals["variable_schedule"] else 0.86
+    flexible_rationale = [
+        "שלוש חלופות לכל ארוחה",
+        "שומרת רזרבה יומית",
+    ]
+    if food_signals["restaurant_or_delivery"]:
+        flexible_rationale.append("מתאימה למסעדות או משלוחים לפי מה שדיווחת")
+    if food_signals["variable_schedule"]:
+        flexible_rationale.append("מתאימה לשעות משתנות לפי ההקשר שאישרת")
+
+    low_effort_score = 0.93 if food_signals["low_cooking"] or food_signals["quick_or_limited_access"] else 0.79
+    low_effort_rationale = [
+        "פחות ארוחות",
+        "מעט התעסקות יומית",
+    ]
+    if food_signals["quick_or_limited_access"]:
+        low_effort_rationale.append("מתאימה לימים עמוסים או גישה מוגבלת לאוכל מסודר")
+    if food_signals["low_cooking"]:
+        low_effort_rationale.append("מותאמת למעט בישול לפי התשובה שלך")
     candidates = [
         _nutrition_candidate(
             title="מסודרת וקבועה",
             strategy="structured",
-            score=0.88 if has_breaks else 0.76,
-            rationale=["פחות החלטות במהלך היום", "חלוקת חלבון עקבית", "מתאימה להכנה מראש"],
-            tradeoffs=["דורשת הכנה מראש", "פחות גמישה לשינויים ספונטניים"],
+            score=structured_score,
+            rationale=structured_rationale,
+            tradeoffs=["פחות גמישה לשינויים ספונטניים"],
             **common,
         ),
         _nutrition_candidate(
             title="גמישה ומאוזנת",
             strategy="flexible",
-            score=0.9,
-            rationale=["שלוש חלופות לכל ארוחה", "מתאימה למסעדות ולשעות משתנות", "שומרת רזרבה יומית"],
+            score=flexible_score,
+            rationale=flexible_rationale,
             tradeoffs=["דורשת יותר בחירות", "נדרש מעקב אחר הרזרבה"],
             **common,
         ),
         _nutrition_candidate(
             title="מינימום התעסקות",
             strategy="low_effort",
-            score=0.92 if cooking in {"none", "basic", "unknown"} else 0.78,
-            rationale=["מעט בישול", "פחות ארוחות", "מתאימה לימים עמוסים או לתיאבון נמוך"],
+            score=low_effort_score,
+            rationale=low_effort_rationale,
             tradeoffs=["פחות גיוון", "ארוחות גדולות יותר"],
             **common,
         ),

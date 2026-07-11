@@ -94,6 +94,19 @@ async def _seed_complete_profile(db: Database) -> None:
     await _set_fact(db, "age", 35)
     await _set_fact(db, "diet_restrictions", "none")
     await _set_fact(db, "allergies", "none")
+    await _set_fact(
+        db,
+        "food_environment_context",
+        {
+            "source_schema": "food_environment_v1",
+            "cooking_level": "moderate",
+            "restaurant_frequency": "low",
+            "delivery_or_takeaway": False,
+            "needs_quick_meals": False,
+            "schedule_variability": False,
+            "limited_food_access": False,
+        },
+    )
     await _set_fact(db, "training_days_per_week", 4)
     await _set_fact(db, "session_minutes", 50)
     await _set_fact(db, "training_location", "gym")

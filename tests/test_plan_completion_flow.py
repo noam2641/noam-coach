@@ -71,6 +71,15 @@ async def _ready_except_sex_and_age(db: Database) -> None:
         "weight_kg": 80,
         "diet_restrictions": "none",
         "allergies": "none",
+        "food_environment_context": {
+            "source_schema": "food_environment_v1",
+            "cooking_level": "moderate",
+            "restaurant_frequency": "low",
+            "delivery_or_takeaway": False,
+            "needs_quick_meals": False,
+            "schedule_variability": False,
+            "limited_food_access": False,
+        },
     }
     for key, value in values.items():
         await _set(db, key, value)
@@ -84,6 +93,15 @@ async def _nutrition_ready_without_daily_goal(db: Database) -> None:
         "age": 30,
         "diet_restrictions": "none",
         "allergies": "none",
+        "food_environment_context": {
+            "source_schema": "food_environment_v1",
+            "cooking_level": "moderate",
+            "restaurant_frequency": "low",
+            "delivery_or_takeaway": False,
+            "needs_quick_meals": False,
+            "schedule_variability": False,
+            "limited_food_access": False,
+        },
         "height_cm": 174,
         "goal_weight_kg": 75,
         "goal_timeframe_weeks": 16,

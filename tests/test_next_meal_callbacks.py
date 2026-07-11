@@ -60,6 +60,15 @@ async def _make_ready_db(tmp_path: Path) -> Database:
         "age": 30,
         "diet_restrictions": "none",
         "allergies": "none",
+        "food_environment_context": {
+            "source_schema": "food_environment_v1",
+            "cooking_level": "moderate",
+            "restaurant_frequency": "low",
+            "delivery_or_takeaway": False,
+            "needs_quick_meals": False,
+            "schedule_variability": False,
+            "limited_food_access": False,
+        },
     }.items():
         await user_model.set_fact(
             db,

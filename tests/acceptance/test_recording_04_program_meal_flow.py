@@ -82,6 +82,15 @@ _WORKOUT_FACTS: dict = {
     "primary_goal": "fat_loss_muscle_retention",
     "diet_restrictions": "none",
     "allergies": "none",
+    "food_environment_context": {
+        "source_schema": "food_environment_v1",
+        "cooking_level": "moderate",
+        "restaurant_frequency": "low",
+        "delivery_or_takeaway": False,
+        "needs_quick_meals": False,
+        "schedule_variability": False,
+        "limited_food_access": False,
+    },
     "training_days_per_week": 4,
     "active_pain": "none",
     "medical_avoidance": "none",
@@ -444,6 +453,15 @@ class TestRecording04ReplayFlow:
             "primary_goal": "fat_loss_muscle_retention",
             "diet_restrictions": "none",
             "allergies": "אגוזים",
+            "food_environment_context": {
+                "source_schema": "food_environment_v1",
+                "cooking_level": "moderate",
+                "restaurant_frequency": "low",
+                "delivery_or_takeaway": False,
+                "needs_quick_meals": False,
+                "schedule_variability": False,
+                "limited_food_access": False,
+            },
         }
         for key, value in facts.items():
             await _set(db, 1, key, value)
@@ -471,6 +489,15 @@ class TestRecording04ReplayFlow:
             "primary_goal": "fat_loss_muscle_retention",
             "diet_restrictions": "חלב, סויה",
             "allergies": "none",
+            "food_environment_context": {
+                "source_schema": "food_environment_v1",
+                "cooking_level": "moderate",
+                "restaurant_frequency": "low",
+                "delivery_or_takeaway": False,
+                "needs_quick_meals": False,
+                "schedule_variability": False,
+                "limited_food_access": False,
+            },
         }
         for key, value in facts.items():
             await _set(db, 1, key, value)

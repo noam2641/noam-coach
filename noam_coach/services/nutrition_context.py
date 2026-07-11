@@ -21,6 +21,7 @@ from noam_coach.services.daily_state import local_day_bounds_utc
 from noam_coach.services.dietary_restrictions import (
     load_restrictions_from_facts,
 )
+from noam_coach.services.food_environment import normalize_food_environment_context
 from noam_coach.services.learned_foods import learned_foods_from_meals
 from noam_coach.services.next_meal import (
     WorkoutPhase,
@@ -57,6 +58,7 @@ FIELD_PROVENANCE: dict[str, dict[str, Any]] = {
     "preferred_foods": {"source": "user_facts:preferred_foods", "writer": "food_preferences.record_food_preference_from_slots", "reader": "menu", "freshness": "on user statement", "fallback": "[]", "sent_to_ai": True},
     "learned_foods": {"source": "approved meal_items history", "writer": "meal approval / persist_meal", "reader": "meal analysis, menu, next_meal", "freshness": "last 180 days", "fallback": "[]", "sent_to_ai": True},
     "allergies": {"source": "user_facts:allergies", "writer": "food_preferences", "reader": "restriction validator", "freshness": "on user statement", "fallback": "[]", "sent_to_ai": True},
+    "food_environment_context": {"source": "user_facts:food_environment_context", "writer": "questions.record_answer", "reader": "planner/menu/next_meal", "freshness": "180 days", "fallback": "None", "sent_to_ai": True},
     "fasting_status": {"source": "daily_flags.fasting", "writer": "flags menu / morning_flag", "reader": "budget", "freshness": "per day", "fallback": "False", "sent_to_ai": True},
     "hunger_level": {"source": "daily_flags.hunger", "writer": "flags menu", "reader": "context", "freshness": "per day", "fallback": "None", "sent_to_ai": True},
     "energy_level": {"source": "daily_flags.energy", "writer": "flags menu", "reader": "context", "freshness": "per day", "fallback": "None", "sent_to_ai": True},
@@ -132,6 +134,7 @@ class NutritionContext:
     fasting_status: bool
     medication_status_reported_today: list[str]
     relevant_daily_symptoms: list[str]
+    food_environment_context: dict[str, Any] | None
     available_prep_minutes: int | None
     eating_location: str | None
     available_equipment: list[str]
@@ -345,6 +348,12 @@ async def build_nutrition_context(
         str(allergy_value) if allergy_value not in (None, "", "none") else None,
     )
     allergies, intolerances, dietary_rules = _restriction_groups(restrictions)
+    food_environment_value = await user_model.get_value(db, user_id, "food_environment_context")
+    food_environment_context = (
+        normalize_food_environment_context(food_environment_value)
+        if food_environment_value not in (None, "", "none")
+        else None
+    )
 
     # Mark optional flag-backed inputs that have no real value yet so they are
     # sent to the AI as "not_captured" instead of an empty/None default that
@@ -429,6 +438,7 @@ async def build_nutrition_context(
             if str(item).strip()
         ],
         relevant_daily_symptoms=_list_fact(flags.get("pain") or flags.get("symptoms")),
+        food_environment_context=food_environment_context,
         available_prep_minutes=flags.get("available_prep_minutes"),
         eating_location=flags.get("eating_location"),
         available_equipment=_list_fact(flags.get("available_equipment")),

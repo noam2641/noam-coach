@@ -241,7 +241,7 @@ async def test_nutrition_completion_stops_instead_of_asking_workout_questions(
     coach_bot.DB.path = db.path
     for key in (
         "weight_kg", "primary_goal", "sex", "age",
-        "diet_restrictions", "allergies",
+        "diet_restrictions", "allergies", "food_environment_context",
     ):
         await user_model.set_fact(
             db, 1, key, "placeholder",

@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import user_model
+from noam_coach.services.food_environment import normalize_food_environment_context
 
 # Priority weights (chapter 7):
 #   priority = safety*3 + plan_impact*2 + urgency + uncertainty - burden
@@ -275,6 +276,25 @@ JIT_QUESTIONS: list[Question] = [
         when=lambda ctx: ctx.get("planning_nutrition", False),
     ),
     Question(
+        id="q_food_environment_context",
+        fact_key="food_environment_context",
+        text=(
+            "איך נראה היום-יום שלך מבחינת אוכל?\n\n"
+            "אפשר לכתוב בקצרה:\n"
+            "• כמה פעמים בשבוע יש לך אפשרות לבשל?\n"
+            "• האם אתה אוכל הרבה במסעדות או מזמין אוכל?\n"
+            "• האם אתה צריך פתרונות מהירים במהלך יום עבודה?\n"
+            "• האם יש שעות או ימים שבהם כמעט אין לך גישה לאוכל מסודר?"
+        ),
+        options=[],
+        free_text_fallback=True,
+        affects=("menu_planning", "meal_timing", "shopping"),
+        plan_impact=5,
+        uncertainty=5,
+        burden=2,
+        when=lambda ctx: ctx.get("planning_nutrition", False),
+    ),
+    Question(
         id="q_cooking_capacity",
         fact_key="cooking_capacity",
         text="כמה התעסקות בהכנת אוכל מתאימה לך בשבוע?",
@@ -384,6 +404,7 @@ _FACT_KEY_DOMAIN: dict[str, str] = {
     "diet_restrictions": "nutrition",
     "allergies": "nutrition",
     "meal_structure_preference": "nutrition",
+    "food_environment_context": "nutrition",
     "cooking_capacity": "nutrition",
     "main_barrier": "profile",
     "coaching_style": "profile",
@@ -511,6 +532,8 @@ async def record_answer(
     value: Any,
 ) -> None:
     """Store an answer as a user-reported fact."""
+    if question.fact_key == "food_environment_context":
+        value = normalize_food_environment_context(value)
     await user_model.set_fact(
         db,
         user_id,
