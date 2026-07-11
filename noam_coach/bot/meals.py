@@ -642,19 +642,36 @@ async def render_meal(target: Any, user_id: int, approval_id: str, refine_count:
         icon = "⛔" if issue.severity == "block" else "⚠️"
         restriction_warnings.append(f"{icon} {esc(issue.message)}")
 
+    def _quantity_unit(item: "FoodItem") -> str:
+        # TASK-9: drinks are measured in volume — render "מ״ל" not "גרם".
+        name = str(item.name or "")
+        if any(word in name for word in ("שייק", "משקה", "שתייה", "מיץ", "קפה", "חלב", "מ״ל", 'מ"ל')):
+            return "מ״ל"
+        return "גרם"
+
     def _item_line(index: int, item: "FoodItem") -> str:
         # TASK-22: meal components are not an ordered sequence — use a plain
         # bullet, not database-style "1." / "2." numbering.
         del index
         line = (
-            f"• {esc(item.name)} — {item.grams:g} גרם | "
+            f"• {esc(item.name)} — {item.grams:g} {_quantity_unit(item)} | "
             f"{item.calories:.0f} קל׳ | {item.protein:.0f} חלבון"
         )
         if item.confidence < 0.6:
             line += " ⚠️"
         return line
 
-    items = "\n".join(_item_line(i, item) for i, item in enumerate(analysis.items))
+    # TASK-9: a single-item meal is rendered simply — the item's own quantity and
+    # macros, with no duplicated identical "meal total" line below it.
+    single_item = len(analysis.items) == 1
+    if single_item:
+        only = analysis.items[0]
+        items = (
+            f"{only.grams:g} {_quantity_unit(only)}\n"
+            f"{only.calories:.0f} קל׳ | {only.protein:.0f} ג׳ חלבון"
+        )
+    else:
+        items = "\n".join(_item_line(i, item) for i, item in enumerate(analysis.items))
 
     if analysis.confidence < 0.7:
         cal = totals["calories"]
@@ -720,13 +737,24 @@ async def render_meal(target: Any, user_id: int, approval_id: str, refine_count:
             )
         keyboard = InlineKeyboardMarkup(option_rows)
     else:
+        if single_item:
+            # TASK-9: no duplicate totals for a one-item meal — the item line
+            # already shows calories/protein; only add carbs/fat once.
+            totals_block = (
+                f"\n\nפחמימות: {totals['carbs']:.0f} ג׳ | שומן: {totals['fat']:.0f} ג׳"
+            )
+        else:
+            totals_block = (
+                f"\n\n<b>סה״כ</b>\n"
+                f"קלוריות: <b>{totals['calories']:.0f}</b>\n"
+                f"חלבון: <b>{totals['protein']:.0f} גרם</b>\n"
+                f"פחמימות: <b>{totals['carbs']:.0f} גרם</b>\n"
+                f"שומן: <b>{totals['fat']:.0f} גרם</b>"
+            )
         text = (
             f"<b>{esc(analysis.meal_name)}</b>\n\n"
-            f"{items}\n\n"
-            f"קלוריות: <b>{totals['calories']:.0f}</b>\n"
-            f"חלבון: <b>{totals['protein']:.0f} גרם</b>\n"
-            f"פחמימות: <b>{totals['carbs']:.0f} גרם</b>\n"
-            f"שומן: <b>{totals['fat']:.0f} גרם</b>\n\n"
+            f"{items}"
+            f"{totals_block}\n\n"
             "הארוחה תיספר רק לאחר אישור." + restriction_block + refine_hint
         )
         if validation.blocked:

@@ -64,6 +64,37 @@ class ClarificationOption(BaseModel):
     fat_delta: float = 0
 
 
+def _title_word_set(text: str) -> set[str]:
+    """Meaningful Hebrew/English word tokens in a title/name, for overlap checks."""
+    import re as _re
+
+    raw = _re.split(r"[\s,\-–/()|.]+", str(text or "").lower())
+    stop = {
+        "עם", "ו", "של", "ב", "ל", "על", "מ", "או", "and", "with", "the", "a",
+        "טעם", "ומגע", "בטעם", "ארוחה", "מנה", "צלחת", "כוס",
+    }
+    words: set[str] = set()
+    for token in raw:
+        token = token.strip("׳״'\"")
+        if len(token) >= 2 and token not in stop and not token.isdigit():
+            words.add(token)
+    return words
+
+
+def derive_meal_title(items: list["FoodItem"]) -> str:
+    """Canonical display title derived from the detected items (TASK-9/14).
+
+    A single item uses its own name; multiple items join the main item names so
+    the title can never introduce a food that is absent from the item list.
+    """
+    names = [str(item.name or "").strip() for item in items if str(item.name or "").strip()]
+    if not names:
+        return "ארוחה"
+    if len(names) == 1:
+        return names[0]
+    return " + ".join(names[:3])
+
+
 class MealAnalysis(BaseModel):
     meal_name: str
     items: list[FoodItem]
@@ -71,6 +102,31 @@ class MealAnalysis(BaseModel):
     question: str | None = None
     options: list[ClarificationOption] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def title_is_supported_by_items(self) -> "MealAnalysis":
+        """TASK-9/14: the meal title must not introduce foods absent from the
+        detected items. When the AI title adds unsupported food words (e.g.
+        "פרו 40 גבינה ותפוח" while only a PRO 40 drink was detected), replace it
+        with a canonical title derived from the items themselves.
+        """
+        if not self.items:
+            return self
+        title_words = _title_word_set(self.meal_name)
+        if not title_words:
+            object.__setattr__(self, "meal_name", derive_meal_title(self.items))
+            return self
+        item_words: set[str] = set()
+        for item in self.items:
+            item_words |= _title_word_set(item.name)
+        # Any title word that is not supported by (a substring of / superstring
+        # of) some item word is an unsupported addition.
+        def _supported(word: str) -> bool:
+            return any(word in iw or iw in word for iw in item_words)
+
+        if not all(_supported(word) for word in title_words):
+            object.__setattr__(self, "meal_name", derive_meal_title(self.items))
+        return self
 
     def totals(self) -> dict[str, float]:
         return {
