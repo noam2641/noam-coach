@@ -296,30 +296,32 @@ async def render_post_meal_confirmation_day_status(user_id: int, totals: dict[st
     # workout event (at its day-specific time) and a valid sleep event. The
     # allocations are recomputed from the CURRENT remaining budget on every
     # call, so each approved meal shrinks the plan.
-    timeline: list[str] = []
+    from noam_coach.services.next_meal import _hhmm_from_iso
+
+    # TASK-11: build the continuation as (time, text) events and sort them by
+    # full clock time. Times are always HH:MM — never a raw ISO/RFC3339 stamp.
+    # "99:99" is a sentinel that keeps untimed items at the end, stably.
+    events: list[tuple[str, str]] = []
+    status_line: str | None = None
     if workout_context is not None:
         # A future workout appears in the timeline at its scheduled time; a
         # completed/uncertain one is surfaced via the status line, not as a
         # future event.
-        workout_event: str | None = None
-        if (
-            workout_context.workout_phase.value.startswith("pre_workout")
-            and workout_context.planned_workout_start
-        ):
-            workout_event = f"🏋️ {esc(workout_context.planned_workout_start)} אימון"
+        if workout_context.workout_phase.value.startswith("pre_workout"):
+            workout_hhmm = _hhmm_from_iso(workout_context.planned_workout_start)
+            if workout_hhmm:
+                events.append((workout_hhmm, f"🏋️ {esc(workout_hhmm)} אימון"))
 
         for allocation in build_remaining_slot_allocations(workout_context):
-            time_part = f"{esc(allocation.time_hint)} · " if allocation.time_hint else ""
-            timeline.append(
+            time_hint = allocation.time_hint or ""
+            time_part = f"{esc(time_hint)} · " if time_hint else ""
+            events.append((
+                time_hint or "99:99",
                 f"🍽️ {time_part}{esc(allocation.label)}: "
-                f"כ-{allocation.calories} קל׳ | כ-{allocation.protein} ג׳ חלבון"
-            )
-        if workout_event:
-            timeline.insert(0, workout_event)
+                f"כ-{allocation.calories} קל׳ | כ-{allocation.protein} ג׳ חלבון",
+            ))
 
         status_line = _WORKOUT_STATUS_LINE_BY_PHASE.get(workout_context.workout_phase.value)
-        if status_line:
-            timeline.append(status_line)
 
         # Only show a concrete bedtime when the sleep time is actually known /
         # confirmed — never present an unconfirmed inference as fact.
@@ -330,12 +332,15 @@ async def render_post_meal_confirmation_day_status(user_id: int, totals: dict[st
         ):
             bedtime = _bedtime_clock(context.current_local_time, workout_context.hours_until_bedtime)
             if bedtime:
-                timeline.append(f"😴 {esc(bedtime)} שינה")
+                events.append((bedtime, f"😴 {esc(bedtime)} שינה"))
 
-    if timeline:
+    if events:
+        events.sort(key=lambda item: item[0])
         lines.append("")
         lines.append("המשך היום:")
-        lines.extend(timeline)
+        lines.extend(text for _time, text in events)
+        if status_line:
+            lines.append(status_line)
 
     return "\n".join(lines)
 
