@@ -21,7 +21,11 @@ from helpers import utc_now
 from noam_coach.bot import onboarding as onboarding_bot
 
 
-async def _ready_db_with_nutrition_and_workout(tmp_path: Path) -> Database:
+async def _ready_db_with_nutrition_and_workout(
+    tmp_path: Path,
+    *,
+    weekly_availability: list[dict[str, Any]] | None = None,
+) -> Database:
     db = Database(str(tmp_path / "unified.db"))
     await db.init()
     await db.execute(
@@ -44,7 +48,8 @@ async def _ready_db_with_nutrition_and_workout(tmp_path: Path) -> Database:
         "training_days_per_week": 3, "active_pain": "none", "medical_avoidance": "none",
         "session_minutes": 50, "training_location": "gym", "equipment": "full_gym",
         "strength_experience": "intermediate",
-        "weekly_availability": [{"weekday": d, "start": "18:47", "minutes": 50} for d in [0, 2, 4]],
+        "weekly_availability": weekly_availability
+        or [{"weekday": d, "start": "18:47", "minutes": 50} for d in [0, 2, 4]],
     }
     for key, value in facts.items():
         await user_model.set_fact(db, 1, key, value, source=user_model.SOURCE_USER, confirmed=True)
@@ -103,6 +108,51 @@ async def test_meals_and_workouts_keys_still_present_for_backward_compat(tmp_pat
         assert "workouts" in day
         assert "items" in day
         assert len(day["items"]) == len(day["meals"]) + len(day["workouts"])
+
+
+@pytest.mark.asyncio
+async def test_unified_week_preserves_day_specific_workout_times(tmp_path: Path) -> None:
+    db = await _ready_db_with_nutrition_and_workout(
+        tmp_path,
+        weekly_availability=[
+            {"weekday": 0, "start": "19:00", "minutes": 50},
+            {"weekday": 2, "start": "18:30", "minutes": 50},
+            {"weekday": 4, "start": "09:00", "minutes": 50},
+        ],
+    )
+    unified = await planning.build_unified_week(db, 1)
+
+    workouts_by_day = {
+        day["weekday"]: day["workouts"][0]["time"]
+        for day in unified.payload["days"]
+        if day.get("workouts")
+    }
+
+    assert workouts_by_day == {0: "19:00", 2: "18:30", 4: "09:00"}
+
+
+@pytest.mark.asyncio
+async def test_unified_week_uses_morning_nutrition_timing_for_friday_morning(tmp_path: Path) -> None:
+    db = await _ready_db_with_nutrition_and_workout(
+        tmp_path,
+        weekly_availability=[
+            {"weekday": 0, "start": "19:00", "minutes": 50},
+            {"weekday": 2, "start": "18:30", "minutes": 50},
+            {"weekday": 4, "start": "09:00", "minutes": 50},
+        ],
+    )
+    unified = await planning.build_unified_week(db, 1)
+
+    friday = next(day for day in unified.payload["days"] if day["weekday"] == 4)
+    friday_workout_meals = [meal for meal in friday["meals"] if meal.get("workout_time") == "09:00"]
+    assert {meal["time"] for meal in friday_workout_meals} == {"07:30", "10:15"}
+    assert any("בוקר" in meal["name"] for meal in friday_workout_meals)
+    assert not any(meal["time"].startswith("17:") for meal in friday_workout_meals)
+
+    monday = next(day for day in unified.payload["days"] if day["weekday"] == 0)
+    monday_workout_meals = [meal for meal in monday["meals"] if meal.get("workout_time") == "19:00"]
+    assert {meal["time"] for meal in monday_workout_meals} == {"17:30", "20:15"}
+    assert not any("בוקר" in meal["name"] for meal in monday_workout_meals)
 
 
 @pytest.mark.asyncio

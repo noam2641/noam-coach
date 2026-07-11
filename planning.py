@@ -393,6 +393,56 @@ def _workday_meal_times(facts: dict[str, dict[str, Any]], slot_count: int) -> li
     return base[:slot_count]
 
 
+def _shift_hhmm(value: str | None, minutes: int) -> str | None:
+    if not value or len(value) < 5 or value[2] != ":":
+        return None
+    try:
+        hour = int(value[:2])
+        minute = int(value[3:5])
+    except ValueError:
+        return None
+    total = max(0, min(23 * 60 + 59, hour * 60 + minute + minutes))
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def _workout_nutrition_meals(session: dict[str, Any]) -> list[dict[str, Any]]:
+    session_time = str(session.get("time") or "").strip()[:5]
+    if not session_time:
+        return []
+    try:
+        hour = int(session_time[:2])
+    except ValueError:
+        hour = 19
+    pre_time = _shift_hhmm(session_time, -90) or session_time
+    post_time = _shift_hhmm(session_time, 75) or session_time
+    if hour < 12:
+        pre_name = "קדם אימון בוקר קל"
+        post_name = "התאוששות אחרי אימון בוקר"
+        pre_guidance = "משהו קל לעיכול לפני האימון; לא ארוחת ערב כבדה"
+        post_guidance = "חלבון ופחמימה מוקדם אחרי האימון כדי לפתוח את היום"
+    else:
+        pre_name = "קדם אימון"
+        post_name = "התאוששות אחרי אימון"
+        pre_guidance = "ארוחה קלה 60-120 דקות לפני האימון"
+        post_guidance = "חלבון אחרי האימון לפי התוכנית"
+    return [
+        {
+            "name": pre_name,
+            "time": pre_time,
+            "guidance": pre_guidance,
+            "workout_time": session_time,
+            "workout_weekday": session.get("weekday"),
+        },
+        {
+            "name": post_name,
+            "time": post_time,
+            "guidance": post_guidance,
+            "workout_time": session_time,
+            "workout_weekday": session.get("weekday"),
+        },
+    ]
+
+
 def _nutrition_candidate(
     *,
     title: str,
@@ -1416,14 +1466,8 @@ async def build_unified_week(db: Any, user_id: int) -> PlanCandidate:
         meals = copy.deepcopy(nutrition_days.get(weekday, {}).get("meals", []))
         sessions = copy.deepcopy(workout_days.get(weekday, []))
         if sessions and meals:
-            session_time = sessions[0].get("time") or "19:00"
-            meals.append(
-                {
-                    "name": "תזמון סביב האימון",
-                    "time": session_time,
-                    "guidance": "ארוחה קלה 60–120 דקות לפני וחלבון לאחר האימון לפי התוכנית",
-                }
-            )
+            for session in sessions:
+                meals.extend(_workout_nutrition_meals(session))
         # D12: a single chronologically-sorted view of the day, merging meals
         # and workouts by "HH:MM" (a plain string sort is chronological for
         # this fixed-width format). "meals"/"workouts" stay on the payload
