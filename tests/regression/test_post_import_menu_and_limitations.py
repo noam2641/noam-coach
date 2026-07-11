@@ -194,9 +194,14 @@ async def test_complete_profile_restores_normal_home_keyboard(
     keyboard = await ui_bot.home_keyboard_for_user(1)
     callbacks = _callbacks(keyboard)
 
+    # Onboarding complete → the normal focused primary menu is restored (not the
+    # "complete my plan" onboarding keyboard).
     assert "planv2:complete_missing" not in callbacks
-    assert "menu:health" in callbacks
-    assert "menu:chart" in callbacks
+    assert "menu:settings" in callbacks
+    # TASK-6: health/chart moved behind the settings screen.
+    settings = _callbacks(ui_bot.settings_keyboard())
+    assert "menu:health" in settings
+    assert "menu:chart" in settings
 
 
 @pytest.mark.asyncio

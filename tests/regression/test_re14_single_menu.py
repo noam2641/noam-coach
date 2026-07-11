@@ -71,11 +71,16 @@ def _callbacks(markup: Any) -> set[str]:
 
 
 def test_single_menu_has_no_more_button() -> None:
+    from noam_coach.bot.ui import settings_keyboard
+
     callbacks = _callbacks(coach_bot.home_keyboard())
     assert "menu:more" not in callbacks
-    # Former "עוד" actions are now on the one menu.
+    # TASK-6: the former "עוד" secondary actions now live behind the
+    # "⚙️ הגדרות ועוד" (menu:settings) entry, not directly on the home menu.
+    assert "menu:settings" in callbacks
+    settings = _callbacks(settings_keyboard())
     assert {"menu:profile", "menu:goal", "menu:chart", "menu:weekly",
-            "menu:health", "menu:about"} <= callbacks
+            "menu:health", "menu:about"} <= settings
 
 
 @pytest.mark.asyncio

@@ -211,35 +211,51 @@ async def update_session_step(
 
 @runtime_bound(RUNTIME_NAMES)
 def home_keyboard() -> InlineKeyboardMarkup:
-    # RE14: ONE menu only. The old split (compact home + a separate "עוד"
-    # screen) confused users with two different menus — everything now lives
-    # on a single screen: daily actions first, settings/rare actions below.
+    # TASK-6: a focused personal-coach home menu, not a control panel. Only the
+    # day-to-day actions are top-level; secondary/system actions live behind
+    # "⚙️ הגדרות ועוד". "תפריט להיום" is reached via the plan and the primary
+    # real-time action is "מה לאכול עכשיו"; the daily summary is mainly an
+    # automatic scheduled message, so neither is a top-level button anymore.
     rows = [
         [
-            button("🍽️ תפריט להיום", "menu:daily_menu"),
-            button("➡️ מה לאכול עכשיו", "menu:nextmeal"),
-        ],
-        [
+            button("🍽️ מה לאכול עכשיו", "menu:nextmeal"),
             button("🏋️ אימון", "menu:workout"),
-            button("🧭 התוכנית שלי", "menu:smartplan"),
         ],
         [
             button("📊 מצב היום", "menu:status"),
-            button("🌙 סיכום יומי", "menu:evening"),
+            button("📅 התוכנית שלי", "menu:smartplan"),
         ],
         [
             button("☀️ עדכון בוקר", "menu:morning"),
             button("📝 עדכונים", "menu:flags"),
         ],
         [
+            button("⚙️ הגדרות ועוד", "menu:settings"),
+        ],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+@runtime_bound(RUNTIME_NAMES)
+def settings_keyboard() -> InlineKeyboardMarkup:
+    """TASK-6: the secondary/system actions moved off the primary home menu.
+
+    Every callback route is preserved — the actions are relocated, not removed.
+    """
+    rows = [
+        [
             button("👤 הפרופיל שלי", "menu:profile"),
-        ],
-        [
             button("🎯 יעד", "menu:goal"),
-            button("📈 גרף", "menu:chart"),
         ],
         [
+            button("🍽️ תפריט להיום", "menu:daily_menu"),
             button("🗓️ שבועי", "menu:weekly"),
+        ],
+        [
+            button("📈 גרף", "menu:chart"),
+            button("🌙 סיכום יומי", "menu:evening"),
+        ],
+        [
             button("⌚ Apple Health", "menu:health"),
         ],
     ]
@@ -247,6 +263,7 @@ def home_keyboard() -> InlineKeyboardMarkup:
     if _is_valid_public_url(SETTINGS.public_base_url or ""):
         bottom.insert(0, button("📱 Mini App", "menu:app"))
     rows.append(bottom)
+    rows.append([button("⬅️ תפריט", "menu:home")])
     return InlineKeyboardMarkup(rows)
 
 

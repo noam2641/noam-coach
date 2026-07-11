@@ -754,6 +754,17 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
         )
         return True
 
+    if data == "menu:settings":
+        # TASK-6: the secondary/system actions moved off the primary home menu.
+        from noam_coach.bot.ui import settings_keyboard
+
+        await safe_edit(
+            query,
+            "<b>⚙️ הגדרות ועוד</b>\n\nפרופיל, יעד, תפריט להיום, שבועי, גרפים ונתוני בריאות.",
+            settings_keyboard(),
+        )
+        return True
+
     if data == "menu:about":
         await safe_edit(
             query,

@@ -114,19 +114,31 @@ def test_session_action_arg_missing_raises() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_home_keyboard_is_the_single_unified_menu() -> None:
-    """RE14: there is exactly ONE menu — no secondary "עוד" screen."""
-    kb = coach_bot.home_keyboard()
-    flat = [btn for row in kb.inline_keyboard for btn in row]
-    callbacks = {btn.callback_data for btn in flat}
-    # Daily actions and settings/rare actions all live on the same screen.
+def test_home_keyboard_is_focused_primary_menu() -> None:
+    """TASK-6: the primary home menu is a focused personal-coach menu, not a
+    control panel. Secondary/system actions move behind "⚙️ הגדרות ועוד"."""
+    from noam_coach.bot.ui import settings_keyboard
+
+    home = {btn.callback_data for row in coach_bot.home_keyboard().inline_keyboard for btn in row}
+    # Focused primary actions only.
+    assert home == {
+        "menu:nextmeal", "menu:workout", "menu:status", "menu:smartplan",
+        "menu:morning", "menu:flags", "menu:settings",
+    }
+    # The overloaded top-level actions are gone from the primary menu.
+    assert "menu:daily_menu" not in home
+    assert "menu:evening" not in home
+    assert "menu:profile" not in home
+    assert "menu:goal" not in home
+    assert "menu:more" not in home
+
+    # All secondary routes are preserved on the settings screen.
+    settings = {btn.callback_data for row in settings_keyboard().inline_keyboard for btn in row}
     assert {
-        "menu:morning", "menu:nextmeal", "menu:workout", "menu:smartplan",
-        "menu:status", "menu:evening", "menu:flags", "menu:profile",
-        "menu:goal", "menu:chart", "menu:weekly", "menu:health", "menu:about",
-    } <= callbacks
-    # No second menu type anymore.
-    assert "menu:more" not in callbacks
+        "menu:profile", "menu:goal", "menu:daily_menu", "menu:weekly",
+        "menu:chart", "menu:evening", "menu:health", "menu:about",
+    } <= settings
+    assert "menu:home" in settings  # back to the primary menu
 
 
 @pytest.mark.asyncio
