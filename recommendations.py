@@ -274,7 +274,17 @@ async def morning_menu(
                         "'saturday' (the Israeli weekend) adapt naturally to a "
                         "different rhythm than a workday. Respect the food "
                         "environment (cooking availability, restaurants, takeaway, "
-                        "quick meals) when choosing meals."
+                        "quick meals) when choosing meals.\n"
+                        # TASK-5: personalize to the user's actual learned foods.
+                        "The context includes 'learned_foods' with a "
+                        "'usual_meal_slot' (breakfast/lunch/afternoon/dinner/late) "
+                        "and 'meal_slot_counts'. When history exists, build meals "
+                        "PRIMARILY from these familiar foods and realistic "
+                        "variations, and place each learned food in the meal slot "
+                        "it is actually eaten in — do NOT put a food the user only "
+                        "eats at dinner into an 08:00 breakfast just because its "
+                        "macros fit. Use new foods only to fill gaps the learned "
+                        "foods cannot cover, for variety, or when explicitly asked."
                     ),
                 },
                 {

@@ -2464,6 +2464,16 @@ async def build_morning_menu_text(user_id: int, ctx: "DailyContext | None" = Non
     ])
     if not ctx.flags:
         text += "\n\n<i>ההצעה נבנתה לפי השגרה שלך, כי עדיין לא התקבל עדכון בוקר להיום.</i>"
+    # TASK-5: be honest about personalization strength. When little learned-food
+    # history exists yet, say the menu is based on targets + confirmed nutrition
+    # info and will improve as more meals are logged — do not imply strong
+    # personalization that was not actually available.
+    learned_foods = getattr(nutrition_context, "learned_foods", None) or []
+    if len(learned_foods) < 3:
+        text += (
+            "\n\n<i>ההצעה נבנתה לפי היעדים והמידע התזונתי שאושר עד עכשיו. "
+            "ככל שיתועדו יותר ארוחות, התפריט יותאם טוב יותר להרגלים שלך.</i>"
+        )
     from noam_coach.services.decision_engine import context_completeness_gate
 
     gate = context_completeness_gate("nutrition", nutrition_request["context_quality"])

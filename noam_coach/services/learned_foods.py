@@ -16,11 +16,45 @@ This module deliberately derives that knowledge from the existing durable
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 from config import TZ
+
+# TASK-5: coarse meal slots derived from the local hour a meal was eaten, used to
+# rank learned foods by relevance to the current meal slot.
+MEAL_SLOT_LABELS_HE: dict[str, str] = {
+    "breakfast": "ארוחת בוקר",
+    "lunch": "ארוחת צהריים",
+    "afternoon": "ארוחת ביניים",
+    "dinner": "ארוחת ערב",
+    "late": "ארוחת לילה",
+}
+
+
+def meal_slot_for_hour(hour: int) -> str:
+    """Map a local hour (0-23) to a coarse meal slot."""
+    if 5 <= hour < 11:
+        return "breakfast"
+    if 11 <= hour < 15:
+        return "lunch"
+    if 15 <= hour < 18:
+        return "afternoon"
+    if 18 <= hour < 22:
+        return "dinner"
+    return "late"
+
+
+def _meal_slot_for_timestamp(eaten_at: str) -> str | None:
+    try:
+        dt = datetime.fromisoformat(str(eaten_at))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(TZ)
+    return meal_slot_for_hour(dt.hour)
+
 
 _NORMALIZE_RE = re.compile(r"[\s\-_/|,.;:()\[\]{}]+")
 _COOKED_MARKERS = ("מבושל", "מבושלת", "מוכן", "מוכנה")
@@ -47,13 +81,34 @@ class LearnedFood:
     avg_carbs: float
     avg_fat: float
     last_eaten_at: str
+    # TASK-5: how often this food was eaten in each meal slot, so menu generation
+    # can rank a learned food by relevance to the current meal slot instead of
+    # treating learned foods as one flat list.
+    slot_counts: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def dominant_slot(self) -> str | None:
+        """The meal slot this food is most associated with, or None if unclear."""
+        if not self.slot_counts:
+            return None
+        slot, count = max(self.slot_counts.items(), key=lambda kv: kv[1])
+        return slot if count > 0 else None
+
+    def slot_relevance(self, slot: str) -> float:
+        """Fraction of this food's occurrences that fell in ``slot`` (0..1)."""
+        total = sum(self.slot_counts.values())
+        if total <= 0:
+            return 0.0
+        return self.slot_counts.get(slot, 0) / total
 
     def prompt_line(self) -> str:
         grams = f"{self.avg_grams:.0f} גרם" if self.avg_grams else "מנה רגילה"
+        slot = self.dominant_slot
+        slot_he = f", בדרך כלל ב{MEAL_SLOT_LABELS_HE.get(slot, slot)}" if slot else ""
         return (
             f"{self.display_name} — הופיע {self.count} פעמים; "
             f"ממוצע למנה: {grams}, {self.avg_calories:.0f} קל׳, "
-            f"{self.avg_protein:.0f} ג׳ חלבון"
+            f"{self.avg_protein:.0f} ג׳ חלבון{slot_he}"
         )
 
     def ai_payload(self) -> dict[str, Any]:
@@ -66,6 +121,8 @@ class LearnedFood:
             "avg_carbs": round(self.avg_carbs, 1),
             "avg_fat": round(self.avg_fat, 1),
             "last_eaten_at": self.last_eaten_at,
+            "usual_meal_slot": self.dominant_slot,
+            "meal_slot_counts": dict(self.slot_counts),
             "source": "approved_meal_history",
         }
 
@@ -144,14 +201,18 @@ async def learned_foods_from_meals(
                 "carbs": 0.0,
                 "fat": 0.0,
                 "last_eaten_at": str(row["eaten_at"] or ""),
+                "slot_counts": {},
             },
         )
         bucket["count"] += 1
-        for field in ("grams", "calories", "protein", "carbs", "fat"):
+        for field_name in ("grams", "calories", "protein", "carbs", "fat"):
             try:
-                bucket[field] += float(row[field] or 0)
+                bucket[field_name] += float(row[field_name] or 0)
             except (TypeError, ValueError):
                 pass
+        slot = _meal_slot_for_timestamp(str(row["eaten_at"] or ""))
+        if slot is not None:
+            bucket["slot_counts"][slot] = bucket["slot_counts"].get(slot, 0) + 1
         if str(row["eaten_at"] or "") > str(bucket["last_eaten_at"] or ""):
             bucket["last_eaten_at"] = str(row["eaten_at"] or "")
             bucket["display_name"] = name
@@ -172,6 +233,7 @@ async def learned_foods_from_meals(
                 avg_carbs=float(bucket["carbs"] or 0) / count,
                 avg_fat=float(bucket["fat"] or 0) / count,
                 last_eaten_at=str(bucket["last_eaten_at"] or ""),
+                slot_counts=dict(bucket["slot_counts"]),
             )
         )
     learned.sort(key=lambda item: (item.count, item.last_eaten_at), reverse=True)
