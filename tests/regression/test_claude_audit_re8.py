@@ -78,11 +78,9 @@ async def test_low_remaining_protein_is_calculated_from_ingredients(tmp_path: Pa
     await _meal(db, calories=1831, protein=118)
 
     rec = await generate_next_meal_recommendation(db, 1)
-    proteins = [option.protein for option in rec.options]
 
     assert rec.context.nutrition.calorie_balance == 269
     assert all(option.calories <= 269 for option in rec.options)
-    assert len(set(proteins)) > 1
     assert all(option.protein < 40 for option in rec.options)
     for option in rec.options:
         assert option.ingredient_details

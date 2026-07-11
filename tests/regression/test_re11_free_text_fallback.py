@@ -1,6 +1,6 @@
 """RE11 regression tests — collapsed "יש/אין" question UX.
 
-Covers the product requirement: for safety_pain, safety_medical_avoidance,
+Covers the product requirement: for the unified safety limitation question,
 q_allergies and q_equipment, the user must be able to type a free-text answer
 directly at the initial question prompt (no forced "יש"/"אחר" tap first), while
 a single "אין" (or a genuine multi-choice, for equipment) button remains for
@@ -59,8 +59,7 @@ def _patch_db(monkeypatch: pytest.MonkeyPatch, db: Database) -> None:
 
 def test_target_questions_have_single_none_button_and_free_text_fallback() -> None:
     for qid, fact_key in (
-        ("safety_pain", "active_pain"),
-        ("safety_medical_avoidance", "medical_avoidance"),
+        ("safety_training_limitations", "training_limitations"),
         ("q_allergies", "allergies"),
     ):
         q = questions.question_by_id(qid)
@@ -82,33 +81,15 @@ async def test_typing_pain_location_directly_is_accepted(
 ) -> None:
     db = await _make_db(tmp_path)
     _patch_db(monkeypatch, db)
-    await onboarding_bot.set_pending(1, "safety_pain")
+    await onboarding_bot.set_pending(1, "safety_training_limitations")
 
     update = FakeUpdate("ברך ימין")
     handled = await onboarding_bot.handle_onboarding_text(update, 1)
     assert handled is True
 
-    fact = await user_model.get_fact(db, 1, "active_pain")
+    fact = await user_model.get_fact(db, 1, "training_limitations")
     assert fact is not None
-    assert fact["value"]["location"] == "ברך ימין"
-    assert fact["confirmed"] is True
-
-
-@pytest.mark.asyncio
-async def test_typing_medical_avoidance_directly_is_accepted(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    db = await _make_db(tmp_path)
-    _patch_db(monkeypatch, db)
-    await onboarding_bot.set_pending(1, "safety_medical_avoidance")
-
-    update = FakeUpdate("לא לעשות סקוואט עמוק")
-    handled = await onboarding_bot.handle_onboarding_text(update, 1)
-    assert handled is True
-
-    fact = await user_model.get_fact(db, 1, "medical_avoidance")
-    assert fact is not None
-    assert fact["value"] == "לא לעשות סקוואט עמוק"
+    assert fact["value"] == "ברך ימין"
     assert fact["confirmed"] is True
 
 
@@ -169,11 +150,11 @@ async def test_none_button_still_works_for_pain(
         async def answer(self, text: str | None = None, show_alert: bool = False) -> None:
             del text, show_alert
 
-    await onboarding_bot.set_pending(1, "safety_pain")
+    await onboarding_bot.set_pending(1, "safety_training_limitations")
     target = FakeTarget()
-    await onboarding_bot.handle_onboarding_callback(target, 1, "qa:safety_pain:0")
+    await onboarding_bot.handle_onboarding_callback(target, 1, "qa:safety_training_limitations:0")
 
-    fact = await user_model.get_fact(db, 1, "active_pain")
+    fact = await user_model.get_fact(db, 1, "training_limitations")
     assert fact is not None
     assert fact["value"] == "none"
 

@@ -646,18 +646,24 @@ async def _handle_session_safety_actions(
                 [
                     [
                         button(
-                            "קל",
+                            "1-2 קל",
                             session_action_data("painlevel", session, 1),
                         ),
                         button(
-                            "בינוני",
-                            session_action_data("painlevel", session, 2),
-                        ),
-                        button(
-                            "חד/חזק",
+                            "3 זהיר",
                             session_action_data("painlevel", session, 3),
                         ),
-                    ]
+                    ],
+                    [
+                        button(
+                            "4-6 לעצור",
+                            session_action_data("painlevel", session, 4),
+                        ),
+                        button(
+                            "7-10 חד/חזק",
+                            session_action_data("painlevel", session, 7),
+                        ),
+                    ],
                 ]
             ),
         )
@@ -665,7 +671,7 @@ async def _handle_session_safety_actions(
 
     if action == "painlevel":
         severity = int(session_action_arg(parts))
-        if severity not in {1, 2, 3}:
+        if severity < 1 or severity > 10:
             await safe_answer_callback(query, "עוצמת הכאב אינה תקינה", show_alert=False)
             return True
         pain_location = session.get("pain_location")
@@ -766,10 +772,10 @@ async def _handle_session_safety_actions(
             kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
         )
 
-        if severity >= 3:
+        if severity >= 4:
             await safe_edit(
                 query,
-                "<b>כאב חד הוא סימן לעצור.</b> אל תמשיך את התרגיל עכשיו. "
+                "<b>כאב 4/10 ומעלה הוא סימן לעצור.</b> אל תמשיך את התרגיל עכשיו. "
                 "אם הכאב מתגבר, מופיעה נפיחות, הקרנה או מגבלה בתנועה — כדאי בדיקה מקצועית.",
                 InlineKeyboardMarkup(
                     [

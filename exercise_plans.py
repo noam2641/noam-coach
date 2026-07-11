@@ -345,6 +345,87 @@ PLANS: dict[str, dict[str, Any]] = {
 }
 
 
+
+# TASK-07: Professional 4-day structures.  The original four-day split used
+# A/B/C/F only, and the consistency candidate sometimes dropped a requested day.
+# These variants let the plan generator respect all four active days while
+# offering Full Body and Upper/Lower structures with varied exercises.
+PLANS.update({
+    "FB1": {
+        "name": "Full Body 1 — בסיס כוח",
+        "exercises": [
+            exercise("leg_press", "Leg Press", 3, 10, 12, 150, 90, 10, ["טווח ללא כאב", "ברכיים בכיוון האצבעות"], [("goblet", "Goblet Squat", 22.5), ("hack", "Hack Squat", 55)], muscle="רגליים"),
+            exercise("chest_machine", "לחיצת חזה במכונה", 3, 8, 12, 120, 45, 5, ["שכמות יציבות", "מרפקים בזווית נוחה"], [("db_bench", "לחיצה עם משקולות", 17.5), ("pushup", "שכיבות סמיכה", 0)], muscle="חזה"),
+            exercise("lat_pull_fb", "משיכה רחבה לחזה", 3, 10, 12, 120, 45, 4.5, ["חזה פתוח", "משיכה לחזה"], [("neutral_pull", "פולי ניטרלי", 45), ("band_row", "חתירה עם גומייה", 0)], muscle="גב"),
+            exercise("dead_bug", "Dead Bug", 2, 8, 12, 60, 0, 0, ["גב תחתון יציב", "נשימה בשליטה"], [], muscle="ליבה"),
+        ],
+    },
+    "FB2": {
+        "name": "Full Body 2 — שרשרת אחורית ומשיכה",
+        "exercises": [
+            exercise("rdl", "דדליפט רומני", 3, 8, 10, 150, 35, 2.5, ["גב ניטרלי", "תנועה מהאגן"], [("hip_thrust", "Hip Thrust", 55), ("cable_pull_through", "Pull-Through בכבל", 25)], muscle="שרשרת אחורית"),
+            exercise("db_bench", "לחיצה עם משקולות", 3, 8, 12, 120, 17.5, 2, ["שליטה מלאה", "טווח ללא כאב"], [("chest_machine", "Chest Press", 45), ("incline_pushup", "שכיבות סמיכה בשיפוע", 0)], muscle="חזה"),
+            exercise("cable_row", "חתירה בכבל", 3, 10, 12, 120, 40, 5, ["גב ארוך", "מרפקים לאחור"], [("row_machine", "מכונת חתירה", 40), ("band_row", "חתירה עם גומייה", 0)], muscle="גב"),
+            exercise("lateral", "הרחקת כתפיים", 2, 12, 15, 75, 7.5, 1, ["מרפק מוביל", "בלי כאב כתף"], [("cable_lateral", "הרחקה בכבל", 5), ("lateral_machine", "מכונת הרחקה", 20)], muscle="כתפיים"),
+        ],
+    },
+    "FB3": {
+        "name": "Full Body 3 — סקוואט קל ודחיפה",
+        "exercises": [
+            exercise("goblet", "Goblet Squat", 3, 10, 12, 120, 22.5, 2.5, ["חזה פתוח", "טווח ללא כאב"], [("chair_squat", "קימה מכיסא", 0), ("leg_press", "Leg Press", 80)], muscle="רגליים"),
+            exercise("incline_machine", "לחיצה בשיפוע במכונה", 3, 8, 12, 120, 40, 5, ["שכמות יציבות", "מרפקים נוחים"], [("incline_db", "לחיצה בשיפוע עם משקולות", 17.5), ("incline_pushup", "שכיבות סמיכה בשיפוע", 0)], muscle="חזה עליון"),
+            exercise("neutral_pull", "משיכה ניטרלית", 3, 10, 12, 120, 45, 5, ["כתפיים נמוכות", "משיכה לשליטה"], [("lat_pull_fb", "משיכה רחבה", 40), ("band_row", "חתירה עם גומייה", 0)], muscle="גב"),
+            exercise("rope_push", "פשיטת מרפק בחבל", 2, 10, 12, 75, 15, 2.5, ["מרפקים צמודים", "ללא כאב מרפק"], [("one_arm_push", "פשיטה ביד אחת", 7.5), ("bar_push", "פשיטה במוט", 20)], muscle="יד אחורית"),
+        ],
+    },
+    "FB4": {
+        "name": "Full Body 4 — התאוששות אקטיבית",
+        "exercises": [
+            exercise("hip_thrust", "Hip Thrust", 3, 8, 12, 120, 55, 5, ["סנטר קל פנימה", "כיווץ ישבן בסוף"], [("glute_bridge", "גשר ישבן", 0), ("back_ext", "היפר-אקסטנשן", 0)], muscle="ישבן"),
+            exercise("shoulder_machine", "לחיצת כתפיים במכונה", 3, 8, 12, 120, 30, 2.5, ["לא לנעול", "טווח ללא כאב"], [("landmine", "Landmine Press", 15), ("wall_push", "דחיפה מול קיר", 0)], muscle="כתפיים"),
+            exercise("one_arm_row", "חתירה יד אחת", 3, 10, 12, 120, 20, 2.5, ["גב ניטרלי", "מרפק לכיוון האגן"], [("cable_row", "חתירה בכבל", 40), ("row_machine", "מכונת חתירה", 40)], muscle="גב"),
+            exercise("cable_pull_through", "Pull-Through בכבל", 2, 10, 12, 90, 25, 2.5, ["תנועה מהאגן", "שליטה מלאה"], [("glute_bridge", "גשר ישבן", 0), ("dead_bug", "Dead Bug", 0)], muscle="שרשרת אחורית"),
+        ],
+    },
+    "U1": {
+        "name": "Upper 1 — חזה וגב",
+        "exercises": [
+            exercise("chest_machine", "לחיצת חזה במכונה", 3, 8, 12, 120, 45, 5, ["שכמות יציבות"], [("db_bench", "לחיצה עם משקולות", 17.5)], muscle="חזה"),
+            exercise("lat_pull", "משיכה רחבה לחזה", 3, 10, 12, 120, 45, 4.5, ["חזה פתוח"], [("neutral_pull", "פולי ניטרלי", 45)], muscle="גב"),
+            exercise("cable_row", "חתירה בכבל", 3, 10, 12, 120, 40, 5, ["גב ארוך"], [("row_machine", "מכונת חתירה", 40)], muscle="גב"),
+            exercise("lateral", "הרחקת כתפיים", 2, 12, 15, 75, 7.5, 1, ["ללא כאב כתף"], [("cable_lateral", "הרחקה בכבל", 5)], muscle="כתפיים"),
+        ],
+    },
+    "L1": {
+        "name": "Lower 1 — רגליים קדמי",
+        "exercises": [
+            exercise("leg_press", "Leg Press", 3, 10, 12, 150, 90, 10, ["ברכיים בכיוון האצבעות"], [("goblet", "Goblet Squat", 22.5)], muscle="רגליים"),
+            exercise("rdl", "דדליפט רומני", 3, 8, 10, 150, 35, 2.5, ["גב ניטרלי"], [("hip_thrust", "Hip Thrust", 55)], muscle="שרשרת אחורית"),
+            exercise("glute_bridge", "גשר ישבן", 3, 10, 15, 90, 0, 0, ["שליטה", "ללא כאב גב"], [("hip_thrust", "Hip Thrust", 50)], muscle="ישבן"),
+            exercise("dead_bug", "Dead Bug", 2, 8, 12, 60, 0, 0, ["ליבה יציבה"], [], muscle="ליבה"),
+        ],
+    },
+    "U2": {
+        "name": "Upper 2 — כתפיים וזרועות",
+        "exercises": [
+            exercise("incline_db", "לחיצה בשיפוע עם משקולות", 3, 8, 12, 120, 17.5, 2, ["טווח נוח"], [("incline_machine", "לחיצה בשיפוע במכונה", 40)], muscle="חזה עליון"),
+            exercise("one_arm_row", "חתירה יד אחת", 3, 10, 12, 120, 20, 2.5, ["גב ניטרלי"], [("cable_row", "חתירה בכבל", 40)], muscle="גב"),
+            exercise("shoulder_machine", "לחיצת כתפיים במכונה", 3, 8, 12, 120, 30, 2.5, ["ללא כאב כתף"], [("landmine", "Landmine Press", 15)], muscle="כתפיים"),
+            exercise("bar_curl", "כפיפת מרפק במוט", 2, 10, 12, 75, 17.5, 2.5, ["מרפקים שקטים", "עצור אם יש כאב מרפק"], [("cable_curl", "כפיפה בכבל", 20)], muscle="יד קדמית"),
+        ],
+    },
+    "L2": {
+        "name": "Lower 2 — שרשרת אחורית",
+        "exercises": [
+            exercise("hip_thrust", "Hip Thrust", 3, 8, 12, 120, 55, 5, ["כיווץ ישבן"], [("glute_bridge", "גשר ישבן", 0)], muscle="ישבן"),
+            exercise("goblet", "Goblet Squat", 3, 10, 12, 120, 22.5, 2.5, ["טווח ללא כאב"], [("chair_squat", "קימה מכיסא", 0)], muscle="רגליים"),
+            exercise("back_ext", "היפר-אקסטנשן", 2, 10, 12, 90, 0, 0, ["תנועה מהאגן"], [("cable_pull_through", "Pull-Through בכבל", 25)], muscle="שרשרת אחורית"),
+            exercise("dead_bug", "Dead Bug", 2, 8, 12, 60, 0, 0, ["ליבה יציבה"], [], muscle="ליבה"),
+        ],
+    },
+})
+
+
 # PLANS above is a read-only template. Per-user parameter edits are stored in
 # the exercise_overrides table and applied on top, so they survive restarts and
 # never leak across users.

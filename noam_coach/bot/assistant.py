@@ -180,7 +180,7 @@ async def _handle_meal_status_action(ctx: FreeTextContext) -> bool:
     start_utc, end_utc = today_bounds_utc()
     meals = await DB.fetch_all(
         "SELECT id, name, calories, protein, eaten_at FROM meals "
-        "WHERE user_id=? AND eaten_at>=? AND eaten_at<? ORDER BY eaten_at",
+        "WHERE user_id=? AND eaten_at>=? AND eaten_at<? AND COALESCE(status, 'consumed')='consumed' ORDER BY eaten_at",
         (ctx.user_id, start_utc, end_utc),
     )
     if not meals:
@@ -269,7 +269,6 @@ async def _reply_next_meal_recommendation(
     *,
     recommendation: Any | None = None,
     prefix: str = "",
-    back_buttons: list[tuple[str, str]] | None = None,
     record_served: bool = True,
 ) -> Any:
     from noam_coach.services.next_meal import (
@@ -283,12 +282,12 @@ async def _reply_next_meal_recommendation(
     if recommendation is None:
         await message.chat.send_action("typing")
         recommendation = await generate_next_meal_recommendation(DB, user_id)
+    # TASK-03: next_meal_action_rows already ends with a "חזור לסיכום היום"
+    # button — no extra status/home row needed on top of the 4-button cap.
     keyboard_rows = [
         [button(label, callback_data) for label, callback_data in row]
         for row in next_meal_action_rows(recommendation)
     ]
-    if back_buttons:
-        keyboard_rows.append([button(label, callback_data) for label, callback_data in back_buttons])
     body = format_next_meal_recommendation(recommendation)
     if prefix:
         body = f"{prefix}\n\n{body}"
@@ -311,14 +310,7 @@ async def _reply_next_meal_recommendation(
 @runtime_bound(RUNTIME_NAMES)
 async def _handle_status_text_action(ctx: FreeTextContext) -> bool:
     if ctx.action == "next_meal":
-        await _reply_next_meal_recommendation(
-            ctx.message,
-            ctx.user_id,
-            back_buttons=[
-                ("⬅️ חזרה למצב היום", "menu:status"),
-                ("🏠 תפריט", "menu:home"),
-            ],
-        )
+        await _reply_next_meal_recommendation(ctx.message, ctx.user_id)
         return True
 
     builders = {
@@ -343,9 +335,16 @@ _ABC_SPLIT_RE = re.compile(r"\babc\b|\ba\s*[/\-]?\s*b\s*[/\-]?\s*c\b|איי\s*ב
 
 
 def requested_split_frequency(text: str) -> int | None:
-    """Return the weekly frequency implied by an explicit split request."""
+    """Return the weekly frequency implied by an explicit split request.
+
+    PATCH-12 / IMG_011: when a user asks for ABC after already declaring four
+    training days, the product expectation is not to drop Sunday and force a
+    3-day ABC.  The project templates now support a professional 4-day
+    "ABC + Full Body" structure, so explicit ABC defaults to four sessions;
+    the availability gate below still protects users with fewer confirmed days.
+    """
     if _ABC_SPLIT_RE.search(text or ""):
-        return 3  # SPLIT_BY_FREQUENCY[3] == A/B/C
+        return 4  # ABC + Full Body when four days are available.
     return None
 
 
@@ -365,7 +364,7 @@ async def _split_availability_gate(user_id: int, split_freq: int) -> tuple[str, 
     if not availability.confirmed or days <= 0 or days >= split_freq:
         return None
     text = (
-        f"תוכנית ABC בנויה ל-{split_freq} אימונים בשבוע, אבל לפי הזמינות "
+        f"תוכנית ABC/Full Body מותאמת דורשת {split_freq} אימונים בשבוע, אבל לפי הזמינות "
         f"שאישרת יש לך {days}. אפשר לבנות תוכנית מלאה שמתאימה לימים שלך, "
         "או בכל זאת ABC."
     )
@@ -404,7 +403,10 @@ async def _handle_plan_text_action(ctx: FreeTextContext) -> bool:
             plan = await build_weekly_plan(ctx.user_id, frequency)
             plan_text = format_weekly_plan(plan)
             if split_freq is not None and frequency == split_freq:
-                plan_text = "בניתי לך תוכנית ABC מלאה — A חזה, B גב, C כתפיים ורגליים:\n\n" + plan_text
+                if frequency >= 4:
+                    plan_text = "בניתי לך תוכנית ABC + Full Body מותאמת ל־4 ימים — בלי להוריד יום אימון שהזנת:\n\n" + plan_text
+                else:
+                    plan_text = "בניתי לך תוכנית ABC מלאה — A חזה, B גב, C כתפיים ורגליים:\n\n" + plan_text
             await ctx.send(
                 plan_text,
                 InlineKeyboardMarkup(
@@ -438,6 +440,28 @@ async def _handle_goal_text_action(ctx: FreeTextContext) -> bool:
     if ctx.action == "set_goal":
         goal_weight = ctx.slots.get("goal_weight")
         if isinstance(goal_weight, (int, float)):
+            from noam_coach.services.goal_validation import (
+                is_explicit_goal_weight_confirmation,
+                validate_goal_weight,
+            )
+
+            current_weight = await user_model.get_value(DB, ctx.user_id, "weight_kg")
+            try:
+                current_weight_float = float(current_weight) if current_weight is not None else None
+            except (TypeError, ValueError):
+                current_weight_float = None
+            validation = validate_goal_weight(float(goal_weight), current_weight_float)
+            if validation.needs_confirmation and not is_explicit_goal_weight_confirmation(ctx.text, float(goal_weight)):
+                await ctx.send(
+                    validation.message,
+                    InlineKeyboardMarkup(
+                        [
+                            [button("✏️ אכתוב יעד אחר", "menu:goals")],
+                            [button("⬅️ תפריט", "menu:home")],
+                        ]
+                    ),
+                )
+                return True
             await set_goal_weight(ctx.user_id, float(goal_weight))
             await ctx.send(
                 f'רשמתי יעד של {goal_weight:g} ק"ג. אבדוק את הקצב לפי משקל, ביצועים, '
@@ -660,15 +684,7 @@ async def route_free_text(update: Update, user_id: int) -> None:
         prefix = ""
         if "למה" in text or "אין" in text:
             prefix = "הנה כפתור והמלצה ל״מה לאכול עכשיו״. זה שייך לתזונה, לא לאימון."
-        await _reply_next_meal_recommendation(
-            message,
-            user_id,
-            prefix=prefix,
-            back_buttons=[
-                ("📊 מצב היום", "menu:status"),
-                ("🏠 תפריט", "menu:home"),
-            ],
-        )
+        await _reply_next_meal_recommendation(message, user_id, prefix=prefix)
         return
 
     from noam_coach.services.next_meal import (
@@ -686,10 +702,6 @@ async def route_free_text(update: Update, user_id: int) -> None:
                 user_id,
                 recommendation=recommendation,
                 prefix=prefix,
-                back_buttons=[
-                    ("📊 מצב היום", "menu:status"),
-                    ("🏠 תפריט", "menu:home"),
-                ],
                 record_served=False,
             )
             return
@@ -921,6 +933,7 @@ async def build_weekly_summary_text(user_id: int) -> str:
         """
         SELECT id, calories, protein, confidence, eaten_at
         FROM meals WHERE user_id=? AND eaten_at>=? AND eaten_at<?
+          AND COALESCE(status, 'consumed')='consumed'
         ORDER BY eaten_at
         """,
         (user_id, start_utc, end_utc),

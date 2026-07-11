@@ -63,6 +63,7 @@ import planning
 import questions
 import recommendations
 import reconcile
+import routine
 import targets
 import training_intelligence
 import user_model
@@ -126,6 +127,7 @@ from noam_coach.services.nutrition_context import (
 from noam_coach.services.weekdays import (
     WEEKDAY_SCHEMA_VERSION,
     normalize_weekday,
+    sunday_first_order,
     weekday_labels_he,
     with_weekday_schema,
 )
@@ -147,6 +149,7 @@ class HealthImportOutcome:
     total_stored: int  # total health rows for user after import
     import_started: str  # ISO-8601 UTC
     import_completed: str  # ISO-8601 UTC
+    dataset_end_date: str | None = None
 
 
 def _health_import_staleness_warning(max_date: Any, *, today: datetime | None = None) -> str:
@@ -162,20 +165,23 @@ def _health_import_staleness_warning(max_date: Any, *, today: datetime | None = 
     )
 
 
+def _health_import_display_max_date(outcome: HealthImportOutcome) -> str | None:
+    return outcome.dataset_end_date or outcome.summary.max_date
+
+
 def _health_import_success_text(outcome: HealthImportOutcome) -> str:
     s = outcome.summary
-    sleep = outcome.profile.get("sleep", {}) or {}
-    workout = outcome.profile.get("workout", {}) or {}
+    max_date = _health_import_display_max_date(outcome)
 
     # --- Source file section ---
     lines = ["<b>ייבוא Apple Health הושלם ✅</b>", ""]
     lines.append("<b>בקובץ שנבחר:</b>")
-    if s.min_date and s.max_date:
-        lines.append(f"• טווח נתונים: {s.min_date} עד {s.max_date}")
-        lines.append(f"• הרשומות החדשות ביותר הן מתאריך: {s.max_date}")
+    if s.min_date and max_date:
+        lines.append(f"• טווח נתונים: {s.min_date} עד {max_date}")
+        lines.append(f"• הרשומות החדשות ביותר הן מתאריך: {max_date}")
     lines.append(f"• רשומות בקובץ: {s.rows:,}")
-    if s.min_date and s.max_date:
-        warning = _health_import_staleness_warning(s.max_date)
+    if s.min_date and max_date:
+        warning = _health_import_staleness_warning(max_date)
         if warning:
             lines.append(warning)
     lines.append("")
@@ -193,32 +199,11 @@ def _health_import_success_text(outcome: HealthImportOutcome) -> str:
     # --- Database totals section ---
     lines.append("<b>במאגר שלך כעת:</b>")
     lines.append(f"• אימונים: {s.workouts:,}")
-    lines.append(f"• לילות שינה: {s.sleep_sessions:,}")
+    lines.append(f"• רשומות שינה מנורמלות: {s.sleep_sessions:,}")
     if s.weight_records:
         lines.append(f"• רשומות משקל: {s.weight_records:,}")
     if s.activity_records:
         lines.append(f"• רשומות פעילות: {s.activity_records:,}")
-    lines.append("")
-
-    # --- Learned patterns ---
-    learned: list[str] = []
-    if sleep.get("typical_bedtime") and sleep.get("typical_wake_time"):
-        learned.append(f"😴 שינה ~{sleep['typical_bedtime']}–{sleep['typical_wake_time']}")
-    if workout.get("weekly_frequency"):
-        hour = workout.get("typical_hour")
-        at = f", בדרך כלל ~{hour}" if hour else ""
-        learned.append(f"🏋️ ~{workout['weekly_frequency']} אימונים בשבוע{at}")
-        day_labels = _workout_days_labels(workout)
-        if day_labels:
-            learned.append(f"📅 ימי אימון נפוצים: {', '.join(day_labels)}")
-    if learned:
-        lines.append("<b>מה למדתי על השגרה שלך:</b>")
-        lines.extend(learned)
-    else:
-        lines.append(
-            "עוד לא הצטברו מספיק נתוני שינה/אימונים בחלון הזמן כדי לזהות "
-            "שגרה ברורה — נמשיך ונלמד תוך כדי."
-        )
 
     return "\n".join(lines)
 
@@ -294,6 +279,29 @@ _WORKOUT_SUBSTEPS = (
 )
 _WIZARD_STEP_ORDER = (*_WORKOUT_SUBSTEPS, "weight_kg", "sleep_schedule")
 
+# Facts that are COMPUTED plan outputs, never HealthKit observations, so the
+# import wizard must never offer them for confirmation. Presenting a calorie
+# target before its prerequisites (height, goal weight, timeframe, goal type)
+# exist is meaningless — and rendered "יעד קלוריות: יעד קלוריות" because the
+# fact carries no user-facing numeric value yet. These are decided by the goal
+# flow, not by confirming an import.
+_WIZARD_EXCLUDED_KEYS = frozenset(
+    {
+        "calorie_target",
+        "manual_calorie_override",
+        "approved_goal",
+        "weight_trend",
+    }
+)
+
+# The three workout sub-steps all share the fact key "workout_pattern", so
+# their edit hints must be keyed by step id (see prompt_health_wizard_edit).
+# The days step has its own frequency-aware prompt and is handled separately.
+_WORKOUT_SUBSTEP_EDIT_HINTS: dict[str, str] = {
+    WIZARD_STEP_WORKOUT_FREQUENCY: "כמה אימונים בשבוע (למשל: 3)",
+    WIZARD_STEP_WORKOUT_HOUR: "שעת אימון מועדפת (למשל: 18:30)",
+}
+
 # What to type when the detected value is wrong — per fact key.
 _WIZARD_EDIT_HINTS: dict[str, str] = {
     "weight_kg": 'משקל עדכני בק"ג (למשל: 82.5)',
@@ -341,6 +349,95 @@ def _workout_days_labels(value: dict[str, Any]) -> list[str]:
         value.get("common_weekdays") or [],
         value.get("weekday_schema") or WEEKDAY_SCHEMA_VERSION,
     )
+
+
+def _parse_health_start(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        raw = str(value).strip()
+        if not raw:
+            return None
+        if raw.endswith("Z"):
+            raw = f"{raw[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+_MIN_RECURRING_WORKOUTS_PER_WEEKDAY = 2
+
+
+def _rank_weekdays_from_dates(dates: list[datetime]) -> list[int]:
+    counts: dict[int, int] = defaultdict(int)
+    newest_by_day: dict[int, datetime] = {}
+    for date in dates:
+        weekday = date.weekday()
+        counts[weekday] += 1
+        if weekday not in newest_by_day or date > newest_by_day[weekday]:
+            newest_by_day[weekday] = date
+    ranked = sorted(
+        counts,
+        key=lambda day: (-counts[day], -newest_by_day[day].timestamp(), day),
+    )
+    return ranked
+
+
+def _recurring_weekdays_from_dates(dates: list[datetime]) -> list[int]:
+    counts: dict[int, int] = defaultdict(int)
+    for date in dates:
+        counts[date.weekday()] += 1
+    ranked = _rank_weekdays_from_dates(dates)
+    return [
+        day for day in ranked
+        if counts[day] >= _MIN_RECURRING_WORKOUTS_PER_WEEKDAY
+    ]
+
+
+async def _historical_workout_weekdays(user_id: int, target_count: int) -> tuple[list[int], str]:
+    """Pick training weekdays from actual imported workout history.
+
+    Real HealthKit workout rows are preferred over template guesses, even when
+    the best usable pattern is older than the latest export window.
+    """
+    if target_count <= 0:
+        return [], "invalid_target"
+
+    rows = await DB.fetch_all(
+        """
+        SELECT start_time
+        FROM health
+        WHERE user_id = ? AND sample_type = 'workout'
+        ORDER BY start_time DESC
+        """,
+        (user_id,),
+    )
+    dates = [
+        parsed
+        for row in rows
+        if (parsed := _parse_health_start(row["start_time"] if isinstance(row, dict) else row[0]))
+    ]
+    if not dates:
+        return [], "no_history"
+
+    newest = max(dates)
+    for window_days in (28, 60, 90, 180):
+        cutoff = newest - timedelta(days=window_days)
+        window_dates = [date for date in dates if date >= cutoff]
+        ranked = _recurring_weekdays_from_dates(window_dates)
+        if len(ranked) >= target_count:
+            return sunday_first_order(ranked[:target_count]), f"last_{window_days}_days"
+
+    ranked = _recurring_weekdays_from_dates(dates)
+    if len(ranked) >= target_count:
+        return sunday_first_order(ranked[:target_count]), "full_history"
+    return sunday_first_order(ranked), "insufficient_history"
 
 
 def _format_pending_fact_value(key: str, value: Any) -> str:
@@ -464,12 +561,101 @@ async def _wizard_done_steps(user_id: int) -> list[str]:
     return [str(step) for step in done if isinstance(step, str)]
 
 
+async def _wizard_deferred_steps(user_id: int) -> list[str]:
+    from noam_coach.bot.onboarding import get_flow_state
+
+    state = await get_flow_state(user_id, HEALTH_CONFIRM_FLOW)
+    payload = (state or {}).get("payload") or {}
+    deferred = payload.get("deferred") or []
+    return [str(step) for step in deferred if isinstance(step, str)]
+
+
+def _confirmed_fact_value(fact: dict[str, Any] | None) -> Any | None:
+    """Return a usable value only for confirmed USER-authored facts.
+
+    Health import estimates are useful as suggestions, but they must not count
+    as the "manual override" that suppresses future prompts.  Only facts saved
+    from a typed/user-confirmed answer (source=user) can block the Health wizard
+    from asking again.  This is the guard that keeps HealthKit from overriding
+    the screenshot case: user wrote Sun/Mon/Wed/Fri, so old/partial Health data
+    may be shown as detected data but can no longer reopen/replace those days.
+    """
+    if not fact or fact.get("kind") == user_model.KIND_GAP:
+        return None
+    if not fact.get("confirmed"):
+        return None
+    if fact.get("source") != user_model.SOURCE_USER:
+        return None
+    return fact.get("value")
+
+
+async def _has_manual_training_frequency(user_id: int) -> bool:
+    """Whether the user already supplied a plan frequency we should trust."""
+    for key in ("active_training_days", "preferred_training_days"):
+        value = _confirmed_fact_value(await user_model.get_fact(DB, user_id, key))
+        if isinstance(value, list) and value:
+            return True
+    value = _confirmed_fact_value(
+        await user_model.get_fact(DB, user_id, "training_days_per_week")
+    )
+    if value is None:
+        return False
+    try:
+        return 1 <= int(float(value)) <= 7
+    except (TypeError, ValueError):
+        return False
+
+
+async def _desired_weekly_frequency(user_id: int) -> int | None:
+    """The number of weekly workouts the user asked to PLAN for (their goal),
+    independent of what HealthKit detected. Used to size the training-day
+    proposal so it always matches what the user requested."""
+    value = _confirmed_fact_value(
+        await user_model.get_fact(DB, user_id, "training_days_per_week")
+    )
+    if value is None:
+        return None
+    try:
+        freq = int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+    return freq if 1 <= freq <= 7 else None
+
+
+async def _has_manual_training_days(user_id: int) -> bool:
+    """Whether the user already supplied concrete training days."""
+    for key in (
+        "active_training_days",
+        "preferred_training_days",
+        "weekly_availability",
+    ):
+        value = _confirmed_fact_value(await user_model.get_fact(DB, user_id, key))
+        if isinstance(value, list) and value:
+            return True
+    return False
+
+
+async def _has_manual_training_hour(user_id: int) -> bool:
+    """Whether the user already supplied a preferred workout time/window."""
+    value = _confirmed_fact_value(
+        await user_model.get_fact(DB, user_id, "workout_window")
+    )
+    return isinstance(value, str) and bool(value.strip())
+
+
 async def _next_wizard_step(
-    user_id: int, done: list[str]
+    user_id: int, done: list[str], deferred: list[str] | None = None
 ) -> tuple[str, dict[str, Any]] | None:
     """Return (step_id, fact) for the next confirmation, honoring sub-steps."""
+    deferred_set = set(deferred or [])
+    first_deferred: tuple[str, dict[str, Any]] | None = None
     pending = await pending_import_facts(user_id)
-    pending_keys = [str(row["key"]) for row in pending]
+    # Never surface computed plan outputs (e.g. calorie_target) as a HealthKit
+    # confirmation — they are not imported observations and have no value to
+    # approve here.
+    pending_keys = [
+        str(row["key"]) for row in pending if str(row["key"]) not in _WIZARD_EXCLUDED_KEYS
+    ]
     ordered_keys = {wizard_step_fact_key(step) for step in _WIZARD_STEP_ORDER}
 
     facts: dict[str, dict[str, Any] | None] = {}
@@ -490,6 +676,29 @@ async def _next_wizard_step(
             step_id, fact.get("value")
         ):
             continue
+        # Do not ask the user to approve weak HealthKit workout inferences when
+        # a confirmed manual answer already exists. This keeps the screenshot
+        # case sane: an old/partial Health export may be insufficient, but it
+        # must not re-open “כמה אימונים בשבוע?” after the user already supplied
+        # active training days/frequency.
+        if (
+            step_id == WIZARD_STEP_WORKOUT_FREQUENCY
+            and await _has_manual_training_frequency(user_id)
+        ):
+            continue
+        if (
+            step_id == WIZARD_STEP_WORKOUT_DAYS
+            and await _has_manual_training_days(user_id)
+        ):
+            continue
+        if (
+            step_id == WIZARD_STEP_WORKOUT_HOUR
+            and await _has_manual_training_hour(user_id)
+        ):
+            continue
+        if step_id in deferred_set:
+            first_deferred = first_deferred or (step_id, fact)
+            continue
         return step_id, fact
 
     # Anything imported but not in the known wizard order still gets reviewed
@@ -509,8 +718,29 @@ async def _next_wizard_step(
                 for s in _WORKOUT_SUBSTEPS
             ):
                 continue
+        # Never confirm a fact with no real user-facing value — that would show
+        # a placeholder (the label repeated as its own value). Skip it instead.
+        if not _has_confirmable_value(key, fact.get("value")):
+            continue
+        if key in deferred_set:
+            first_deferred = first_deferred or (key, fact)
+            continue
         return key, fact
-    return None
+    return first_deferred
+
+
+def _has_confirmable_value(key: str, value: Any) -> bool:
+    """True when a pending fact has a real value worth confirming (not a
+    placeholder). Dict-shaped detected patterns are checked by their own
+    formatter; scalar facts must render to something other than the bare label.
+    """
+    if value is None:
+        return False
+    if isinstance(value, dict):
+        display = _format_pending_fact_value(key, value)
+        return bool(display) and display != user_model.display_label(key)
+    display = user_model.display_value(key, value)
+    return bool(display) and display != "לא צוין" and display != user_model.display_label(key)
 
 
 HEALTH_POST_WIZARD_FLOW = "health_post_wizard"
@@ -539,7 +769,11 @@ async def _send_wizard_screen(
 
 
 _SKIP_WIZARD_BUTTON_ROW = [
-    InlineKeyboardButton("⏭️ דלג על שאר האישורים", callback_data="health:skip_wizard")
+    InlineKeyboardButton("⏩ דלג על שאר האישורים", callback_data="health:skip_wizard")
+]
+
+_DEFER_WIZARD_BUTTON_ROW = [
+    InlineKeyboardButton("⏭️ דלג כרגע", callback_data="health:skip_item")
 ]
 
 
@@ -569,13 +803,17 @@ async def ask_next_health_confirm_step(
     from noam_coach.bot.onboarding import set_flow_state, clear_flow_state, set_pending
 
     done = await _wizard_done_steps(user_id)
-    next_step = await _next_wizard_step(user_id, done)
+    deferred = await _wizard_deferred_steps(user_id)
+    next_step = await _next_wizard_step(user_id, done, deferred)
     if next_step is None:
         await clear_flow_state(user_id, HEALTH_CONFIRM_FLOW)
         return False
 
     step_id, fact = next_step
-    await set_flow_state(user_id, HEALTH_CONFIRM_FLOW, step_id, {"done": done})
+    payload: dict[str, Any] = {"done": done}
+    if deferred:
+        payload["deferred"] = deferred
+    await set_flow_state(user_id, HEALTH_CONFIRM_FLOW, step_id, payload)
     await set_pending(user_id, f"__health_edit_{step_id}__")
 
     quality = await _wizard_quality_report(user_id)
@@ -595,6 +833,8 @@ async def ask_next_health_confirm_step(
         key = wizard_step_fact_key(step_id)
         wq = (quality or {}).get("workout_frequency") or {}
 
+        freshness = (quality or {}).get("freshness") or {}
+
         # RE13: with too few usable weeks there is no trustworthy number to
         # approve — ask the user directly instead of dressing a guess up as
         # a detected routine.
@@ -602,15 +842,14 @@ async def ask_next_health_confirm_step(
             text = (
                 f"{header}"
                 f"{esc(wq.get('warning_he') or 'אין מספיק שבועות עם נתוני שעון כדי לזהות שגרת אימונים אמינה.')}\n"
-                "כמה אימונים בשבוע תרצה לתכנן? בחר או כתוב מספר."
+                "אין לי מספיק מידע אמין מהשעון כדי לבחור עבורך מספר. "
+                "כתוב כמה אימונים בשבוע תרצה לתכנן, למשל: 3."
             )
-            keyboard = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(str(n), callback_data=f"health:confirm:{key}:trend:{n}")
-                    for n in (2, 3, 4)
-                ],
-                _SKIP_WIZARD_BUTTON_ROW,
-            ])
+            # UX cleanup: do not show generic 2/3/4 suggestion buttons for a
+            # weak HealthKit estimate. When data is not trustworthy, a typed
+            # answer is clearer and avoids nudging the user into a wrong plan.
+            # Keep only the explicit wizard escape hatch.
+            keyboard = InlineKeyboardMarkup([_DEFER_WIZARD_BUTTON_ROW, _SKIP_WIZARD_BUTTON_ROW])
             await _send_wizard_screen(target, text, keyboard)
             return True
 
@@ -628,6 +867,7 @@ async def ask_next_health_confirm_step(
                 [InlineKeyboardButton(label, callback_data=f"health:confirm:{key}:trend:{choice:g}")]
                 for label, choice in proposal.choices
             ]
+            rows.append(_DEFER_WIZARD_BUTTON_ROW)
             rows.append(_SKIP_WIZARD_BUTTON_ROW)
             await _send_wizard_screen(target, text, InlineKeyboardMarkup(rows))
             return True
@@ -637,45 +877,196 @@ async def ask_next_health_confirm_step(
         # exact number, not the strict raw value stored in the pattern.
         if wq.get("policy") == routine.POLICY_RELAXED and wq.get("frequency") is not None:
             approved = max(1, min(7, round(float(wq["frequency"]))))
+            # Frame the number as what was actually PERFORMED (workout records),
+            # not as "weeks with enough watch wear" — wear affects confidence,
+            # not whether a logged workout counts.
+            stale_prefix = ""
+            if freshness.get("is_stale") and freshness.get("latest_sample_date"):
+                stale_prefix = (
+                    "⚠️ שים לב: קובץ הבריאות האחרון מסתיים ב-"
+                    f"{esc(str(freshness['latest_sample_date']))}, ולכן השבועות האחרונים לא נכנסו לחישוב. "
+                    "מומלץ לייצא ZIP חדש מהאייפון.\n\n"
+                )
             text = (
-                f"{header}"
-                f"{esc(f'זוהתה הערכה של כ-{approved} אימונים בשבוע.')}\n"
-                f"{esc(wq.get('warning_he') or '')}\n"
-                "זה מספיק להערכה ראשונית, אבל כדאי לאשר ידנית.\n"
-                "האם לאשר גם עבור תוכנית האימונים?\n"
-                "אם לא — ציין כמות אימונים רצויה בשבוע."
+                f"{stale_prefix}"
+                "<b>אישור נתונים מהייבוא</b>\n\n"
+                "אפשר ללמוד מהתקופה האחרונה שתועדה בקובץ ששגרת האימונים שלך "
+                f"נראית סביב {approved} אימונים בשבוע.\n\n"
+                "האם להשתמש בזה כבסיס לתוכנית? או רשום את כמות האימונים השבועית "
+                "לבניית התוכנית."
             )
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton(
-                    f"✅ אשר {approved} בשבוע",
+                    f"✅ השתמש לפי מה שתועד — {approved}",
                     callback_data=f"health:confirm:{key}:trend:{approved}",
                 )],
+                _DEFER_WIZARD_BUTTON_ROW,
                 _SKIP_WIZARD_BUTTON_ROW,
             ])
             await _send_wizard_screen(target, text, keyboard)
             return True
 
-    # RE13: a sleep schedule detected from too few nights is an anecdote,
-    # not a routine — never offer it as a regular confirmation.
+    # Sleep uses all valid HealthKit sleep history and is not gated by watch
+    # wear. Only ask manually when the sleep records themselves are too sparse.
     if step_id == "sleep_schedule" and isinstance(fact.get("value"), dict):
         from noam_coach.services.health_quality import (
             SLEEP_MIN_NIGHTS_FOR_CONFIRMATION,
         )
 
-        nights = fact["value"].get("nights_sampled")
+        value = fact["value"]
+        nights = value.get("nights_sampled")
         if nights is not None and int(nights) < SLEEP_MIN_NIGHTS_FOR_CONFIRMATION:
             text = (
                 f"{header}"
-                f"{esc(f'זוהתה שינה רק ב-{int(nights)} לילות, ולכן זה לא מספיק כדי לקבוע שגרת שינה.')}\n"
+                "לא זיהיתי דפוס שינה מספיק ברור מתוך היסטוריית השינה בקובץ.\n"
                 "אפשר לכתוב ידנית שעת שינה וקימה ממוצעת (למשל: 23:00-07:00), "
-                "או להמשיך בלי."
+                "או לדלג כרגע ולחזור לזה לפני סיום בניית התוכנית."
             )
             keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("⏭️ השאר ריק והמשך", callback_data="health:skip_item")],
+                _DEFER_WIZARD_BUTTON_ROW,
                 _SKIP_WIZARD_BUTTON_ROW,
             ])
             await _send_wizard_screen(target, text, keyboard)
             return True
+        if nights is not None:
+            bedtime = value.get("typical_bedtime") or value.get("bedtime")
+            wake = value.get("typical_wake_time") or value.get("wake_time")
+            duration = value.get("avg_duration_minutes")
+            lines = [
+                "<b>אישור נתונים מהייבוא</b>",
+                "",
+                "לפי היסטוריית השינה שתועדה בקובץ, השגרה שלך נראית סביב:",
+            ]
+            if bedtime:
+                lines.append(f"שעת שינה: {esc(str(bedtime))}")
+            if wake:
+                lines.append(f"שעת קימה: {esc(str(wake))}")
+            if duration:
+                hours = float(duration) / 60.0
+                lines.append(f"משך שינה ממוצע: {hours:.1f} שעות")
+            lines.extend([
+                "",
+                "נתתי משקל גבוה יותר לרשומות החדשות יותר, והשתמשתי גם בהיסטוריית שינה ישנה יותר כדי לזהות את הדפוס הכללי.",
+                "",
+                "להשתמש בזה כשגרת השינה שלך לתוכנית?",
+            ])
+            text = "\n".join(lines)
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ אשר", callback_data=f"health:confirm:{step_id}")],
+                _DEFER_WIZARD_BUTTON_ROW,
+                _SKIP_WIZARD_BUTTON_ROW,
+            ])
+            await _send_wizard_screen(target, text, keyboard)
+            return True
+
+    if step_id == "avg_steps":
+        sq = (quality or {}).get("steps") or {}
+        if sq.get("average") is not None:
+            start = sq.get("window_start") or "?"
+            end = sq.get("window_end") or "?"
+            days = int(sq.get("days_used") or 0)
+            raw = sq.get("raw_all_sources_average")
+            conservative = sq.get("dominant_or_priority_source_average")
+            baseline = sq.get("selected_planning_baseline") or sq.get("average")
+            sources = sq.get("sources_found") or []
+            lines = [
+                header.rstrip(),
+                f"ניתחתי את 28 הימים הקלנדריים המלאים האחרונים בקובץ: {esc(str(start))} עד {esc(str(end))}.",
+                f"נמצאו נתוני צעדים עבור {days} ימים.",
+                "",
+            ]
+            if raw is not None:
+                lines.append(f"לפי כל מקורות StepCount יחד: בערך {int(raw):,} צעדים ביום.")
+            if conservative is not None:
+                lines.append(
+                    f"לפי החישוב השמרני שמפחית סיכון לכפל בין מקורות: בערך {int(conservative):,} צעדים ביום."
+                )
+            lines.append(
+                f"לבינתיים אשתמש בכ-{int(baseline):,} צעדים ביום כבסיס זמני לתוכנית."
+            )
+            if sources:
+                lines.append(f"מקורות StepCount שנמצאו: {esc(', '.join(map(str, sources)))}.")
+            lines.append("\nלהשתמש בזה כבסיס לתוכנית?")
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ השתמש כבסיס זמני", callback_data="health:confirm:avg_steps")],
+                [InlineKeyboardButton("📊 הצג פירוט יומי", callback_data="health:steps_breakdown")],
+                _DEFER_WIZARD_BUTTON_ROW,
+                _SKIP_WIZARD_BUTTON_ROW,
+            ])
+            await _send_wizard_screen(target, "\n".join(lines), keyboard)
+            return True
+
+    # Training days: choose from real imported workout history. If the file
+    # does not contain enough actual weekday evidence, ask instead of guessing.
+    if step_id == WIZARD_STEP_WORKOUT_DAYS and isinstance(fact.get("value"), dict):
+        value = fact["value"]
+        desired = await _desired_weekly_frequency(user_id)
+        target_count = desired if desired is not None else max(1, len(_workout_days_indices(value)))
+        proposed, history_source = await _historical_workout_weekdays(user_id, target_count)
+
+        if len(proposed) < target_count:
+            lines = [header.rstrip()]
+            if desired is not None:
+                lines.append(f"עדכנת שאתה רוצה {desired} אימונים בשבוע ✅\n")
+            lines.append(
+                "לא זיהיתי דפוס מספיק ברור של ימי אימון מתוך היסטוריית האימונים בקובץ."
+            )
+            lines.append(
+                f"כדי לבנות תוכנית ל-{target_count} אימונים בשבוע, כתוב את הימים המועדפים עליך "
+                "(לדוגמה: ראשון, שני, רביעי, שישי)."
+            )
+            lines.append("אפשר גם לדלג כרגע ולחזור לשאלה הזו לפני סיום בניית התוכנית.")
+            text = "\n".join(lines)
+            keyboard = InlineKeyboardMarkup([
+                _DEFER_WIZARD_BUTTON_ROW,
+                _SKIP_WIZARD_BUTTON_ROW,
+            ])
+            await _send_wizard_screen(target, text, keyboard)
+            return True
+
+        # Keep display AND the eventual confirm consistent: the proposal becomes
+        # the value that gets approved.
+        value["common_weekdays"] = proposed
+        value["weekday_selection_basis"] = "health_workout_history"
+        value["weekday_selection_source"] = history_source
+        await user_model.set_fact(
+            DB, user_id, "workout_pattern", value,
+            kind=fact.get("kind", user_model.KIND_ESTIMATE),
+            source=fact.get("source", user_model.SOURCE_DERIVED),
+            confirmed=False,
+        )
+
+        proposed_labels = weekday_labels_he(proposed)
+        lines = [header.rstrip()]
+        if desired is not None:
+            lines.append(f"עדכנת שאתה רוצה {desired} אימונים בשבוע ✅\n")
+        lines.append(
+            "לפי היסטוריית האימונים שתועדה בקובץ, הימים שבהם התאמנת הכי הרבה הם:\n"
+            f"{', '.join(proposed_labels)}."
+        )
+        if history_source == "full_history":
+            lines.append(
+                "השתמשתי בכל היסטוריית האימונים הזמינה בקובץ כי התקופה האחרונה לבדה לא הספיקה לדפוס יציב."
+            )
+        lines.append("\nלאשר את הימים האלה לתוכנית האימונים?")
+        if desired is not None:
+            lines.append(
+                f"אם תרצה לשנות — פשוט כתוב {desired} ימים מופרדים בפסיק "
+                "(למשל: ראשון, שני, רביעי, שישי)."
+            )
+        else:
+            lines.append(
+                "אם תרצה לשנות — פשוט כתוב את הימים הרצויים מופרדים בפסיק "
+                "(למשל: ראשון, שלישי, חמישי)."
+            )
+        text = "\n".join(lines)
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ אשר", callback_data=f"health:confirm:{step_id}")],
+            _DEFER_WIZARD_BUTTON_ROW,
+            _SKIP_WIZARD_BUTTON_ROW,
+        ])
+        await _send_wizard_screen(target, text, keyboard)
+        return True
 
     detected, scope, hint = _wizard_step_prompt(step_id, fact, quality)
     text = (
@@ -686,6 +1077,7 @@ async def ask_next_health_confirm_step(
     keyboard = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("✅ אשר", callback_data=f"health:confirm:{step_id}")],
+            _DEFER_WIZARD_BUTTON_ROW,
             _SKIP_WIZARD_BUTTON_ROW,
         ]
     )
@@ -703,7 +1095,11 @@ async def _mark_wizard_substep_done(
     done = await _wizard_done_steps(user_id)
     if step_id not in done:
         done.append(step_id)
-    await set_flow_state(user_id, HEALTH_CONFIRM_FLOW, step_id, {"done": done})
+    deferred = [step for step in await _wizard_deferred_steps(user_id) if step != step_id]
+    payload: dict[str, Any] = {"done": done}
+    if deferred:
+        payload["deferred"] = deferred
+    await set_flow_state(user_id, HEALTH_CONFIRM_FLOW, step_id, payload)
     remaining = [
         s
         for s in _WORKOUT_SUBSTEPS
@@ -788,6 +1184,78 @@ async def apply_health_wizard_trend_choice(
     return f"✅ אושר: {trend_value:g} אימונים בשבוע"
 
 
+async def prompt_health_wizard_edit(target: Any, user_id: int, step_id: str) -> None:
+    """Show a "type your correction" prompt for a wizard step (✏️ שנה ימים).
+
+    Pending edit state is already active from ask_next_health_confirm_step, so
+    the user's next free-text message is captured. For training days the prompt
+    spells out that exactly the requested number of days must be entered.
+    """
+    from noam_coach.bot.onboarding import set_pending
+
+    await set_pending(user_id, f"__health_edit_{step_id}__")
+    if step_id == WIZARD_STEP_WORKOUT_DAYS:
+        desired = await _desired_weekly_frequency(user_id)
+        if desired is not None:
+            text = (
+                f"כתוב בדיוק {desired} ימי אימון, מופרדים בפסיק.\n"
+                "למשל: ראשון, שני, רביעי, שישי."
+            )
+        else:
+            text = "כתוב את ימי האימון הרצויים, מופרדים בפסיק.\nלמשל: ראשון, שלישי, חמישי."
+    elif step_id in _WORKOUT_SUBSTEP_EDIT_HINTS:
+        # The three workout sub-steps share one fact key (workout_pattern), so
+        # the hint must be keyed by the step, not the fact key — otherwise they
+        # all fall back to the meaningless generic "ערך אחר".
+        text = f"כתוב {_WORKOUT_SUBSTEP_EDIT_HINTS[step_id]}."
+    else:
+        hint = _WIZARD_EDIT_HINTS.get(wizard_step_fact_key(step_id), "ערך אחר")
+        text = f"כתוב {hint}."
+    keyboard = InlineKeyboardMarkup([_SKIP_WIZARD_BUTTON_ROW])
+    await _send_wizard_screen(target, text, keyboard)
+
+
+async def show_steps_daily_breakdown(target: Any, user_id: int) -> None:
+    report = await _wizard_quality_report(user_id)
+    steps = (report or {}).get("steps") or {}
+    rows = steps.get("daily_breakdown") or []
+    if not rows:
+        await _send_wizard_screen(
+            target,
+            "אין פירוט צעדים זמין כרגע.",
+            InlineKeyboardMarkup([_DEFER_WIZARD_BUTTON_ROW, _SKIP_WIZARD_BUTTON_ROW]),
+        )
+        return
+    lines = [
+        "<b>פירוט יומי לצעדים</b>",
+        f"חלון: {esc(str(steps.get('window_start') or '?'))} עד {esc(str(steps.get('window_end') or '?'))}",
+        "",
+        "תאריך | כל המקורות | שמרני | מקור | ביטחון",
+    ]
+    for item in rows[-28:]:
+        selected = item.get("selected_step_count_for_baseline")
+        raw = item.get("total_step_count_all_sources")
+        selected_text = "-" if selected is None else f"{int(float(selected)):,}"
+        raw_text = "-" if raw is None else f"{int(float(raw)):,}"
+        source = item.get("dominant_source") or "-"
+        confidence = item.get("confidence") or "-"
+        lines.append(
+            f"{item.get('date')} | {raw_text} | {selected_text} | {esc(str(source))} | {esc(str(confidence))}"
+        )
+    lines.extend([
+        "",
+        f"raw_all_sources_average: {steps.get('raw_all_sources_average')}",
+        f"dominant_or_priority_source_average: {steps.get('dominant_or_priority_source_average')}",
+        f"selected_planning_baseline: {steps.get('selected_planning_baseline')}",
+    ])
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ השתמש כבסיס זמני", callback_data="health:confirm:avg_steps")],
+        _DEFER_WIZARD_BUTTON_ROW,
+        _SKIP_WIZARD_BUTTON_ROW,
+    ])
+    await _send_wizard_screen(target, "\n".join(lines), keyboard)
+
+
 async def apply_health_wizard_text_edit(
     user_id: int, step_id: str, text: str
 ) -> tuple[bool, str]:
@@ -814,7 +1282,10 @@ async def apply_health_wizard_text_edit(
         return True, f"עודכן: {approved} אימונים בשבוע ✅"
 
     if step_id == WIZARD_STEP_WORKOUT_DAYS:
-        from noam_coach.services.availability import parse_hebrew_availability_answer
+        from noam_coach.services.availability import (
+            parse_hebrew_availability_answer,
+            save_user_training_availability,
+        )
 
         parsed = parse_hebrew_availability_answer(text)
         slots = [
@@ -824,10 +1295,21 @@ async def apply_health_wizard_text_edit(
         if not slots:
             return False, "לא זיהיתי ימים. כתוב למשל: ראשון, שלישי, חמישי."
         indices = sorted({int(slot["weekday"]) for slot in slots})
+        # The chosen days must match the requested weekly frequency — otherwise
+        # the plan can't be built for the number of workouts the user asked for.
+        desired = await _desired_weekly_frequency(user_id)
+        if desired is not None and len(indices) != desired:
+            return (
+                False,
+                f"בחרת {len(indices)} ימים, אבל הגדרת {desired} אימונים בשבוע. "
+                f"צריך לבחור בדיוק {desired} ימים.",
+            )
+        parsed = type(parsed)(slots, parsed.workout_window, parsed.session_minutes)
         await user_model.set_fact(
             DB, user_id, "weekly_availability", slots,
             kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
         )
+        await save_user_training_availability(DB, user_id, parsed)
         updated = {
             **current,
             "common_weekdays": indices,
@@ -854,21 +1336,39 @@ async def apply_health_wizard_text_edit(
         await _mark_wizard_substep_done(user_id, step_id, updated)
         return True, f"עודכן: שעת אימון {hhmm} ✅"
 
+    if key == "avg_steps":
+        match = re.search(r"\d[\d,]*", text)
+        if not match:
+            return False, "כתוב מספר צעדים יומי, למשל: 7000."
+        steps = int(match.group(0).replace(",", ""))
+        if not (500 <= steps <= 50000):
+            return False, "מספר הצעדים לא נראה תקין. כתוב למשל: 7000."
+        await user_model.set_fact(
+            DB, user_id, "avg_steps", steps,
+            kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
+        )
+        return True, f"עודכן: {steps:,} צעדים ביום ✅"
+
     return False, "לא הצלחתי לעדכן את הפריט הזה."
 
 
 async def skip_health_wizard_item(user_id: int, step_id: str) -> None:
-    """Skip one wizard item without applying it: a workout sub-step is only
-    marked as handled (no plan fact written); a whole fact is invalidated."""
-    if step_id in _WORKOUT_SUBSTEPS:
-        done = await _wizard_done_steps(user_id)
-        if step_id not in done:
-            done.append(step_id)
-        from noam_coach.bot.onboarding import set_flow_state
+    """Defer one wizard item without applying or invalidating it.
 
-        await set_flow_state(user_id, HEALTH_CONFIRM_FLOW, step_id, {"done": done})
-        return
-    await user_model.invalidate_fact(DB, user_id, wizard_step_fact_key(step_id))
+    "דלג כרגע" is intentionally different from "דלג על שאר האישורים": it
+    moves the current question behind the other pending questions, then asks it
+    again before the wizard can finish.
+    """
+    from noam_coach.bot.onboarding import set_flow_state
+
+    done = await _wizard_done_steps(user_id)
+    deferred = await _wizard_deferred_steps(user_id)
+    if step_id not in done and step_id not in deferred:
+        deferred.append(step_id)
+    payload: dict[str, Any] = {"done": done}
+    if deferred:
+        payload["deferred"] = deferred
+    await set_flow_state(user_id, HEALTH_CONFIRM_FLOW, step_id, payload)
 
 
 async def start_health_confirm_wizard(
@@ -907,6 +1407,7 @@ async def finish_health_confirm_wizard(
     what was just confirmed even on the final step.
     """
     from noam_coach.bot.onboarding import get_flow_state, clear_flow_state, show_onboarding_basics
+    from noam_coach.bot.ui import home_keyboard_for_user
 
     state = await get_flow_state(user_id, HEALTH_POST_WIZARD_FLOW)
     payload = state or {}
@@ -914,32 +1415,15 @@ async def finish_health_confirm_wizard(
     summary_text = (payload.get("payload") or {}).get("summary_text", "")
     await clear_flow_state(user_id, HEALTH_POST_WIZARD_FLOW)
 
-    followup = await _health_import_followup_text(user_id)
-    # RE13: close the wizard with a short data-quality summary — what was
-    # counted, what was left out and whether a fresher export is needed.
-    quality_section = ""
-    with suppress(Exception):
-        report = await _wizard_quality_report(user_id)
-        if report and (report.get("freshness") or {}).get("latest_sample_date"):
-            from noam_coach.services.health_quality import quality_summary_lines_he
-
-            # The import summary itself may already carry the "not fresh —
-            # export a new ZIP" warning; don't repeat the same advice twice
-            # in one message.
-            already_advised = "הנתונים אינם טריים" in (summary_text or "")
-            quality_section = "\n\n" + "\n".join(
-                quality_summary_lines_he(
-                    report, include_export_recommendation=not already_advised
-                )
-            )
+    planning_summary = await _health_confirmed_planning_summary_text(user_id)
     text = (
-        (summary_text + quality_section + followup)
+        (summary_text + "\n\n" + planning_summary)
         if summary_text
-        else ("<b>סיכום הייבוא</b>" + quality_section + followup)
+        else ("<b>סיכום הייבוא</b>\n\n" + planning_summary)
     )
     if ack_text:
         text = f"{ack_text}\n\n{text}"
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ תפריט", callback_data="menu:home")]])
+    keyboard = await home_keyboard_for_user(user_id)
     await _send_wizard_screen(target, text, keyboard)
 
     message = getattr(target, "message", target)
@@ -947,6 +1431,143 @@ async def finish_health_confirm_wizard(
         await show_onboarding_basics(message, user_id)
     else:
         await run_post_import_reconciliation(message, user_id)
+
+
+def _confirmed_planning_value(fact: dict[str, Any] | None) -> Any | None:
+    """Return a fact value only when it can be used as an accepted plan input."""
+    if not fact or fact.get("kind") == user_model.KIND_GAP:
+        return None
+    if not fact.get("confirmed"):
+        return None
+    return fact.get("value")
+
+
+def _format_weekly_availability(value: Any) -> str | None:
+    if not isinstance(value, list):
+        return None
+    days: list[int] = []
+    for slot in value:
+        if not isinstance(slot, dict) or not slot.get("available", True):
+            continue
+        normalized = normalize_weekday(
+            slot.get("weekday"),
+            slot.get("weekday_schema") or WEEKDAY_SCHEMA_VERSION,
+        )
+        if normalized.weekday is not None:
+            days.append(normalized.weekday)
+    if not days:
+        return None
+    return ", ".join(weekday_labels_he(sorted(set(days))))
+
+
+def _format_sleep_schedule(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    bedtime = value.get("typical_bedtime") or value.get("bedtime")
+    wake = value.get("typical_wake_time") or value.get("wake_time")
+    if bedtime and wake:
+        return f"{bedtime}–{wake}"
+    return None
+
+
+async def _health_confirmed_planning_summary_text(user_id: int) -> str:
+    """Final Health wizard summary: only confirmed/user-overridden plan inputs.
+
+    Imported estimates can be excellent hints, but the final screen must not
+    make them look like decisions. This mirrors the facts consumed by the plan
+    readiness/generation path: confirmed user facts and explicitly confirmed
+    Health values are shown; unconfirmed estimates stay pending.
+    """
+    fact_keys = (
+        "training_days_per_week",
+        "weekly_availability",
+        "workout_window",
+        "weight_kg",
+        "avg_steps",
+        "sleep_schedule",
+        "training_limitations",
+    )
+    facts = {
+        key: (
+            await user_model.get_training_limitations_fact(DB, user_id)
+            if key == "training_limitations"
+            else await user_model.get_fact(DB, user_id, key)
+        )
+        for key in fact_keys
+    }
+
+    lines = [
+        "<b>נתוני תכנון שאושרו עד עכשיו</b>",
+    ]
+
+    confirmed_any = False
+
+    frequency = _confirmed_planning_value(facts["training_days_per_week"])
+    if frequency is not None:
+        lines.append(f"• אימונים בשבוע: {esc(user_model.display_value('training_days_per_week', frequency))}")
+        confirmed_any = True
+
+    days = _format_weekly_availability(_confirmed_planning_value(facts["weekly_availability"]))
+    if days:
+        lines.append(f"• ימי אימון: {esc(days)}")
+        confirmed_any = True
+
+    workout_window = _confirmed_planning_value(facts["workout_window"])
+    if workout_window:
+        lines.append(f"• שעת אימון מועדפת: {esc(str(workout_window))}")
+        confirmed_any = True
+
+    weight = _confirmed_planning_value(facts["weight_kg"])
+    if weight is not None:
+        lines.append(f"• משקל נוכחי: {esc(user_model.display_value('weight_kg', weight))}")
+        confirmed_any = True
+
+    steps = _confirmed_planning_value(facts["avg_steps"])
+    if steps is not None:
+        lines.append(f"• בסיס צעדים יומי: {esc(user_model.display_value('avg_steps', steps))}")
+        confirmed_any = True
+
+    sleep_value = _confirmed_planning_value(facts["sleep_schedule"])
+    sleep_display = _format_sleep_schedule(sleep_value)
+    if sleep_display:
+        lines.append(f"• שינה: {esc(sleep_display)}")
+        confirmed_any = True
+    elif facts["sleep_schedule"] and facts["sleep_schedule"].get("kind") != user_model.KIND_GAP:
+        lines.append("• שינה: עדיין לא אושרה")
+
+    limitations = _confirmed_planning_value(facts["training_limitations"])
+    if limitations and limitations != "none":
+        lines.append(f"• כאב, פציעה או מגבלה: {esc(user_model.display_value('training_limitations', limitations))}")
+        confirmed_any = True
+
+    if not confirmed_any:
+        lines.append("• עדיין אין נתוני תכנון מאושרים מהייבוא.")
+
+    readiness = await user_model.compute_all_readiness(DB, user_id)
+    missing_labels: list[str] = []
+    for profile_name in ("safety", "workout", "nutrition"):
+        for label in readiness.get(profile_name, {}).get("missing_labels", []):
+            if label not in missing_labels:
+                missing_labels.append(label)
+
+    lines.extend(["", "<b>עדיין חסר לפני סיום בניית התוכנית</b>"])
+    if missing_labels:
+        lines.extend([
+            "",
+            "👉 <b>השלב הבא:</b> להשלים את הפרטים שנשארו כדי לבנות את תוכנית האימונים והתזונה שלך.",
+            f"נשארו לך {len(missing_labels)} פרטים להשלמה.",
+            "כדי להשלים את הפרופיל, לחץ על <b>🎯 השלם את התוכנית שלי</b> והמשך לענות על השאלות שנותרו.",
+            "אפשר לדלג על שאלה ספציפית ולחזור אליה בהמשך.",
+            "אחרי שהמידע יהיה שלם, אשתמש בנתוני HealthKit שאושרו ובתשובות שלך כדי לבנות את התוכנית.",
+            "",
+        ])
+        lines.extend(f"• {esc(label)}" for label in missing_labels[:8])
+        if len(missing_labels) > 8:
+            lines.append(f"• ועוד {len(missing_labels) - 8} פריטים")
+    else:
+        lines.append("• אין פריטי חובה חסרים כרגע.")
+
+    return "\n".join(lines)
 
 
 async def _health_import_followup_text(user_id: int) -> str:
@@ -1026,6 +1647,8 @@ async def import_health_export_file(
         inserted, duplicates = await upsert_health_rows(user_id, rows)
         await sync_health_measurements_to_facts(user_id)
         profile = await save_routine_profile(user_id)
+        dataset_end = await routine.newest_health_sample_date(DB, user_id, TZ)
+        dataset_end_date = dataset_end.isoformat() if dataset_end else summary.max_date
         import_completed = datetime.now(timezone.utc).isoformat()
         # Get total stored records for user
         total_row = await DB.fetch_one(
@@ -1052,8 +1675,9 @@ async def import_health_export_file(
                 "inserted": inserted,
                 "duplicates": duplicates,
                 "total_rows_in_file": summary.rows,
-                "source_date_range": f"{summary.min_date}..{summary.max_date}",
+                "source_date_range": f"{summary.min_date}..{dataset_end_date}",
                 "total_stored": total_stored,
+                "newest_record": dataset_end_date,
             },
         )
         return HealthImportOutcome(
@@ -1067,6 +1691,7 @@ async def import_health_export_file(
             total_stored=total_stored,
             import_started=import_started,
             import_completed=import_completed,
+            dataset_end_date=dataset_end_date,
         )
     finally:
         with suppress(Exception):
@@ -1223,7 +1848,7 @@ async def try_handle_local_health_path(
             entity="health",
             source="local_path",
             properties={
-                "newest_record": outcome.summary.max_date,
+                "newest_record": _health_import_display_max_date(outcome),
                 "inserted": outcome.inserted,
             },
         )
@@ -1397,8 +2022,8 @@ async def send_to_user(
     text: str,
     *,
     reply_markup: InlineKeyboardMarkup | None = None,
-) -> None:
-    await context.bot.send_message(
+) -> Any:
+    return await context.bot.send_message(
         chat_id=SETTINGS.telegram_allowed_user_id,
         text=text,
         reply_markup=reply_markup,
@@ -1465,9 +2090,24 @@ async def job_morning(context: CallbackContext) -> None:
     )
 
     async def send_menu() -> None:
-        await send_to_user(
+        # TASK-05: send the daily menu as a separate pin-friendly message and
+        # remember its Telegram id for refresh/replace flows.
+        from noam_coach.services.daily_menu_state import remember_daily_menu_message
+
+        sent = await send_to_user(
             context,
             await build_morning_menu_text(user_id),
+            reply_markup=InlineKeyboardMarkup([
+                [button("🔄 רענן תפריט", "menu:refresh_daily_menu"), button("🍽 מה לאכול עכשיו", "menu:nextmeal")],
+                [button("✏️ החלף ארוחה", "menu:replace_daily_meal"), button("📊 מצב היום", "menu:status")],
+            ]),
+        )
+        await remember_daily_menu_message(
+            DB,
+            user_id,
+            chat_id=getattr(getattr(sent, "chat", None), "id", user_id),
+            message_id=getattr(sent, "message_id", None),
+            source="morning_job",
         )
 
     await deliver_proactive_message(
@@ -1736,6 +2376,14 @@ def _evening_coach_review_lines(ctx: "DailyContext") -> list[str]:
 
 @runtime_bound(RUNTIME_NAMES)
 async def build_morning_menu_text(user_id: int, ctx: "DailyContext | None" = None) -> str:
+    """Return the standalone daily menu message.
+
+    TASK-05/06: the morning check-in is already delivered as its own message in
+    ``job_morning``.  The nutrition menu must therefore be a pin-friendly,
+    self-contained daily menu — not a long blended morning briefing/status
+    message.  Legacy callback name ``menu:morning`` still calls this function,
+    but its product meaning is now "תפריט להיום".
+    """
     if ctx is None:
         ctx = await build_daily_context(user_id)
     nutrition_context = await build_nutrition_context(
@@ -1746,7 +2394,7 @@ async def build_morning_menu_text(user_id: int, ctx: "DailyContext | None" = Non
     )
     nutrition_request = build_nutrition_ai_request(
         nutrition_context,
-        "Build today's nutrition menu",
+        "Build today's standalone nutrition menu",
     )
     menu = await recommendations.morning_menu(
         OPENAI_CLIENT,
@@ -1757,11 +2405,16 @@ async def build_morning_menu_text(user_id: int, ctx: "DailyContext | None" = Non
         ctx.flags,
         nutrition_request["context"],
     )
-    text = "\n".join([*_daily_coach_brief_lines(ctx), "", format_morning_menu(menu)])
+    workout_note = "יום אימון" if _ctx_has_workout(ctx) else "יום ללא אימון מתוכנן"
+    target_line = f"יעד: {ctx.calorie_target:.0f} קל׳ | {ctx.protein_target:.0f} ג׳ חלבון"
+    text = "\n".join([
+        f"<b>תפריט להיום — {esc(workout_note)}</b>",
+        esc(target_line),
+        "",
+        format_morning_menu(menu),
+    ])
     if not ctx.flags:
-        text += "\n\n<i>המלצה זו נבנתה לפי השגרה שלך, כי עדיין לא התקבל עדכון בוקר להיום.</i>"
-    # RE9-X2: if critical nutrition context is missing, say the recommendation
-    # is based on partial info instead of presenting a guess as certainty.
+        text += "\n\n<i>ההצעה נבנתה לפי השגרה שלך, כי עדיין לא התקבל עדכון בוקר להיום.</i>"
     from noam_coach.services.decision_engine import context_completeness_gate
 
     gate = context_completeness_gate("nutrition", nutrition_request["context_quality"])

@@ -213,7 +213,12 @@ async def test_next_meal_explanation_shows_remaining_calculation(db: Database) -
 
 
 @pytest.mark.asyncio
-async def test_next_meal_actions_include_how_calculated_button(db: Database) -> None:
+async def test_next_meal_actions_are_the_task03_four_buttons(db: Database) -> None:
+    """TASK-03: at most 4 actions on the single recommendation — confirm
+    eaten, refresh, change quantities, back to status. No per-option "plan"
+    button and no separate "why" button (the reason is already inline in the
+    recommendation text itself).
+    """
     now = datetime.now(TZ).replace(hour=14, minute=0, second=0, microsecond=0)
     await _ready_user(db, now)
 
@@ -221,9 +226,12 @@ async def test_next_meal_actions_include_how_calculated_button(db: Database) -> 
     rows = next_meal_action_rows(rec)
     callbacks = [callback for row in rows for _label, callback in row]
 
-    assert ("איך חושב?", "nextmeal:why") in [button for row in rows for button in row]
+    assert len(callbacks) <= 4
     assert any(callback.startswith("nextmeal:save:") for callback in callbacks)
-    assert any(callback.startswith("nextmeal:plan:") for callback in callbacks)
+    assert "nextmeal:refresh" in callbacks
+    assert any(callback.startswith("nextmeal:editqty:") for callback in callbacks)
+    assert "menu:status" in callbacks
+    assert not any(callback.startswith("nextmeal:plan:") for callback in callbacks)
     assert not any(callback.startswith("nextmeal:choose:") for callback in callbacks)
 
 
@@ -363,13 +371,14 @@ async def test_options_respect_disliked_foods(db: Database) -> None:
 @pytest.mark.asyncio
 async def test_next_meal_feedback_is_temporary_rejection_and_regenerates(db: Database) -> None:
     """re7 P1-7/8: 'לא מתאים לי' temporarily rejects the option (no permanent
-    dislike) and returns a genuinely different alternative."""
+    dislike) and returns a genuinely different alternative. TASK-03: there is
+    only ever one exposed option, so this rejects/replaces option 1."""
     now = datetime.now(TZ).replace(hour=17, minute=0, second=0, microsecond=0)
     await _ready_user(db, now)
     initial = await generate_next_meal_recommendation(db, 1, now=now)
-    rejected_title = initial.options[1].title
+    rejected_title = initial.options[0].title
 
-    saved_item, refreshed = await save_next_meal_option_feedback(db, 1, 2, now=now)
+    saved_item, refreshed = await save_next_meal_option_feedback(db, 1, 1, now=now)
     refreshed_titles = [option.title for option in refreshed.options]
 
     assert saved_item == rejected_title
@@ -392,6 +401,28 @@ async def test_next_meal_history_prioritizes_fresh_options(db: Database) -> None
 
     assert second_titles[0] not in first_titles
     assert any(title not in first_titles for title in second_titles)
+
+
+@pytest.mark.asyncio
+async def test_recent_logged_meal_is_not_recommended_again_immediately(db: Database) -> None:
+    now = datetime.now(TZ).replace(hour=17, minute=0, second=0, microsecond=0)
+    await _ready_user(db, now)
+    first = await generate_next_meal_recommendation(db, 1, now=now)
+    just_eaten = first.options[0].title
+
+    await _meal(
+        db,
+        1,
+        now,
+        calories=1,
+        protein=0,
+        minutes_ago=30,
+        name=just_eaten,
+    )
+    second = await generate_next_meal_recommendation(db, 1, now=now)
+
+    assert second.options[0].title != just_eaten
+    assert any(just_eaten in notice for notice in second.notices)
 
 
 @pytest.mark.asyncio
@@ -449,6 +480,6 @@ async def test_mini_api_returns_same_rendered_recommendation(db: Database, monke
 
     assert "recommendation" in body
     assert "text" in body
-    # Answer-first rendering: leads with options, not the old header.
-    assert "אפשרות 1" in body["text"]
+    # Answer-first rendering: leads with the option itself, not the old header.
+    assert "למה עכשיו" in body["text"]
     assert body["recommendation"]["context"]["nutrition"]["consumed_calories"] == 700

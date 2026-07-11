@@ -99,7 +99,7 @@ async def test_typing_correction_directly_works_without_edit_button(
     handled = await onboarding_bot.handle_onboarding_text(update, 1)
     assert handled is True
     fact = await user_model.get_fact(db, 1, "weight_kg")
-    assert fact["value"] == "95.5"
+    assert fact["value"] == 95.5
     assert fact["source"] == user_model.SOURCE_USER
     assert fact["confirmed"] is True
 

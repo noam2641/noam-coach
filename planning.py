@@ -91,7 +91,7 @@ def _fact_label(key: str) -> str:
 FACT_LABELS = {key: user_model.display_label(key) for key in (
     "weight_kg", "height_cm", "age", "sex", "primary_goal",
     "training_days_per_week", "session_minutes", "training_location",
-    "equipment", "strength_experience", "active_pain", "medical_avoidance",
+    "equipment", "strength_experience", "training_limitations", "active_pain", "medical_avoidance",
     "diet_restrictions", "allergies", "work_schedule", "meal_break_info",
     "cooking_capacity", "workout_window", "weekly_availability",
 )}
@@ -116,6 +116,10 @@ async def collect_facts(db: Any, user_id: int) -> dict[str, dict[str, Any]]:
         hydrated["affects"] = json.loads(row["affects"]) if row.get("affects") else []
         hydrated["confirmed"] = bool(row.get("confirmed"))
         facts[row["key"]] = hydrated
+    if "training_limitations" not in facts:
+        limitation_fact = await user_model.get_training_limitations_fact(db, user_id)
+        if limitation_fact is not None:
+            facts["training_limitations"] = limitation_fact
     return facts
 
 
@@ -612,7 +616,47 @@ def _schedule_sessions(
 # lower per-session fatigue, better adherence) and for beginners generally.
 _CONSISTENCY_SPLIT_OVERRIDES: dict[int, list[str]] = {
     3: ["F", "F", "F"],
+    4: ["FB1", "FB2", "FB3", "FB4"],
 }
+
+_BALANCED_SPLIT_OVERRIDES: dict[int, list[str]] = {
+    4: ["U1", "L1", "U2", "L2"],
+}
+
+_PERFORMANCE_SPLIT_OVERRIDES: dict[int, list[str]] = {
+    4: ["A", "B", "C", "F"],
+}
+
+
+def _strategy_split_override(strategy: str, frequency: int) -> list[str] | None:
+    """Return a strategy-specific split without dropping requested days.
+
+    PATCH-11 / TASK-07: PATCH-10 introduced professional 4-day structures in
+    ``exercise_plans.py`` but the plan builder still called this helper before
+    it existed.  This is a real runtime gap: workout candidates could fail when
+    generated, even though compileall passed.
+
+    The override is deliberately conservative:
+    * consistency = 4 varied full-body sessions;
+    * balanced = true Upper/Lower for four days;
+    * performance = ABC + Full Body.
+
+    Unknown frequencies fall back to ``SPLIT_BY_FREQUENCY``.  We also validate
+    that all referenced plan codes exist so a typo cannot silently ship.
+    """
+    mapping_by_strategy = {
+        "consistency": _CONSISTENCY_SPLIT_OVERRIDES,
+        "balanced": _BALANCED_SPLIT_OVERRIDES,
+        "performance": _PERFORMANCE_SPLIT_OVERRIDES,
+    }
+    split = mapping_by_strategy.get(str(strategy or ""), {}).get(int(frequency))
+    if split is None:
+        return None
+    if len(split) != int(frequency):
+        return None
+    if any(code not in PLANS for code in split):
+        return None
+    return list(split)
 
 # E4: sets-per-exercise multiplier by strategy, bounded so consistency never
 # drops below a minimally-effective volume and performance never exceeds a
@@ -821,9 +865,7 @@ def _workout_candidate(
             )
             for d in resolved_preferred_days
         ]
-    split_override = (
-        _CONSISTENCY_SPLIT_OVERRIDES.get(frequency) if strategy == "consistency" else None
-    )
+    split_override = _strategy_split_override(strategy, frequency)
     sessions, assumed = _schedule_sessions(
         frequency,
         availability,
@@ -834,9 +876,14 @@ def _workout_candidate(
     _apply_strategy_volume(sessions, strategy)
     equipment_value = _fact_value(facts, "equipment")
     location = _fact_value(facts, "training_location")
-    pain_value = _fact_value(facts, "active_pain")
-    medical_avoidance = _fact_value(facts, "medical_avoidance")
+    limitations = _fact_value(facts, "training_limitations")
     experience = str(_fact_value(facts, "strength_experience", "beginner") or "beginner")
+    training_profile = training_intelligence.client_training_profile_from_facts(
+        facts,
+        available_days_per_week=frequency,
+        preferred_training_days=resolved_preferred_days,
+        time_per_workout_minutes=minutes,
+    )
     assumptions: list[str] = []
     if assumed:
         assumptions.append("ימי האימון נבחרו זמנית וטעונים אישור")
@@ -848,8 +895,8 @@ def _workout_candidate(
             session["exercises"],
             equipment_value=equipment_value,
             location=location,
-            pain_value=pain_value,
-            medical_avoidance=medical_avoidance,
+            pain_value=limitations,
+            medical_avoidance=limitations,
             experience=experience,
         )
         session["exercises"] = adapted
@@ -871,6 +918,7 @@ def _workout_candidate(
         assumptions.append("התוכנית הותאמה לציוד, לניסיון ולמגבלות שדווחו")
     payload = {
         "frequency": frequency,
+        "training_profile": training_profile.public_payload(),
         "sessions": sessions,
         "progression": {
             "method": "double_progression_rir",
@@ -879,6 +927,17 @@ def _workout_candidate(
         },
         "days_source": "default" if assumed else "confirmed_availability",
         "adaptation_audit": adaptation_audit,
+        "plan_rationale": {
+            "split_type": strategy,
+            "frequency": frequency,
+            "why_this_split": list(rationale),
+            "tradeoffs": list(tradeoffs),
+            "days_source": "default" if assumed else "confirmed_availability",
+            "equipment_considered": list(training_profile.available_equipment),
+            "pain_areas_considered": list(training_profile.pain_areas),
+            "progression_rule": "double_progression_rir_with_pain_hold",
+            "safety_rule": "do_not_increase_load_when_active_pain_matches_joint_load",
+        },
     }
     quality_issues = workout_quality_issues(payload)
     quality_penalty = 0.12 if quality_issues else 0.0
@@ -914,7 +973,12 @@ async def build_workout_candidates(db: Any, user_id: int) -> list[PlanCandidate]
     # invented availability.
     confirmed_days_available = len(avail.preferred_days) if avail.preferred_days else avail.max_days_per_week
     performance_ceiling = max(avail.max_days_per_week, confirmed_days_available)
-    consistency_freq = max(MIN_FREQUENCY, desired - 1)
+    # TASK-07: explicit training availability must not lose a day.  The old
+    # "consistency" candidate used desired-1, which recreated the screenshot bug:
+    # a user who supplied four days (Sun/Mon/Wed/Fri) could still see a 3-day
+    # plan.  All candidates now respect the active day count; they differ by
+    # split/volume, not by silently dropping a training day.
+    consistency_freq = desired
     performance_freq = min(MAX_FREQUENCY, performance_ceiling, desired + 1)
     # REC-PROGRAM-04-01: Pass resolved availability to candidates
     _avail_kwargs = {
@@ -924,7 +988,7 @@ async def build_workout_candidates(db: Any, user_id: int) -> list[PlanCandidate]
     }
     return [
         _workout_candidate(
-            "מקסימום עקביות",
+            ("Full Body מותאם" if desired >= 4 else "מקסימום עקביות"),
             "consistency",
             consistency_freq,
             facts,
@@ -934,7 +998,7 @@ async def build_workout_candidates(db: Any, user_id: int) -> list[PlanCandidate]
             **_avail_kwargs,
         ),
         _workout_candidate(
-            "מאוזנת",
+            ("Upper / Lower מאוזן" if desired >= 4 else "מאוזנת"),
             "balanced",
             desired,
             facts,
@@ -944,7 +1008,7 @@ async def build_workout_candidates(db: Any, user_id: int) -> list[PlanCandidate]
             **_avail_kwargs,
         ),
         _workout_candidate(
-            "ביצועים",
+            ("ABC + Full Body מותאם" if desired >= 4 else "ביצועים"),
             "performance",
             performance_freq,
             facts,
@@ -1261,7 +1325,7 @@ async def build_unified_week(db: Any, user_id: int) -> PlanCandidate:
 async def adherence_snapshot(db: Any, user_id: int, start_utc: str, end_utc: str) -> dict[str, Any]:
     goal = await active_goal(db, user_id)
     meals = await db.fetch_all(
-        "SELECT calories, protein FROM meals WHERE user_id=? AND eaten_at>=? AND eaten_at<?",
+        "SELECT calories, protein FROM meals WHERE user_id=? AND eaten_at>=? AND eaten_at<? AND COALESCE(status, 'consumed')='consumed'",
         (user_id, start_utc, end_utc),
     )
     sessions = await db.fetch_all(

@@ -266,12 +266,11 @@ async def sync_health_measurements_to_facts(user_id: int) -> None:
                 source=user_model.SOURCE_APPLE_HEALTH,
             )
 
-    # Daily-steps average counts only days the watch was worn through the
-    # evening — a partial day undercounts steps, so it is burned rather than
-    # allowed to drag the average down (routine.average_daily_steps).
-    steps = await routine.average_daily_steps(
-        _current_db(), user_id, TZ, SETTINGS.routine_window_days
-    )
+    # Daily-steps average over the last 28 complete days. StepCount is NOT
+    # dropped for low watch wear (steps also come from the iPhone) — the
+    # baseline is the all-days average; wear only affects confidence
+    # (routine.average_daily_steps).
+    steps = await routine.average_daily_steps(_current_db(), user_id, TZ)
     if steps.avg is not None:
         await user_model.set_fact(
             _current_db(), user_id, "avg_steps",

@@ -104,3 +104,63 @@ def with_weekday_schema(payload: dict[str, Any]) -> dict[str, Any]:
     out = dict(payload)
     out["weekday_schema"] = WEEKDAY_SCHEMA_VERSION
     return out
+
+
+# Balanced weekly templates (Monday-first indices) used to spread N training
+# days across the week when the user's data doesn't already pin them down.
+# Chosen to avoid back-to-back days where possible so recovery is even.
+_BALANCED_TEMPLATES: dict[int, list[int]] = {
+    1: [1],                    # שני
+    2: [1, 4],                 # שני, שישי
+    3: [6, 2, 4],              # ראשון, שלישי, חמישי
+    4: [6, 1, 3, 5],           # ראשון, שני, רביעי, שישי
+    5: [6, 1, 3, 4, 5],        # ראשון, שני, רביעי, חמישי, שישי
+    6: [6, 0, 1, 3, 4, 5],     # ראשון..שישי
+}
+
+
+def propose_training_days(
+    detected: "list[int] | tuple[int, ...]",
+    count: int,
+    *,
+    schema: Any = WEEKDAY_SCHEMA_VERSION,
+) -> tuple[list[int], list[int]]:
+    """Propose exactly ``count`` training days (Monday-first indices).
+
+    The user's DETECTED days (ordered strongest-first) are kept, then the list
+    is topped up from a balanced weekly template so the proposal always matches
+    the requested frequency — never fewer days than the user asked for. When
+    there are more detected days than requested, the strongest ``count`` win.
+
+    Returns ``(proposed_days, added_days)`` where ``proposed_days`` is in
+    Israeli display order and ``added_days`` are the template days appended to
+    reach ``count`` (so the UI can explain "I added X to reach N").
+    """
+    count = max(0, min(7, int(count)))
+    if count == 0:
+        return [], []
+
+    kept: list[int] = []
+    for raw in detected:
+        result = normalize_weekday(raw, schema)
+        if result.weekday is not None and result.weekday not in kept:
+            kept.append(result.weekday)
+    kept = kept[:count]
+
+    added: list[int] = []
+    if len(kept) < count:
+        template = _BALANCED_TEMPLATES.get(count, _BALANCED_TEMPLATES[6])
+        for day in template:
+            if len(kept) + len(added) >= count:
+                break
+            if day not in kept and day not in added:
+                added.append(day)
+        # Extremely rare: template + kept still short (kept had odd extras).
+        for day in range(7):
+            if len(kept) + len(added) >= count:
+                break
+            if day not in kept and day not in added:
+                added.append(day)
+
+    proposed = sunday_first_order(kept + added)
+    return proposed, added

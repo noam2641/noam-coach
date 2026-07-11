@@ -254,7 +254,7 @@ async def test_scenario4_text_budget_correction_recomputes(tmp_path: Path, monke
 
     reply = update.effective_message.replies[-1]
     # Stayed in the recommendation flow (did not drop to the generic main menu).
-    assert "אפשרות 1" in reply
+    assert "למה עכשיו" in reply
     assert "269" in reply
     # The recomputed options still respect the 269 budget.
     refreshed = await generate_next_meal_recommendation(db, 1)

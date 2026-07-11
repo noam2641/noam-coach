@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from config import TZ
 from db import Database
 from helpers import utc_now
 from noam_coach.services.next_meal import (
@@ -55,15 +56,45 @@ async def test_re9_recommendation_shows_after_meal_remaining(tmp_path: Path) -> 
 
 @pytest.mark.asyncio
 async def test_re9_exactly_one_recommended_option_with_reason(tmp_path: Path) -> None:
-    """RE9-013/052/053: exactly one option is marked recommended, with a reason."""
+    """RE9-013/052/053: exactly one option is marked recommended, with a reason.
+
+    TASK-03: the displayed text no longer needs a "⭐ מומלץ עבורך" star since
+    there is only ever one option shown (nothing to be recommended over) —
+    the reason itself ("למה עכשיו") still appears in the message.
+    """
     db = await _db(tmp_path)
     rec = await generate_next_meal_recommendation(db, 1)
     recommended = [o for o in rec.options if o.recommended]
     assert len(recommended) == 1
     assert recommended[0].recommended_reason
     text = format_next_meal_recommendation(rec)
-    assert "מומלץ עבורך" in text
+    assert "למה עכשיו" in text
     assert "התאמה" in text
+
+
+@pytest.mark.asyncio
+async def test_next_meal_no_meals_headline_does_not_imply_consumed_remaining(tmp_path: Path) -> None:
+    db = await _db(tmp_path, calories=2100, protein=160)
+
+    rec = await generate_next_meal_recommendation(db, 1)
+    text = format_next_meal_recommendation(rec)
+
+    assert rec.context.nutrition.meals_logged_count == 0
+    assert "עוד לא נרשמו ארוחות היום" in text
+    assert "נשארו לך היום" not in text
+
+
+@pytest.mark.asyncio
+async def test_next_meal_main_screen_surfaces_near_bedtime_notice(tmp_path: Path) -> None:
+    db = await _db(tmp_path, calories=2100, protein=160)
+    now = datetime(2026, 6, 28, 22, 15, tzinfo=TZ)
+
+    rec = await generate_next_meal_recommendation(db, 1, now=now)
+    text = format_next_meal_recommendation(rec)
+
+    assert rec.budget.policy == "near_bedtime"
+    assert any("שינה" in notice for notice in rec.notices)
+    assert "שינה" in text
 
 
 @pytest.mark.asyncio

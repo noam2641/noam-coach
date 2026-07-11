@@ -24,6 +24,7 @@ idempotent (duplicate rows are skipped, not duplicated).
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import stat
 import xml.etree.ElementTree as ET
@@ -501,16 +502,35 @@ def iter_health_rows(
             source_device="apple_watch",
         )
 
-    # Flush dedup'd daily sums (steps, active_calories) — pick preferred source.
+    # Flush dedup'd daily sums. For StepCount, keep source diagnostics and use
+    # the dominant source as the conservative planning value. Apple Watch can
+    # cover only part of a day while iPhone covers the rest, so "Watch always
+    # wins" undercounts many mixed-source days.
     for (metric, unit, day), per_source in dedup_acc.items():
-        total, source = _pick_preferred_source(per_source)
+        if metric == "steps":
+            source = max(per_source, key=lambda src: per_source[src])
+            total = per_source[source]
+            source_device = json.dumps(
+                {
+                    "selected_source": source,
+                    "source_totals": per_source,
+                    "raw_all_sources": sum(per_source.values()),
+                    "conservative": total,
+                    "selection_reason": "dominant_stepcount_source_for_day",
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        else:
+            total, source = _pick_preferred_source(per_source)
+            source_device = source
         yield HealthRow(
             external_id=f"ah:{metric}:{day.isoformat()}",
             sample_type=metric,
             value=round(total, 3),
             unit=unit,
             start_time=_day_start_iso(day, local_tz),
-            source_device=source,
+            source_device=source_device,
         )
 
     # Flush remaining daily sums (non-dedup metrics).

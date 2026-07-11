@@ -292,7 +292,12 @@ def _parse_rest_seconds(text: str) -> int | None:
 
 def _parse_workout_parameter_text(text: str) -> list[dict[str, Any]]:
     normalized = text.strip().lower()
-    scope = "all" if any(marker in normalized for marker in ("כל התרגילים", "כולם", "לכולם", "all exercises")) else "current"
+    if any(marker in normalized for marker in ("כל התוכנית", "לכל התוכנית", "התוכנית כולה", "whole plan", "entire plan")):
+        scope = "program"
+    elif any(marker in normalized for marker in ("כל התרגילים", "כולם", "לכולם", "all exercises")):
+        scope = "all"
+    else:
+        scope = "current"
     updates: list[dict[str, Any]] = []
 
     if any(marker in normalized for marker in ("מנוחה", "rest")):
@@ -351,7 +356,12 @@ async def _handle_workout_parameter_text(
 
     plan = await get_user_plan(user_id, code)
     exercise_name = plan["exercises"][exercise_index]["name"] if 0 <= exercise_index < len(plan["exercises"]) else "התרגיל"
-    scope_label = "לכל התרגילים" if any(item.get("scope") == "all" for item in updates) else f"לתרגיל {exercise_name}"
+    if any(item.get("scope") == "program" for item in updates):
+        scope_label = "לכל התוכנית"
+    elif any(item.get("scope") == "all" for item in updates):
+        scope_label = "לכל התרגילים באימון הזה"
+    else:
+        scope_label = f"לתרגיל {exercise_name}"
     summary = ", ".join(str(item["label"]) for item in updates)
     await conversation.set_active_flow(
         DB,
@@ -473,6 +483,18 @@ async def handle_text_message(
         remember_active_recommendation,
     )
 
+    from noam_coach.services.daily_menu_edit import try_build_daily_menu_edit_reply
+
+    daily_menu_edit = await try_build_daily_menu_edit_reply(DB, user_id, text)
+    if daily_menu_edit is not None:
+        reply_text, reply_rows = daily_menu_edit
+        await update.effective_message.reply_text(
+            reply_text,
+            reply_markup=InlineKeyboardMarkup([[button(label, cb) for label, cb in row] for row in reply_rows]),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     correction = await handle_recommendation_correction(DB, user_id, text)
     if correction is not None:
         prefix, recommendation = correction
@@ -480,7 +502,6 @@ async def handle_text_message(
             [button(label, cb) for label, cb in row]
             for row in next_meal_action_rows(recommendation)
         ]
-        keyboard_rows.append([button("⬅️ חזרה למצב היום", "menu:status"), button("🏠 תפריט", "menu:home")])
         body = format_next_meal_recommendation(recommendation)
         if prefix:
             body = f"{prefix}\n\n{body}"

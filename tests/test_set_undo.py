@@ -82,3 +82,44 @@ async def test_undo_reactivates_completed_session(tmp_path, monkeypatch) -> None
     session = await db.fetch_one("SELECT * FROM sessions WHERE id=?", (session_id,))
     assert session["status"] == "active"
     assert session["ended_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_split_set_rows_get_distinct_client_event_ids(tmp_path, monkeypatch) -> None:
+    db = coach_bot.Database(str(tmp_path / "split_event_ids.db"))
+    await db.init()
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(1,'A',NULL,?)",
+        (coach_bot.utc_now(),),
+    )
+    monkeypatch.setattr(coach_bot, "DB", db)
+    import noam_coach.bot.workout_runtime as workout_runtime
+
+    monkeypatch.setattr(workout_runtime, "DB", db)
+    session_id = await db.execute(
+        "INSERT INTO sessions(user_id, code, name, plan, status, exercise_index, set_number, started_at) "
+        "VALUES(1,'T','Test',?, 'active', 0, 1, ?)",
+        (json.dumps(_PLAN, ensure_ascii=False), coach_bot.utc_now()),
+    )
+    session = await db.fetch_one("SELECT * FROM sessions WHERE id=?", (session_id,))
+
+    completed, _rest = await workout_runtime.save_split_set(
+        session,
+        60,
+        5,
+        55,
+        4,
+        2,
+        client_event_id="client-abc",
+    )
+
+    assert completed is False
+    rows = await db.fetch_all(
+        "SELECT source, client_event_id FROM sets WHERE session_id=? ORDER BY id",
+        (session_id,),
+    )
+    assert [row["source"] for row in rows] == ["telegram_split_primary", "telegram_split_secondary"]
+    assert [row["client_event_id"] for row in rows] == [
+        "client-abc:primary",
+        "client-abc:secondary",
+    ]

@@ -192,8 +192,10 @@ async def analyze_meal_image(image_bytes: bytes, user_id: int | None = None) -> 
         raise RuntimeError("OPENAI_API_KEY אינו מוגדר")
 
     from noam_coach.services.meal_prompts import ISRAELI_LOCALE_BLOCK, safety_context_block
+    from noam_coach.services.learned_foods import learned_foods_prompt_block
 
     safety_context = await _meal_safety_context(user_id)
+    learned_context = await learned_foods_prompt_block(DB, user_id)
     encoded = base64.b64encode(image_bytes).decode("utf-8")
     response = await OPENAI_CLIENT.responses.parse(
         model=SETTINGS.openai_model,
@@ -215,6 +217,7 @@ async def analyze_meal_image(image_bytes: bytes, user_id: int | None = None) -> 
                     "Do not present estimates as medical advice.\n\n"
                     + ISRAELI_LOCALE_BLOCK
                     + safety_context_block(safety_context)
+                    + learned_context
                 ),
             },
             {
@@ -246,8 +249,10 @@ async def analyze_meal_text(description: str, user_id: int | None = None) -> Mea
         raise RuntimeError("OPENAI_API_KEY אינו מוגדר")
 
     from noam_coach.services.meal_prompts import ISRAELI_LOCALE_BLOCK, safety_context_block
+    from noam_coach.services.learned_foods import learned_foods_prompt_block
 
     safety_context = await _meal_safety_context(user_id)
+    learned_context = await learned_foods_prompt_block(DB, user_id)
     response = await OPENAI_CLIENT.responses.parse(
         model=SETTINGS.openai_model,
         input=[
@@ -267,6 +272,7 @@ async def analyze_meal_text(description: str, user_id: int | None = None) -> Mea
                     "concrete calorie deltas. Not medical advice.\n\n"
                     + ISRAELI_LOCALE_BLOCK
                     + safety_context_block(safety_context)
+                    + learned_context
                 ),
             },
             {
@@ -321,6 +327,15 @@ async def reanalyze_meal_with_text_and_image(
         raise RuntimeError("OPENAI_API_KEY אינו מוגדר")
 
     from noam_coach.services.meal_prompts import ISRAELI_LOCALE_BLOCK
+    from noam_coach.services.learned_foods import learned_foods_prompt_block
+
+    learned_user_id = None
+    if isinstance(nutrition_context, dict):
+        try:
+            learned_user_id = int(nutrition_context.get("user_id") or 0) or None
+        except (TypeError, ValueError):
+            learned_user_id = None
+    learned_context = await learned_foods_prompt_block(DB, learned_user_id)
 
     image_bytes = Path(image_path).read_bytes()
     encoded = base64.b64encode(image_bytes).decode("utf-8")
@@ -364,6 +379,7 @@ async def reanalyze_meal_with_text_and_image(
                     + locked_block
                     + "\n\n"
                     + ISRAELI_LOCALE_BLOCK
+                    + learned_context
                 ),
             },
             {

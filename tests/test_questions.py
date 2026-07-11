@@ -42,9 +42,9 @@ def test_safety_questions_have_high_priority() -> None:
 
 
 def test_question_by_id_found() -> None:
-    q = questions.question_by_id("safety_pain")
+    q = questions.question_by_id("safety_training_limitations")
     assert q is not None
-    assert q.fact_key == "active_pain"
+    assert q.fact_key == "training_limitations"
 
 
 def test_question_by_id_not_found() -> None:
@@ -53,7 +53,9 @@ def test_question_by_id_not_found() -> None:
 
 def test_onboarding_questions_subset() -> None:
     ids = {q.id for q in questions.ONBOARDING_QUESTIONS}
-    assert "safety_pain" in ids
+    assert "safety_training_limitations" in ids
+    assert "safety_pain" not in ids
+    assert "safety_medical_avoidance" not in ids
     assert "q_primary_goal" in ids
     assert "q_training_days" in ids
 

@@ -1,12 +1,14 @@
 """Codex-audit regression — an explicit ABC request builds a FULL plan.
 
 Covers (images 11-12 of the audit round):
-  * "תוכנית ABC" in free text is detected as a 3-day split request — it must
-    route to plan building, never to a single-exercise edit screen.
+  * "תוכנית ABC" in free text is detected as a split request — it must route
+    to plan building, never to a single-exercise edit screen. Per PATCH-12 /
+    TASK-07 an explicit ABC now targets a 4-day "ABC + Full Body" structure
+    so a user who declared four training days does not lose a day.
   * When the user's CONFIRMED availability has fewer days than the split
     needs, the bot explains the mismatch and offers a fitting alternative
     instead of silently building an unfollowable plan.
-  * When availability fits (or is unknown), a full A/B/C plan is built and
+  * When availability fits (or is unknown), a full plan is built and
     presented as such.
 """
 
@@ -22,10 +24,12 @@ from noam_coach.services.availability import TrainingAvailability
 
 
 def test_abc_split_is_detected_in_free_text() -> None:
-    assert assistant_bot.requested_split_frequency("אני רוצה תוכנית ABC") == 3
-    assert assistant_bot.requested_split_frequency("תבנה לי אימון abc") == 3
-    assert assistant_bot.requested_split_frequency("תוכנית איי בי סי") == 3
-    assert assistant_bot.requested_split_frequency("תוכנית A/B/C") == 3
+    # PATCH-12 / TASK-07: explicit ABC targets a 4-day "ABC + Full Body" plan
+    # so a user with four declared days keeps all four.
+    assert assistant_bot.requested_split_frequency("אני רוצה תוכנית ABC") == 4
+    assert assistant_bot.requested_split_frequency("תבנה לי אימון abc") == 4
+    assert assistant_bot.requested_split_frequency("תוכנית איי בי סי") == 4
+    assert assistant_bot.requested_split_frequency("תוכנית A/B/C") == 4
 
 
 def test_plain_plan_request_is_not_a_split_request() -> None:
@@ -109,11 +113,12 @@ def _plan_ctx(text: str) -> assistant_bot.FreeTextContext:
 
 
 @pytest.mark.asyncio
-async def test_abc_request_builds_full_three_day_plan(
+async def test_abc_request_builds_full_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The full path: ABC in free text → frequency 3 → a complete plan is
-    built and labeled as ABC — not an exercise-parameter screen."""
+    """The full path: ABC in free text → frequency 4 (ABC + Full Body) → a
+    complete plan is built and labeled as ABC — not an exercise-parameter
+    screen. The user here has four confirmed days, so no day is dropped."""
     built: list[int] = []
 
     async def fits(_db: Any, _user_id: int) -> TrainingAvailability:
@@ -138,7 +143,7 @@ async def test_abc_request_builds_full_three_day_plan(
     ctx = _plan_ctx("אני רוצה תוכנית ABC")
     handled = await assistant_bot._handle_plan_text_action(ctx)
     assert handled is True
-    assert built == [3]
+    assert built == [4]
     reply = ctx.message.texts[-1]
     assert "ABC" in reply and "PLAN-BODY" in reply
 
@@ -166,4 +171,5 @@ async def test_abc_request_blocked_by_confirmed_two_days(
         for row in ctx.message.markups[-1].inline_keyboard
         for btn in row
     }
-    assert "plan:set:2" in callbacks and "plan:set:3" in callbacks
+    # The fit (2 confirmed days) and the requested ABC frequency (4) are offered.
+    assert "plan:set:2" in callbacks and "plan:set:4" in callbacks

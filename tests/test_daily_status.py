@@ -72,7 +72,9 @@ async def test_profile_formats_structured_values_without_raw_dicts(tmp_path, mon
 
     text = await coach_bot.build_profile_text(1)
 
-    assert "ראשון 18:00 45 דקות" in text
+    # PATCH-12 / TASK-10: the profile shows one structured availability block
+    # (via resolve_availability), never a raw stored dict.
+    assert "זמינות פעילה לתוכנית" in text
     assert "{'weekday'" not in text
     assert '"weekday"' not in text
-    assert "available" not in text
+    assert "'available'" not in text

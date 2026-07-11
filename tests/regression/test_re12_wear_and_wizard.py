@@ -14,6 +14,7 @@ Covers:
 from __future__ import annotations
 
 import datetime as dt
+import json
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -79,12 +80,18 @@ class RoutingDB:
         workouts: list[dict[str, Any]] | None = None,
         wear: list[dict[str, Any]] | None = None,
         steps: list[dict[str, Any]] | None = None,
+        newest: str | None = None,
     ) -> None:
         self.workouts = workouts or []
         self.wear = wear or []
         self.steps = steps or []
+        self.newest = newest
 
     async def fetch_all(self, sql: str, parameters: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+        if "MAX(COALESCE(end_time, start_time))" in sql:
+            return [{"latest": self.newest}]
+        if "MAX(start_time)" in sql:
+            return [{"newest": self.newest}]
         if "watch_wear" in sql:
             return self.wear
         if "sample_type='workout'" in sql:
@@ -163,12 +170,41 @@ def _steps_row(day: dt.date, steps: float) -> dict[str, Any]:
     return {"value": steps, "start_time": start.isoformat()}
 
 
+def _steps_row_sources(day: dt.date, sources: dict[str, float]) -> dict[str, Any]:
+    start = dt.datetime.combine(day, dt.time(0, 0), tzinfo=TZ)
+    selected_source = max(sources, key=sources.get)
+    selected = sources[selected_source]
+    return {
+        "value": selected,
+        "start_time": start.isoformat(),
+        "source_device": json.dumps(
+            {
+                "selected_source": selected_source,
+                "source_totals": sources,
+                "raw_all_sources": sum(sources.values()),
+                "conservative": selected,
+                "selection_reason": "dominant_stepcount_source_for_day",
+            },
+            ensure_ascii=False,
+        ),
+    }
+
+
+def _iso(day: dt.date, hour: int) -> str:
+    """ISO timestamp on ``day`` at ``hour`` — used as the dataset's newest sample
+    so the steps window anchors to a known complete day."""
+    return dt.datetime.combine(day, dt.time(hour, 0), tzinfo=TZ).isoformat()
+
+
 @pytest.mark.asyncio
-async def test_steps_average_burns_partial_and_unworn_days() -> None:
+async def test_steps_baseline_counts_all_days_wear_only_affects_confidence() -> None:
+    """Steps come from the iPhone too — a low-wear day is NOT deleted from the
+    baseline average, it only lowers confidence. The baseline is the all-days
+    mean; a separate high-confidence mean is exposed for transparency."""
     today = dt.datetime.now(TZ).date()
-    full_day = today - dt.timedelta(days=3)      # worn 08:00-22:00 → counts
-    partial_day = today - dt.timedelta(days=4)   # taken off at 15:00 → burned
-    unworn_day = today - dt.timedelta(days=5)    # no wear row → burned
+    full_day = today - dt.timedelta(days=3)      # worn 08:00-22:00 → high conf
+    partial_day = today - dt.timedelta(days=4)   # watch off at 15:00 → low conf
+    unworn_day = today - dt.timedelta(days=5)    # no wear row → low conf
 
     steps = [
         _steps_row(full_day, 10000),
@@ -179,26 +215,133 @@ async def test_steps_average_burns_partial_and_unworn_days() -> None:
         _wear_row(full_day, 8.0, 22.0),
         _wear_row(partial_day, 8.0, 15.0),
     ]
-    db = RoutingDB(steps=steps, wear=wear)
+    db = RoutingDB(steps=steps, wear=wear, newest=_iso(full_day, 23))
     result = await routine.average_daily_steps(db, 1, TZ)
-    assert result.wear_filtered is True
-    assert result.days_sampled == 1
+    # Baseline = mean of ALL 3 step days, never dropped to the single worn day.
+    assert result.days_sampled == 3
+    assert result.avg == pytest.approx((10000 + 4000 + 300) / 3)
+    # Wear only affects confidence: 1 full-wear day, 2 excluded from high-conf.
+    assert result.high_conf_days == 1
     assert result.days_excluded == 2
-    assert result.avg == pytest.approx(10000)
+    assert result.avg_high_conf == pytest.approx(10000)
+    assert result.wear_filtered is True
 
 
 @pytest.mark.asyncio
 async def test_steps_average_without_wear_data_uses_all_days() -> None:
     today = dt.datetime.now(TZ).date()
-    steps = [
-        _steps_row(today - dt.timedelta(days=3), 8000),
-        _steps_row(today - dt.timedelta(days=4), 6000),
-    ]
-    db = RoutingDB(steps=steps, wear=[])
+    a = today - dt.timedelta(days=3)
+    b = today - dt.timedelta(days=4)
+    steps = [_steps_row(a, 8000), _steps_row(b, 6000)]
+    db = RoutingDB(steps=steps, wear=[], newest=_iso(a, 23))
     result = await routine.average_daily_steps(db, 1, TZ)
     assert result.wear_filtered is False
     assert result.days_sampled == 2
     assert result.avg == pytest.approx(7000)
+
+
+@pytest.mark.asyncio
+async def test_steps_iphone_only_day_with_low_wear_is_not_deleted() -> None:
+    """A day with StepCount from the iPhone but low/no watch wear still counts
+    toward the baseline — it is not deleted just because the watch was off."""
+    today = dt.datetime.now(TZ).date()
+    worn = today - dt.timedelta(days=3)
+    iphone_only = today - dt.timedelta(days=4)  # steps present, no wear row
+    db = RoutingDB(
+        steps=[_steps_row(worn, 9000), _steps_row(iphone_only, 7000)],
+        wear=[_wear_row(worn, 8.0, 22.0)],
+        newest=_iso(worn, 23),
+    )
+    result = await routine.average_daily_steps(db, 1, TZ)
+    assert result.days_sampled == 2  # the iPhone-only day was kept
+    assert result.avg == pytest.approx(8000)  # (9000 + 7000) / 2
+    assert result.high_conf_days == 1
+    assert result.avg_high_conf == pytest.approx(9000)
+
+
+@pytest.mark.asyncio
+async def test_steps_partial_export_end_day_is_excluded() -> None:
+    """When the file ends mid-day (last sample before evening), that partial
+    day is excluded so its half-recorded steps do not undercount the average."""
+    today = dt.datetime.now(TZ).date()
+    partial_end = today - dt.timedelta(days=2)   # export ends here at 15:00
+    full_day = today - dt.timedelta(days=3)
+    db = RoutingDB(
+        steps=[_steps_row(full_day, 8000), _steps_row(partial_end, 1200)],
+        wear=[],
+        newest=_iso(partial_end, 15),  # mid-day final timestamp → partial
+    )
+    result = await routine.average_daily_steps(db, 1, TZ)
+    assert result.days_sampled == 1  # only the full day counted
+    assert result.avg == pytest.approx(8000)
+
+
+@pytest.mark.asyncio
+async def test_steps_baseline_not_dragged_down_by_few_wear_days() -> None:
+    """28 step days but only 9 with full wear: the baseline stays the all-days
+    average (a healthy ~7000), NOT the low-wear-only subset that would collapse
+    it to ~3000."""
+    today = dt.datetime.now(TZ).date()
+    anchor = today - dt.timedelta(days=3)
+    steps: list[dict[str, Any]] = []
+    wear: list[dict[str, Any]] = []
+    for i in range(28):
+        day = anchor - dt.timedelta(days=i)
+        steps.append(_steps_row(day, 7000))
+        if i < 9:  # only 9 days have full wear
+            wear.append(_wear_row(day, 8.0, 22.0))
+    db = RoutingDB(steps=steps, wear=wear, newest=_iso(anchor, 23))
+    result = await routine.average_daily_steps(db, 1, TZ)
+    assert result.days_sampled == 28
+    assert result.avg == pytest.approx(7000)  # all-days baseline, not collapsed
+    assert result.high_conf_days == 9
+    assert result.avg_high_conf == pytest.approx(7000)
+
+
+def test_importer_stepcount_keeps_source_diagnostics_and_dominant_value(tmp_path: Path) -> None:
+    xml = tmp_path / "export.xml"
+    xml.write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<HealthData>
+ <Record type="HKQuantityTypeIdentifierStepCount" sourceName="Noam Apple Watch"
+         startDate="2026-06-01 08:00:00 +0300" endDate="2026-06-01 08:10:00 +0300" value="50"/>
+ <Record type="HKQuantityTypeIdentifierStepCount" sourceName="Noam iPhone"
+         startDate="2026-06-01 09:00:00 +0300" endDate="2026-06-01 23:00:00 +0300" value="5800"/>
+</HealthData>
+""",
+        encoding="utf-8",
+    )
+
+    rows = list(health_import.iter_health_rows(xml, local_tz=TZ, now=dt.datetime(2026, 7, 1, tzinfo=TZ)))
+    step = next(row for row in rows if row.sample_type == "steps")
+    payload = json.loads(step.source_device or "{}")
+
+    assert step.value == pytest.approx(5800)
+    assert payload["raw_all_sources"] == pytest.approx(5850)
+    assert payload["source_totals"]["Noam Apple Watch"] == pytest.approx(50)
+    assert payload["source_totals"]["Noam iPhone"] == pytest.approx(5800)
+    assert payload["selected_source"] == "Noam iPhone"
+
+
+@pytest.mark.asyncio
+async def test_steps_diagnostics_compute_raw_and_conservative_separately() -> None:
+    anchor = dt.date(2026, 6, 15)
+    steps = [
+        _steps_row_sources(anchor - dt.timedelta(days=1), {"iPhone": 7000, "Apple Watch": 2000}),
+        _steps_row_sources(anchor, {"iPhone": 6000}),
+    ]
+    db = RoutingDB(steps=steps, wear=[], newest=_iso(anchor, 23))
+
+    result = await routine.average_daily_steps(db, 1, TZ)
+
+    assert result.days_sampled == 2
+    assert result.raw_all_sources_avg == pytest.approx((9000 + 6000) / 2)
+    assert result.dominant_or_priority_source_avg == pytest.approx((7000 + 6000) / 2)
+    assert result.selected_planning_baseline == pytest.approx(result.dominant_or_priority_source_avg)
+    included = [row for row in result.daily_breakdown if row["included"]]
+    assert len(included) == 2
+    assert sum(row["selected_step_count_for_baseline"] for row in included) / 2 == pytest.approx(result.avg)
+    assert {"iPhone", "Apple Watch"}.issubset(set(result.sources_found))
 
 
 # ---------------------------------------------------------------------------

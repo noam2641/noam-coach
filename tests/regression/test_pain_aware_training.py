@@ -156,7 +156,7 @@ def test_pain_safety_guidance_escalates_sharp_pain_without_diagnosis() -> None:
     region = training_intelligence.ActivePainRegion(
         region="elbow",
         label="מרפק",
-        severity=3,
+        severity=4,
         age_days=0,
     )
 
@@ -521,7 +521,7 @@ async def test_show_session_escalates_sharp_active_pain_warning(
     db = await _make_db(tmp_path, "sharp_pain_warning.db")
     _patch_all(monkeypatch, db)
 
-    await _insert_pain_constraint(db, location="elbow", severity=3)
+    await _insert_pain_constraint(db, location="elbow", severity=4)
     plan = {
         "name": "Test",
         "exercises": [
@@ -703,15 +703,15 @@ async def test_severe_pain_only_offers_skip_and_finish(
     )
     refreshed = await db.fetch_one("SELECT * FROM sessions WHERE id=?", (session["id"],))
 
-    severity_3_data = coach_bot.session_action_data("painlevel", dict(refreshed), 3)
+    severity_4_data = coach_bot.session_action_data("painlevel", dict(refreshed), 4)
     await callback_session_bot.handle_session_action_callback(
-        query, context=None, user_id=1, data=severity_3_data
+        query, context=None, user_id=1, data=severity_4_data
     )
 
     markup = query.reply_markups[-1]
     labels = [btn.text for row in markup.inline_keyboard for btn in row]
     assert labels == ["דלג", "סיים"]
-    assert "כאב חד" in query.messages[-1]
+    assert "4/10" in query.messages[-1]
 
 
 @pytest.mark.asyncio

@@ -164,6 +164,62 @@ def _parse_weekly_availability_days(value: Any) -> tuple[list[int], list[str]]:
     return sorted(set(days)), sorted(set(warnings))
 
 
+def _parse_day_fact(value: Any) -> tuple[list[int], list[str]]:
+    """Parse a compact weekday-list fact such as active_training_days."""
+    if value is None:
+        return [], []
+    raw_items = value if isinstance(value, list) else [value]
+    days: list[int] = []
+    warnings: list[str] = []
+    for item in raw_items:
+        normalized = normalize_weekday(item, WEEKDAY_SCHEMA_VERSION)
+        if normalized.weekday is None:
+            warnings.append(normalized.reason or "invalid_weekday")
+            continue
+        if normalized.needs_confirmation and normalized.reason:
+            warnings.append(normalized.reason)
+        days.append(normalized.weekday)
+    return sorted(set(days)), sorted(set(warnings))
+
+
+async def save_user_training_availability(
+    db: Any,
+    user_id: int,
+    parsed: ParsedAvailabilityAnswer,
+) -> None:
+    """Persist manually supplied availability as the active source of truth.
+
+    HealthKit may propose workout days, but a typed user correction must become
+    preferred_training_days + active_training_days.  Plan generation/resolution
+    should read active_training_days first, so a Health inference can never
+    silently remove a day the user explicitly gave.
+    """
+    days = sorted({int(slot["weekday"]) for slot in parsed.weekly_availability if "weekday" in slot})
+    if days:
+        await user_model.set_fact(
+            db, user_id, "preferred_training_days", days,
+            kind=user_model.KIND_FACT, source=SOURCE_USER, confirmed=True,
+        )
+        await user_model.set_fact(
+            db, user_id, "active_training_days", days,
+            kind=user_model.KIND_FACT, source=SOURCE_USER, confirmed=True,
+        )
+        await user_model.set_fact(
+            db, user_id, "training_days_per_week", len(days),
+            kind=user_model.KIND_FACT, source=SOURCE_USER, confirmed=True,
+        )
+    if parsed.workout_window:
+        await user_model.set_fact(
+            db, user_id, "workout_window", parsed.workout_window,
+            kind=user_model.KIND_FACT, source=SOURCE_USER, confirmed=True,
+        )
+    if parsed.session_minutes:
+        await user_model.set_fact(
+            db, user_id, "session_minutes", parsed.session_minutes,
+            kind=user_model.KIND_FACT, source=SOURCE_USER, confirmed=True,
+        )
+
+
 def _parse_workout_window_time(value: Any) -> str | None:
     """Extract an HH:MM string from a workout_window fact value."""
     if value is None:
@@ -398,6 +454,23 @@ async def resolve_availability(db: Any, user_id: int) -> TrainingAvailability:
     conflicts: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------
+    # (0) active/preferred training days — explicit user correction wins
+    # ------------------------------------------------------------------
+    for fact_key, label in (
+        ("active_training_days", "user_corrected"),
+        ("preferred_training_days", "user_confirmed"),
+    ):
+        day_fact = await get_fact(db, user_id, fact_key)
+        if day_fact and day_fact.get("kind") != user_model.KIND_GAP:
+            parsed_days, day_warnings = _parse_day_fact(day_fact.get("value"))
+            warnings.extend(day_warnings)
+            if parsed_days:
+                conf = float(day_fact.get("confidence") or 0.95)
+                confirmed = bool(day_fact.get("confirmed"))
+                preferred_days_candidates.append((label, parsed_days, conf, confirmed))
+                days_per_week_candidates.append((label, len(parsed_days), conf, confirmed))
+
+    # ------------------------------------------------------------------
     # (a) training_days_per_week — explicit user report
     # ------------------------------------------------------------------
     tdpw_fact = await get_fact(db, user_id, "training_days_per_week")
@@ -493,9 +566,18 @@ async def resolve_availability(db: Any, user_id: int) -> TrainingAvailability:
                 if normalized.needs_confirmation and normalized.reason:
                     warnings.append(normalized.reason)
             if parsed:
+                parsed_sorted = sorted(set(parsed))
                 preferred_days_candidates.append(
-                    (_fact_source_label(wp_fact), sorted(set(parsed)), conf, confirmed)
+                    (_fact_source_label(wp_fact), parsed_sorted, conf, confirmed)
                 )
+                # Keep the Health-derived days visible as detected data, but do
+                # not make them active if the user has supplied preferred/active days.
+                existing_active = await get_fact(db, user_id, "active_training_days")
+                if existing_active is None:
+                    await user_model.set_fact(
+                        db, user_id, "detected_training_days", parsed_sorted,
+                        kind=KIND_ESTIMATE, source=user_model.SOURCE_DERIVED, confirmed=False,
+                    )
 
         typical_hour = pattern.get("typical_hour")
         if isinstance(typical_hour, str) and len(typical_hour) == 5 and typical_hour[2] == ":":
@@ -596,15 +678,31 @@ def _format_day_list(days: list[int]) -> str:
     return ", ".join(names[:-1]) + " ו" + names[-1]
 
 
+def _source_note(source: str) -> str:
+    if source in {"user_corrected", "user_confirmed", "user_reported"}:
+        return "עודכן ידנית"
+    if source == "confirmed_health_inference":
+        return "זוהה מ־HealthKit ואושר"
+    if source == "fresh_health_inference":
+        return "זוהה מ־HealthKit — דורש אישור"
+    if source == "default":
+        return "ברירת מחדל"
+    return "מקור מעורב"
+
+
 def format_availability_summary(avail: TrainingAvailability) -> str:
-    """Return a Hebrew bullet-point summary of the resolved availability."""
+    """Return a Hebrew bullet-point summary of the active availability."""
+    field_sources = avail.field_sources or {}
     lines = ["לפי מה ששמור אצלי:"]
     lines.append(f"• עד {avail.max_days_per_week} אימונים בשבוע")
     if avail.preferred_days:
-        lines.append(f"• ימים מועדפים: {_format_day_list(avail.preferred_days)}")
+        source = _source_note(str(field_sources.get("preferred_days") or avail.source))
+        lines.append(f"• ימים פעילים לתוכנית: {_format_day_list(avail.preferred_days)} — {source}")
     lines.append(f"• כ־{avail.session_minutes} דקות לאימון")
     if avail.preferred_time:
         lines.append(f"• שעה מועדפת: {avail.preferred_time}")
+    if avail.conflicts:
+        lines.append("• HealthKit הציע ימים אחרים, אבל הערך הידני נשאר פעיל")
     return "\n".join(lines)
 
 

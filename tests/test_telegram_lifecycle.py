@@ -229,11 +229,18 @@ async def test_unexpected_telegram_admin_alert_is_redacted(
 ) -> None:
     telegram_errors._LAST_ADMIN_NOTICE_AT.clear()
     admin_messages: list[str] = []
+    logged_lines: list[str] = []
 
     async def notify_admin(_bot: object, text: str) -> None:
         admin_messages.append(text)
 
-    monkeypatch.setattr(coach_bot, "LOGGER", FakeLogger())
+    class CapturingLogger:
+        def _record(self, message: str, *args: Any) -> None:
+            logged_lines.append(message % args if args else message)
+
+        debug = warning = error = info = _record
+
+    monkeypatch.setattr(coach_bot, "LOGGER", CapturingLogger())
     monkeypatch.setattr(coach_bot, "notify_admin", notify_admin)
     RUNTIME_STATE.shutting_down = False
 
@@ -247,12 +254,19 @@ async def test_unexpected_telegram_admin_alert_is_redacted(
         ),  # type: ignore[arg-type]
     )
 
+    # PATCH-12: the admin chat gets a generic note (the owner may be the same
+    # chat as the end user), so it must contain NO error text at all — the
+    # redacted detail lives in the logs instead.
     assert admin_messages
     message = admin_messages[0]
     assert "plainsecret" not in message
     assert "ABCDEFGHIJKLMNOPQRSTUVWXYZ" not in message
     assert "noam" not in message
-    assert "<redacted" in message
+
+    logged = " ".join(logged_lines)
+    assert "plainsecret" not in logged
+    assert "ABCDEFGHIJKLMNOPQRSTUVWXYZ" not in logged
+    assert "<redacted" in logged
 
 
 @pytest.mark.asyncio

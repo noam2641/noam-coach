@@ -66,10 +66,14 @@ def _callback_data(markup: Any) -> set[str]:
 
 
 @pytest.mark.asyncio
-async def test_next_meal_menu_exposes_direct_eat_and_plan_buttons(
+async def test_next_meal_menu_exposes_the_task03_four_buttons(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """TASK-03: "מה לאכול עכשיו" shows exactly one recommendation with at
+    most 4 actions — confirm eaten, refresh, change quantities, back to
+    status. No numbered alternatives, no per-option "plan for later" button.
+    """
     db = await _make_ready_db(tmp_path)
     monkeypatch.setattr(coach_bot, "DB", db)
     monkeypatch.setattr(callback_menu_bot, "DB", db)
@@ -79,14 +83,15 @@ async def test_next_meal_menu_exposes_direct_eat_and_plan_buttons(
 
     assert handled is True
     callbacks = _callback_data(query.reply_markups[-1])
+    assert len(callbacks) <= 4
     assert "nextmeal:save:1" in callbacks
-    assert "nextmeal:plan:1" in callbacks
-    assert "nextmeal:save:2" in callbacks
-    assert "nextmeal:plan:2" in callbacks
     assert "nextmeal:refresh" in callbacks
+    assert "nextmeal:editqty:1" in callbacks
+    assert "menu:status" in callbacks
+    assert "nextmeal:save:2" not in callbacks
+    assert not any(data.startswith("nextmeal:plan:") for data in callbacks)
     assert not any(data.startswith("nextmeal:choose:") for data in callbacks)
     assert not any(data.startswith("nextmeal:dislike:") for data in callbacks)
-    assert not any(data.startswith("nextmeal:editqty:") for data in callbacks)
 
 
 @pytest.mark.asyncio
@@ -100,13 +105,13 @@ async def test_next_meal_not_suitable_is_temporary_not_permanent_dislike(
     monkeypatch.setattr(callback_menu_bot, "DB", db)
 
     query = FakeQuery()
-    handled = await callback_menu_bot.handle_menu_callback(query, 1, "nextmeal:dislike:2")
+    handled = await callback_menu_bot.handle_menu_callback(query, 1, "nextmeal:dislike:1")
 
     assert handled is True
     # No permanent dislike was stored.
     assert await user_model.get_value(db, 1, "disliked_foods") in (None, "", "none", [])
-    # A refreshed recommendation is shown.
+    # A refreshed (still single) recommendation is shown.
     assert "רעננתי" in query.messages[-1] or "אפשרות" in query.messages[-1]
     callbacks = _callback_data(query.reply_markups[-1])
     assert "nextmeal:save:1" in callbacks
-    assert "nextmeal:plan:1" in callbacks
+    assert not any(data.startswith("nextmeal:plan:") for data in callbacks)

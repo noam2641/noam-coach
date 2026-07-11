@@ -216,7 +216,7 @@ def home_keyboard() -> InlineKeyboardMarkup:
     # on a single screen: daily actions first, settings/rare actions below.
     rows = [
         [
-            button("🍽️ תפריט להיום", "menu:morning"),
+            button("🍽️ תפריט להיום", "menu:daily_menu"),
             button("➡️ מה לאכול עכשיו", "menu:nextmeal"),
         ],
         [
@@ -228,7 +228,10 @@ def home_keyboard() -> InlineKeyboardMarkup:
             button("🌙 סיכום יומי", "menu:evening"),
         ],
         [
-            button("📝 עדכון בוקר", "menu:flags"),
+            button("☀️ עדכון בוקר", "menu:morning"),
+            button("📝 עדכונים", "menu:flags"),
+        ],
+        [
             button("👤 הפרופיל שלי", "menu:profile"),
         ],
         [
@@ -245,6 +248,29 @@ def home_keyboard() -> InlineKeyboardMarkup:
         bottom.insert(0, button("📱 Mini App", "menu:app"))
     rows.append(bottom)
     return InlineKeyboardMarkup(rows)
+
+
+def focused_onboarding_keyboard() -> InlineKeyboardMarkup:
+    """Small home keyboard for users who still need plan/profile answers."""
+    return InlineKeyboardMarkup(
+        [
+            [button("🎯 השלם את התוכנית שלי", "planv2:complete_missing")],
+            [
+                button("➡️ מה לאכול עכשיו", "menu:nextmeal"),
+                button("🍽️ רשום ארוחה", "menu:food"),
+            ],
+            [button("📊 מצב היום", "menu:status")],
+        ]
+    )
+
+
+def _planning_missing_keys(readiness: dict[str, dict[str, Any]]) -> list[str]:
+    keys: list[str] = []
+    for profile_name in ("workout", "nutrition", "safety"):
+        for key in readiness.get(profile_name, {}).get("missing", []):
+            if key not in keys:
+                keys.append(key)
+    return keys
 
 
 @runtime_bound(RUNTIME_NAMES)
@@ -298,15 +324,19 @@ async def _home_hint(user_id: int) -> str:
 
         # Check if profile is incomplete for critical decisions
         readiness = await user_model.compute_all_readiness(DB, user_id)
-        workout_r = readiness.get("workout", {})
-        nutrition_r = readiness.get("nutrition", {})
-        if not workout_r.get("ready") or not nutrition_r.get("ready"):
-            missing_count = len(workout_r.get("missing", [])) + len(nutrition_r.get("missing", []))
+        missing_keys = _planning_missing_keys(readiness)
+        if missing_keys:
+            missing_count = len(missing_keys)
             if missing_count > 0:
                 return (
-                    f"👉 <b>הפעולה הבאה:</b> להשלים {missing_count} פרטים "
-                    "הדרושים לתוכנית האימונים והתזונה.\n\n"
-                    "שלח תמונת אוכל או בחר פעולה."
+                    "👉 <b>השלב הבא:</b> להשלים את הפרטים שנשארו כדי לבנות "
+                    "את תוכנית האימונים והתזונה שלך.\n\n"
+                    f"נשארו לך {missing_count} פרטים להשלמה.\n\n"
+                    "כדי להשלים את הפרופיל, לחץ על <b>🎯 השלם את התוכנית שלי</b> "
+                    "והמשך לענות על השאלות שנותרו.\n\n"
+                    "אפשר לדלג על שאלה ספציפית ולחזור אליה בהמשך. אחרי שהמידע "
+                    "יהיה שלם, אשתמש בנתוני HealthKit שאושרו ובתשובות שלך כדי "
+                    "לבנות את התוכנית."
                 )
 
         action = await _resolve_home_action(user_id)
@@ -326,6 +356,9 @@ async def home_keyboard_for_user(user_id: int) -> InlineKeyboardMarkup:
     Falls back to the static home_keyboard() on any failure.
     """
     try:
+        readiness = await user_model.compute_all_readiness(DB, user_id)
+        if _planning_missing_keys(readiness):
+            return focused_onboarding_keyboard()
         action = await _resolve_home_action(user_id)
         if action and action.callback and action.title:
             next_row = [button(f"👉 {action.title}", action.callback)]

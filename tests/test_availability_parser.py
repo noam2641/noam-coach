@@ -146,3 +146,39 @@ async def test_resolve_availability_marks_missing_weekday_schema_for_confirmatio
 
     assert availability.preferred_days == [0]
     assert "missing_or_unknown_weekday_schema" in (availability.warnings or [])
+
+
+@pytest.mark.asyncio
+async def test_active_training_days_override_health_detected_days(tmp_path: Path) -> None:
+    db = Database(str(tmp_path / "availability_active_days.db"))
+    await db.init()
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(1, 'Test', NULL, ?)",
+        (utc_now(),),
+    )
+    await user_model.set_fact(
+        db,
+        1,
+        "workout_pattern",
+        {
+            "weekly_frequency": 2,
+            "common_weekdays": [0, 2],
+            "weekday_schema": WEEKDAY_SCHEMA_VERSION,
+        },
+        kind=user_model.KIND_ESTIMATE,
+        source=user_model.SOURCE_DERIVED,
+        confirmed=False,
+    )
+    await user_model.set_fact(
+        db,
+        1,
+        "active_training_days",
+        [6, 0, 2, 4],
+        kind=user_model.KIND_FACT,
+        source=user_model.SOURCE_USER,
+        confirmed=True,
+    )
+    availability = await resolve_availability(db, 1)
+    assert availability.preferred_days == [0, 2, 4, 6]
+    assert availability.max_days_per_week == 4
+    assert availability.field_sources["preferred_days"] == "user_corrected"

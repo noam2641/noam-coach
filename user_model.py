@@ -185,6 +185,25 @@ FACT_REGISTRY: dict[str, FactSpec] = {
         "reported",
         ("workout_schedule",),
     ),
+    "detected_training_days": FactSpec(
+        "detected_training_days",
+        "ימי אימון שזוהו מנתוני בריאות",
+        "inferred",
+        ("workout_schedule", "workout_timing"),
+        visibility="internal",
+    ),
+    "preferred_training_days": FactSpec(
+        "preferred_training_days",
+        "ימי אימון שהמשתמש בחר",
+        "reported",
+        ("workout_schedule", "workout_timing"),
+    ),
+    "active_training_days": FactSpec(
+        "active_training_days",
+        "ימי אימון פעילים לתוכנית",
+        "reported",
+        ("workout_schedule", "workout_timing"),
+    ),
     "active_workout_plan": FactSpec(
         "active_workout_plan",
         "תוכנית אימונים פעילה",
@@ -381,6 +400,14 @@ FACT_REGISTRY: dict[str, FactSpec] = {
         "reported",
         ("exercise_selection", "safety"),
     ),
+    "training_limitations": FactSpec(
+        "training_limitations",
+        "כאב, פציעה או מגבלה",
+        "reported",
+        ("exercise_selection", "safety"),
+        required_for=("safety",),
+        expires_after_days=30,
+    ),
     # --- internal system state (never shown in profile) ---
     "onboarding_stage": FactSpec(
         "onboarding_stage",
@@ -429,8 +456,9 @@ FACT_DISPLAY_LABELS: dict[str, str] = {
     "outdoor": "בחוץ",
     "mixed": "משולב",
     # Safety completeness
-    "active_pain": "כאב/פציעה פעילה",
-    "medical_avoidance": "הימנעות לפי רופא",
+    "active_pain": "כאב, פציעה או מגבלה",
+    "medical_avoidance": "כאב, פציעה או מגבלה",
+    "training_limitations": "כאב, פציעה או מגבלה",
     # Profile fields
     "primary_goal": "מטרה ראשית",
     "strength_experience": "ניסיון באימוני כוח",
@@ -539,8 +567,8 @@ READINESS_PROFILES = {
         name="workout",
         label="אימון",
         required=(
-            "primary_goal", "training_days_per_week", "active_pain",
-            "medical_avoidance", "session_minutes", "training_location",
+            "primary_goal", "training_days_per_week", "training_limitations",
+            "session_minutes", "training_location",
             "equipment", "strength_experience", "weekly_availability",
         ),
         optional=("workout_window", "training_preferences", "performance_goal"),
@@ -548,7 +576,7 @@ READINESS_PROFILES = {
     "safety": ReadinessProfile(
         name="safety",
         label="שאלון בטיחות",
-        required=("active_pain", "medical_avoidance"),
+        required=("training_limitations",),
         optional=(),
     ),
     "tracking": ReadinessProfile(
@@ -627,7 +655,11 @@ async def compute_readiness(
     not_applicable: list[str] = []
 
     for key in profile.required:
-        fact = await get_fact(db, user_id, key)
+        fact = (
+            await get_training_limitations_fact(db, user_id)
+            if key == "training_limitations"
+            else await get_fact(db, user_id, key)
+        )
         status = fact_confirmation_status(fact, key)
         if status == CONFIRM_DEFERRED:
             deferred.append(key)
@@ -645,7 +677,11 @@ async def compute_readiness(
 
     optional_present = 0
     for key in profile.optional:
-        fact = await get_fact(db, user_id, key)
+        fact = (
+            await get_training_limitations_fact(db, user_id)
+            if key == "training_limitations"
+            else await get_fact(db, user_id, key)
+        )
         if fact_is_usable_for_decision(key, fact):
             optional_present += 1
             present.append(key)
@@ -967,8 +1003,114 @@ async def get_fact(db: SupportsDB, user_id: int, key: str) -> dict[str, Any] | N
     return _hydrate(row)
 
 
+def _limitation_text(value: Any) -> str:
+    if value in (None, "", "none", "None", "__not_applicable__"):
+        return ""
+    if isinstance(value, dict):
+        if value.get("missing") or value.get("skipped"):
+            return ""
+        parts = [
+            str(value.get(name)).strip()
+            for name in ("location", "note", "details", "avoid")
+            if value.get(name)
+        ]
+        return "; ".join(dict.fromkeys(parts))
+    if isinstance(value, (list, tuple, set)):
+        parts = [_limitation_text(item) for item in value]
+        return "; ".join(dict.fromkeys(part for part in parts if part))
+    return str(value).strip()
+
+
+async def get_training_limitations_fact(
+    db: SupportsDB, user_id: int
+) -> dict[str, Any] | None:
+    """Canonical training limitation fact, synthesized from legacy fields.
+
+    ``training_limitations`` is the planning source of truth. Older installs may
+    still have ``active_pain`` and/or ``medical_avoidance`` rows; synthesize a
+    canonical fact so existing injury and medical-avoidance data is preserved
+    without asking the user twice.
+    """
+    canonical = await get_fact(db, user_id, "training_limitations")
+    if canonical is not None:
+        return canonical
+
+    legacy: list[dict[str, Any]] = []
+    for key in ("active_pain", "medical_avoidance"):
+        fact = await get_fact(db, user_id, key)
+        if fact is not None:
+            legacy.append(fact)
+    if not legacy:
+        return None
+
+    if any(fact.get("kind") == KIND_GAP for fact in legacy):
+        return {
+            "user_id": user_id,
+            "key": "training_limitations",
+            "value": {"missing": True},
+            "kind": KIND_GAP,
+            "source": SOURCE_USER,
+            "confidence": 0.0,
+            "confirmed": False,
+            "valid": True,
+            "affects": list(FACT_REGISTRY["training_limitations"].affects),
+            "updated_at": max((str(fact.get("updated_at") or "") for fact in legacy), default="") or _now(),
+            "created_at": max((str(fact.get("created_at") or "") for fact in legacy), default="") or _now(),
+        }
+
+    texts = [_limitation_text(fact.get("value")) for fact in legacy]
+    texts = [text for text in texts if text]
+    if not texts:
+        if all(fact.get("confirmed") for fact in legacy):
+            value: Any = "none"
+        else:
+            return None
+    else:
+        value = "; ".join(dict.fromkeys(texts))
+
+    return {
+        "user_id": user_id,
+        "key": "training_limitations",
+        "value": value,
+        "kind": KIND_FACT,
+        "source": SOURCE_USER,
+        "confidence": max(float(fact.get("confidence") or 0.85) for fact in legacy),
+        "confirmed": any(bool(fact.get("confirmed")) for fact in legacy),
+        "valid": True,
+        "affects": list(FACT_REGISTRY["training_limitations"].affects),
+        "updated_at": max((str(fact.get("updated_at") or "") for fact in legacy), default="") or _now(),
+        "created_at": max((str(fact.get("created_at") or "") for fact in legacy), default="") or _now(),
+    }
+
+
+async def ensure_training_limitations_fact(db: SupportsDB, user_id: int) -> dict[str, Any] | None:
+    """Persist the synthesized canonical limitation fact when legacy data exists."""
+    existing = await get_fact(db, user_id, "training_limitations")
+    if existing is not None:
+        return existing
+    synthesized = await get_training_limitations_fact(db, user_id)
+    if synthesized is None or synthesized.get("kind") == KIND_GAP:
+        return synthesized
+    await set_fact(
+        db,
+        user_id,
+        "training_limitations",
+        synthesized.get("value"),
+        kind=KIND_FACT,
+        source=SOURCE_USER,
+        confidence=float(synthesized.get("confidence") or 0.85),
+        confirmed=bool(synthesized.get("confirmed")),
+        affects=FACT_REGISTRY["training_limitations"].affects,
+    )
+    return await get_fact(db, user_id, "training_limitations")
+
+
 async def get_value(db: SupportsDB, user_id: int, key: str, default: Any = None) -> Any:
-    fact = await get_fact(db, user_id, key)
+    fact = (
+        await get_training_limitations_fact(db, user_id)
+        if key == "training_limitations"
+        else await get_fact(db, user_id, key)
+    )
     return fact["value"] if fact else default
 
 

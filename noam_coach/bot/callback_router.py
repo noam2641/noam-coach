@@ -282,9 +282,13 @@ async def on_error(
     else:
         LOGGER.error("[%s] Telegram error: %s", error_id, safe_error)
     if decision.notify_admin:
+        # PATCH-12 / IMG_002+IMG_008: the bot owner may be the same Telegram chat
+        # as the end user.  Never send raw Telegram exception text into the chat
+        # (e.g. "Query is too old..." or getaddrinfo stack traces).  Detailed
+        # information stays in the application logs with the same error_id.
         await notify_admin(
             context.bot,
-            f"[{error_id}] Telegram error ({decision.fingerprint}): {safe_error}",
+            f"[{error_id}] זוהתה תקלה פנימית בבוט. הפרטים המלאים נשמרו בלוגים; בצ׳אט לא מוצג traceback.",
         )
     if isinstance(update, Update) and update.effective_message:
         data = ""

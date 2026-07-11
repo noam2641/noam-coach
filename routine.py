@@ -19,6 +19,7 @@ an awaitable ``fetch_all(sql, params) -> list[dict]``) and a ``tzinfo``.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import statistics
 from dataclasses import asdict, dataclass, field
 from typing import Any, Protocol, Sequence
@@ -96,6 +97,22 @@ def robust_median(values: Sequence[float]) -> float | None:
     return statistics.median(cleaned)
 
 
+def weighted_mean(values: Sequence[float], weights: Sequence[float]) -> float | None:
+    if not values or not weights or len(values) != len(weights):
+        return None
+    pairs = [
+        (float(value), float(weight))
+        for value, weight in zip(values, weights, strict=False)
+        if weight > 0
+    ]
+    if not pairs:
+        return None
+    total_weight = sum(weight for _value, weight in pairs)
+    if total_weight <= 0:
+        return None
+    return sum(value * weight for value, weight in pairs) / total_weight
+
+
 def circular_hour_mean(hours: Sequence[float]) -> float | None:
     """Mean of clock hours treating them as angles (so 23:30 & 00:30 ~ 00:00).
 
@@ -118,6 +135,46 @@ def circular_hour_mean(hours: Sequence[float]) -> float | None:
     return hour % 24.0
 
 
+def weighted_circular_hour_mean(
+    hours: Sequence[float], weights: Sequence[float]
+) -> float | None:
+    import math
+
+    if not hours or not weights or len(hours) != len(weights):
+        return None
+    pairs = [
+        (float(hour), float(weight))
+        for hour, weight in zip(hours, weights, strict=False)
+        if weight > 0
+    ]
+    if not pairs:
+        return None
+    sin_sum = sum(weight * math.sin(2 * math.pi * hour / 24.0) for hour, weight in pairs)
+    cos_sum = sum(weight * math.cos(2 * math.pi * hour / 24.0) for hour, weight in pairs)
+    if sin_sum == 0 and cos_sum == 0:
+        return None
+    angle = math.atan2(sin_sum, cos_sum)
+    return ((angle / (2 * math.pi)) * 24.0) % 24.0
+
+
+def weighted_std_minutes(values: Sequence[float], weights: Sequence[float]) -> float | None:
+    mean = weighted_mean(values, weights)
+    if mean is None:
+        return None
+    pairs = [
+        (float(value), float(weight))
+        for value, weight in zip(values, weights, strict=False)
+        if weight > 0
+    ]
+    if len(pairs) < 2:
+        return None
+    total_weight = sum(weight for _value, weight in pairs)
+    if total_weight <= 0:
+        return None
+    variance = sum(weight * ((value - mean) ** 2) for value, weight in pairs) / total_weight
+    return variance ** 0.5
+
+
 def hour_to_hhmm(hour: float | None) -> str | None:
     if hour is None:
         return None
@@ -136,6 +193,7 @@ class SleepSchedule:
     typical_bedtime: str | None = None
     typical_wake_time: str | None = None
     avg_duration_minutes: float | None = None
+    variability_minutes: float | None = None
     nights_sampled: int = 0
 
 
@@ -214,11 +272,54 @@ class DayWear:
         )
 
 
+_DATASET_SAMPLE_TYPES = (
+    "watch_wear",
+    "resting_heart_rate",
+    "sleep_session",
+    "workout",
+    "steps",
+    "active_energy",
+)
+
+
+async def newest_health_sample_date(
+    db: SupportsFetchAll,
+    user_id: int,
+    tz: ZoneInfo,
+) -> dt.date | None:
+    """Local date of the newest relevant health sample — the dataset end.
+
+    HealthKit exports are often stale (the ZIP ends days/weeks before today).
+    Anchoring the analysis window to this date instead of "today" lets the
+    bot still learn from the last period the file actually covers, rather than
+    reporting "not enough recent data" just because the export is old.
+    Returns None when the user has no relevant samples at all.
+    """
+    placeholders = ",".join("?" for _ in _DATASET_SAMPLE_TYPES)
+    rows = await db.fetch_all(
+        f"""
+        SELECT MAX(start_time) AS newest
+        FROM health
+        WHERE user_id=? AND sample_type IN ({placeholders})
+        """,
+        (user_id, *_DATASET_SAMPLE_TYPES),
+    )
+    newest_raw = rows[0].get("newest") if rows else None
+    if not newest_raw:
+        return None
+    try:
+        return _to_local(str(newest_raw), tz).date()
+    except ValueError:
+        return None
+
+
 async def load_wear_days(
     db: SupportsFetchAll,
     user_id: int,
     tz: ZoneInfo,
     window_days: int = DEFAULT_WINDOW_DAYS,
+    *,
+    anchor: dt.date | None = None,
 ) -> dict[dt.date, DayWear] | None:
     """Map each local day in the window to its watch-wear coverage.
 
@@ -231,17 +332,31 @@ async def load_wear_days(
     win. For data imported before those rows existed, wear is inferred from
     watch-only signals: resting heart rate, sleep sessions, workouts, and
     steps rows whose source is the watch.
+
+    ``anchor`` is the end of the window (defaults to today). Pass the dataset
+    end date to analyze a stale export's last available period instead of an
+    empty "recent" window.
     """
-    since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=window_days)).isoformat()
+    window_end = anchor or dt.datetime.now(tz).date()
+    since = (
+        dt.datetime.combine(window_end - dt.timedelta(days=window_days), dt.time.min, tzinfo=tz)
+        .astimezone(dt.timezone.utc)
+        .isoformat()
+    )
+    until = (
+        dt.datetime.combine(window_end + dt.timedelta(days=1), dt.time.min, tzinfo=tz)
+        .astimezone(dt.timezone.utc)
+        .isoformat()
+    )
     rows = await db.fetch_all(
         """
         SELECT sample_type, start_time, end_time, source_device
         FROM health
-        WHERE user_id=? AND start_time>=?
+        WHERE user_id=? AND start_time>=? AND start_time<?
           AND sample_type IN ('watch_wear','resting_heart_rate','sleep_session','workout','steps')
         ORDER BY start_time
         """,
-        (user_id, since),
+        (user_id, since, until),
     )
     if not rows:
         return None
@@ -307,39 +422,147 @@ def _fully_worn(
     return all(start + dt.timedelta(days=offset) in wear_days for offset in range(7))
 
 
+# Steps use their own window: a 28-day baseline is the product default, wider
+# than the wear-policy window because StepCount is reliable even without watch
+# wear (it also comes from the iPhone).
+STEPS_WINDOW_DAYS = 28
+
+
 @dataclass(frozen=True)
 class StepsAverage:
-    """Daily-steps average restricted to fully-covered wear days."""
+    """Daily-steps average.
 
-    avg: float | None
-    days_sampled: int
-    days_excluded: int
-    wear_filtered: bool
+    ``avg`` is the planning baseline: the mean of EVERY day that has a
+    StepCount sample, because steps come from the iPhone too and a low-wear
+    day must not be deleted (only its confidence is lower). ``avg_high_conf``
+    is the mean restricted to full-wear days, shown alongside for transparency
+    when the two disagree. ``days_sampled`` counts all step days; ``days_excluded``
+    counts step days that lacked full wear (used for the confidence note, NOT
+    removed from ``avg``).
+    """
+
+    avg: float | None  # baseline: all step days
+    days_sampled: int  # all days with a StepCount sample
+    days_excluded: int  # step days without full wear (confidence only)
+    wear_filtered: bool  # True when some step days lacked full wear
+    avg_high_conf: float | None = None  # mean over full-wear days only
+    high_conf_days: int = 0
+    window_start: dt.date | None = None
+    window_end: dt.date | None = None
+    raw_all_sources_avg: float | None = None
+    dominant_or_priority_source_avg: float | None = None
+    selected_planning_baseline: float | None = None
+    sources_found: list[str] = field(default_factory=list)
+    daily_breakdown: list[dict[str, Any]] = field(default_factory=list)
+
+
+async def _last_complete_step_day(
+    db: SupportsFetchAll, user_id: int, tz: ZoneInfo, *, window_days: int
+) -> dt.date | None:
+    """The last day inside the window that is a COMPLETE day of data.
+
+    An export that ends mid-day (e.g. 2026-06-16 15:09) has a partial final
+    day that would undercount steps, so it is excluded: the newest sample of
+    any relevant type must fall on a later date than the candidate end day for
+    that day to count as complete. Returns None when there is no data.
+    """
+    anchor = await newest_health_sample_date(db, user_id, tz)
+    if anchor is None:
+        return None
+    # Decide whether the anchor day is COMPLETE or a mid-day export end. Use the
+    # latest coverage timestamp on that day (end_time when present, else
+    # start_time) across all relevant samples — a wear row that runs to 22:00 or
+    # a sample after the evening cutoff means the day is complete; only a whole
+    # day whose latest coverage is before the evening is treated as partial.
+    latest_rows = await db.fetch_all(
+        f"""
+        SELECT MAX(COALESCE(end_time, start_time)) AS latest
+        FROM health
+        WHERE user_id=? AND sample_type IN ({",".join("?" for _ in _DATASET_SAMPLE_TYPES)})
+        """,
+        (user_id, *_DATASET_SAMPLE_TYPES),
+    )
+    latest_raw = latest_rows[0].get("latest") if latest_rows else None
+    if latest_raw:
+        try:
+            latest_local = _to_local(str(latest_raw), tz)
+            if latest_local.date() == anchor and latest_local.hour < WEAR_EVENING_HOUR:
+                return anchor - dt.timedelta(days=1)
+        except ValueError:
+            pass
+    return anchor
+
+
+def _step_source_payload(row: dict[str, Any]) -> tuple[dict[str, float], float, str, str]:
+    """Return (source totals, raw all-source steps, selected source, reason).
+
+    New imports store JSON diagnostics in ``source_device``. Legacy rows only
+    contain the already-selected daily value, so they are treated as a single
+    unknown source.
+    """
+    selected = float(row.get("value") or 0.0)
+    source_device = row.get("source_device")
+    if isinstance(source_device, str) and source_device.strip().startswith("{"):
+        try:
+            payload = json.loads(source_device)
+        except json.JSONDecodeError:
+            payload = {}
+        totals_raw = payload.get("source_totals") if isinstance(payload, dict) else None
+        if isinstance(totals_raw, dict) and totals_raw:
+            totals = {
+                str(source): float(value or 0.0)
+                for source, value in totals_raw.items()
+            }
+            raw = float(payload.get("raw_all_sources") or sum(totals.values()))
+            selected_source = str(payload.get("selected_source") or max(totals, key=totals.get))
+            reason = str(payload.get("selection_reason") or "source_diagnostics")
+            return totals, raw, selected_source, reason
+    source = str(source_device or "unknown")
+    return {source: selected}, selected, source, "legacy_selected_daily_steps"
 
 
 async def average_daily_steps(
     db: SupportsFetchAll,
     user_id: int,
     tz: ZoneInfo,
-    window_days: int = DEFAULT_WINDOW_DAYS,
+    window_days: int = STEPS_WINDOW_DAYS,
+    *,
+    anchor: dt.date | None = None,
 ) -> StepsAverage:
-    """Average daily steps counting only days the watch was worn through the
-    evening — partial days (watch off, or put on late / taken off early)
-    are burned. Falls back to the plain average when wear coverage is
-    unknown or no day qualifies (some signal beats none, and the caller can
-    tell via ``wear_filtered``).
+    """Average daily steps over the last ``window_days`` complete days.
+
+    StepCount is NOT dropped for low watch wear — steps also come from the
+    iPhone, so every day with a StepCount sample counts toward the baseline
+    ``avg``. Wear coverage only affects confidence (``avg_high_conf`` /
+    ``days_excluded``), never removes a day from the baseline. The window ends
+    at the last COMPLETE day in the file (a partial export end is excluded),
+    so a stale export is still analyzed over its own final weeks.
     """
-    since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=window_days)).isoformat()
+    window_end = anchor or await _last_complete_step_day(db, user_id, tz, window_days=window_days)
+    if window_end is None:
+        return StepsAverage(avg=None, days_sampled=0, days_excluded=0, wear_filtered=False)
+
+    since = (
+        dt.datetime.combine(window_end - dt.timedelta(days=window_days - 1), dt.time.min, tzinfo=tz)
+        .astimezone(dt.timezone.utc)
+        .isoformat()
+    )
+    until = (
+        dt.datetime.combine(window_end + dt.timedelta(days=1), dt.time.min, tzinfo=tz)
+        .astimezone(dt.timezone.utc)
+        .isoformat()
+    )
     rows = await db.fetch_all(
         """
-        SELECT value, start_time
+        SELECT value, start_time, source_device
         FROM health
-        WHERE user_id=? AND sample_type='steps' AND start_time>=?
+        WHERE user_id=? AND sample_type='steps' AND start_time>=? AND start_time<?
         ORDER BY start_time
         """,
-        (user_id, since),
+        (user_id, since, until),
     )
-    per_day: dict[dt.date, float] = {}
+    window_start = window_end - dt.timedelta(days=window_days - 1)
+    per_day: dict[dt.date, dict[str, Any]] = {}
     for row in rows:
         start_raw = row.get("start_time")
         if not start_raw:
@@ -348,30 +571,112 @@ async def average_daily_steps(
             day = _to_local(str(start_raw), tz).date()
         except ValueError:
             continue
-        per_day[day] = max(per_day.get(day, 0.0), float(row.get("value") or 0.0))
-    if not per_day:
-        return StepsAverage(avg=None, days_sampled=0, days_excluded=0, wear_filtered=False)
+        # Guard the window explicitly (not every backend applies the SQL date
+        # filter): exclude anything after the last complete day or before the
+        # 28-day window start.
+        if day < window_start or day > window_end:
+            continue
+        source_totals, raw_all, selected_source, reason = _step_source_payload(row)
+        selected = max(source_totals.values()) if source_totals else float(row.get("value") or 0.0)
+        existing = per_day.get(day)
+        if existing is None or selected > float(existing["selected_step_count_for_baseline"]):
+            per_day[day] = {
+                "total_step_count_all_sources": raw_all,
+                "total_by_source": source_totals,
+                "dominant_source": selected_source,
+                "selected_step_count_for_baseline": selected,
+                "selection_reason": reason,
+            }
 
-    wear_days = await load_wear_days(db, user_id, tz, window_days)
-    if wear_days is not None:
-        valid = {
-            day: steps
-            for day, steps in per_day.items()
-            if (wear := wear_days.get(day)) is not None and wear.covers_until_evening
-        }
-        if valid:
-            return StepsAverage(
-                avg=statistics.fmean(valid.values()),
-                days_sampled=len(valid),
-                days_excluded=len(per_day) - len(valid),
-                wear_filtered=True,
-            )
+    wear_days = await load_wear_days(db, user_id, tz, window_days, anchor=window_end)
+    breakdown: list[dict[str, Any]] = []
+    selected_values: list[float] = []
+    raw_values: list[float] = []
+    sources: set[str] = set()
+    for offset in range(window_days):
+        day = window_start + dt.timedelta(days=offset)
+        item = per_day.get(day)
+        wear = wear_days.get(day) if wear_days is not None else None
+        has_full_wear = bool(wear is not None and wear.covers_until_evening)
+        if item is None:
+            breakdown.append({
+                "date": day.isoformat(),
+                "total_step_count_all_sources": 0,
+                "total_by_source": {},
+                "source_intervals_or_coverage": "daily_aggregate",
+                "dominant_source": None,
+                "selected_step_count_for_baseline": None,
+                "has_watch_wear": wear is not None,
+                "confidence": "high" if has_full_wear else "low",
+                "included": False,
+                "excluded": True,
+                "reason": "no_stepcount_record_for_day",
+                "selection_reason": "missing",
+            })
+            continue
+        selected = float(item["selected_step_count_for_baseline"])
+        raw = float(item["total_step_count_all_sources"])
+        selected_values.append(selected)
+        raw_values.append(raw)
+        sources.update(str(source) for source in item["total_by_source"])
+        confidence = "high" if has_full_wear else "medium"
+        breakdown.append({
+            "date": day.isoformat(),
+            "total_step_count_all_sources": round(raw, 1),
+            "total_by_source": {
+                source: round(float(value), 1)
+                for source, value in item["total_by_source"].items()
+            },
+            "source_intervals_or_coverage": "daily_aggregate_with_source_totals",
+            "dominant_source": item["dominant_source"],
+            "selected_step_count_for_baseline": round(selected, 1),
+            "has_watch_wear": wear is not None,
+            "confidence": confidence,
+            "included": True,
+            "excluded": False,
+            "reason": "",
+            "selection_reason": item["selection_reason"],
+        })
+
+    if not selected_values:
+        return StepsAverage(
+            avg=None,
+            days_sampled=0,
+            days_excluded=0,
+            wear_filtered=False,
+            window_start=window_start,
+            window_end=window_end,
+            daily_breakdown=breakdown,
+        )
+
+    # Baseline: EVERY step day. Steps are not deleted for missing wear.
+    baseline_avg = statistics.fmean(selected_values)
+    raw_avg = statistics.fmean(raw_values)
+
+    high_conf = {
+        day: float(item["selected_step_count_for_baseline"])
+        for day, item in per_day.items()
+        if wear_days is not None
+        and (wear := wear_days.get(day)) is not None
+        and wear.covers_until_evening
+    }
+    avg_high_conf = statistics.fmean(high_conf.values()) if high_conf else None
+    days_excluded = len(selected_values) - len(high_conf) if wear_days is not None else 0
 
     return StepsAverage(
-        avg=statistics.fmean(per_day.values()),
-        days_sampled=len(per_day),
-        days_excluded=0,
-        wear_filtered=False,
+        avg=baseline_avg,
+        days_sampled=len(selected_values),
+        days_excluded=days_excluded,
+        wear_filtered=wear_days is not None and days_excluded > 0,
+        avg_high_conf=avg_high_conf,
+        high_conf_days=len(high_conf),
+        window_start=window_start,
+        window_end=window_end,
+        raw_all_sources_avg=raw_avg,
+        dominant_or_priority_source_avg=baseline_avg,
+        selected_planning_baseline=baseline_avg,
+        sources_found=sorted(sources),
+        daily_breakdown=breakdown,
     )
 
 
@@ -437,6 +742,8 @@ async def analyze_training_weeks(
     user_id: int,
     tz: ZoneInfo,
     window_days: int = DEFAULT_WINDOW_DAYS,
+    *,
+    anchor: dt.date | None = None,
 ) -> TrainingWeekAnalysis | None:
     """Per-week wear/workout stats + the policy the product should use.
 
@@ -445,20 +752,34 @@ async def analyze_training_weeks(
     the data is insufficient and the user should be asked directly.
     Returns None when there is no wear evidence at all (legacy import) —
     callers must then keep the pre-RE13 behavior.
+
+    ``anchor`` ends the analysis window (defaults to today). Passing the
+    dataset end date lets a stale export still be analyzed over its own last
+    weeks instead of an empty window relative to today.
     """
-    wear_days = await load_wear_days(db, user_id, tz, window_days)
+    window_end = anchor or dt.datetime.now(tz).date()
+    wear_days = await load_wear_days(db, user_id, tz, window_days, anchor=window_end)
     if wear_days is None:
         return None
 
-    since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=window_days)).isoformat()
+    since = (
+        dt.datetime.combine(window_end - dt.timedelta(days=window_days), dt.time.min, tzinfo=tz)
+        .astimezone(dt.timezone.utc)
+        .isoformat()
+    )
+    until = (
+        dt.datetime.combine(window_end + dt.timedelta(days=1), dt.time.min, tzinfo=tz)
+        .astimezone(dt.timezone.utc)
+        .isoformat()
+    )
     rows = await db.fetch_all(
         """
         SELECT start_time, value
         FROM health
-        WHERE user_id=? AND sample_type='workout' AND start_time>=?
+        WHERE user_id=? AND sample_type='workout' AND start_time>=? AND start_time<?
         ORDER BY start_time
         """,
-        (user_id, since),
+        (user_id, since, until),
     )
     workout_days: list[dt.date] = []
     for row in rows:
@@ -470,7 +791,7 @@ async def analyze_training_weeks(
         except ValueError:
             continue
 
-    today_local = dt.datetime.now(tz).date()
+    today_local = window_end
     window_start = today_local - dt.timedelta(days=window_days)
     weeks: list[WeekWearStats] = []
     for start, end in _complete_weeks(window_start, today_local):
@@ -609,51 +930,85 @@ async def learn_sleep_schedule(
     tz: ZoneInfo,
     window_days: int = DEFAULT_WINDOW_DAYS,
 ) -> SleepSchedule:
-    since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=window_days)).isoformat()
     rows = await db.fetch_all(
         """
-        SELECT start_time, end_time, value
+        SELECT start_time, end_time, value, source_device
         FROM health
-        WHERE user_id=? AND sample_type='sleep_session' AND start_time>=?
+        WHERE user_id=? AND sample_type='sleep_session'
         ORDER BY start_time
         """,
-        (user_id, since),
+        (user_id,),
     )
     if not rows:
         return SleepSchedule()
 
-    # Group asleep segments into nights and take, per night, the earliest
-    # bedtime and latest wake time so fragmented sleep stages collapse.
-    nights: dict[dt.date, dict[str, Any]] = {}
+    # Sleep validity is based on the sleep records themselves, not on watch-wear
+    # coverage. HealthKit sleep may come from Apple Health, iPhone sleep
+    # schedules, Apple Watch, manual entries, or third-party sources.
+    #
+    # Group asleep intervals into nights and union overlaps so duplicate source
+    # intervals cannot count the same sleep period multiple times.
+    nights: dict[dt.date, list[tuple[dt.datetime, dt.datetime]]] = {}
     for row in rows:
         start = _to_local(row["start_time"], tz)
-        end = _to_local(row["end_time"], tz) if row["end_time"] else start
+        end = _to_local(row["end_time"], tz) if row.get("end_time") else start
+        if end <= start:
+            continue
+        minutes = (end - start).total_seconds() / 60.0
+        if minutes < 30 or minutes > 16 * 60:
+            continue
         # Attribute a sleep segment to the "night of" the prior evening: if it
         # starts after noon it belongs to that calendar date, else the day
         # before (early-morning sleep belongs to the previous night).
         night_key = start.date() if start.hour >= 12 else (start.date() - dt.timedelta(days=1))
-        bucket = nights.setdefault(night_key, {"start": start, "end": end, "minutes": 0.0})
-        bucket["start"] = min(bucket["start"], start)
-        bucket["end"] = max(bucket["end"], end)
-        bucket["minutes"] += float(row["value"] or 0.0)
+        nights.setdefault(night_key, []).append((start, end))
 
     bedtimes: list[float] = []
     wake_times: list[float] = []
     durations: list[float] = []
-    for bucket in nights.values():
+    night_dates: list[dt.date] = []
+    for night_date, intervals in nights.items():
+        if not intervals:
+            continue
+        intervals = sorted(intervals, key=lambda item: item[0])
+        merged: list[tuple[dt.datetime, dt.datetime]] = []
+        for start, end in intervals:
+            if not merged or start > merged[-1][1]:
+                merged.append((start, end))
+            else:
+                prev_start, prev_end = merged[-1]
+                merged[-1] = (prev_start, max(prev_end, end))
+        start = merged[0][0]
+        end = merged[-1][1]
+        total_minutes = sum((e - s).total_seconds() / 60.0 for s, e in merged)
+        if total_minutes < 120 or total_minutes > 16 * 60:
+            continue
         # Unwrap bedtime so late-night hours sort near 24-26 not 0-2.
-        bh = _hour_of_day(bucket["start"])
+        bh = _hour_of_day(start)
         bedtimes.append(bh if bh >= 12 else bh + 24)
-        wake_times.append(_hour_of_day(bucket["end"]))
-        durations.append(bucket["minutes"])
+        wake_times.append(_hour_of_day(end))
+        durations.append(total_minutes)
+        night_dates.append(night_date)
 
-    bedtime_hour = robust_mean(bedtimes)
-    _mean_duration = robust_mean(durations)
+    if not night_dates:
+        return SleepSchedule()
+
+    newest_night = max(night_dates)
+    half_life_days = max(float(window_days), 1.0)
+    weights = [
+        0.5 ** (max((newest_night - night_date).days, 0) / half_life_days)
+        for night_date in night_dates
+    ]
+
+    bedtime_hour = weighted_mean(bedtimes, weights)
+    _mean_duration = weighted_mean(durations, weights)
+    variability = weighted_std_minutes(durations, weights)
     return SleepSchedule(
         typical_bedtime=hour_to_hhmm(None if bedtime_hour is None else bedtime_hour % 24),
-        typical_wake_time=hour_to_hhmm(circular_hour_mean(wake_times)),
+        typical_wake_time=hour_to_hhmm(weighted_circular_hour_mean(wake_times, weights)),
         avg_duration_minutes=(round(_mean_duration, 1) if _mean_duration is not None else None),
-        nights_sampled=len(nights),
+        variability_minutes=(round(variability, 1) if variability is not None else None),
+        nights_sampled=len(night_dates),
     )
 
 

@@ -220,6 +220,7 @@ async def save_split_set(
     second_weight: float,
     second_reps: int,
     rir: int,
+    client_event_id: str | None = None,
 ) -> tuple[bool, int]:
     plan = json.loads(session["plan"])
     idx = session["exercise_index"]
@@ -227,6 +228,7 @@ async def save_split_set(
     current = plan["exercises"][idx]
     completed = False
     now = utc_now()
+    event_base = client_event_id or f"telegram_split:{session['id']}:{idx}:{set_no}:{secrets.token_hex(8)}"
 
     async with DB.transaction() as conn:
         if set_no < current["sets"]:
@@ -272,7 +274,7 @@ async def save_split_set(
                     first_reps,
                     rir,
                     "telegram_split_primary",
-                    None,
+                    f"{event_base}:primary",
                     now,
                 ),
                 (
@@ -284,7 +286,7 @@ async def save_split_set(
                     second_reps,
                     rir,
                     "telegram_split_secondary",
-                    None,
+                    f"{event_base}:secondary",
                     now,
                 ),
             ],

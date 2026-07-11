@@ -184,34 +184,60 @@ def _workout_section(analysis: routine.TrainingWeekAnalysis | None) -> dict[str,
 
 
 def _steps_section(steps: routine.StepsAverage) -> dict[str, Any]:
-    if steps.days_sampled >= STEPS_DAYS_FOR_HIGH_CONFIDENCE:
+    # Confidence reflects how many days had FULL wear, but the average itself
+    # is always the all-days baseline (steps come from the iPhone too, so a
+    # low-wear day is not deleted — only trusted a little less).
+    high_conf_days = steps.high_conf_days
+    if high_conf_days >= STEPS_DAYS_FOR_HIGH_CONFIDENCE:
         confidence = CONFIDENCE_HIGH
-    elif steps.days_sampled >= STEPS_DAYS_FOR_MEDIUM_CONFIDENCE:
+    elif high_conf_days >= STEPS_DAYS_FOR_MEDIUM_CONFIDENCE:
         confidence = CONFIDENCE_MEDIUM
     else:
         confidence = CONFIDENCE_LOW
 
+    average = None if steps.avg is None else round(steps.avg)
+    average_high_conf = None if steps.avg_high_conf is None else round(steps.avg_high_conf)
+    raw_average = (
+        None if steps.raw_all_sources_avg is None else round(steps.raw_all_sources_avg)
+    )
+    conservative_average = (
+        None if steps.dominant_or_priority_source_avg is None
+        else round(steps.dominant_or_priority_source_avg)
+    )
+
     if steps.avg is None:
         explanation = "אין נתוני צעדים בחלון הזמן האחרון."
         warning = ""
-    elif steps.wear_filtered:
-        explanation = (
-            f"החישוב מבוסס על {steps.days_sampled} ימים שבהם היו מספיק נתוני שעון."
-        )
-        warning = (
-            f"{steps.days_excluded} ימים לא נספרו כי לא היו בהם מספיק נתוני לבישה."
-            if steps.days_excluded
-            else ""
-        )
     else:
-        explanation = f"החישוב מבוסס על {steps.days_sampled} ימים."
-        warning = "לא היו נתוני לבישת שעון, ולכן כל הימים נספרו ללא סינון."
+        explanation = f"החישוב מבוסס על {steps.days_sampled} ימי צעדים."
+        warning = ""
+        # Surface both numbers only when full-wear days disagree meaningfully
+        # with the all-days baseline — otherwise the extra line is just noise.
+        if (
+            average_high_conf is not None
+            and steps.days_excluded
+            and abs(average - average_high_conf) >= 750
+        ):
+            warning = (
+                f"לפי כלל ימי הצעדים: {average:,}. לפי ימים עם לבישת שעון מלאה: "
+                f"{average_high_conf:,}. הנתון חלקי כי בחלק מהימים השעון לא נלבש מספיק."
+            )
 
     return {
         "confidence": confidence,
         "days_used": steps.days_sampled,
         "days_excluded": steps.days_excluded,
-        "average": None if steps.avg is None else round(steps.avg),
+        "high_confidence_days": high_conf_days,
+        "average": average,
+        "average_all_days": average,
+        "average_high_confidence": average_high_conf,
+        "raw_all_sources_average": raw_average,
+        "dominant_or_priority_source_average": conservative_average,
+        "selected_planning_baseline": average,
+        "window_start": steps.window_start.isoformat() if steps.window_start else None,
+        "window_end": steps.window_end.isoformat() if steps.window_end else None,
+        "sources_found": steps.sources_found,
+        "daily_breakdown": steps.daily_breakdown,
         "wear_filtered": steps.wear_filtered,
         "warning_he": warning,
         "explanation_he": explanation,
@@ -298,8 +324,15 @@ async def build_health_quality_report(
     optional and never drags the whole report down), and a very stale export
     caps it at medium — old data can be internally consistent yet stale.
     """
-    analysis = await routine.analyze_training_weeks(db, user_id, tz, window_days)
-    steps = await routine.average_daily_steps(db, user_id, tz, window_days)
+    # Anchor the analysis to the dataset's last day, not "today": a stale
+    # export (ending weeks ago) must still be analyzed over its own final
+    # weeks instead of an empty recent window (TASK-11 / stale-window fix).
+    anchor = await routine.newest_health_sample_date(db, user_id, tz)
+    analysis = await routine.analyze_training_weeks(db, user_id, tz, window_days, anchor=anchor)
+    # Steps use their own 28-day window and their own "last complete day"
+    # anchor (a mid-day export end is excluded), and are never dropped for
+    # low watch wear — see routine.average_daily_steps.
+    steps = await routine.average_daily_steps(db, user_id, tz)
     sleep_schedule = await routine.learn_sleep_schedule(db, user_id, tz, window_days)
 
     workout = _workout_section(analysis)

@@ -134,43 +134,24 @@ async def test_home_keyboard_for_user_includes_next_action_button(
     tmp_path: Any,
     monkeypatch: Any,
 ) -> None:
-    """REC-PLAN-MEAL-03-16: home_keyboard_for_user must include a button whose
-    callback matches the next_best_action callback when one is available."""
-    from unittest.mock import AsyncMock
-
-    import coach_intelligence
-
-    sentinel_callback = "planv2:profile"
-    fake_action = coach_intelligence.NextAction(
-        kind="complete_profile",
-        title="להשלים את הפרופיל",
-        reason="test",
-        priority=90,
-        callback=sentinel_callback,
-    )
-
-    monkeypatch.setattr(
-        coach_bot,
-        "_resolve_home_action",
-        AsyncMock(return_value=fake_action),
-    )
+    """When required planning data is missing, home shows the focused plan CTA
+    instead of the full daily coach keyboard."""
 
     kb = await coach_bot.home_keyboard_for_user(user_id=1)
     all_callbacks = {btn.callback_data for row in kb.inline_keyboard for btn in row}
-    # The next-action callback must appear as a dedicated button.
-    assert sentinel_callback in all_callbacks, (
-        "home_keyboard_for_user must add a button for the next_best_action callback"
-    )
-    # The static home buttons must still be present.
-    assert "menu:profile" in all_callbacks
-    assert "menu:morning" in all_callbacks
+    assert "planv2:complete_missing" in all_callbacks
+    assert "menu:nextmeal" in all_callbacks
+    assert "menu:status" in all_callbacks
+    assert "menu:morning" not in all_callbacks
+    assert "menu:health" not in all_callbacks
 
 
 @pytest.mark.asyncio
 async def test_home_keyboard_for_user_falls_back_when_no_callback(
     monkeypatch: Any,
 ) -> None:
-    """When next_best_action returns an action with no callback, fall back to static keyboard."""
+    """When profile data is incomplete, missing-data focus wins even if a
+    mocked next action has no callback."""
     from unittest.mock import AsyncMock
 
     import coach_intelligence
@@ -190,9 +171,9 @@ async def test_home_keyboard_for_user_falls_back_when_no_callback(
     )
 
     kb = await coach_bot.home_keyboard_for_user(user_id=1)
-    # Without a callback, the keyboard must equal the static home keyboard.
-    static_kb = coach_bot.home_keyboard()
-    assert len(kb.inline_keyboard) == len(static_kb.inline_keyboard)
+    callbacks = {btn.callback_data for row in kb.inline_keyboard for btn in row}
+    assert "planv2:complete_missing" in callbacks
+    assert "menu:morning" not in callbacks
 
 
 @pytest.mark.asyncio

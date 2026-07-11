@@ -232,11 +232,12 @@ async def _render_next_meal_screen(
     )
 
     recommendation = recommendation or await generate_next_meal_recommendation(DB, user_id)
+    # TASK-03: next_meal_action_rows already ends with a "חזור לסיכום היום"
+    # button — no extra status/home row needed on top of the 4-button cap.
     keyboard_rows = [
         [button(label, callback_data) for label, callback_data in row]
         for row in next_meal_action_rows(recommendation)
     ]
-    keyboard_rows.append([button("⬅️ חזרה למצב היום", "menu:status"), button("🏠 תפריט", "menu:home")])
     text = format_next_meal_recommendation(recommendation)
     if prefix:
         text = f"{prefix}\n\n{text}"
@@ -310,7 +311,7 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
         await _render_next_meal_screen(
             query,
             user_id,
-            prefix="רעננתי את ההצעות. אפשר לבחור אפשרות ואז לכתוב שינוי חופשי לפני שמירה.",
+            prefix="רעננתי את ההצעה. אפשר לאשר, לשנות כמויות, או לבקש רענון נוסף.",
         )
         return True
 
@@ -402,10 +403,9 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
                 "רק אחרי אישור מפורש אשמור את זה כארוחה."
             ),
             InlineKeyboardMarkup([
-                [button("🍽 אכלתי עכשיו", f"nextmeal:save:{option_number}")],
-                [button("📅 תכנן להמשך", f"nextmeal:plan:{option_number}")],
-                [button("🔄 הצעות אחרות", "nextmeal:refresh")],
-                [button("⬅️ חזרה להמלצה", "menu:nextmeal")],
+                [button("✅ אשר שאכלתי", f"nextmeal:save:{option_number}")],
+                [button("🔄 רענן הצעה", "nextmeal:refresh"), button("✏️ שנה כמויות", f"nextmeal:editqty:{option_number}")],
+                [button("📊 חזור לסיכום היום", "menu:status")],
             ]),
         )
         return True
@@ -617,6 +617,19 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
             await finish_health_confirm_wizard(query, user_id, ack_text=ack)
         return True
 
+    if data.startswith("health:edit:"):
+        from noam_coach.services.health_jobs import prompt_health_wizard_edit
+
+        step_id = data.split(":", 2)[2]
+        await prompt_health_wizard_edit(query, user_id, step_id)
+        return True
+
+    if data == "health:steps_breakdown":
+        from noam_coach.services.health_jobs import show_steps_daily_breakdown
+
+        await show_steps_daily_breakdown(query, user_id)
+        return True
+
     if data == "health:skip_item":
         from noam_coach.services.health_jobs import (
             HEALTH_CONFIRM_FLOW,
@@ -760,6 +773,14 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
         )
         return True
 
+    if data == "menu:food":
+        await safe_edit(
+            query,
+            "שלח תמונת אוכל או כתוב מה אכלת, ואנתח את הארוחה לפני שמירה.",
+            InlineKeyboardMarkup([[button("⬅️ תפריט", "menu:home")]]),
+        )
+        return True
+
     if data == "menu:status":
         await safe_edit(
             query,
@@ -768,12 +789,12 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
         )
         return True
 
-    if data in ("menu:morning", "menu:today", "menu:nextmeal", "menu:evening"):
+    if data in ("menu:morning", "menu:today", "menu:daily_menu", "menu:refresh_daily_menu", "menu:nextmeal", "menu:evening"):
         # "menu:today" is a legacy alias for "menu:morning" (old keyboards may
         # still carry it) — both render the same daily menu screen.
         await safe_edit(query, "רגע, מכין לך… ⏳", None)
         try:
-            if data in ("menu:morning", "menu:today"):
+            if data in ("menu:morning", "menu:today", "menu:daily_menu", "menu:refresh_daily_menu"):
                 text = await build_morning_menu_text(user_id)
             elif data == "menu:nextmeal":
                 await _render_next_meal_screen(query, user_id)
@@ -782,10 +803,44 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
                 text = await build_evening_summary_text(user_id)
         except Exception as exc:  # noqa: BLE001
             text = friendly_error(exc, "on-demand recommendation")
+        if data in ("menu:morning", "menu:today", "menu:daily_menu", "menu:refresh_daily_menu"):
+            keyboard = InlineKeyboardMarkup([
+                [button("🔄 רענן תפריט", "menu:refresh_daily_menu"), button("🍽 מה לאכול עכשיו", "menu:nextmeal")],
+                [button("✏️ החלף ארוחה", "menu:replace_daily_meal"), button("📊 מצב היום", "menu:status")],
+                [button("⬅️ תפריט", "menu:home")],
+            ])
+            if data == "menu:daily_menu" and getattr(query, "message", None) is not None:
+                # TASK-05: explicit daily-menu tap creates a standalone message
+                # the user can pin.  The current menu screen is only acknowledged.
+                from noam_coach.services.daily_menu_state import remember_daily_menu_message
+
+                sent = await query.message.reply_text(text, reply_markup=keyboard, parse_mode="HTML")
+                await remember_daily_menu_message(
+                    DB,
+                    user_id,
+                    chat_id=getattr(getattr(sent, "chat", None), "id", user_id),
+                    message_id=getattr(sent, "message_id", None),
+                    source="menu_callback",
+                )
+                await safe_edit(
+                    query,
+                    "שלחתי לך את תפריט היום כהודעה עצמאית שאפשר לנעוץ ✅",
+                    InlineKeyboardMarkup([[button("📊 מצב היום", "menu:status"), button("⬅️ תפריט", "menu:home")]]),
+                )
+                return True
+        else:
+            keyboard = InlineKeyboardMarkup([[button("⬅️ תפריט", "menu:home")]])
+        await safe_edit(query, text, keyboard)
+        return True
+
+    if data == "menu:replace_daily_meal":
         await safe_edit(
             query,
-            text,
-            InlineKeyboardMarkup([[button("⬅️ תפריט", "menu:home")]]),
+            "איזו ארוחה בתפריט תרצה להחליף? כתוב למשל: 'תחליף לי את ארוחת הבוקר לחלבון אחר'.\n\nבינתיים אפשר גם לקבל המלצה מיידית שמתחשבת במצב היום.",
+            InlineKeyboardMarkup([
+                [button("🍽 מה לאכול עכשיו", "menu:nextmeal"), button("🔄 רענן תפריט", "menu:refresh_daily_menu")],
+                [button("📊 מצב היום", "menu:status"), button("⬅️ תפריט", "menu:home")],
+            ]),
         )
         return True
 

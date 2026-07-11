@@ -144,6 +144,27 @@ def _profile_block(profile: dict[str, Any]) -> str:
     )
 
 
+def _learned_food_names(nutrition_context: dict[str, Any] | None, limit: int = 3) -> list[str]:
+    raw = (nutrition_context or {}).get("learned_foods") or []
+    names: list[str] = []
+    for item in raw:
+        if isinstance(item, dict):
+            name = str(item.get("name") or "").strip()
+        else:
+            name = str(item).strip()
+        if name and name not in names:
+            names.append(name)
+        if len(names) >= limit:
+            break
+    return names
+
+
+def _with_learned_food(base: str, learned_names: list[str], index: int) -> str:
+    if len(learned_names) <= index:
+        return base
+    return f"{base} עם {learned_names[index]}"
+
+
 async def morning_menu(
     client: Any | None,
     model: str,
@@ -160,6 +181,12 @@ async def morning_menu(
         first_time = profile.get("eating", {}).get("first_meal_time", "בבוקר") or "בבוקר"
         has_ritalin = flags.get("ritalin")
         is_fasting = flags.get("fasting", False)
+        learned_names = _learned_food_names(nutrition_context)
+        learned_note = (
+            "שילבתי פריטים שמופיעים אצלך הרבה: " + ", ".join(learned_names)
+            if learned_names
+            else ""
+        )
         meals: list[MenuMeal] = []
         notes: list[str] = []
 
@@ -167,23 +194,51 @@ async def morning_menu(
             notes.append("יום צום — לא מציע ארוחות. שתה הרבה מים.")
         elif has_ritalin:
             notes.append("ריטלין — התיאבון יורד. דגש על חלבון בארוחות קטנות.")
+            if learned_note:
+                notes.append(learned_note)
             meals = [
-                MenuMeal(name="ארוחה קלה עתירת חלבון", time_hint=first_time,
-                         calories=cal * 0.25, protein=prot * 0.3,
-                         note="קטנה ופשוטה — התיאבון נמוך"),
-                MenuMeal(name="ארוחת צהריים עם חלבון", time_hint="צהריים",
-                         calories=cal * 0.35, protein=prot * 0.35),
-                MenuMeal(name="ארוחת ערב (כשהתיאבון חוזר)", time_hint="ערב",
-                         calories=cal * 0.4, protein=prot * 0.35),
+                MenuMeal(
+                    name=_with_learned_food("ארוחה קלה עתירת חלבון", learned_names, 0),
+                    time_hint=first_time,
+                    calories=cal * 0.25,
+                    protein=prot * 0.3,
+                    note="קטנה ופשוטה — התיאבון נמוך",
+                ),
+                MenuMeal(
+                    name="ארוחת צהריים עם חלבון",
+                    time_hint="צהריים",
+                    calories=cal * 0.35,
+                    protein=prot * 0.35,
+                ),
+                MenuMeal(
+                    name="ארוחת ערב (כשהתיאבון חוזר)",
+                    time_hint="ערב",
+                    calories=cal * 0.4,
+                    protein=prot * 0.35,
+                ),
             ]
         else:
+            if learned_note:
+                notes.append(learned_note)
             meals = [
-                MenuMeal(name="ארוחת בוקר עתירת חלבון", time_hint=first_time,
-                         calories=cal * 0.3, protein=prot * 0.35),
-                MenuMeal(name="ארוחת צהריים מאוזנת", time_hint="צהריים",
-                         calories=cal * 0.35, protein=prot * 0.3),
-                MenuMeal(name="ארוחת ערב", time_hint="ערב",
-                         calories=cal * 0.35, protein=prot * 0.35),
+                MenuMeal(
+                    name=_with_learned_food("ארוחת בוקר עתירת חלבון", learned_names, 0),
+                    time_hint=first_time,
+                    calories=cal * 0.3,
+                    protein=prot * 0.35,
+                ),
+                MenuMeal(
+                    name=_with_learned_food("ארוחת צהריים מאוזנת", learned_names, 1),
+                    time_hint="צהריים",
+                    calories=cal * 0.35,
+                    protein=prot * 0.3,
+                ),
+                MenuMeal(
+                    name=_with_learned_food("ארוחת ערב", learned_names, 2),
+                    time_hint="ערב",
+                    calories=cal * 0.35,
+                    protein=prot * 0.35,
+                ),
             ]
         training_advice = "ארוחה עם פחמימות שעה לפני האימון." if today_has_workout else ""
         closing_parts = ["(ללא AI — תפריט בסיס)"] + notes

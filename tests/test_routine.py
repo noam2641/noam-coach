@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -122,6 +123,71 @@ async def test_learn_sleep_schedule_with_data() -> None:
     assert result.typical_bedtime is not None
     assert result.typical_wake_time is not None
     assert result.avg_duration_minutes is not None
+
+
+@pytest.mark.asyncio
+async def test_learn_sleep_schedule_uses_full_history_without_wear_gate() -> None:
+    rows = [
+        _sleep_row("2026-01-10T23:05:00+03:00", "2026-01-11T07:05:00+03:00", 480),
+        _sleep_row("2026-01-11T23:10:00+03:00", "2026-01-12T07:00:00+03:00", 470),
+        _sleep_row("2026-01-12T23:00:00+03:00", "2026-01-13T07:15:00+03:00", 495),
+        _sleep_row("2026-01-13T23:20:00+03:00", "2026-01-14T07:10:00+03:00", 470),
+        _sleep_row("2026-01-14T23:15:00+03:00", "2026-01-15T07:05:00+03:00", 470),
+        _sleep_row("2026-01-15T23:05:00+03:00", "2026-01-16T06:55:00+03:00", 470),
+        _sleep_row("2026-01-16T23:10:00+03:00", "2026-01-17T07:10:00+03:00", 480),
+    ]
+    db = MockDB(rows)
+
+    result = await routine.learn_sleep_schedule(db, 1, TZ)
+
+    assert result.nights_sampled == 7
+    assert result.typical_bedtime is not None
+    assert result.typical_wake_time is not None
+    assert result.avg_duration_minutes is not None
+    assert result.variability_minutes is not None
+    assert "watch_wear" not in db._query_log[-1]
+    assert "start_time>=" not in db._query_log[-1].replace(" ", "")
+
+
+@pytest.mark.asyncio
+async def test_learn_sleep_schedule_merges_overlapping_sources_per_night() -> None:
+    rows = [
+        _sleep_row("2026-06-10T23:00:00+03:00", "2026-06-11T07:00:00+03:00", 480),
+        _sleep_row("2026-06-10T23:30:00+03:00", "2026-06-11T06:30:00+03:00", 420),
+    ]
+    db = MockDB(rows)
+
+    result = await routine.learn_sleep_schedule(db, 1, TZ)
+
+    assert result.nights_sampled == 1
+    assert result.avg_duration_minutes == pytest.approx(480.0)
+
+
+@pytest.mark.asyncio
+async def test_learn_sleep_schedule_weights_recent_history_more() -> None:
+    old_rows = [
+        _sleep_row(
+            (dt.datetime(2026, 1, day, 1, 0, tzinfo=TZ)).isoformat(),
+            (dt.datetime(2026, 1, day, 9, 0, tzinfo=TZ)).isoformat(),
+            480,
+        )
+        for day in range(10, 17)
+    ]
+    recent_rows = [
+        _sleep_row(
+            (dt.datetime(2026, 6, day, 23, 0, tzinfo=TZ)).isoformat(),
+            (dt.datetime(2026, 6, day + 1, 7, 0, tzinfo=TZ)).isoformat(),
+            480,
+        )
+        for day in range(10, 13)
+    ]
+    db = MockDB([*old_rows, *recent_rows])
+
+    result = await routine.learn_sleep_schedule(db, 1, TZ)
+
+    assert result.nights_sampled == 10
+    assert result.typical_bedtime is not None
+    assert result.typical_bedtime.startswith("23")
 
 
 @pytest.mark.asyncio

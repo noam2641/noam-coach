@@ -152,7 +152,7 @@ async def test_typing_correction_directly_at_basics_screen_works(
 async def test_confirm_existing_pain_shows_no_update_button_and_accepts_text(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """safety_pain is a free_text_fallback question — the "already have"
+    """The unified limitation question is free_text_fallback — the "already have"
     screen must not force a tap on "לא, אעדכן" before typing works."""
     db = await _make_db(tmp_path)
     _patch_db(monkeypatch, db)
@@ -174,9 +174,9 @@ async def test_confirm_existing_pain_shows_no_update_button_and_accepts_text(
     update = FakeUpdate("כתף שמאל")
     handled = await onboarding_bot.handle_onboarding_text(update, 1)
     assert handled is True
-    fact = await user_model.get_fact(db, 1, "active_pain")
+    fact = await user_model.get_fact(db, 1, "training_limitations")
     assert fact is not None
-    assert fact["value"]["location"] == "כתף שמאל"
+    assert fact["value"] == "כתף שמאל"
     assert fact["source"] == user_model.SOURCE_USER
 
 

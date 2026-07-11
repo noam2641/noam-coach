@@ -22,10 +22,37 @@ from helpers import utc_now
 from models import MiniProfileUpdate
 from noam_coach.services.weekdays import (
     monday_first_to_sunday_first,
+    propose_training_days,
     sunday_first_order,
     sunday_first_to_monday_first,
     weekday_he,
 )
+
+
+def test_propose_training_days_tops_up_to_requested_count() -> None:
+    # Only two detected days (Mon=0, Wed=2) but the user wants 4 → keep both,
+    # add two balanced days to reach exactly 4.
+    proposed, added = propose_training_days([0, 2], 4)
+    assert len(proposed) == 4
+    assert 0 in proposed and 2 in proposed  # detected days kept
+    assert len(added) == 2                  # two days added
+    assert set(added).isdisjoint({0, 2})    # no duplicates
+
+
+def test_propose_training_days_never_exceeds_requested_count() -> None:
+    # More detected days than requested → keep the strongest N (order preserved).
+    proposed, added = propose_training_days([1, 3, 5, 6], 2)
+    assert len(proposed) == 2
+    assert added == []
+    assert set(proposed) <= {1, 3, 5, 6}
+
+
+def test_propose_training_days_pure_fallback_when_nothing_detected() -> None:
+    proposed, added = propose_training_days([], 3)
+    assert len(proposed) == 3
+    assert len(added) == 3  # all from the balanced template
+    # Balanced template for 3 spreads the days out (no back-to-back).
+    assert proposed == sunday_first_order([6, 2, 4])
 
 
 def test_sunday_first_key_orders_sunday_before_monday() -> None:

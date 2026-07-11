@@ -110,8 +110,9 @@ async def test_workout_candidates_differ_in_frequency_and_content(tmp_path: Path
     just differently-labeled copies of the same days/exercises/sets."""
     db = await _ready_db(tmp_path)
     # desired=4 (explicit statement) with 6 confirmed slots gives performance
-    # (desired+1=5) real headroom below MAX_FREQUENCY=6, while consistency
-    # (desired-1=3) has headroom below desired too.
+    # (desired+1=5) real headroom below MAX_FREQUENCY=6. TASK-07: consistency
+    # no longer drops to desired-1 — it keeps all declared days and differs by
+    # split/volume instead.
     slots = [
         {"weekday": day, "weekday_schema": WEEKDAY_SCHEMA_VERSION, "start": "19:00", "minutes": 50}
         for day in [0, 1, 2, 3, 4, 5]
@@ -125,9 +126,10 @@ async def test_workout_candidates_differ_in_frequency_and_content(tmp_path: Path
         by_strategy["consistency"], by_strategy["balanced"], by_strategy["performance"],
     )
 
-    # Frequency must differ: consistency trades a day down, performance adds
-    # a day up — bounded by (but here comfortably inside) declared availability.
-    assert consistency.payload["frequency"] < balanced.payload["frequency"] < performance.payload["frequency"]
+    # TASK-07: no candidate drops below the declared day count; consistency and
+    # balanced both keep all four days, performance may add one.
+    assert consistency.payload["frequency"] == balanced.payload["frequency"] == 4
+    assert performance.payload["frequency"] >= balanced.payload["frequency"]
 
     # Content must differ too: at minimum, the payloads are not byte-identical
     # once "strategy"/"title" are excluded — same-day/same-split plans used to
@@ -143,19 +145,19 @@ async def test_workout_candidates_differ_in_frequency_and_content(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_three_day_consistency_uses_full_body_not_abc(tmp_path: Path) -> None:
-    """E3: A/B/C at 3 days/week trains legs only once (shared with shoulders),
-    a real weakness for fat-loss goals — consistency should offer Full-Body x3
-    instead of A/B/C when IT specifically runs at a 3-day frequency."""
+async def test_consistency_uses_full_body_and_keeps_all_days(tmp_path: Path) -> None:
+    """E3 / TASK-07: the consistency candidate uses varied Full-Body sessions
+    (a real weakness of a 3-day A/B/C is training legs only once) AND keeps
+    every declared training day — it must not drop a day to a lower frequency."""
     db = await _ready_db(tmp_path)
-    # Force consistency to land on exactly 3 days: desired=4 -> consistency=3.
     await user_model.set_fact(db, 1, "training_days_per_week", 4, source=user_model.SOURCE_USER, confirmed=True)
 
     workout = await planning.generate_candidates(db, 1, "workout")
     consistency = next(c for c in workout if c.strategy == "consistency")
-    assert consistency.payload["frequency"] == 3
+    # No day dropped: four declared days stay four varied Full-Body sessions.
+    assert consistency.payload["frequency"] == 4
     codes = [s["code"] for s in consistency.payload["sessions"]]
-    assert codes == ["F", "F", "F"]
+    assert codes == ["FB1", "FB2", "FB3", "FB4"]
 
     # A/B/C (shared leg day) is still legitimate for other strategies at 3 days.
     balanced_at_three = planning._workout_candidate(

@@ -99,6 +99,7 @@ async def assess_day(
         SELECT id, confidence, calories, protein, created_at
         FROM meals
         WHERE user_id=? AND eaten_at>=? AND eaten_at<?
+          AND COALESCE(status, 'consumed')='consumed'
         ORDER BY eaten_at
         """,
         (user_id, start_utc, end_utc),

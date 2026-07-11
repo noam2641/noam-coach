@@ -21,6 +21,91 @@ class ExerciseProfile:
     joint_load: tuple[str, ...] = ()
     skill: str = "beginner"
     avoid_tokens: tuple[str, ...] = ()
+    regressions: tuple[str, ...] = ()
+    progressions: tuple[str, ...] = ()
+    technique_cues: tuple[str, ...] = ()
+    secondary_muscles: tuple[str, ...] = ()
+    contraindications: tuple[str, ...] = ()
+    common_mistakes: tuple[str, ...] = ()
+    safe_range_notes: tuple[str, ...] = ()
+
+    def public_metadata(self) -> dict[str, Any]:
+        return {
+            "exercise_id": self.exercise_id,
+            "name_he": self.exercise_id,
+            "name_en": self.exercise_id,
+            "movement_pattern": self.movement,
+            "primary_muscles": list(self.primary_muscles),
+            "secondary_muscles": list(self.secondary_muscles),
+            "equipment": list(self.equipment),
+            "equipment_required": list(self.equipment),
+            "joint_load": list(self.joint_load),
+            "skill": self.skill,
+            "difficulty_level": self.skill,
+            "regressions": list(self.regressions),
+            "regression_options": list(self.regressions),
+            "progressions": list(self.progressions),
+            "progression_options": list(self.progressions),
+            "technique_cues": list(self.technique_cues),
+            "coaching_cues": list(self.technique_cues),
+            "contraindications": list(self.contraindications),
+            "common_mistakes": list(self.common_mistakes),
+            "safe_range_notes": list(self.safe_range_notes),
+        }
+
+
+@dataclass(frozen=True)
+class ClientTrainingProfile:
+    user_id: int | None = None
+    age: Any = None
+    sex: Any = None
+    height: Any = None
+    current_weight: Any = None
+    goal_type: str = "general_fitness"
+    target_weight: Any = None
+    training_experience: str = "beginner"
+    training_history_text: str = ""
+    available_days_per_week: int | None = None
+    preferred_training_days: tuple[int, ...] = ()
+    time_per_workout_minutes: int | None = None
+    training_location: Any = None
+    available_equipment: tuple[str, ...] = ()
+    injuries: tuple[str, ...] = ()
+    pain_areas: tuple[str, ...] = ()
+    movement_limitations: tuple[str, ...] = ()
+    medical_flags: tuple[str, ...] = ()
+    sleep_quality: Any = None
+    average_steps: Any = None
+    stress_level: Any = None
+    preferred_style: Any = None
+    disliked_exercises: tuple[str, ...] = ()
+
+    def public_payload(self) -> dict[str, Any]:
+        return {
+            "user_id": self.user_id,
+            "age": self.age,
+            "sex": self.sex,
+            "height": self.height,
+            "current_weight": self.current_weight,
+            "goal_type": self.goal_type,
+            "target_weight": self.target_weight,
+            "training_experience": self.training_experience,
+            "training_history_text": self.training_history_text,
+            "available_days_per_week": self.available_days_per_week,
+            "preferred_training_days": list(self.preferred_training_days),
+            "time_per_workout_minutes": self.time_per_workout_minutes,
+            "training_location": self.training_location,
+            "available_equipment": list(self.available_equipment),
+            "injuries": list(self.injuries),
+            "pain_areas": list(self.pain_areas),
+            "movement_limitations": list(self.movement_limitations),
+            "medical_flags": list(self.medical_flags),
+            "sleep_quality": self.sleep_quality,
+            "average_steps": self.average_steps,
+            "stress_level": self.stress_level,
+            "preferred_style": self.preferred_style,
+            "disliked_exercises": list(self.disliked_exercises),
+        }
 
 
 CATALOG: dict[str, ExerciseProfile] = {
@@ -121,6 +206,89 @@ def _text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False).casefold()
 
 
+def _fact_value(facts: dict[str, dict[str, Any]], key: str, default: Any = None) -> Any:
+    fact = facts.get(key)
+    if not fact:
+        return default
+    value = fact.get("value", default)
+    return default if value is None else value
+
+
+def _tuple_value(value: Any) -> tuple[Any, ...]:
+    if value is None or value == "":
+        return ()
+    if isinstance(value, (list, tuple, set)):
+        return tuple(item for item in value if item not in (None, ""))
+    return (value,)
+
+
+def _normalize_goal_type(value: Any) -> str:
+    text = _text(value)
+    if any(token in text for token in ("fat_loss", "fat_loss_muscle_retention", "weight_loss")):
+        return "fat_loss"
+    if any(token in text for token in ("muscle", "׳׳¡׳”", "׳©׳¨׳™׳¨")):
+        return "muscle_gain"
+    if any(token in text for token in ("strength", "׳›׳•׳—")):
+        return "strength"
+    if any(token in text for token in ("rehab", "return", "׳₪׳¦׳™׳¢", "׳—׳–׳¨׳”")):
+        return "rehab_or_return"
+    if any(token in text for token in ("health", "general_health")):
+        return "health"
+    return "general_fitness"
+
+
+def client_training_profile_from_facts(
+    facts: dict[str, dict[str, Any]],
+    *,
+    user_id: int | None = None,
+    available_days_per_week: int | None = None,
+    preferred_training_days: list[int] | tuple[int, ...] | None = None,
+    time_per_workout_minutes: int | None = None,
+) -> ClientTrainingProfile:
+    """Build the professional training-profile snapshot stored with a plan."""
+    equipment = normalize_equipment(
+        _fact_value(facts, "equipment"),
+        _fact_value(facts, "training_location"),
+    )
+    limitations = _fact_value(facts, "training_limitations")
+    if limitations is None:
+        limitations = " ".join(
+            str(value or "")
+            for value in (
+                _fact_value(facts, "active_pain"),
+                _fact_value(facts, "medical_avoidance"),
+            )
+            if value
+        )
+    pain = pain_regions(limitations, None)
+    medical = _tuple_value(limitations)
+    return ClientTrainingProfile(
+        user_id=user_id,
+        age=_fact_value(facts, "age"),
+        sex=_fact_value(facts, "sex"),
+        height=_fact_value(facts, "height_cm"),
+        current_weight=_fact_value(facts, "weight_kg"),
+        goal_type=_normalize_goal_type(_fact_value(facts, "primary_goal")),
+        target_weight=_fact_value(facts, "goal_weight_kg"),
+        training_experience=str(_fact_value(facts, "strength_experience", "beginner") or "beginner"),
+        training_history_text=str(_fact_value(facts, "training_history_text", "") or ""),
+        available_days_per_week=available_days_per_week,
+        preferred_training_days=tuple(int(day) for day in (preferred_training_days or ()) if isinstance(day, int)),
+        time_per_workout_minutes=time_per_workout_minutes,
+        training_location=_fact_value(facts, "training_location"),
+        available_equipment=tuple(sorted(equipment)),
+        injuries=medical,
+        pain_areas=tuple(sorted(pain)),
+        movement_limitations=medical,
+        medical_flags=medical,
+        sleep_quality=_fact_value(facts, "sleep_quality"),
+        average_steps=_fact_value(facts, "average_steps"),
+        stress_level=_fact_value(facts, "stress_level"),
+        preferred_style=_fact_value(facts, "preferred_style"),
+        disliked_exercises=_tuple_value(_fact_value(facts, "disliked_exercises")),
+    )
+
+
 def normalize_equipment(value: Any, location: Any = None) -> set[str]:
     text = f"{_text(value)} {_text(location)}"
     available: set[str] = set()
@@ -146,7 +314,7 @@ def normalize_equipment(value: Any, location: Any = None) -> set[str]:
 
 
 PAIN_REGION_TOKENS: dict[str, tuple[str, ...]] = {
-    "knee": ("ברך", "knee"),
+    "knee": ("ברך", "ברכיים", "knee"),
     "shoulder": ("כתף", "shoulder"),
     "back": ("גב", "back", "מותן"),
     "elbow": ("מרפק", "elbow", "טניס אלכן", "טניס אלבו", "אלבו"),
@@ -260,9 +428,9 @@ def pain_safety_guidance(region: ActivePainRegion) -> str:
         f"בגלל שדיווחת לאחרונה על כאב ב{region.label}, "
         "שמרתי עומס שמרני בתרגיל הזה. בצע רק בטווח ללא כאב."
     )
-    if region.severity is not None and region.severity >= 3:
+    if region.severity is not None and region.severity >= 4:
         return (
-            f"כאב חד/חזק ב{region.label} הוא סימן לעצור את התרגיל עכשיו. "
+            f"כאב 4/10 ומעלה ב{region.label} הוא סימן לעצור את התרגיל עכשיו. "
             "אל תנסה לעבוד סביב כאב חד. אם הכאב מתגבר, מופיעה נפיחות, הקרנה "
             "או מגבלה בתנועה, כדאי לפנות לבדיקה מקצועית."
         )
@@ -367,6 +535,69 @@ def adapt_exercises(
             adapted.append(replacement)
     return adapted, changes
 
+
+
+
+def exercise_catalog_entry(exercise_id: str) -> dict[str, Any] | None:
+    """Return structured metadata for a catalog exercise.
+
+    TASK-08: callers should not hard-code joint load or movement-pattern rules.
+    This exposes the existing deterministic catalog as the single place for
+    substitutions, pain-aware checks and plan-quality gates.
+    """
+    profile = CATALOG.get(str(exercise_id))
+    if profile is None:
+        return None
+    replacements = REPLACEMENTS.get(profile.movement, [])
+    result = profile.public_metadata()
+    result["substitutions"] = [dict(item) for item in replacements]
+    result["contraindications"] = [
+        f"active_{joint}_pain" for joint in profile.joint_load
+    ]
+    return result
+
+
+def substitutions_for_exercise(
+    exercise_id: str,
+    *,
+    equipment_value: Any = None,
+    location: Any = None,
+    pain_value: Any = None,
+    medical_avoidance: Any = None,
+    experience: str = "beginner",
+) -> list[dict[str, Any]]:
+    """Return allowed substitutions from the same movement pattern.
+
+    It respects equipment and current pain regions.  If knee pain is active,
+    for example, squat-pattern replacements that still load the knee are
+    filtered out before they reach the UI.
+    """
+    profile = CATALOG.get(str(exercise_id))
+    if profile is None:
+        return []
+    equipment = normalize_equipment(equipment_value, location)
+    pain = pain_regions(pain_value, medical_avoidance)
+    allowed: list[dict[str, Any]] = []
+    for replacement in REPLACEMENTS.get(profile.movement, []):
+        candidate_profile = CATALOG.get(str(replacement.get("id")))
+        if candidate_profile is None:
+            continue
+        ok, reasons = exercise_allowed(
+            {"id": replacement.get("id")},
+            equipment=equipment,
+            pain=pain,
+            experience=experience,
+        )
+        if not ok:
+            continue
+        allowed.append({
+            **replacement,
+            "movement_pattern": candidate_profile.movement,
+            "primary_muscles": list(candidate_profile.primary_muscles),
+            "joint_load": list(candidate_profile.joint_load),
+            "reason": "אותה תבנית תנועה, עומס מותאם לנתונים שלך",
+        })
+    return allowed
 
 def warmup_sets(exercise: dict[str, Any], working_weight: float | None = None) -> list[dict[str, Any]]:
     weight = float(working_weight if working_weight is not None else exercise.get("weight") or 0)

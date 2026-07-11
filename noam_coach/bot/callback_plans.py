@@ -479,29 +479,42 @@ async def _handle_workout_parameter_actions(
             )
             return True
         plan = await get_user_plan(user_id, code)
+        active_plan = await user_model.get_value(DB, user_id, "active_workout_plan")
+        program_codes = []
+        if isinstance(active_plan, dict):
+            program_codes = [str(s.get("code")) for s in active_plan.get("sessions", []) if s.get("code")]
+        program_codes = list(dict.fromkeys(program_codes or [code]))
         applied: list[str] = []
+        affected_count = 0
         for update_item in pending_updates:
             if not isinstance(update_item, dict):
                 continue
             scope = str(update_item.get("scope") or "current")
-            indices = range(len(plan["exercises"])) if scope == "all" else [exercise_index]
             field = str(update_item.get("field") or "")
-            for idx in indices:
-                if not 0 <= idx < len(plan["exercises"]):
-                    continue
-                if field == "reps":
-                    rmin = int(update_item.get("rmin") or plan["exercises"][idx]["rmin"])
-                    rmax = int(update_item.get("rmax") or plan["exercises"][idx]["rmax"])
-                    await set_exercise_override(user_id, code, idx, "rmin", rmin)
-                    await set_exercise_override(user_id, code, idx, "rmax", max(rmin, rmax))
-                elif field in {"weight", "sets", "rest"}:
-                    await set_exercise_override(user_id, code, idx, field, float(update_item["value"]))
+            target_codes = program_codes if scope == "program" else [code]
+            for target_code in target_codes:
+                target_plan = await get_user_plan(user_id, target_code)
+                indices = range(len(target_plan["exercises"])) if scope in {"all", "program"} else [exercise_index]
+                for idx in indices:
+                    if not 0 <= idx < len(target_plan["exercises"]):
+                        continue
+                    if field == "reps":
+                        rmin = int(update_item.get("rmin") or target_plan["exercises"][idx]["rmin"])
+                        rmax = int(update_item.get("rmax") or target_plan["exercises"][idx]["rmax"])
+                        await set_exercise_override(user_id, target_code, idx, "rmin", rmin)
+                        await set_exercise_override(user_id, target_code, idx, "rmax", max(rmin, rmax))
+                        affected_count += 1
+                    elif field in {"weight", "sets", "rest"}:
+                        await set_exercise_override(user_id, target_code, idx, field, float(update_item["value"]))
+                        affected_count += 1
             label = str(update_item.get("label") or field)
             if label:
                 applied.append(label)
         await conversation.clear_active_flow(DB, user_id)
         summary = ", ".join(applied) if applied else "השינוי"
         scope_label = str(payload.get("scope_label") or "")
+        if affected_count:
+            scope_label = f"{scope_label} ({affected_count} תרגילים הושפעו)"
         await safe_edit(
             query,
             f"שמרתי: {summary} {scope_label} ✅",

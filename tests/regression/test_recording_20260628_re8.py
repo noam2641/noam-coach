@@ -153,21 +153,29 @@ async def test_next_meal_keyboard_is_direct_and_keeps_planned_consumed_explicit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """TASK-03: "מה לאכול עכשיו" is a single immediate recommendation — the
+    keyboard offers at most 4 actions on that one option (confirm eaten,
+    refresh, change quantities, back to status), never multiple numbered
+    options or a "plan for later" per-option button.
+    """
     db = await _ready_db(tmp_path)
     _bind(monkeypatch, db)
     rec = await generate_next_meal_recommendation(db, 1)
+    assert len(rec.options) == 1
 
     rows = next_meal_action_rows(rec)
     callbacks = [callback for row in rows for _label, callback in row]
-    assert sum(callback.startswith("nextmeal:save:") for callback in callbacks) == len(rec.options)
-    assert sum(callback.startswith("nextmeal:plan:") for callback in callbacks) == len(rec.options)
-    assert not any(callback.startswith("nextmeal:choose:") for callback in callbacks)
+    assert len(callbacks) <= 4
+    assert callbacks.count("nextmeal:save:1") == 1
     assert "nextmeal:refresh" in callbacks
+    assert "nextmeal:editqty:1" in callbacks
+    assert "menu:status" in callbacks
+    assert not any(callback.startswith("nextmeal:plan:") for callback in callbacks)
+    assert not any(callback.startswith("nextmeal:choose:") for callback in callbacks)
     assert not any(
         callback.startswith((
             "nextmeal:smaller:",
             "nextmeal:bigger:",
-            "nextmeal:editqty:",
             "nextmeal:nostock:",
             "nextmeal:dislikeitem:",
         ))
@@ -175,10 +183,12 @@ async def test_next_meal_keyboard_is_direct_and_keeps_planned_consumed_explicit(
     )
     assert all(len(callback.encode("utf-8")) <= 64 for callback in callbacks)
 
+    # The plan-for-later callback still exists underneath (reachable from a
+    # free-text correction), and still records a planned (not consumed) meal.
     query = FakeQuery()
     await callback_menu_bot.handle_menu_callback(query, 1, "menu:nextmeal")
     before = await db.fetch_one("SELECT COUNT(*) AS c FROM meals WHERE user_id=1")
-    await callback_menu_bot.handle_menu_callback(query, 1, "nextmeal:plan:2")
+    await callback_menu_bot.handle_menu_callback(query, 1, "nextmeal:plan:1")
     after = await db.fetch_one("SELECT COUNT(*) AS c FROM meals WHERE user_id=1")
     assert int(before["c"]) == int(after["c"]) == 0
     assert "עדיין לא נספר" in query.messages[-1]
@@ -288,7 +298,7 @@ async def test_route_free_text_next_meal_bypasses_ai_and_never_routes_to_workout
     reply = update.effective_message.replies[-1]
     assert "מה לאכול עכשיו" in reply
     assert "לא לאימון" in reply
-    assert "אפשרות 1" in reply
+    assert "למה עכשיו" in reply
 
 
 def test_profile_display_never_leaks_missing_dict() -> None:

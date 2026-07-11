@@ -447,7 +447,11 @@ async def ask_next_question(target: Any, user_id: int) -> bool:
     # RE11: a typed correction is accepted directly at this same prompt (no
     # forced tap on "לא, אעדכן" first) for any question that accepts free
     # text at all — plain free-text questions and free_text_fallback ones.
-    existing = await user_model.get_fact(DB, user_id, question.fact_key)
+    existing = (
+        await user_model.get_training_limitations_fact(DB, user_id)
+        if question.fact_key == "training_limitations"
+        else await user_model.get_fact(DB, user_id, question.fact_key)
+    )
     if existing and existing.get("value") is not None and existing["kind"] != user_model.KIND_GAP:
         val_display = _format_fact_value(question.fact_key, existing["value"])
         source_label = user_model.SOURCE_LABELS.get(
@@ -561,6 +565,46 @@ async def first_missing_plan_question(
 
 
 @runtime_bound(RUNTIME_NAMES)
+async def render_plan_completion_done(target: Any, user_id: int, plan_type: str | None) -> None:
+    """Render the correct next step after a scoped completion flow.
+
+    IMG_014/TASK-01: after nutrition completion, do not throw the user back into
+    workout questions or a broad hub.  Show the nutrition actions that match the
+    user's current intent.
+    """
+    from noam_coach.bot.ui import button, safe_edit
+
+    if plan_type == "nutrition":
+        text = (
+            "<b>סיימנו את נתוני התזונה הבסיסיים ✅</b>\n"
+            "לא אעבור עכשיו לשאלות אימון. אפשר להמשיך ישר לתזונה."
+        )
+        keyboard = InlineKeyboardMarkup([
+            [button("📌 בנה תפריט יומי", "menu:daily_menu")],
+            [button("🍽 מה לאכול עכשיו", "menu:nextmeal")],
+            [button("🎯 עדכן יעד", "menu:goal")],
+            [button("⬅️ חזור לתוכניות", "menu:smartplan")],
+        ])
+    elif plan_type == "workout":
+        text = (
+            "<b>סיימנו את נתוני האימון הבסיסיים ✅</b>\n"
+            "אפשר לבנות הצעת אימונים שמתחשבת בימים, זמן, ציוד וכאב."
+        )
+        keyboard = InlineKeyboardMarkup([
+            [button("🏋️ צור 3 הצעות אימון", "planv2:generate:workout")],
+            [button("👤 בדוק פרופיל", "menu:profile")],
+            [button("⬅️ חזור לתוכניות", "menu:smartplan")],
+        ])
+    else:
+        await render_smart_plan_hub(target, user_id)
+        return
+    if hasattr(target, "edit_message_text"):
+        await safe_edit(target, text, keyboard)
+    else:
+        await target.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+
+
+@runtime_bound(RUNTIME_NAMES)
 async def ask_next_plan_completion_question(
     target: Any, user_id: int, plan_type: str | None = None
 ) -> bool:
@@ -576,7 +620,7 @@ async def ask_next_plan_completion_question(
     question = await first_missing_plan_question(user_id, plan_type)
     if question is None:
         await clear_flow_state(user_id, PLAN_COMPLETION_FLOW)
-        await render_smart_plan_hub(target, user_id)
+        await render_plan_completion_done(target, user_id, plan_type)
         return False
     await set_flow_state(
         user_id,
@@ -1478,52 +1522,66 @@ def _weekday_label(value: Any) -> str:
 
 @runtime_bound(RUNTIME_NAMES)
 async def build_profile_text(user_id: int) -> str:
-    view = await user_model.get_profile_view(DB, user_id)
+    """Build the /profile text as a product screen, not a debug dump.
 
-    def block(title: str, facts: list[dict[str, Any]]) -> list[str]:
-        if not facts:
-            return []
-        out = [f"<b>{title}</b>"]
-        for fact in facts:
-            spec = user_model.FACT_REGISTRY.get(fact["key"])
-            if not spec:
-                continue
-            label = spec.label
-            display = _format_fact_value(fact["key"], fact["value"])
-            if display == "לא צוין":
-                continue
-            mark = "✓" if fact["confirmed"] else "·"
-            out.append(f"{mark} {esc(label)}: {esc(display)}")
-        if len(out) <= 1:
-            return []
-        out.append("")
-        return out
-
-    lines = ["<b>הפרופיל שלך</b>", ""]
-    lines += block("📏 נמדד", view["measured"])
-    lines += block("💬 דווח על ידך", view["reported"])
-    if view["gaps"]:
-        lines.append("<b>❔ חסר</b>")
-        for gap in view["gaps"]:
-            spec = user_model.FACT_REGISTRY.get(gap["key"])
-            if not spec:
-                continue
-            lines.append(f"· {esc(spec.label)}")
-    # REC-PROGRAM-04-01: Show resolved training availability
+    PATCH-12 / IMG_001+IMG_004+IMG_013: the profile screenshots showed two
+    contradictory training-availability blocks, long measured/reported dumps and
+    repeated source labels.  This command now uses the same precedence rules as
+    plan generation and displays one active value per topic.
+    """
+    snapshot = await planning.profile_snapshot(DB, user_id)
+    facts = snapshot.get("facts", {})
     from noam_coach.services.availability import format_availability_summary, resolve_availability
+
+    def _fact_line(key: str, *, label_override: str | None = None) -> str | None:
+        fact = facts.get(key)
+        if not fact or fact.get("kind") == user_model.KIND_GAP:
+            return None
+        display = _format_fact_value(key, fact.get("value"))
+        if not display or display == "לא צוין":
+            return None
+        spec = user_model.FACT_REGISTRY.get(key)
+        label = label_override or (spec.label if spec else planning.FACT_LABELS.get(key, key))
+        suffix = " · טרם אושר" if not fact.get("confirmed") else ""
+        return f"• <b>{esc(label)}</b>: {esc(display)}{suffix}"
+
+    def _add_block(lines: list[str], title: str, keys: tuple[str, ...]) -> None:
+        rows = [row for key in keys if (row := _fact_line(key))]
+        if rows:
+            lines.extend(["", f"<b>{esc(title)}</b>", *rows])
+
+    lines: list[str] = ["<b>הפרופיל שלך</b>"]
+    _add_block(
+        lines,
+        "🎯 יעד וגוף",
+        ("primary_goal", "weight_kg", "height_cm", "body_fat_pct", "avg_steps", "goal_weight_kg", "goal_timeframe_weeks"),
+    )
+    _add_block(
+        lines,
+        "🍽️ תזונה",
+        ("diet_restrictions", "allergies", "meal_structure_preference", "cooking_capacity", "restaurant_frequency"),
+    )
+    _add_block(
+        lines,
+        "🏋️ אימונים",
+        ("training_days_per_week", "session_minutes", "training_location", "equipment", "workout_window", "strength_experience", "training_limitations"),
+    )
+
     avail = await resolve_availability(DB, user_id)
-    avail_text = format_availability_summary(avail)
-    lines += ["", "<b>🗓️ זמינות לאימון</b>"]
-    for avail_line in avail_text.split("\n"):
-        lines.append(esc(avail_line))
+    availability_lines = [line.strip() for line in format_availability_summary(avail).split("\n") if line.strip()]
+    if availability_lines:
+        lines.extend(["", "<b>🗓️ זמינות פעילה לתוכנית</b>"])
+        lines.extend(esc(line) for line in availability_lines[:4])
+        if avail.conflicts:
+            lines.append("• HealthKit נשמר כרמז בלבד; הימים שהזנת ידנית הם המקור הפעיל.")
 
     constraints = await active_constraints(user_id)
     if constraints:
-        lines += ["", "<b>⚠️ מגבלות פעילות</b>"]
-        for c in constraints:
-            loc = f" ({esc(c['location'])})" if c["location"] else ""
-            kind_label = {"pain": "כאב", "medical_avoidance": "הימנעות רפואית"}.get(c["kind"], c["kind"])
-            lines.append(f"· {esc(kind_label)}{loc}")
+        lines.extend(["", "<b>⚠️ מגבלות וכאב</b>"])
+        for c in constraints[:5]:
+            loc = f" — {esc(c['location'])}" if c.get("location") else ""
+            kind_label = {"pain": "כאב", "medical_avoidance": "הימנעות רפואית"}.get(c.get("kind"), str(c.get("kind") or "מגבלה"))
+            lines.append(f"• {esc(kind_label)}{loc}")
 
     readiness = await user_model.compute_all_readiness(DB, user_id)
     lines += [
@@ -1536,18 +1594,14 @@ async def build_profile_text(user_id: int) -> str:
         r = readiness[name]
         pct = int(r["score"] * 100)
         label = r.get("label") or profile.label
-        if name == "safety":
-            status_txt = "הושלם" if r["ready"] else "חסר מידע"
-            icon = "✅" if r["ready"] else "⚠️"
-            lines.append(f"{icon} {esc(label)}: {status_txt}")
-        elif r["ready"]:
+        if r["ready"]:
             lines.append(f"✅ {esc(label)}: {pct}% — מוכן")
-        else:
-            detail_labels = r.get("missing_labels") or [
-                user_model.display_label(key) for key in r["missing"]
-            ]
-            detail = f" — חסר: {esc(', '.join(detail_labels))}" if detail_labels else ""
-            lines.append(f"⚠️ {esc(label)}: {pct}%{detail}")
+            continue
+        detail_labels = r.get("missing_labels") or [
+            user_model.display_label(key) for key in r["missing"]
+        ]
+        detail = f" — חסר: {esc(', '.join(detail_labels[:4]))}" if detail_labels else ""
+        lines.append(f"⚠️ {esc(label)}: {pct}%{detail}")
 
     return "\n".join(lines) or "עוד אין נתונים בפרופיל."
 
@@ -1971,7 +2025,14 @@ async def render_candidate_list(target: Any, user_id: int, plan_type: str) -> No
         expiry_minutes=24 * 60,
     )
     flow = await conversation.get_active_flow(DB, user_id)
-    lines = [f"<b>שלוש הצעות {_plan_type_label(plan_type)}</b>", ""]
+    if plan_type == "nutrition":
+        lines = [
+            "<b>בחירת סגנון תזונה — חד־פעמי</b>",
+            "זה לא תפריט יומי. כאן בוחרים אסטרטגיה כללית; תפריט להיום נמצא במסך נפרד.",
+            "",
+        ]
+    else:
+        lines = [f"<b>שלוש הצעות {_plan_type_label(plan_type)}</b>", ""]
     rows = []
     for index, candidate in enumerate(candidates, start=1):
         lines.append(_format_candidate(candidate, index))
@@ -2008,7 +2069,10 @@ async def render_candidate_list(target: Any, user_id: int, plan_type: str) -> No
             version=flow.version,
             flow_id=flow.flow_id,
         )
-        rows.append([button(f"בחר הצעה {index}: {candidate['title']}", callback)])
+        if plan_type == "nutrition":
+            rows.append([button(f"בחר סגנון {index}: {candidate['title']}", callback)])
+        else:
+            rows.append([button(f"בחר הצעה {index}: {candidate['title']}", callback)])
     rows.append([button("🔄 צור מחדש", f"planv2:generate:{plan_type}")])
     rows.append([button("⬅️ לתוכניות", "menu:smartplan")])
     await safe_edit(target, "\n".join(lines), InlineKeyboardMarkup(rows))
@@ -2016,41 +2080,77 @@ async def render_candidate_list(target: Any, user_id: int, plan_type: str) -> No
 
 @runtime_bound(RUNTIME_NAMES)
 async def render_profile_snapshot(target: Any, user_id: int) -> None:
+    """Render a user-facing profile summary, not a debug dump.
+
+    TASK-10: the screenshots showed contradictory availability blocks and
+    source labels repeated on almost every line.  This renderer now shows one
+    active value per field, groups facts by topic, and surfaces provenance only
+    where it changes behavior (mainly training availability vs. HealthKit).
+    """
     snapshot = await planning.profile_snapshot(DB, user_id)
     facts = snapshot["facts"]
-    # REC-PROGRAM-04-01: Resolve and display training availability
     from noam_coach.services.availability import format_availability_summary, resolve_availability
+
     avail = await resolve_availability(DB, user_id)
-    lines = ["<b>כך הבנתי אותך</b>", ""]
-    for key in (
-        "primary_goal", "weight_kg", "work_schedule", "commute_minutes",
-        "training_days_per_week", "weekly_availability", "session_minutes",
-        "training_location", "equipment", "cooking_capacity", "diet_restrictions",
-        "allergies", "active_pain",
-    ):
+    lines = ["<b>כך הבנתי אותך</b>"]
+
+    def _fact_line(key: str) -> str | None:
         fact = facts.get(key)
         if not fact or fact.get("kind") == user_model.KIND_GAP:
-            continue
-        spec = user_model.FACT_REGISTRY.get(key)
-        label = spec.label if spec else key
-        # REC-PLAN-MEAL-03-07: Use Hebrew source labels, never raw source keys
-        source = user_model.SOURCE_LABELS.get(fact.get("source"), "")
-        confirm = "" if fact.get("confirmed") else " · טרם אושר"
+            return None
         display_val = _format_fact_value(key, fact.get("value"))
-        lines.append(f"• <b>{esc(label)}</b>: {esc(display_val)} <i>({esc(source)}{confirm})</i>")
-    # REC-PROGRAM-04-01: Availability summary in profile snapshot
-    avail_text = format_availability_summary(avail)
-    lines += [""]
-    for avail_line in avail_text.split("\n"):
-        lines.append(esc(avail_line))
-    missing = []
+        if not display_val or display_val == "לא צוין":
+            return None
+        spec = user_model.FACT_REGISTRY.get(key)
+        label = spec.label if spec else planning.FACT_LABELS.get(key, key)
+        confirm = " · טרם אושר" if not fact.get("confirmed") else ""
+        return f"• <b>{esc(label)}</b>: {esc(display_val)}{confirm}"
+
+    def _add_block(title: str, keys: tuple[str, ...]) -> None:
+        rows = [line for key in keys if (line := _fact_line(key))]
+        if not rows:
+            return
+        lines.extend(["", f"<b>{esc(title)}</b>"])
+        lines.extend(rows)
+
+    _add_block(
+        "🎯 יעד וגוף",
+        ("primary_goal", "weight_kg", "goal_weight_kg", "goal_timeframe_weeks"),
+    )
+    _add_block(
+        "🍽️ תזונה",
+        ("cooking_capacity", "diet_restrictions", "allergies", "disliked_foods"),
+    )
+    _add_block(
+        "🏋️ אימונים",
+        ("training_days_per_week", "session_minutes", "training_location", "equipment", "workout_window", "training_limitations"),
+    )
+    _add_block(
+        "🕒 שגרת יום",
+        ("work_schedule", "commute_minutes", "sleep_window"),
+    )
+
+    # One canonical availability block.  We intentionally do not render the raw
+    # weekly_availability fact above, because that was the source of the profile
+    # contradiction: a HealthKit-derived availability line next to a different
+    # user-declared preferred-days line.  The resolver applies precedence and the
+    # formatter explains it in human terms.
+    lines.extend(["", "<b>🗓️ זמינות פעילה לתוכנית</b>"])
+    for avail_line in format_availability_summary(avail).split("\n"):
+        if avail_line.strip():
+            lines.append(esc(avail_line))
+    if avail.conflicts:
+        lines.append("• HealthKit נשמר כרמז, אבל הימים הידניים הם המקור הפעיל לתוכנית.")
+
+    missing: list[str] = []
     for group in ("nutrition", "workout", "safety"):
         missing.extend(snapshot["readiness"][group]["missing"])
     missing = list(dict.fromkeys(missing))
     if missing:
         lines += ["", "<b>חסר לפני תוכנית מלאה</b>"]
         for key in missing[:8]:
-            lines.append(f"• {esc(planning.FACT_LABELS.get(key, user_model.FACT_REGISTRY.get(key).label if user_model.FACT_REGISTRY.get(key) else key))}")
+            spec = user_model.FACT_REGISTRY.get(key)
+            lines.append(f"• {esc(planning.FACT_LABELS.get(key, spec.label if spec else key))}")
     else:
         lines += ["", "✅ יש מספיק מידע ליצירת הצעות."]
     await safe_edit(
@@ -2201,38 +2301,49 @@ async def check_plan_readiness(user_id: int) -> list[str]:
 
 @runtime_bound(RUNTIME_NAMES)
 async def build_weekly_plan(user_id: int, frequency: int) -> dict[str, Any]:
-    """Map a split onto the user's detected training days (or sensible
-    defaults), store it as the active plan in the user model, and return it."""
-    # Clamp here so no caller can request a frequency without a matching split.
-    frequency = max(MIN_FREQUENCY, min(MAX_FREQUENCY, frequency))
-    profile = await load_routine_profile(user_id)
-    workout = profile.get("workout") or {}
-    detected_days = list(workout.get("common_weekdays") or [])
-    hour = workout.get("typical_hour")
+    """Build the active weekly workout plan from the resolved availability.
 
+    TASK-07/11: user-confirmed days are the source of truth.  HealthKit can
+    suggest patterns, but it must not silently remove a day the user typed
+    manually (for example Sunday, Monday, Wednesday, Friday).
+    """
+    from noam_coach.services.availability import resolve_availability
+
+    availability = await resolve_availability(DB, user_id)
+    requested = int(frequency or availability.max_days_per_week or 3)
+    frequency = max(MIN_FREQUENCY, min(MAX_FREQUENCY, requested))
     split = SPLIT_BY_FREQUENCY.get(frequency, SPLIT_BY_FREQUENCY[3])
-    # Choose days: prefer detected days; pad with a full weekday spread.
+
+    preferred_days = list(availability.preferred_days or [])
+    # Sunday-first spread, then fill missing slots without dropping explicit days.
     default_spread = [6, 1, 3, 0, 4, 5, 2]  # Sun,Tue,Thu,Mon,Fri,Sat,Wed (0=Mon)
-    days = detected_days + [d for d in default_spread if d not in detected_days]
-    chosen_days = sorted(days[:frequency])
+    days = preferred_days + [day for day in default_spread if day not in preferred_days]
+    chosen_days = sorted(days[:frequency], key=sunday_first_key)
+    hour = availability.preferred_time
 
     sessions = [
         {
-            "weekday": chosen_days[i]
-            if i < len(chosen_days)
-            else default_spread[i % len(default_spread)],
+            "weekday": chosen_days[i] if i < len(chosen_days) else default_spread[i % len(default_spread)],
             "time": hour,
             "code": split[i],
             "name": PLANS[split[i]]["name"],
         }
         for i in range(frequency)
     ]
-    days_source = "detected" if detected_days else "default"
+    days_source = availability.field_sources.get("preferred_days") if availability.field_sources else availability.source
+    structure_label = {
+        1: "Full Body",
+        2: "Full Body כפול",
+        3: "A/B/C",
+        4: "A/B/C + Full Body",
+    }.get(frequency, "A/B/C מחזורי")
     plan = {
         "frequency": frequency,
         "method": "moving_weight_double_progression",
+        "structure": structure_label,
         "sessions": sessions,
-        "days_source": days_source,
+        "days_source": days_source or "default",
+        "availability_confirmed": availability.confirmed,
     }
     await user_model.set_fact(
         DB,
@@ -2250,7 +2361,7 @@ async def build_weekly_plan(user_id: int, frequency: int) -> dict[str, Any]:
         plan,
         kind=user_model.KIND_FACT,
         source=user_model.SOURCE_SYSTEM,
-        confidence=0.8,
+        confidence=0.85 if availability.confirmed else 0.65,
         confirmed=True,
         affects=("workout_schedule",),
     )
@@ -2259,25 +2370,43 @@ async def build_weekly_plan(user_id: int, frequency: int) -> dict[str, Any]:
 
 @runtime_bound(RUNTIME_NAMES)
 def format_weekly_plan(plan: dict[str, Any]) -> str:
+    structure = plan.get("structure") or "תוכנית אימונים"
     lines = [
         f"<b>התוכנית השבועית שלך — {plan['frequency']} אימונים</b>",
+        f"מבנה: {esc(str(structure))}",
+        "",
+        "<i>כל יום מוצג עם התרגילים המרכזיים, סטים, חזרות, מנוחה ודגש קצר — לא רק שם האימון.</i>",
         "",
     ]
     sorted_sessions = sorted(plan["sessions"], key=lambda s: sunday_first_key(s["weekday"]))
     for i, s in enumerate(sorted_sessions, start=1):
         when = weekday_he(s["weekday"])
         at = f" · {s['time']}" if s.get("time") else ""
-        lines.append(f"{i}. יום {when}{at} — {s['name']}")
+        code = str(s.get("code") or "")
+        template = PLANS.get(code, {})
+        exercises = template.get("exercises", [])[:5]
+        lines.append(f"<b>{i}. יום {when}{at} — {esc(str(s['name']))}</b>")
+        for ex_index, ex in enumerate(exercises, start=1):
+            rest = int(ex.get("rest") or 0)
+            rest_label = f"{rest // 60}:{rest % 60:02d}" if rest else "—"
+            cue = ""
+            cues = ex.get("cues") or []
+            if cues:
+                cue = f" · דגש: {esc(str(cues[0]))}"
+            lines.append(
+                f"  {ex_index}. {esc(str(ex.get('name') or ex.get('name_he') or 'תרגיל'))} — "
+                f"{int(ex.get('sets') or 0)}×{int(ex.get('rmin') or 0)}–{int(ex.get('rmax') or 0)}, "
+                f"מנוחה {rest_label}, RIR 2{cue}"
+            )
+        lines.append("")
     if plan.get("days_source") == "default":
         lines += [
-            "",
             "⚠️ <i>הימים נבחרו אוטומטית — עדיין אין מספיק נתונים לזהות את "
             "הימים הקבועים שלך. אפשר לשנות למטה.</i>",
+            "",
         ]
     lines += [
-        "",
-        "<i>שיטת משקל נע: נשארים על אותו משקל עד שליטה בטווח החזרות, ואז "
-        "עולים מדרגה. כל אימון נבנה לפי הביצועים האחרונים שלך.</i>",
+        "<i>שיטת התקדמות: נשארים על אותו משקל עד שליטה בטווח החזרות עם RIR מתאים, ואז עולים מדרגה. אם יש כאב — לא מעלים עומס ומוצעת חלופה.</i>",
         "",
         'פתח "אימון" כדי להתחיל את האימון הבא לפי הסדר.',
     ]
@@ -2296,6 +2425,55 @@ def _diet_type_keyboard(food_item: str) -> InlineKeyboardMarkup:
         [button("🆘 אלרגיה מאובחנת", f"qa:diet_type:allergy:{safe_item}")],
         [button("❌ לא התכוונתי להימנע", f"qa:diet_type:cancel:{safe_item}")],
     ])
+
+
+_HEALTH_EDIT_NUMERIC_SPECS: dict[str, tuple[float, float, str]] = {
+    "weight_kg": (30, 300, 'ק"ג'),
+    "goal_weight_kg": (30, 300, 'ק"ג'),
+    "height_cm": (120, 230, 'ס"מ'),
+    "body_fat_pct": (3, 80, "%"),
+    "avg_steps": (0, 100000, "צעדים"),
+    "resting_hr": (30, 220, "פעימות לדקה"),
+}
+
+
+def _parse_sleep_window_text(text: str) -> dict[str, str] | None:
+    match = re.search(r"\b(\d{1,2}):(\d{2})\s*[-–—]\s*(\d{1,2}):(\d{2})\b", text)
+    if not match:
+        return None
+    start_hour, start_minute, end_hour, end_minute = (int(part) for part in match.groups())
+    if not (0 <= start_hour <= 23 and 0 <= end_hour <= 23 and 0 <= start_minute <= 59 and 0 <= end_minute <= 59):
+        return None
+    return {
+        "typical_bedtime": f"{start_hour:02d}:{start_minute:02d}",
+        "typical_wake_time": f"{end_hour:02d}:{end_minute:02d}",
+    }
+
+
+def _parse_health_fact_text_edit(key: str, text: str) -> tuple[bool, Any, str | None]:
+    stripped = text.strip()
+    if key == "sleep_schedule":
+        parsed_sleep = _parse_sleep_window_text(stripped)
+        if parsed_sleep is None:
+            return False, None, "כתוב טווח שינה, למשל 23:00-07:00."
+        return True, parsed_sleep, None
+
+    spec = _HEALTH_EDIT_NUMERIC_SPECS.get(key)
+    if spec is None:
+        return True, stripped, None
+    if questions.looks_like_time_range(stripped):
+        return False, None, (
+            "זה נראה כמו טווח שעות. כרגע ביקשתי מספר עבור "
+            f"{user_model.display_label(key)}."
+        )
+    match = re.search(r"\d+(?:[.,]\d+)?", stripped)
+    if not match:
+        return False, None, f"כתוב מספר עבור {user_model.display_label(key)}."
+    value = float(match.group(0).replace(",", "."))
+    minimum, maximum, unit = spec
+    if value < minimum or value > maximum:
+        return False, None, f"הערך צריך להיות בין {minimum:g} ל-{maximum:g} {unit}."
+    return True, int(value) if value.is_integer() else value, None
 
 
 @runtime_bound(RUNTIME_NAMES)
@@ -2328,10 +2506,9 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
         # RE10-14: free-text edit for a profile field with no dedicated
         # question (currently only weight_kg).
         key = pending[len("__profile_edit_"):-2]
-        try:
-            value: Any = float(text.strip().replace(",", "."))
-        except ValueError:
-            await message.reply_text("כתוב מספר, למשל 82.5.")
+        parsed_ok, value, parse_error = _parse_health_fact_text_edit(key, text)
+        if not parsed_ok:
+            await message.reply_text(parse_error or "כתוב מספר, למשל 82.5.")
             return True
         await user_model.set_fact(
             DB, user_id, key, value,
@@ -2363,14 +2540,18 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
             if not await ask_next_health_confirm_step(message, user_id, ack_text=reply):
                 await finish_health_confirm_wizard(message, user_id, ack_text=reply)
             return True
+        parsed_ok, parsed_value, parse_error = _parse_health_fact_text_edit(key, text)
+        if not parsed_ok:
+            await message.reply_text(parse_error or "לא הצלחתי להבין את הערך. נסה שוב.")
+            return True
         await user_model.set_fact(
-            DB, user_id, key, text.strip(),
+            DB, user_id, key, parsed_value,
             kind=user_model.KIND_FACT,
             source=user_model.SOURCE_USER,
             confirmed=True,
         )
         await clear_pending(user_id)
-        ack = f"עודכן: {esc(user_model.display_label(key))} — {esc(text.strip())} ✅"
+        ack = f"עודכן: {esc(user_model.display_label(key))} — {esc(user_model.display_value(key, parsed_value))} ✅"
         if not await ask_next_health_confirm_step(message, user_id, ack_text=ack):
             await finish_health_confirm_wizard(message, user_id, ack_text=ack)
         return True
@@ -2432,11 +2613,12 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
         await user_model.set_fact(
             DB,
             user_id,
-            "active_pain",
-            {"location": text, "status": "active"},
+            "training_limitations",
+            text,
             kind=user_model.KIND_FACT,
             source=user_model.SOURCE_USER,
             confirmed=True,
+            affects=("exercise_selection", "safety"),
         )
         await clear_pending(user_id)
         await message.reply_text(
@@ -2455,6 +2637,16 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
             "WHERE id=(SELECT MAX(id) FROM medical_constraints "
             "WHERE user_id=? AND kind='medical_avoidance')",
             (text, user_id),
+        )
+        await user_model.set_fact(
+            DB,
+            user_id,
+            "training_limitations",
+            text,
+            kind=user_model.KIND_FACT,
+            source=user_model.SOURCE_USER,
+            confirmed=True,
+            affects=("exercise_selection", "safety"),
         )
         await clear_pending(user_id)
         await message.reply_text("נרשם, אתאים את התוכנית בהתאם.")
@@ -2565,7 +2757,7 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
     # should never have to tap "יש"/"אחר" before typing. Route the typed text
     # through the same detail-persistence used by the button follow-up flow.
     if question is not None and question.free_text_fallback and question.fact_key in (
-        "active_pain", "medical_avoidance", "allergies", "equipment",
+        "training_limitations", "active_pain", "medical_avoidance", "allergies", "equipment",
     ):
         if question.fact_key == "equipment":
             # Free text may also match one of the quick-pick categories.
@@ -2582,25 +2774,19 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
             )
             await clear_pending(user_id)
             await message.reply_text(f"רשמתי: {text}. אבחר תרגילים בהתאם.")
-        elif question.fact_key == "active_pain":
+        elif question.fact_key in {"training_limitations", "active_pain"}:
             await save_medical_constraint(
-                user_id, kind="pain", note="reported during onboarding",
+                user_id, kind="pain", location=text, note="reported during onboarding",
                 affects=("exercise_selection",),
             )
-            await DB.execute(
-                "UPDATE medical_constraints SET location=? "
-                "WHERE id=(SELECT MAX(id) FROM medical_constraints "
-                "WHERE user_id=? AND kind='pain')",
-                (text, user_id),
-            )
             await user_model.set_fact(
-                DB, user_id, "active_pain", {"location": text, "status": "active"},
+                DB, user_id, "training_limitations", text,
                 kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
-                confirmed=True,
+                confirmed=True, affects=("exercise_selection", "safety"),
             )
             await clear_pending(user_id)
             await message.reply_text(
-                f"רשמתי כאב ב{text}. אנסה להסיר או להחליף תרגילים שמעמיסים על האזור הזה. "
+                f"רשמתי: {text}. אתאים את התוכנית והתרגילים בהתאם. "
                 "אם הכאב חד, מתגבר או מגביל תנועה — כדאי בדיקה מקצועית."
             )
         elif question.fact_key == "medical_avoidance":
@@ -2615,7 +2801,7 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
                 (text, user_id),
             )
             await user_model.set_fact(
-                DB, user_id, "medical_avoidance", text,
+                DB, user_id, "training_limitations", text,
                 kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
                 confirmed=True, affects=("exercise_selection", "safety"),
             )
@@ -2674,6 +2860,27 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
                 await message.reply_text(str(exc))
                 return True
 
+        if question.fact_key == "goal_weight_kg":
+            from noam_coach.services.goal_validation import (
+                is_explicit_goal_weight_confirmation,
+                validate_goal_weight,
+            )
+
+            current_weight = await user_model.get_value(DB, user_id, "weight_kg")
+            try:
+                current_weight_float = float(current_weight) if current_weight is not None else None
+            except (TypeError, ValueError):
+                current_weight_float = None
+            validation = validate_goal_weight(float(value), current_weight_float)
+            if validation.needs_confirmation and not is_explicit_goal_weight_confirmation(text, float(value)):
+                await message.reply_text(
+                    validation.message,
+                    reply_markup=InlineKeyboardMarkup([
+                        [button("⬅️ תפריט", "menu:home")],
+                    ]),
+                )
+                return True
+
         # REC-PLAN-MEAL-03-01: Parse dietary restriction answers with
         # a structured follow-up for restriction type classification.
         if question.fact_key in ("diet_restrictions", "allergies"):
@@ -2723,45 +2930,19 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
             value = text
 
         if question.fact_key in {"weekly_availability", "workout_window", "session_minutes"}:
-            from noam_coach.services.availability import parse_hebrew_availability_answer
+            from noam_coach.services.availability import (
+                parse_hebrew_availability_answer,
+                save_user_training_availability,
+            )
 
             parsed_availability = parse_hebrew_availability_answer(text)
             if question.fact_key == "weekly_availability" and parsed_availability.weekly_availability:
                 value = parsed_availability.weekly_availability
-                if parsed_availability.training_days_per_week:
-                    await user_model.set_fact(
-                        DB,
-                        user_id,
-                        "training_days_per_week",
-                        parsed_availability.training_days_per_week,
-                        kind=user_model.KIND_FACT,
-                        source=user_model.SOURCE_USER,
-                        confirmed=True,
-                    )
-            if parsed_availability.workout_window:
-                if question.fact_key == "workout_window":
-                    value = parsed_availability.workout_window
-                await user_model.set_fact(
-                    DB,
-                    user_id,
-                    "workout_window",
-                    parsed_availability.workout_window,
-                    kind=user_model.KIND_FACT,
-                    source=user_model.SOURCE_USER,
-                    confirmed=True,
-                )
-            if parsed_availability.session_minutes:
-                if question.fact_key == "session_minutes":
-                    value = parsed_availability.session_minutes
-                await user_model.set_fact(
-                    DB,
-                    user_id,
-                    "session_minutes",
-                    parsed_availability.session_minutes,
-                    kind=user_model.KIND_FACT,
-                    source=user_model.SOURCE_USER,
-                    confirmed=True,
-                )
+            if parsed_availability.workout_window and question.fact_key == "workout_window":
+                value = parsed_availability.workout_window
+            if parsed_availability.session_minutes and question.fact_key == "session_minutes":
+                value = parsed_availability.session_minutes
+            await save_user_training_availability(DB, user_id, parsed_availability)
 
         try:
             await questions.record_answer(DB, user_id, question, value)

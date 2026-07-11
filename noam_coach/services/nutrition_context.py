@@ -21,6 +21,7 @@ from noam_coach.services.daily_state import local_day_bounds_utc
 from noam_coach.services.dietary_restrictions import (
     load_restrictions_from_facts,
 )
+from noam_coach.services.learned_foods import learned_foods_from_meals
 from noam_coach.services.next_meal import (
     WorkoutPhase,
     build_workout_nutrition_context,
@@ -54,6 +55,7 @@ FIELD_PROVENANCE: dict[str, dict[str, Any]] = {
     "reported_meals": {"source": "meals", "writer": "meal logging", "reader": "context builder", "freshness": "per meal", "fallback": "[]", "sent_to_ai": True},
     "disliked_foods": {"source": "user_facts:disliked_foods", "writer": "food_preferences.record_food_preference_from_slots", "reader": "next_meal/_restrictions", "freshness": "on user statement", "fallback": "[]", "sent_to_ai": True},
     "preferred_foods": {"source": "user_facts:preferred_foods", "writer": "food_preferences.record_food_preference_from_slots", "reader": "menu", "freshness": "on user statement", "fallback": "[]", "sent_to_ai": True},
+    "learned_foods": {"source": "approved meal_items history", "writer": "meal approval / persist_meal", "reader": "meal analysis, menu, next_meal", "freshness": "last 180 days", "fallback": "[]", "sent_to_ai": True},
     "allergies": {"source": "user_facts:allergies", "writer": "food_preferences", "reader": "restriction validator", "freshness": "on user statement", "fallback": "[]", "sent_to_ai": True},
     "fasting_status": {"source": "daily_flags.fasting", "writer": "flags menu / morning_flag", "reader": "budget", "freshness": "per day", "fallback": "False", "sent_to_ai": True},
     "hunger_level": {"source": "daily_flags.hunger", "writer": "flags menu", "reader": "context", "freshness": "per day", "fallback": "None", "sent_to_ai": True},
@@ -121,6 +123,7 @@ class NutritionContext:
     medical_food_constraints: list[dict[str, Any]]
     disliked_foods: list[str]
     preferred_foods: list[str]
+    learned_foods: list[dict[str, Any]]
     recently_rejected_meals: list[str]
     appetite: str | None
     hunger_level: str | None
@@ -201,9 +204,10 @@ async def _reported_meals(db: Any, user_id: int, local_now: datetime | None = No
     start_utc, end_utc = local_day_bounds_utc(local_now)
     rows = await db.fetch_all(
         """
-        SELECT id, name, calories, protein, carbs, fat, confidence, eaten_at
+        SELECT id, name, calories, protein, carbs, fat, confidence, eaten_at, COALESCE(status, 'consumed') AS status
         FROM meals
         WHERE user_id=? AND eaten_at>=? AND eaten_at<?
+          AND COALESCE(status, 'consumed')='consumed'
         ORDER BY eaten_at ASC, id ASC
         """,
         (user_id, start_utc, end_utc),
@@ -310,8 +314,12 @@ async def build_nutrition_context(
     *,
     daily_ctx: Any | None = None,
     now: datetime | None = None,
+    local_now: datetime | None = None,
 ) -> NutritionContext:
-    local_now = (now or getattr(daily_ctx, "now", None) or datetime.now(TZ)).astimezone(TZ)
+    # `local_now` is kept as a compatibility alias for existing regression tests
+    # and callers. Prefer `now` in new code. If both are provided, `now` wins.
+    resolved_now = now or local_now or getattr(daily_ctx, "now", None) or datetime.now(TZ)
+    local_now = resolved_now.astimezone(TZ)
     local_day = local_now.date().isoformat()
     flags = dict(getattr(daily_ctx, "flags", None) or await _daily_flags(db, user_id, local_day))
     profile = dict(getattr(daily_ctx, "profile", None) or await _routine_profile(db, user_id))
@@ -408,6 +416,7 @@ async def build_nutrition_context(
         medical_food_constraints=list(getattr(daily_ctx, "active_constraints", []) or []),
         disliked_foods=_list_fact(await user_model.get_value(db, user_id, "disliked_foods")),
         preferred_foods=_list_fact(await user_model.get_value(db, user_id, "preferred_foods")),
+        learned_foods=[food.ai_payload() for food in await learned_foods_from_meals(db, user_id, limit=8, min_count=1)],
         recently_rejected_meals=_list_fact(flags.get("recently_rejected_meals")),
         appetite=flags.get("appetite"),
         hunger_level=flags.get("hunger"),

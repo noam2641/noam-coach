@@ -34,6 +34,11 @@ from noam_coach.services.food_preferences import (
     preference_restrictions_from_facts,
     record_food_preference_from_slots,
 )
+from noam_coach.services.learned_foods import (
+    learned_food_keys,
+    learned_foods_from_meals,
+    text_matches_learned_food,
+)
 from noam_coach.services.weekdays import local_weekday
 
 
@@ -969,16 +974,10 @@ def _prioritize_fresh_options(
     if not recent_titles:
         return options
     recent_keys = {_free_text_preference_key(title) for title in recent_titles if str(title).strip()}
-    fresh = [
-        option
-        for option in options
-        if _free_text_preference_key(option.title) not in recent_keys
-    ]
-    stale = [
-        option
-        for option in options
-        if _free_text_preference_key(option.title) in recent_keys
-    ]
+    fresh: list[MealOption] = []
+    stale: list[MealOption] = []
+    for option in options:
+        (stale if _matches_recent_meal(option, recent_keys) else fresh).append(option)
     return [*fresh, *stale] if fresh else options
 
 
@@ -1009,6 +1008,26 @@ def _free_text_preference_key(value: str) -> str:
             for char in str(value).lower()
         ).split()
     )
+
+
+def _matches_recent_meal(option: MealOption, recent_keys: set[str]) -> bool:
+    """Return True when an option repeats a recently served or logged meal."""
+    if not recent_keys:
+        return False
+    option_keys = [
+        _free_text_preference_key(option.title),
+        *(
+            _free_text_preference_key(_strip_quantity(ingredient))
+            for ingredient in option.ingredients
+            if str(ingredient).strip()
+        ),
+    ]
+    for recent in recent_keys:
+        if not recent:
+            continue
+        if any(recent == key or recent in key or key in recent for key in option_keys if key):
+            return True
+    return False
 
 
 def option_fingerprint(option: MealOption) -> str:
@@ -1151,6 +1170,7 @@ def _score_option(
     budget: MealBudget,
     context: WorkoutNutritionContext,
     recent_keys: set[str],
+    learned_keys: set[str] | None = None,
 ) -> tuple[float, str]:
     """Deterministic match score in [0,1] plus the single strongest reason.
 
@@ -1194,12 +1214,25 @@ def _score_option(
     simplicity = max(0.0, 0.1 - 0.02 * max(0, len(option.ingredient_details or option.ingredients) - 3))
     reasons.append((simplicity, "פשוט ומהיר להכנה"))
 
+    # Learned-food preference: if an option uses products/foods the user has
+    # repeatedly approved in real meals, prefer it as long as it already passed
+    # the calorie/protein and restriction gates. This is a small bonus, not a
+    # hard override, so budget fit and safety still win.
+    learned_match = text_matches_learned_food(
+        [option.title, *option.ingredients],
+        learned_keys or set(),
+    )
+    if learned_match:
+        reasons.append((0.12, "כולל פריט שאתה אוכל לעיתים קרובות"))
+
     base = min(1.0, sum(weight for weight, _ in reasons))
     best_reason = max((r for r in reasons if r[1]), key=lambda r: r[0], default=(0.0, ""))[1]
+    if learned_match:
+        best_reason = "כולל פריט שאתה אוכל לעיתים קרובות"
 
     # Freshness dominates ordering (RE9-041): a recently-served title must never
     # outrank a fresh one, so apply a large penalty rather than a small bonus.
-    if _free_text_preference_key(option.title) in recent_keys:
+    if _matches_recent_meal(option, recent_keys):
         return base - 1.0, best_reason
     if base >= 0.5 and "לאחרונה" not in best_reason:
         best_reason = best_reason or "לא הצעתי לך את זה לאחרונה"
@@ -1211,10 +1244,13 @@ def _rank_and_recommend(
     budget: MealBudget,
     context: WorkoutNutritionContext,
     recent_keys: set[str],
+    learned_keys: set[str] | None = None,
 ) -> list[MealOption]:
     """Score, sort (desc) and mark exactly one option as recommended."""
     for option in options:
-        option.score, option.recommended_reason = _score_option(option, budget, context, recent_keys)
+        option.score, option.recommended_reason = _score_option(
+            option, budget, context, recent_keys, learned_keys
+        )
         option.recommended = False
     ranked = sorted(options, key=lambda o: o.score, reverse=True)
     if ranked:
@@ -1306,10 +1342,20 @@ async def generate_next_meal_recommendation(
                 options.append(option)
             if len(options) >= 4:
                 break
-    # RE9-052/053/013: rank the validated pool by deterministic score, then keep
-    # the top options and mark exactly one as "⭐ מומלץ עבורך".
+    # RE9-052/053/013: rank the validated pool by deterministic score.
+    # TASK-03: "מה לאכול עכשיו" is a single immediate recommendation, not a
+    # menu of alternatives — only the top-scoring option is ever exposed.
+    # Ranking against a pool of >=2 candidates (topped up above) still keeps
+    # the single choice higher quality than picking the first valid option.
     recent_keys = {_free_text_preference_key(title) for title in recent_titles if str(title).strip()}
-    options = _rank_and_recommend(options, budget, context, recent_keys)[:2]
+    if (
+        context.recent_meal_name
+        and context.recent_meal_minutes_ago is not None
+        and context.recent_meal_minutes_ago < 360
+    ):
+        recent_keys.add(_free_text_preference_key(context.recent_meal_name))
+    learned_foods = await learned_foods_from_meals(db, user_id, limit=12, min_count=2)
+    options = _rank_and_recommend(options, budget, context, recent_keys, learned_food_keys(learned_foods))[:1]
 
     notices: list[str] = []
     if budget.policy == "low_remaining":
@@ -1600,21 +1646,21 @@ def option_feedback_actions(recommendation: NextMealRecommendation) -> list[list
 
 
 def next_meal_action_rows(recommendation: NextMealRecommendation) -> list[list[tuple[str, str]]]:
-    """Primary next-meal actions shown on the recommendation screen.
+    """TASK-03: "מה לאכול עכשיו" exposes a focused action set.
 
-    RE9 recording follow-up: choosing must not be ambiguous. The first screen
-    separates "I ate this" from "plan this for later" so consumed and planned
-    stay distinct without forcing an extra tap through a generic choice screen.
+    The user asked for one immediate recommendation and at most 4 actions.
+    Workout ambiguity is explained in the text, not added as another button
+    cluster; otherwise the screen turns back into the overloaded menu that the
+    task is meant to remove.
     """
     rows: list[list[tuple[str, str]]] = []
-    rows.extend(workout_clarification_actions(recommendation))
-    for index, _option in enumerate(recommendation.options, 1):
+    if recommendation.options:
+        rows.append([("✅ אשר שאכלתי", "nextmeal:save:1")])
         rows.append([
-            (f"🍽 אכלתי אפשרות {index}", f"nextmeal:save:{index}"),
-            (f"📅 תכנן אפשרות {index}", f"nextmeal:plan:{index}"),
+            ("🔄 רענן הצעה", "nextmeal:refresh"),
+            ("✏️ שנה כמויות", "nextmeal:editqty:1"),
         ])
-    rows.append([("איך חושב?", "nextmeal:why")])
-    rows.append([("🔄 הצעות אחרות", "nextmeal:refresh")])
+    rows.append([("📊 חזור לסיכום היום", "menu:status")])
     return rows
 
 
@@ -1729,13 +1775,15 @@ def format_next_meal_recommendation(recommendation: NextMealRecommendation) -> s
     elif nutrition.goal_status == "default":
         goal_note = " (ברירת מחדל עד לאישור יעד)"
 
+    # TASK-03: a single immediate suggestion, not a numbered list to compare —
+    # no "אפשרות N" label, no per-option "recommended" star (there is nothing
+    # else here to be recommended over).
     lines = [_remaining_headline(nutrition) + goal_note, _nutrition_status_line(nutrition), ""]
-    for index, option in enumerate(recommendation.options, 1):
-        star = " ⭐ מומלץ עבורך" if option.recommended else ""
+    for option in recommendation.options:
         after = _after_meal_line(nutrition, option)
         reason = option.recommended_reason or option.rationale or recommendation.budget.rationale
         lines += [
-            f"<b>אפשרות {index}: {esc(option.title)}</b>{star}",
+            f"<b>{esc(option.title)}</b>",
             f"{esc(', '.join(option.ingredients))}",
             f"כ-{option.calories} קל׳ | כ-{option.protein} גרם חלבון | "
             f"ארוחה {meal_size_label_he(option.calories)}{_fit_score_label(option)}",
@@ -1743,16 +1791,13 @@ def format_next_meal_recommendation(recommendation: NextMealRecommendation) -> s
         lines.append(f"<i>למה עכשיו: {esc(reason)}</i>")
         if after:
             lines.append(after)
-        if option.recommended and option.recommended_reason:
-            lines.append(f"<i>{esc(option.recommended_reason)}</i>")
         lines.append("")
-    if recommendation.options:
-        if nutrition.calorie_balance is not None and nutrition.calorie_balance >= 0 and not recommendation.budget.allows_overage:
-            lines.append("שתיהן מתאימות ליתרה שלך כרגע.")
-        elif recommendation.budget.allows_overage and recommendation.budget.overage_reason:
-            lines.append(f"שים לב: ההצעה חורגת מעט מהיתרה ({esc(recommendation.budget.overage_reason)}).")
+    for notice in recommendation.notices[:2]:
+        lines.append(f"<i>{esc(notice)}</i>")
+    if recommendation.options and recommendation.budget.allows_overage and recommendation.budget.overage_reason:
+        lines.append(f"שים לב: ההצעה חורגת מעט מהיתרה ({esc(recommendation.budget.overage_reason)}).")
     if recommendation.needs_workout_clarification:
-        lines.append("לא אניח שהאימון קרה בלי דיווח — אפשר לעדכן בכפתורים.")
+        lines.append("לא אניח שהאימון קרה בלי דיווח — אפשר לעדכן את סטטוס האימון דרך ״מצב היום״.")
     return "\n".join(lines).strip()
 
 
@@ -2312,8 +2357,8 @@ async def save_chosen_meal(
     await db.execute(
         """
         INSERT INTO meals(user_id, name, calories, protein, carbs, fat,
-                          confidence, eaten_at, created_at)
-        VALUES(?, ?, ?, ?, 0, 0, ?, ?, ?)
+                          confidence, eaten_at, created_at, status)
+        VALUES(?, ?, ?, ?, 0, 0, ?, ?, ?, 'consumed')
         """,
         (user_id, option.title, int(option.calories), int(option.protein), 0.6, iso_now, iso_now),
     )

@@ -78,11 +78,13 @@ class Question:
 
 SAFETY_QUESTIONS: list[Question] = [
     Question(
-        id="safety_pain",
-        fact_key="active_pain",
+        id="safety_training_limitations",
+        fact_key="training_limitations",
         text=(
-            "לפני שאבנה תוכנית אימון — יש כרגע כאב, פציעה או מגבלה פעילה "
-            "שכדאי שאתחשב בה בבחירת התרגילים?"
+            "האם יש לך כאב, פציעה או מגבלה שצריך לקחת בחשבון באימונים?\n\n"
+            "לדוגמה: כאבי ברכיים, מרפק טניס, פציעה קיימת, מגבלה בתנועה או "
+            "הנחיה רפואית להימנע מתרגיל/תנועה מסוימת.\n\n"
+            "אם כן — כתוב לי בקצרה מה הבעיה וממה צריך להימנע."
         ),
         options=[("אין", "none")],
         free_text_fallback=True,
@@ -91,19 +93,6 @@ SAFETY_QUESTIONS: list[Question] = [
         plan_impact=4,
         urgency=4,
         uncertainty=3,
-        burden=1,
-    ),
-    Question(
-        id="safety_medical_avoidance",
-        fact_key="medical_avoidance",
-        text=("האם רופא הנחה אותך להימנע מסוג פעילות מסוים? זה ישפיע על אילו תרגילים אכלול."),
-        options=[("לא", "none")],
-        free_text_fallback=True,
-        affects=("exercise_selection", "safety"),
-        safety=5,
-        plan_impact=3,
-        urgency=3,
-        uncertainty=2,
         burden=1,
     ),
 ]
@@ -116,7 +105,7 @@ PLAN_QUESTIONS: list[Question] = [
     Question(
         id="q_sex",
         fact_key="sex",
-        text="כדי לחשב לך יעד קלוריות מדויק — מה המין שלך?",
+        text="מה המין שלך? - להתאמת יעד קלוריות",
         options=[("זכר", "male"), ("נקבה", "female")],
         affects=("calorie_target",),
         plan_impact=4,
@@ -126,7 +115,7 @@ PLAN_QUESTIONS: list[Question] = [
     Question(
         id="q_age",
         fact_key="age",
-        text="ובן כמה אתה? כתוב מספר (לחישוב יעד הקלוריות).",
+        text="בן כמה אתה? כתוב מספר",
         options=[],  # free text number
         numeric=True,
         min_value=14,
@@ -142,7 +131,7 @@ PLAN_QUESTIONS: list[Question] = [
         fact_key="primary_goal",
         text="מה המטרה הראשית שלך כרגע?",
         options=[
-            ("ירידה בשומן + שמירת שריר", "fat_loss_muscle_retention"),
+            ("ירידה בשומן + ועלייה במסת שריר", "fat_loss_muscle_retention"),
             ("עלייה במסת שריר", "muscle_gain"),
             ("כוח", "strength"),
             ("בריאות וכושר כללי", "general_health"),
@@ -197,7 +186,7 @@ PLAN_QUESTIONS: list[Question] = [
     Question(
         id="q_training_days",
         fact_key="training_days_per_week",
-        text="כמה ימים בשבוע תוכל להתאמן בפועל? כתוב מספר (למשל 3).",
+        text="כמה ימים בשבוע תוכל להתאמן בפועל? כתוב מספר",
         options=[],  # free text — user types the number
         numeric=True,
         min_value=1,
@@ -379,6 +368,7 @@ QUESTION_DOMAINS = ("nutrition", "training", "healthkit", "goals", "profile")
 _FACT_KEY_DOMAIN: dict[str, str] = {
     "active_pain": "training",
     "medical_avoidance": "training",
+    "training_limitations": "training",
     "sex": "profile",
     "age": "profile",
     "height_cm": "profile",
@@ -409,8 +399,7 @@ def question_domain(question: Question) -> str:
 # Everything else (location, equipment, experience, diet) is recorded as a gap
 # and asked just-in-time later, when a decision actually needs it.
 _ONBOARDING_IDS = {
-    "safety_pain",
-    "safety_medical_avoidance",
+    "safety_training_limitations",
     "q_primary_goal",
     "q_training_days",
     "q_sex",
@@ -441,7 +430,11 @@ async def _is_relevant(
     # REC-PLAN-MEAL-03-05: An unconfirmed fact (e.g. from Apple Health import)
     # is still relevant — ask_next_question will show confirmation UI instead of
     # re-asking from scratch.
-    existing = await user_model.get_fact(db, user_id, q.fact_key)
+    existing = (
+        await user_model.get_training_limitations_fact(db, user_id)
+        if q.fact_key == "training_limitations"
+        else await user_model.get_fact(db, user_id, q.fact_key)
+    )
     if existing is None:
         return True
     if existing["kind"] == user_model.KIND_GAP:
@@ -501,7 +494,11 @@ async def pending_safety_questions(db: user_model.SupportsDB, user_id: int) -> l
     """
     pending = []
     for q in SAFETY_QUESTIONS:
-        fact = await user_model.get_fact(db, user_id, q.fact_key)
+        fact = (
+            await user_model.get_training_limitations_fact(db, user_id)
+            if q.fact_key == "training_limitations"
+            else await user_model.get_fact(db, user_id, q.fact_key)
+        )
         if fact is None or fact["kind"] == user_model.KIND_GAP:
             pending.append(q)
     return pending
