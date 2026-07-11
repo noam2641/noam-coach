@@ -227,6 +227,32 @@ async def test_legacy_pain_and_doctor_avoidance_merge_without_duplication(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("legacy_key", "legacy_value", "expected"),
+    [
+        ("active_pain", {"location": "מרפק טניס", "status": "active"}, "מרפק טניס"),
+        ("medical_avoidance", "להימנע מלחיצת כתפיים כבדה", "להימנע מלחיצת כתפיים כבדה"),
+    ],
+)
+async def test_single_legacy_limitation_field_is_preserved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_key: str,
+    legacy_value: Any,
+    expected: str,
+) -> None:
+    db = await _make_db(tmp_path)
+    _patch_db(monkeypatch, db)
+    await _set_fact(db, legacy_key, legacy_value)
+
+    fact = await user_model.get_training_limitations_fact(db, 1)
+
+    assert fact is not None
+    assert fact["key"] == "training_limitations"
+    assert expected in fact["value"]
+
+
+@pytest.mark.asyncio
 async def test_planner_and_exercise_selection_read_canonical_limitations(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

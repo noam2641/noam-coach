@@ -180,9 +180,18 @@ async def test_home_keyboard_for_user_falls_back_when_no_callback(
 async def test_home_keyboard_for_user_falls_back_on_error(
     monkeypatch: Any,
 ) -> None:
-    """When _resolve_home_action raises, home_keyboard_for_user returns the static keyboard."""
+    """When profile is complete but _resolve_home_action raises, return the static keyboard."""
     from unittest.mock import AsyncMock
 
+    monkeypatch.setattr(
+        coach_bot.user_model,
+        "compute_all_readiness",
+        AsyncMock(return_value={
+            "workout": {"ready": True, "missing": []},
+            "nutrition": {"ready": True, "missing": []},
+            "safety": {"ready": True, "missing": []},
+        }),
+    )
     monkeypatch.setattr(
         coach_bot,
         "_resolve_home_action",

@@ -333,7 +333,7 @@ class TestFreshnessConstants:
 class TestDisplayLabels:
     def test_display_label_returns_hebrew_for_known_keys(self) -> None:
         assert user_model.display_label("workout_pattern") == "דפוס האימונים שלך"
-        assert user_model.display_label("active_pain") == "כאב/פציעה פעילה"
+        assert user_model.display_label("active_pain") == "כאב, פציעה או מגבלה"
         assert user_model.display_label("primary_goal") == "מטרה ראשית"
 
     def test_display_label_falls_back_to_registry(self) -> None:
@@ -634,25 +634,18 @@ class TestEnhancedReadiness:
     @pytest.mark.asyncio
     async def test_deferred_fact_appears_in_readiness_deferred(self, tmp_path: Path) -> None:
         db = await _make_db(tmp_path)
-        await user_model.defer_fact(db, 1, "active_pain")
+        await user_model.defer_fact(db, 1, "training_limitations")
         result = await user_model.compute_readiness(db, 1, "safety")
-        assert "active_pain" in result["deferred"]
-        assert "active_pain" in result["missing"]
+        assert result["deferred"] == ["training_limitations"]
+        assert result["missing"] == ["training_limitations"]
 
     @pytest.mark.asyncio
     async def test_not_applicable_satisfies_readiness(self, tmp_path: Path) -> None:
         db = await _make_db(tmp_path)
-        # Mark both safety facts
-        await user_model.mark_not_applicable(db, 1, "active_pain")
-        await user_model.set_fact(
-            db, 1, "medical_avoidance", "none",
-            kind=user_model.KIND_FACT,
-            source=user_model.SOURCE_USER,
-            confirmed=True,
-        )
+        await user_model.mark_not_applicable(db, 1, "training_limitations")
         result = await user_model.compute_readiness(db, 1, "safety")
-        assert "active_pain" in result["not_applicable"]
-        assert "active_pain" in result["present"]
+        assert result["not_applicable"] == ["training_limitations"]
+        assert result["present"] == ["training_limitations"]
         assert result["ready"] is True
 
     @pytest.mark.asyncio

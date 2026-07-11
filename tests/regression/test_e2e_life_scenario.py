@@ -252,7 +252,7 @@ async def test_full_life_scenario_from_onboarding_to_meal_correction(
     )
     assert constraint is not None
     assert constraint["location"] == "elbow"
-    fact = await user_model.get_fact(db, 1, "active_pain")
+    fact = await user_model.get_fact(db, 1, "training_limitations")
     assert fact is not None
     assert "מרפק" in fact["value"]["location"]
 

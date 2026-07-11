@@ -391,7 +391,6 @@ FACT_REGISTRY: dict[str, FactSpec] = {
         "כאב/פציעה פעילה",
         "reported",
         ("exercise_selection", "safety"),
-        required_for=("safety",),
         expires_after_days=7,
     ),
     "medical_avoidance": FactSpec(

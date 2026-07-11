@@ -750,25 +750,26 @@ async def _handle_session_safety_actions(
             await show_session(query, user_id, session_id)
             return True
 
-        # Mirror into the active_pain fact so future plan generation
-        # (planning.py -> training_intelligence.adapt_exercises) and
-        # recommend_load also see a pain reported mid-workout, not only pain
-        # reported during onboarding. Previously this only reached
-        # medical_constraints, so it never affected anything after this
-        # session ended.
-        existing_pain = await user_model.get_value(DB, user_id, "active_pain")
+        # Mirror into the canonical planning fact so future plan generation
+        # and load recommendations see pain reported mid-workout.
+        existing_limitations = await user_model.get_value(DB, user_id, "training_limitations")
         existing_location = ""
-        if isinstance(existing_pain, dict):
-            existing_location = str(existing_pain.get("location") or "")
-        elif isinstance(existing_pain, str):
-            existing_location = existing_pain
+        if isinstance(existing_limitations, dict):
+            existing_location = str(
+                existing_limitations.get("location")
+                or existing_limitations.get("details")
+                or existing_limitations.get("note")
+                or ""
+            )
+        elif isinstance(existing_limitations, str) and existing_limitations != "none":
+            existing_location = existing_limitations
         region_label = training_intelligence.pain_region_label(pain_location)
         if region_label and region_label not in existing_location:
             merged_location = f"{existing_location}, {region_label}".strip(", ")
         else:
             merged_location = existing_location or region_label
         await user_model.set_fact(
-            DB, user_id, "active_pain", {"location": merged_location, "status": "active"},
+            DB, user_id, "training_limitations", {"location": merged_location, "status": "active"},
             kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
         )
 

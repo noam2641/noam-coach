@@ -20,7 +20,7 @@ async def test_unconfirmed_estimate_does_not_satisfy_required_readiness(tmp_path
     await user_model.set_fact(
         db,
         1,
-        "active_pain",
+        "training_limitations",
         "none",
         kind=user_model.KIND_ESTIMATE,
         source=user_model.SOURCE_DERIVED,
@@ -36,8 +36,8 @@ async def test_unconfirmed_estimate_does_not_satisfy_required_readiness(tmp_path
     )
     readiness = await user_model.compute_readiness(db, 1, "safety")
     assert readiness["ready"] is False
-    assert "active_pain" in readiness["missing"]
+    assert readiness["missing"] == ["training_limitations"]
 
-    await user_model.confirm_fact(db, 1, "active_pain")
+    await user_model.confirm_fact(db, 1, "training_limitations")
     readiness = await user_model.compute_readiness(db, 1, "safety")
     assert readiness["ready"] is True

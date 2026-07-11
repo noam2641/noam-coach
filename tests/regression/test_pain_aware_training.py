@@ -798,13 +798,13 @@ async def test_mild_pain_filters_real_lat_pull_alternatives_by_pain_region(
 
 
 @pytest.mark.asyncio
-async def test_painlevel_mirrors_into_active_pain_fact(
+async def test_painlevel_mirrors_into_training_limitations_fact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Before this fix, an in-workout pain report only reached
-    medical_constraints and never touched the active_pain fact, so it had
+    medical_constraints and never touched the planning limitation fact, so it had
     zero effect on future plan generation (planning.py's adapt_exercises
-    reads active_pain, not medical_constraints)."""
+    reads training_limitations, not medical_constraints)."""
     db = await _make_db(tmp_path, "fact_mirror.db")
     _patch_all(monkeypatch, db)
     session = await _make_lat_pull_session(db)
@@ -820,7 +820,7 @@ async def test_painlevel_mirrors_into_active_pain_fact(
         query, context=None, user_id=1, data=severity_2_data
     )
 
-    fact = await user_model.get_fact(db, 1, "active_pain")
+    fact = await user_model.get_fact(db, 1, "training_limitations")
     assert fact is not None
     assert "מרפק" in fact["value"]["location"]
 
