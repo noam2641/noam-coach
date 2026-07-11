@@ -87,6 +87,7 @@ class WorkoutNutritionContext:
     minutes_until_workout: int | None = None
     minutes_since_workout: int | None = None
     hours_until_bedtime: float | None = None
+    sleep_reference: str = "unknown"
     meals_remaining_estimate: int = 1
     recent_meal_minutes_ago: int | None = None
     recent_meal_name: str | None = None
@@ -430,24 +431,30 @@ async def _restrictions(db: Any, user_id: int) -> list[DietaryRestriction]:
     return merge_with_preference_restrictions(base, preferences)
 
 
-async def _bedtime_hours(db: Any, user_id: int, now: datetime) -> float | None:
-    sleep_fact = await user_model.get_value(db, user_id, "sleep_schedule")
+async def _bedtime_hours(db: Any, user_id: int, now: datetime) -> tuple[float | None, str]:
+    sleep_row = await user_model.get_fact(db, user_id, "sleep_schedule")
+    sleep_fact = sleep_row.get("value") if sleep_row else None
     bedtime = None
+    source = "unknown"
     if isinstance(sleep_fact, dict):
         bedtime = sleep_fact.get("bedtime") or sleep_fact.get("typical_bedtime")
+        source = "confirmed_fact" if sleep_row and sleep_row.get("confirmed") else "unconfirmed_fact"
     if not bedtime:
         row = await db.fetch_one("SELECT profile FROM routine_profile WHERE user_id=?", (user_id,))
         if row:
             try:
                 profile = json.loads(row["profile"] or "{}")
                 bedtime = (profile.get("sleep") or {}).get("typical_bedtime")
+                source = "routine_profile" if bedtime else source
             except (TypeError, json.JSONDecodeError):
                 bedtime = None
     parsed = _parse_hhmm(bedtime) or time(23, 0)
+    if not bedtime:
+        source = "default"
     bed_dt = datetime.combine(now.date(), parsed, tzinfo=TZ)
     if bed_dt <= now:
         bed_dt += timedelta(days=1)
-    return round((bed_dt - now).total_seconds() / 3600, 1)
+    return round((bed_dt - now).total_seconds() / 3600, 1), source
 
 
 async def _active_session(db: Any, user_id: int) -> dict[str, Any] | None:
@@ -631,7 +638,7 @@ async def build_workout_nutrition_context(
     nutrition, _goal = await _nutrition_totals(db, user_id, now=local_now)
     workout = await _workout_state(db, user_id, local_now, flags)
     recent_name, recent_minutes = await _recent_meal(db, user_id, local_now)
-    hours_until_bedtime = await _bedtime_hours(db, user_id, local_now)
+    hours_until_bedtime, sleep_reference = await _bedtime_hours(db, user_id, local_now)
     restrictions = await _restrictions(db, user_id)
     assumptions: list[str] = []
     if nutrition.goal_status in {"default", "unavailable"}:
@@ -656,6 +663,7 @@ async def build_workout_nutrition_context(
         minutes_until_workout=workout.get("minutes_until"),
         minutes_since_workout=workout.get("minutes_since"),
         hours_until_bedtime=hours_until_bedtime,
+        sleep_reference=sleep_reference,
         meals_remaining_estimate=_meals_remaining(hours_until_bedtime, recent_minutes, flags),
         recent_meal_minutes_ago=recent_minutes,
         recent_meal_name=recent_name,
@@ -1764,6 +1772,104 @@ def _nutrition_status_line(nutrition: NutritionTotals) -> str:
     return f"<i>{esc(_goal_source_label(nutrition))}; {esc(meals_text)}.</i>"
 
 
+def _context_datetime(context: WorkoutNutritionContext) -> datetime | None:
+    return _parse_dt(context.local_now)
+
+
+def _hhmm_from_iso(value: str | None) -> str | None:
+    parsed = _parse_dt(value)
+    if not parsed:
+        return None
+    return parsed.astimezone(TZ).strftime("%H:%M")
+
+
+def _hhmm_shifted(value: str | None, minutes: int) -> str | None:
+    parsed = _parse_dt(value)
+    if not parsed:
+        return None
+    return (parsed.astimezone(TZ) + timedelta(minutes=minutes)).strftime("%H:%M")
+
+
+def _sleep_status_line(context: WorkoutNutritionContext) -> str | None:
+    hours = context.hours_until_bedtime
+    if hours is None or context.sleep_reference in {"default", "unknown", "unconfirmed_fact"}:
+        return None
+    if hours < 1:
+        return "פחות משעה עד השינה המשוערת."
+    if hours == 1:
+        return "כשעה עד השינה המשוערת."
+    return f"כ-{hours:g} שעות עד השינה המשוערת."
+
+
+def _workout_status_line(context: WorkoutNutritionContext) -> str:
+    phase = context.workout_phase
+    planned = _hhmm_from_iso(context.planned_workout_start)
+    actual_end = _hhmm_from_iso(context.actual_workout_end)
+    if phase == WorkoutPhase.REST_DAY:
+        return "לא נמצא אימון מתוכנן או פעיל היום."
+    if phase == WorkoutPhase.WORKOUT_CANCELLED:
+        return "סימנת שלא מתאמן היום."
+    if phase == WorkoutPhase.DURING_WORKOUT:
+        return "האימון מסומן כפעיל עכשיו."
+    if phase in {WorkoutPhase.PRE_WORKOUT_EARLY, WorkoutPhase.PRE_WORKOUT_NEAR, WorkoutPhase.PRE_WORKOUT_IMMEDIATE}:
+        suffix = f" בשעה {planned}" if planned else ""
+        return f"מתוכנן אימון היום{suffix}, והוא עדיין לא תועד כבוצע."
+    if phase in {WorkoutPhase.POST_WORKOUT_IMMEDIATE, WorkoutPhase.POST_WORKOUT_LATER, WorkoutPhase.WORKOUT_COMPLETED_EARLIER}:
+        suffix = f" סביב {actual_end}" if actual_end else ""
+        return f"האימון של היום כבר תועד{suffix}; הארוחה מכוונת להתאוששות."
+    if phase == WorkoutPhase.WORKOUT_PLANNED_TIME_PASSED:
+        suffix = f" בשעה {planned}" if planned else ""
+        return f"האימון שתוכנן{suffix} כבר עבר, אבל לא תועד אם בוצע."
+    return "סטטוס האימון היום לא ודאי."
+
+
+def _slot_time_hint(context: WorkoutNutritionContext, allocation: RemainingSlotAllocation, index: int) -> str:
+    if allocation.time_hint:
+        return allocation.time_hint
+    if index == 0:
+        return "עכשיו"
+    if "לפני אימון" in allocation.label:
+        return _hhmm_shifted(context.planned_workout_start, -90) or "בהמשך"
+    if "אחרי אימון" in allocation.label:
+        return _hhmm_shifted(context.planned_workout_end, 15) or _hhmm_shifted(context.planned_workout_start, 75) or "אחרי האימון"
+    now = _context_datetime(context)
+    if allocation.is_night_meal:
+        if now and context.hours_until_bedtime is not None and context.sleep_reference not in {"default", "unknown", "unconfirmed_fact"}:
+            return (now + timedelta(hours=max(0.0, context.hours_until_bedtime - 1.0))).strftime("%H:%M")
+        return "לקראת סוף היום"
+    if now:
+        return (now + timedelta(hours=2.5 * index)).strftime("%H:%M")
+    return "בהמשך"
+
+
+def _remaining_day_timeline_lines(context: WorkoutNutritionContext) -> list[str]:
+    allocations = build_remaining_slot_allocations(context)
+    if not allocations:
+        return []
+    lines: list[str] = []
+    planned = _hhmm_from_iso(context.planned_workout_start)
+    for index, allocation in enumerate(allocations):
+        time_hint = _slot_time_hint(context, allocation, index)
+        lines.append(
+            f"• {esc(time_hint)} · {esc(allocation.label)}: "
+            f"כ-{allocation.calories} קל׳ | כ-{allocation.protein} ג׳ חלבון"
+        )
+        if (
+            planned
+            and index == 0
+            and context.workout_phase in {
+                WorkoutPhase.PRE_WORKOUT_EARLY,
+                WorkoutPhase.PRE_WORKOUT_NEAR,
+                WorkoutPhase.PRE_WORKOUT_IMMEDIATE,
+            }
+        ):
+            lines.append(f"• {esc(planned)} · אימון מתוכנן")
+    total_calories = sum(item.calories for item in allocations)
+    total_protein = sum(item.protein for item in allocations)
+    lines.append(f"<i>סך התכנון: כ-{total_calories} קל׳ | כ-{total_protein} ג׳ חלבון.</i>")
+    return lines
+
+
 def format_next_meal_recommendation(recommendation: NextMealRecommendation) -> str:
     """Answer-first message (re7 P1-10): remaining + options first, short note,
     and the long explanation only via the 'why it fits' detail view."""
@@ -1775,10 +1881,24 @@ def format_next_meal_recommendation(recommendation: NextMealRecommendation) -> s
     elif nutrition.goal_status == "default":
         goal_note = " (ברירת מחדל עד לאישור יעד)"
 
+    lines = [_remaining_headline(nutrition) + goal_note, _nutrition_status_line(nutrition)]
+    sleep_line = _sleep_status_line(context)
+    if sleep_line:
+        lines.append(f"<i>{esc(sleep_line)}</i>")
+    lines += [
+        "",
+        "<b>סטטוס אימון</b>",
+        f"• {esc(_workout_status_line(context))}",
+        "",
+    ]
+    timeline = _remaining_day_timeline_lines(context)
+    if timeline:
+        lines += ["<b>תכנון שאר היום</b>", *timeline, ""]
+
     # TASK-03: a single immediate suggestion, not a numbered list to compare —
     # no "אפשרות N" label, no per-option "recommended" star (there is nothing
     # else here to be recommended over).
-    lines = [_remaining_headline(nutrition) + goal_note, _nutrition_status_line(nutrition), ""]
+    lines.append("<b>הארוחה המומלצת עכשיו</b>")
     for option in recommendation.options:
         after = _after_meal_line(nutrition, option)
         reason = option.recommended_reason or option.rationale or recommendation.budget.rationale
@@ -1798,6 +1918,7 @@ def format_next_meal_recommendation(recommendation: NextMealRecommendation) -> s
         lines.append(f"שים לב: ההצעה חורגת מעט מהיתרה ({esc(recommendation.budget.overage_reason)}).")
     if recommendation.needs_workout_clarification:
         lines.append("לא אניח שהאימון קרה בלי דיווח — אפשר לעדכן את סטטוס האימון דרך ״מצב היום״.")
+        lines.append("<i>אפשר גם לכתוב: כן, סיימתי / עוד לא, אתאמן בהמשך / לא מתאמן היום.</i>")
     return "\n".join(lines).strip()
 
 

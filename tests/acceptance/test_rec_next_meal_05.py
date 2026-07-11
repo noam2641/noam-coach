@@ -20,6 +20,7 @@ from db import Database
 from helpers import utc_now
 from noam_coach.services.next_meal import (
     WorkoutPhase,
+    build_remaining_slot_allocations,
     format_next_meal_explanation,
     format_next_meal_recommendation,
     generate_next_meal_recommendation,
@@ -165,6 +166,41 @@ async def test_next_meal_explains_each_option(db: Database) -> None:
 
 
 @pytest.mark.asyncio
+async def test_next_meal_main_screen_is_remaining_day_planner(db: Database) -> None:
+    now = datetime.now(TZ).replace(hour=16, minute=30, second=0, microsecond=0)
+    await _ready_user(db, now)
+    await _workout_plan(db, now, time_text="18:00")
+
+    rec = await generate_next_meal_recommendation(db, 1, now=now)
+    text = format_next_meal_recommendation(rec)
+
+    remaining_idx = text.index("נשארו")
+    sleep_idx = text.index("עד השינה")
+    workout_idx = text.index("סטטוס אימון")
+    timeline_idx = text.index("תכנון שאר היום")
+    immediate_idx = text.index("הארוחה המומלצת עכשיו")
+    why_idx = text.index("למה עכשיו:")
+
+    assert remaining_idx < sleep_idx < workout_idx < timeline_idx < immediate_idx < why_idx
+    assert "18:00" in text
+    assert "אימון מתוכנן" in text
+    assert "סך התכנון" in text
+
+
+@pytest.mark.asyncio
+async def test_next_meal_timeline_respects_remaining_budget(db: Database) -> None:
+    now = datetime.now(TZ).replace(hour=14, minute=0, second=0, microsecond=0)
+    await _ready_user(db, now)
+
+    rec = await generate_next_meal_recommendation(db, 1, now=now)
+    allocations = build_remaining_slot_allocations(rec.context)
+    text = format_next_meal_recommendation(rec)
+
+    assert sum(slot.calories for slot in allocations) <= rec.context.nutrition.calorie_balance
+    assert f"סך התכנון: כ-{sum(slot.calories for slot in allocations)}" in text
+
+
+@pytest.mark.asyncio
 async def test_next_meal_near_bedtime_stays_light_even_with_large_balance(db: Database) -> None:
     now = datetime.now(TZ).replace(hour=22, minute=0, second=0, microsecond=0)
     await _ready_user(db, now)
@@ -298,7 +334,11 @@ async def test_planned_time_passed_needs_clarification_not_assumption(db: Databa
 
     assert rec.context.workout_phase == WorkoutPhase.WORKOUT_PLANNED_TIME_PASSED
     assert rec.needs_workout_clarification is True
-    assert "לא אניח שהאימון קרה בלי דיווח" in format_next_meal_recommendation(rec)
+    text = format_next_meal_recommendation(rec)
+    assert "לא אניח שהאימון קרה בלי דיווח" in text
+    assert "כן, סיימתי" in text
+    assert "עוד לא, אתאמן בהמשך" in text
+    assert "לא מתאמן היום" in text
 
 
 @pytest.mark.asyncio
