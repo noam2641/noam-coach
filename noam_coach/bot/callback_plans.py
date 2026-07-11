@@ -147,16 +147,7 @@ async def _render_planning_blocked(
     labels = [planning.FACT_LABELS.get(key) or user_model.display_label(key) for key in missing]
     tail = f"\n\nחסר: {esc(', '.join(labels))}" if labels else ""
     rows = []
-    if "active_goal" in missing:
-        rows.append([button("🎯 אשר יעד ואז נמשיך", "menu:goal")])
-        remaining_missing = [key for key in missing if key != "active_goal"]
-        if remaining_missing and plan_type:
-            # RE10-8: when both a goal AND profile facts are missing, offer a
-            # single path that completes the facts too instead of forcing a
-            # second round-trip through this screen after the goal is approved.
-            rows.append([button("▶️ השלם גם את שאר הפרטים", f"planv2:complete_missing:{plan_type}")])
-    else:
-        rows.append([button("▶️ השלם עכשיו", f"planv2:complete_missing:{plan_type}" if plan_type else "planv2:complete_missing")])
+    rows.append([button("▶️ השלם עכשיו", f"planv2:complete_missing:{plan_type}" if plan_type else "planv2:complete_missing")])
     rows.append([button("👤 הצג מה חסר", "planv2:profile")])
     rows.append([button("⬅️ חזרה לתוכניות", "menu:smartplan")])
     await safe_edit(
@@ -654,7 +645,7 @@ async def handle_plan_callback(query: Any, user_id: int, data: str) -> bool:
             ]
             # REC-ONBOARD-02-10: grouped missing info with direct completion
             missing_display = list(readiness.get("missing_labels", labels))
-            if needs_goal:
+            if needs_goal and readiness["ready"]:
                 missing_display.append(user_model.display_label("active_goal"))
             lines_m = [f"<b>חסרים פרטים ליצירת תוכנית {user_model.display_label(plan_type)}:</b>", ""]
             lines_m.extend(f"• {esc(label)}" for label in missing_display)
@@ -663,11 +654,7 @@ async def handle_plan_callback(query: Any, user_id: int, data: str) -> bool:
                 lines_m.append("")
                 lines_m.append("<i>נדחו למילוי מאוחר:</i>")
                 lines_m.extend(f"• {esc(user_model.display_label(k))}" for k in deferred)
-            buttons_m = []
-            if needs_goal:
-                buttons_m.append([button("🎯 אשר יעד ואז נמשיך", "menu:goal")])
-            if not readiness["ready"]:
-                buttons_m.append([button("▶️ השלם עכשיו", f"planv2:complete_missing:{plan_type}")])
+            buttons_m = [[button("▶️ השלם עכשיו", f"planv2:complete_missing:{plan_type}")]]
             buttons_m.append([button("⏳ אשלים אחר כך", "menu:smartplan")])
             buttons_m.append([button("⬅️ חזרה לתוכניות", "menu:smartplan")])
             await safe_edit(

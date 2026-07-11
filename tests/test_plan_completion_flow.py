@@ -76,6 +76,22 @@ async def _ready_except_sex_and_age(db: Database) -> None:
         await _set(db, key, value)
 
 
+async def _nutrition_ready_without_daily_goal(db: Database) -> None:
+    values = {
+        "weight_kg": 80,
+        "primary_goal": "fat_loss_muscle_retention",
+        "sex": "male",
+        "age": 30,
+        "diet_restrictions": "none",
+        "allergies": "none",
+        "height_cm": 174,
+        "goal_weight_kg": 75,
+        "goal_timeframe_weeks": 16,
+    }
+    for key, value in values.items():
+        await _set(db, key, value)
+
+
 @pytest.mark.asyncio
 async def test_plan_menu_clears_completion_flow_without_name_error(
     tmp_path: Path,
@@ -182,7 +198,11 @@ async def test_missing_active_goal_is_shown_upfront_without_calling_generate(
     assert "יעד יומי מאושר" in text
     markup = target.reply_markups[-1]
     button_labels = [btn.text for row in markup.inline_keyboard for btn in row]
-    assert any("אשר יעד ואז נמשיך" in label for label in button_labels)
+    assert not any("אשר יעד" in label for label in button_labels)
+    assert any("השלם עכשיו" in label for label in button_labels)
+    callbacks = [btn.callback_data for row in markup.inline_keyboard for btn in row]
+    assert "menu:goal" not in callbacks
+    assert "planv2:complete_missing:nutrition" in callbacks
 
 
 @pytest.mark.asyncio
@@ -448,4 +468,109 @@ async def test_complete_missing_plan_details_continues_until_plan_hub(
 
     assert continued is True
     assert "מרכז" in target.messages[-1] or "תוכנית" in target.messages[-1]
+    assert await core_services.get_flow_state(1, onboarding_bot.PLAN_COMPLETION_FLOW) is None
+
+
+@pytest.mark.asyncio
+async def test_nutrition_completion_starts_with_missing_primary_goal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = await _make_db(tmp_path)
+    monkeypatch.setattr(coach_bot, "DB", db)
+    monkeypatch.setattr(onboarding_bot, "DB", db)
+    monkeypatch.setattr(core_services, "DB", db)
+    monkeypatch.setattr(callback_plans_bot, "DB", db)
+    await _set(db, "weight_kg", 80)
+
+    target = FakeTarget()
+    handled = await callback_plans_bot.handle_plan_callback(target, 1, "planv2:complete_missing:nutrition")
+
+    assert handled is True
+    state = await core_services.get_flow_state(1, onboarding_bot.PLAN_COMPLETION_FLOW)
+    assert state is not None
+    assert state["step"] == "q_primary_goal"
+    assert "מטרה" in target.messages[-1]
+
+
+@pytest.mark.asyncio
+async def test_nutrition_missing_list_places_primary_goal_first(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = await _make_db(tmp_path)
+    monkeypatch.setattr(coach_bot, "DB", db)
+    monkeypatch.setattr(onboarding_bot, "DB", db)
+    monkeypatch.setattr(core_services, "DB", db)
+    monkeypatch.setattr(callback_plans_bot, "DB", db)
+
+    target = FakeTarget()
+    handled = await callback_plans_bot.handle_plan_callback(target, 1, "planv2:generate:nutrition")
+
+    assert handled is True
+    text = target.messages[-1]
+    first_goal = text.index("• מטרה ראשית")
+    first_weight = text.index("• משקל")
+    assert first_goal < first_weight
+
+
+@pytest.mark.asyncio
+async def test_workout_completion_starts_with_missing_primary_goal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = await _make_db(tmp_path)
+    monkeypatch.setattr(coach_bot, "DB", db)
+    monkeypatch.setattr(onboarding_bot, "DB", db)
+    monkeypatch.setattr(core_services, "DB", db)
+    monkeypatch.setattr(callback_plans_bot, "DB", db)
+    await _set(db, "training_days_per_week", 3)
+
+    target = FakeTarget()
+    handled = await callback_plans_bot.handle_plan_callback(target, 1, "planv2:complete_missing:workout")
+
+    assert handled is True
+    state = await core_services.get_flow_state(1, onboarding_bot.PLAN_COMPLETION_FLOW)
+    assert state is not None
+    assert state["step"] == "q_primary_goal"
+
+
+@pytest.mark.asyncio
+async def test_skipped_primary_goal_is_resumed_first(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = await _make_db(tmp_path)
+    monkeypatch.setattr(coach_bot, "DB", db)
+    monkeypatch.setattr(onboarding_bot, "DB", db)
+    monkeypatch.setattr(core_services, "DB", db)
+    monkeypatch.setattr(callback_plans_bot, "DB", db)
+    await user_model.record_skip(db, 1, "primary_goal")
+    await _set(db, "weight_kg", 80)
+
+    target = FakeTarget()
+    await callback_plans_bot.handle_plan_callback(target, 1, "planv2:complete_missing:nutrition")
+
+    state = await core_services.get_flow_state(1, onboarding_bot.PLAN_COMPLETION_FLOW)
+    assert state is not None
+    assert state["step"] == "q_primary_goal"
+
+
+@pytest.mark.asyncio
+async def test_nutrition_completion_renders_daily_goal_after_required_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = await _make_db(tmp_path)
+    monkeypatch.setattr(coach_bot, "DB", db)
+    monkeypatch.setattr(onboarding_bot, "DB", db)
+    monkeypatch.setattr(core_services, "DB", db)
+    monkeypatch.setattr(callback_plans_bot, "DB", db)
+    await _nutrition_ready_without_daily_goal(db)
+
+    target = FakeTarget()
+    handled = await callback_plans_bot.handle_plan_callback(target, 1, "planv2:complete_missing:nutrition")
+
+    assert handled is True
+    assert "הצעת יעד" in target.messages[-1]
     assert await core_services.get_flow_state(1, onboarding_bot.PLAN_COMPLETION_FLOW) is None

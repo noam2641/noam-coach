@@ -552,12 +552,22 @@ async def first_missing_plan_question(
     workout questions just because ``workout`` is first in the static tuple.
     """
     readiness = await user_model.compute_all_readiness(DB, user_id)
+    profile_order = _plan_completion_profile_order(plan_type)
+    if plan_type in {"nutrition", "workout"}:
+        for profile_name in profile_order:
+            if "primary_goal" in readiness.get(profile_name, {}).get("missing", []):
+                question = questions.question_by_fact_key("primary_goal")
+                if question is not None:
+                    return question
+
     seen: set[str] = set()
-    for profile_name in _plan_completion_profile_order(plan_type):
+    for profile_name in profile_order:
         for key in readiness.get(profile_name, {}).get("missing", []):
             if key in seen:
                 continue
             seen.add(key)
+            if key == "primary_goal" and plan_type in {"nutrition", "workout"}:
+                continue
             question = questions.question_by_fact_key(key)
             if question is not None:
                 return question
@@ -582,7 +592,6 @@ async def render_plan_completion_done(target: Any, user_id: int, plan_type: str 
         keyboard = InlineKeyboardMarkup([
             [button("📌 בנה תפריט יומי", "menu:daily_menu")],
             [button("🍽 מה לאכול עכשיו", "menu:nextmeal")],
-            [button("🎯 עדכן יעד", "menu:goal")],
             [button("⬅️ חזור לתוכניות", "menu:smartplan")],
         ])
     elif plan_type == "workout":
@@ -619,6 +628,16 @@ async def ask_next_plan_completion_question(
 
     question = await first_missing_plan_question(user_id, plan_type)
     if question is None:
+        if plan_type == "nutrition":
+            goal = await planning.active_goal(DB, user_id)
+            if goal is None:
+                if await ask_next_goal_wizard_question(target, user_id):
+                    return True
+                await clear_flow_state(user_id, PLAN_COMPLETION_FLOW)
+                from noam_coach.bot.callback_plans import render_goal_proposal
+
+                await render_goal_proposal(target, user_id)
+                return True
         await clear_flow_state(user_id, PLAN_COMPLETION_FLOW)
         await render_plan_completion_done(target, user_id, plan_type)
         return False

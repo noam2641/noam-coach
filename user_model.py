@@ -554,7 +554,7 @@ READINESS_PROFILES = {
         name="nutrition",
         label="תזונה",
         required=(
-            "weight_kg", "primary_goal", "sex", "age",
+            "primary_goal", "weight_kg", "sex", "age",
             "diet_restrictions", "allergies",
         ),
         optional=(
