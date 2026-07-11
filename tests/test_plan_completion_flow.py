@@ -708,5 +708,5 @@ async def test_nutrition_completion_renders_daily_goal_after_required_context(
     handled = await callback_plans_bot.handle_plan_callback(target, 1, "planv2:complete_missing:nutrition")
 
     assert handled is True
-    assert "הצעת יעד" in target.messages[-1]
+    assert "יעד יומי" in target.messages[-1]  # TASK-4: renamed from "הצעת יעד"
     assert await core_services.get_flow_state(1, onboarding_bot.PLAN_COMPLETION_FLOW) is None

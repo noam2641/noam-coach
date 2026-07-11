@@ -148,8 +148,8 @@ async def test_menu_goal_renders_proposal_once_wizard_facts_all_known(
 
     assert handled is True
     text = target.messages[-1]
-    assert "הצעת יעד" in text
-    assert "כתוב יעד קלורי אחר" in "".join(
+    assert "יעד יומי" in text  # TASK-4: renamed from "הצעת יעד"
+    assert "שנה קלוריות" in "".join(
         btn.text for row in target.reply_markups[-1].inline_keyboard for btn in row
     )
     # The wizard flow must be cleared once the proposal is shown.
@@ -270,3 +270,40 @@ async def test_feasible_goal_has_no_extra_decision_buttons(
     )
     assert "כנראה לא יושג" not in text
     assert "onb:edit:goal_timeframe_weeks" not in callbacks
+
+
+@pytest.mark.asyncio
+async def test_goal_screen_uses_daily_target_heading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TASK-4: the heading is "יעד יומי", not "הצעת יעד"."""
+    db = await _make_db(tmp_path)
+    text, _cb = await _goal_screen_text_and_buttons(
+        db, monkeypatch, weight=90.0, goal_weight=87.0, weeks=16
+    )
+    assert "יעד יומי" in text
+    assert "הצעת יעד" not in text
+
+
+@pytest.mark.asyncio
+async def test_infeasible_goal_is_decision_oriented(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TASK-4: an infeasible goal leads with a direct recommendation and offers
+    explicit decisions (approve recommended / change weight / change timeline /
+    change calories) instead of a vague "❌ דחה"."""
+    db = await _make_db(tmp_path)
+    text, callbacks = await _goal_screen_text_and_buttons(
+        db, monkeypatch, weight=101.8, goal_weight=83.0, weeks=13
+    )
+    labels_src = callbacks  # callbacks list; check the text + callbacks
+    del labels_src
+    # Direct recommendation is shown.
+    assert "ההמלצה שלי" in text
+    assert "ביקשת להגיע" in text
+    # Explicit decision callbacks; no reject_goal.
+    assert any(cb.startswith("approve_goal:") for cb in callbacks)
+    assert "onb:edit:goal_weight_kg" in callbacks
+    assert "onb:edit:goal_timeframe_weeks" in callbacks
+    assert "goal:manual" in callbacks
+    assert not any(cb.startswith("reject_goal:") for cb in callbacks)

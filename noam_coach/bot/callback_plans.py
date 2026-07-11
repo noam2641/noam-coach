@@ -320,27 +320,41 @@ async def render_goal_proposal(query: Any, user_id: int) -> None:
         if payload["provisional"]
         else "✅ מחושב מהפרופיל שלך"
     )
-    rows = [
-        [
-            button("✅ אשר יעד" if not payload["provisional"] else "⏳ השתמש זמנית", f"approve_goal:{approval_id}"),
-            button("❌ דחה", f"reject_goal:{approval_id}"),
-        ],
-        [button("✏️ כתוב יעד קלורי אחר", "goal:manual")],
-    ]
-    # TASK-18: when the target does not align with the requested timeline, give
-    # the user explicit choices — extend the timeline, change the target weight,
-    # or review the goal — rather than only the approve/reject pair.
+    # TASK-4: the daily target is decision-oriented. When the requested goal +
+    # timeline is infeasible, lead with a single direct recommendation and
+    # replace the vague "❌ דחה" with explicit decisions (approve the recommended
+    # target / change target weight / change timeline / change calories). Goal
+    # feasibility is kept separate from the data-quality precision note above.
+    infeasible = bool(
+        feasibility is not None and feasibility.applicable and not feasibility.feasible
+    )
+    if infeasible:
+        rows = [
+            [button("✅ אשר יעד מומלץ", f"approve_goal:{approval_id}")],
+            [
+                button("🎯 שנה יעד משקל", "onb:edit:goal_weight_kg"),
+                button("⏳ שנה טווח זמן", "onb:edit:goal_timeframe_weeks"),
+            ],
+            [button("✏️ שנה קלוריות", "goal:manual")],
+        ]
+    else:
+        rows = [
+            [
+                button("✅ אשר יעד" if not payload["provisional"] else "⏳ השתמש זמנית", f"approve_goal:{approval_id}"),
+                button("✏️ שנה קלוריות", "goal:manual"),
+            ],
+        ]
+
     feasibility_block = ""
     if feasibility is not None and feasibility.applicable:
-        icon = "✅" if feasibility.feasible else "⚠️"
-        feasibility_block = f"\n\n{icon} <i>{esc(feasibility.message)}</i>"
-        if not feasibility.feasible:
-            rows.insert(
-                1,
-                [
-                    button("⏳ להאריך את הזמן", "onb:edit:goal_timeframe_weeks"),
-                    button("🎯 לשנות משקל יעד", "onb:edit:goal_weight_kg"),
-                ],
+        if feasibility.feasible:
+            feasibility_block = f"\n\n✅ <i>{esc(feasibility.message)}</i>"
+        else:
+            # Requested outcome + gap stated once, then the direct recommendation
+            # (the recommended target is the one behind "✅ אשר יעד מומלץ").
+            feasibility_block = (
+                f"\n\n⚠️ {esc(feasibility.message)}"
+                f"\n\n💡 <b>{esc(feasibility.recommendation)}</b>"
             )
     # RE10-9: the missing items are already spelled out in status_line above,
     # so a redundant "מה חסר" button here would just repeat the same
@@ -348,16 +362,20 @@ async def render_goal_proposal(query: Any, user_id: int) -> None:
     if not missing:
         rows.append([button("👤 הצג פרופיל מלא", "planv2:profile")])
     rows.append([button("⬅️ תפריט", "menu:home")])
+
+    # When the goal is infeasible we lead with the recommendation and skip the
+    # long AI explanation, so the screen does not repeat the same reasoning.
+    explanation_block = "" if infeasible else f"\n\n<i>{esc(display_explanation)}</i>"
     await safe_edit(
         query,
         (
-            "<b>הצעת יעד</b>\n\n"
+            "<b>יעד יומי</b>\n\n"
             f"קלוריות: <b>{payload['calories']:,}</b>\n"
             f"חלבון: <b>{payload['protein']} גרם</b>\n"
             f"צעדים: <b>{payload['steps']:,}</b>\n\n"
             f"{status_line}"
-            f"{feasibility_block}\n\n"
-            f"<i>{esc(display_explanation)}</i>\n\n"
+            f"{feasibility_block}"
+            f"{explanation_block}\n\n"
             "היעד לא ישתנה בעתיד בלי אישור שלך."
         ),
         InlineKeyboardMarkup(rows),

@@ -264,6 +264,9 @@ class GoalFeasibility:
     projected_weight_at_deadline_kg: float
     realistic_weeks_for_target: int | None
     message: str = ""
+    # TASK-4: a direct, decision-oriented recommendation (what the system
+    # professionally recommends), separate from the neutral explanation above.
+    recommendation: str = ""
 
 
 # A calorie target "achieves" the requested goal when its projected weight at
@@ -322,6 +325,8 @@ def assess_goal_feasibility(t: Targets) -> GoalFeasibility:
     feasible = abs(projected - goal_weight) <= _FEASIBILITY_TOLERANCE_KG
 
     direction = "ירידה" if is_loss else "עלייה"
+    recommendation = ""
+    requested_weeks = int(round(weeks))
     if feasible:
         message = (
             f"בקצב המשוער של כ-{abs(actual_weekly_rate):.2f} ק\"ג {direction} בשבוע, "
@@ -330,18 +335,24 @@ def assess_goal_feasibility(t: Targets) -> GoalFeasibility:
         )
     else:
         projected_change = abs(weight - projected)
+        # TASK-4: the message states the requested outcome and the gap once —
+        # without repeating the deficit math across several warning paragraphs.
         message = (
-            f"לפי ההערכה הנוכחית, {t.calories:,} קל׳ ביום יוצרים "
-            f"{'גירעון' if is_loss else 'עודף'} של כ-{abs(implied_daily):,} קל׳ ביום. "
-            f"בקצב הזה היעד של {goal_weight:g} ק\"ג בתוך הזמן שבחרת כנראה לא יושג — "
-            f"הצפי הוא כ-{projected_change:.1f} ק\"ג {direction} בתקופה (כ-{projected:.1f} ק\"ג), "
-            + (
-                f"ולהגעה ליעד בקצב בטוח נדרשות כ-{realistic_weeks} שבועות. "
-                if realistic_weeks is not None
-                else ""
-            )
-            + "אפשר לשמור על היעד הבטוח ולהאריך את הזמן, לעדכן את משקל היעד, "
-            "או לחזור ולערוך את היעד. כל המספרים הם הערכה."
+            f"ביקשת להגיע מ-{weight:g} ק\"ג ל-{goal_weight:g} ק\"ג בתוך "
+            f"{requested_weeks} שבועות. בקצב הבטוח של כ-{abs(actual_weekly_rate):.2f} "
+            f"ק\"ג {direction} בשבוע הצפי בתקופה הזו הוא כ-{projected_change:.1f} ק\"ג "
+            f"(כ-{projected:.1f} ק\"ג), כלומר היעד המקורי כנראה לא יושג בזמן שביקשת."
+        )
+        # TASK-4: a single direct recommendation with the practical reasoning,
+        # instead of "here is your target, warning: it doesn't reach your goal".
+        weeks_text = (
+            f"כ-{realistic_weeks} שבועות" if realistic_weeks is not None else "טווח זמן ארוך יותר"
+        )
+        recommendation = (
+            f"ההמלצה שלי: לשמור על יעד של {t.calories:,} קל׳ ביום ולהאריך את היעד "
+            f"ל-{weeks_text}, עם התאמה לפי קצב ה{direction} בפועל. "
+            "קצב מתון יותר שומר על מסת שריר, קל יותר להתמדה, מאפשר התאוששות "
+            "וביצועים באימונים, ומוביל לתוצאה בת-קיימא. כל המספרים הם הערכה."
         )
 
     return GoalFeasibility(
@@ -353,4 +364,5 @@ def assess_goal_feasibility(t: Targets) -> GoalFeasibility:
         projected_weight_at_deadline_kg=round(projected, 1),
         realistic_weeks_for_target=realistic_weeks,
         message=message,
+        recommendation=recommendation,
     )

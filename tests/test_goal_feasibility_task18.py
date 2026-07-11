@@ -63,8 +63,12 @@ def test_mismatched_target_message_does_not_claim_deadline_is_met() -> None:
         _t(calories=2130, maintenance=2836, weight=101.8, goal_weight=83.0, weeks=13.0)
     )
     assert "כנראה לא יושג" in f.message
-    # Presented as an estimate, not a guarantee.
-    assert "הערכה" in f.message
+    # TASK-4: a single direct recommendation, framed as an estimate.
+    assert f.recommendation
+    assert "ההמלצה שלי" in f.recommendation
+    assert "הערכה" in f.recommendation
+    # Practical reasoning is included (muscle / adherence / sustainable pace).
+    assert "שריר" in f.recommendation
 
 
 def test_realistic_alternative_timeline_is_generated() -> None:
