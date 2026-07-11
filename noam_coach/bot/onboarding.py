@@ -1881,6 +1881,46 @@ _STRATEGY_WHY: dict[str, str] = {
     "performance": "יותר נפח ודגש התקדמות לכל קבוצת שריר",
 }
 
+# TASK-3: a consistent A/B/C/D comparison per strategy. Each line describes only
+# what the strategy engine actually implements (planning.py):
+#   consistency = repeated full-body sessions, slightly LOWER per-exercise volume;
+#   balanced    = Upper/Lower split, baseline volume;
+#   performance = ABC + Full-Body split, slightly HIGHER per-exercise volume.
+# A — Weekly structure · B — Workout character · C — Progression · D — Best fit.
+_STRATEGY_EXPLAINER: dict[str, dict[str, str]] = {
+    "consistency": {
+        "A": "אימוני גוף מלא חוזרים — כל אימון מכסה את רוב הגוף",
+        "B": "חשיפה חוזרת לכל קבוצת שריר, כיסוי רחב בכל אימון",
+        "C": "עומס מתון והתקדמות פשוטה וחזרתית",
+        "D": "מתאים לשגרה לא יציבה — נשאר יעיל גם אם מפספסים אימון",
+    },
+    "balanced": {
+        "A": "חלוקת Upper/Lower — פלג גוף עליון ותחתון לסירוגין",
+        "B": "חשיפת שריר מאוזנת עם חלוקת עומס והתאוששות",
+        "C": "עומס בסיסי עם עומס-יתר מתקדם ובר-קיימא",
+        "D": "מתאים למי שבדרך כלל שומר על השגרה השבועית",
+    },
+    "performance": {
+        "A": "חלוקת ABC + גוף מלא — יותר תלות ברצף השבועי המתוכנן",
+        "B": "יותר התמחות ונפח לכל קבוצת שריר",
+        "C": "נפח מעט גבוה יותר והתקדמות מכוונת בעומס/נפח",
+        "D": "מתאים למי שמתעדף התקדמות באימונים ושומר על עקביות",
+    },
+}
+
+
+def _strategy_explainer_lines(strategy: str) -> list[str]:
+    """A/B/C/D explanation for one strategy (TASK-3)."""
+    spec = _STRATEGY_EXPLAINER.get(strategy)
+    if not spec:
+        return ["✓ " + esc(_STRATEGY_WHY.get(strategy, ""))]
+    return [
+        f"• מבנה שבועי: {esc(spec['A'])}",
+        f"• אופי האימון: {esc(spec['B'])}",
+        f"• התקדמות: {esc(spec['C'])}",
+        f"• למי מתאים: {esc(spec['D'])}",
+    ]
+
 # Which strategy is highlighted as recommended for each primary goal.  This only
 # adds the ⭐ badge; it never removes the other choices.
 _STRATEGY_RECOMMENDATION_FOR_GOAL: dict[str, str] = {
@@ -1910,10 +1950,6 @@ async def render_workout_type_choice(target: Any, user_id: int) -> None:
         )
         return
 
-    # Per-strategy candidate data (rationale/tradeoffs) enriches the description
-    # when it exists, but does NOT gate which strategies are shown.
-    by_strategy = {str(c.get("strategy") or ""): c for c in candidates}
-
     primary_goal = str(await user_model.get_value(DB, user_id, "primary_goal") or "")
     recommended = _STRATEGY_RECOMMENDATION_FOR_GOAL.get(primary_goal, "balanced")
 
@@ -1934,15 +1970,10 @@ async def render_workout_type_choice(target: Any, user_id: int) -> None:
         is_recommended = strategy == recommended
         badge = " (⭐ מומלץ עבורך)" if is_recommended else ""
         lines.append(f"<b>{esc(label)}{badge}</b>")
-        candidate = by_strategy.get(strategy)
-        rationale = (candidate or {}).get("rationale") or []
-        tradeoffs = (candidate or {}).get("tradeoffs") or []
-        if rationale:
-            lines.append("✓ " + " · ".join(esc(str(item)) for item in rationale[:2]))
-        else:
-            lines.append("✓ " + esc(_STRATEGY_WHY[strategy]))
-        if tradeoffs:
-            lines.append("△ " + " · ".join(esc(str(item)) for item in tradeoffs[:1]))
+        # TASK-3: consistent A/B/C/D explanation grounded in what the strategy
+        # engine actually implements (weekly structure / character / progression
+        # / best fit), instead of an abstract one-liner.
+        lines.extend(_strategy_explainer_lines(strategy))
         lines.append("")
         callback = conversation.encode_callback(
             "planv2", "wiz_type", strategy, version=flow.version, flow_id=flow.flow_id,
@@ -1984,7 +2015,13 @@ async def render_workout_structure_choice(target: Any, user_id: int, strategy: s
     flow = await conversation.get_active_flow(DB, user_id)
 
     label = _STRATEGY_LABELS.get(strategy, candidate.get("title", strategy))
-    lines = [f"<b>שלב 2 מתוך 3 — מבנה התוכנית: {esc(label)}</b>", ""]
+    # TASK-3: acknowledge the selection immediately, then continue to step 2.
+    lines = [
+        f"✅ בחרת: <b>{esc(label)}</b>",
+        "",
+        f"<b>שלב 2 מתוך 3 — מבנה התוכנית: {esc(label)}</b>",
+        "",
+    ]
     lines.append(_format_candidate(candidate, None))
     payload = candidate.get("payload", {})
     sessions = sorted(payload.get("sessions", []), key=lambda s: sunday_first_key(s.get("weekday", 0)))
