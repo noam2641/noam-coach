@@ -2353,7 +2353,14 @@ def _ctx_has_workout(ctx: "DailyContext") -> bool:
 
 @runtime_bound(RUNTIME_NAMES)
 def _data_quality_disclaimer(ctx: "DailyContext") -> str:
-    if not ctx.goal_computed:
+    # TASK-7: do not show "the targets haven't been computed yet" when the user
+    # already has a confirmed/active goal (e.g. a manually approved goal whose
+    # goal_computed flag is False). The warning is only for the true no-goal /
+    # default-values case (status "default"/"proposal_only").
+    goal = getattr(ctx, "goal", None) or {}
+    goal_status = str(goal.get("status") or "")
+    has_confirmed_goal = goal_status in {"active", "active_provisional"}
+    if not ctx.goal_computed and not has_confirmed_goal:
         return (
             "\n\n⚠️ <i>היעדים עדיין לא חושבו מהנתונים שלך — "
             "ההמלצות מבוססות על ערכי ברירת מחדל. "

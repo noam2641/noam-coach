@@ -284,7 +284,16 @@ async def morning_menu(
                         "it is actually eaten in — do NOT put a food the user only "
                         "eats at dinner into an 08:00 breakfast just because its "
                         "macros fit. Use new foods only to fill gaps the learned "
-                        "foods cannot cover, for variety, or when explicitly asked."
+                        "foods cannot cover, for variety, or when explicitly asked.\n"
+                        # TASK-7: schedule + target-total consistency.
+                        "Format each meal for a chronological schedule: put a real "
+                        "clock time (HH:MM) in 'time_hint', a short meal-context in "
+                        "'name' (e.g. 'ארוחת בוקר'/'ארוחת צהריים'/'ארוחת ביניים'/"
+                        "'ארוחת ערב'/'קדם אימון'/'אחרי אימון' — never 'ארוחה 1/2/3'), "
+                        "and the actual food components in 'note'. The SUM of the "
+                        "meals' calories must match the daily calorie target and the "
+                        "SUM of protein must match the protein target (within ~5%). "
+                        "Do not add a generic closing sentence."
                     ),
                 },
                 {

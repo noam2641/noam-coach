@@ -396,26 +396,59 @@ async def fetch_goal(user_id: int) -> dict[str, Any]:
     }
 
 
+_MEAL_NUMBER_RE = re.compile(r"^\s*ארוחה\s*\d+\s*[-–:]?\s*")
+_TIME_IN_TEXT_RE = re.compile(r"\b([01]?\d|2[0-3]):[0-5]\d\b")
+
+
+def _menu_meal_time(meal: "recommendations.MenuMeal") -> str:
+    """Extract an HH:MM time from the meal's time_hint or name, else ''."""
+    for source in (meal.time_hint or "", meal.name or ""):
+        match = _TIME_IN_TEXT_RE.search(str(source))
+        if match:
+            return match.group(0)
+    return ""
+
+
+def _menu_meal_context(meal: "recommendations.MenuMeal") -> str:
+    """A meaningful meal-context label with any "ארוחה N" prefix and inline time
+    removed (TASK-7: never show "ארוחה 1/2/3")."""
+    name = str(meal.name or "").strip()
+    name = _MEAL_NUMBER_RE.sub("", name).strip()
+    name = _TIME_IN_TEXT_RE.sub("", name).strip(" -–:•")
+    return name or "ארוחה"
+
+
 @runtime_bound(RUNTIME_NAMES)
 def format_morning_menu(menu: recommendations.MorningMenu) -> str:
+    """TASK-7: render the daily menu as a chronological eating schedule.
+
+    Each entry reads: time — meal-context / calories | protein / components.
+    No "ארוחה 1/2/3" numbering; entries are ordered by their time when known.
+    """
     lines = [f"<b>{esc(menu.headline)}</b>", ""]
-    for meal in menu.meals:
-        # TASK-20: don't repeat the time.  When the meal name already carries the
-        # time hint (e.g. an AI menu that names a meal "ארוחה 1 - 08:00" and also
-        # sets time_hint="08:00"), show the name only instead of "… (08:00)".
-        time_hint = (meal.time_hint or "").strip()
-        show_hint = bool(time_hint) and time_hint not in meal.name
-        suffix = f" ({esc(time_hint)})" if show_hint else ""
-        lines.append(
-            f"• <b>{esc(meal.name)}</b>{suffix} — "
-            f"{meal.calories:.0f} קל׳, {meal.protein:.0f} ג׳ חלבון"
-        )
-        if meal.note:
-            lines.append(f"   <i>{esc(meal.note)}</i>")
+
+    # Order chronologically by resolved time; untimed entries keep their order
+    # at the end (stable sort with a high sentinel).
+    def _sort_key(indexed: tuple[int, "recommendations.MenuMeal"]) -> tuple[str, int]:
+        i, meal = indexed
+        t = _menu_meal_time(meal)
+        return (t or "99:99", i)
+
+    ordered = [meal for _, meal in sorted(enumerate(menu.meals), key=_sort_key)]
+    for meal in ordered:
+        time = _menu_meal_time(meal)
+        context = _menu_meal_context(meal)
+        header = f"🍽️ {esc(time)} — <b>{esc(context)}</b>" if time else f"🍽️ <b>{esc(context)}</b>"
+        lines.append(header)
+        lines.append(f"{meal.calories:.0f} קל׳ | {meal.protein:.0f} ג׳ חלבון")
+        components = str(meal.note or "").strip()
+        if components:
+            lines.append(esc(components))
+        lines.append("")
+    if lines and lines[-1] == "":
+        lines.pop()
     if menu.training_advice:
         lines += ["", f"🏋️ {esc(menu.training_advice)}"]
-    if menu.closing:
-        lines += ["", esc(menu.closing)]
     return "\n".join(lines)
 
 

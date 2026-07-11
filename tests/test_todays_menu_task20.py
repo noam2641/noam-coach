@@ -17,22 +17,29 @@ from recommendations import MenuMeal, MorningMenu
 
 
 def test_meal_time_is_not_duplicated_when_name_contains_it() -> None:
+    # TASK-7: the entry reads "08:00 — <context>"; the time appears once and the
+    # "ארוחה 1" numbering is stripped.
     menu = MorningMenu(
         headline="תפריט הבוקר",
         meals=[MenuMeal(name="ארוחה 1 - 08:00", time_hint="08:00", calories=300, protein=40)],
     )
     text = format_morning_menu(menu)
-    # The time appears once (inside the name), not again as "(08:00)".
     assert text.count("08:00") == 1
+    assert "ארוחה 1" not in text
 
 
-def test_meal_time_hint_still_shown_when_distinct_from_name() -> None:
+def test_menu_entry_is_time_context_macros(monkeypatch=None) -> None:
+    # TASK-7: time — context, then calories | protein, then components.
     menu = MorningMenu(
         headline="תפריט הבוקר",
-        meals=[MenuMeal(name="ארוחת בוקר עתירת חלבון", time_hint="08:00", calories=300, protein=40)],
+        meals=[MenuMeal(name="ארוחת בוקר", time_hint="08:00", calories=600, protein=46, note="חביתה וסלט")],
     )
     text = format_morning_menu(menu)
-    assert "(08:00)" in text
+    assert "08:00 — " in text
+    assert "ארוחת בוקר" in text
+    assert "600 קל׳ | 46 ג׳ חלבון" in text
+    assert "חביתה וסלט" in text
+    assert "ארוחה 1" not in text
 
 
 def test_day_type_weekday() -> None:

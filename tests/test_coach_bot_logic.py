@@ -584,9 +584,11 @@ def test_format_morning_menu() -> None:
     result = coach_bot.format_morning_menu(menu)
     assert "תפריט הבוקר" in result
     assert "ארוחת בוקר" in result
-    assert "חשוב" in result
-    assert "לפני אימון" in result
-    assert "בהצלחה!" in result
+    assert "חשוב" in result  # components (note) are shown
+    assert "לפני אימון" in result  # training advice kept
+    # TASK-7: schedule format (time — context) and no generic closing text.
+    assert "08:00 — " in result
+    assert "בהצלחה!" not in result
 
 
 def test_format_morning_menu_empty() -> None:
