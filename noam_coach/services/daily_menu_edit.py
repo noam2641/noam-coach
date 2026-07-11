@@ -20,6 +20,10 @@ from typing import Any
 
 from config import TZ
 from helpers import esc
+from noam_coach.services.daily_menu_state import (
+    get_active_daily_menu,
+    remember_active_daily_menu,
+)
 from noam_coach.services.learned_foods import learned_foods_from_meals
 
 
@@ -47,12 +51,34 @@ _SLOT_LABELS = {
     "dinner": "ארוחת הערב",
     "snack": "ארוחת הביניים",
 }
-_CHANGE_TOKENS = ("תחליף", "החלף", "תשנה", "שנה", "רענן", "תעדכן", "לעדכן", "להחליף")
+_CHANGE_TOKENS = (
+    "תחליף",
+    "החלף",
+    "תשנה",
+    "שנה",
+    "רענן",
+    "תעדכן",
+    "לעדכן",
+    "להחליף",
+    "בלי",
+    "ללא",
+    "פחות",
+    "יותר",
+    "גדול",
+    "גדולה",
+    "קטן",
+    "קטנה",
+    "מסעד",
+    "בישול",
+    "לא אוהב",
+    "לא אוהבת",
+    "לא רוצה",
+)
 _PROTEIN_TOKENS = ("חלבון", "protein", "גבינה", "יוגורט", "טונה", "עוף", "ביצה")
 _LIGHT_TOKENS = ("קל", "קלה", "קטן", "קטנה", "פחות", "דל", "דליל")
 
 
-def parse_daily_menu_edit(text: str) -> DailyMenuEditIntent | None:
+def parse_daily_menu_edit(text: str, *, active_menu_context: bool = False) -> DailyMenuEditIntent | None:
     """Parse a natural-language daily-menu edit request.
 
     Returns None for ordinary chat so it does not steal unrelated messages.
@@ -64,7 +90,7 @@ def parse_daily_menu_edit(text: str) -> DailyMenuEditIntent | None:
     mentions_menu = "תפריט" in normalized or any(
         any(alias in normalized for alias in aliases) for _, aliases in _SLOT_ALIASES
     )
-    if not (has_change and mentions_menu):
+    if not (has_change and (mentions_menu or active_menu_context)):
         return None
     slot = "snack"
     for candidate, aliases in _SLOT_ALIASES:
@@ -72,7 +98,10 @@ def parse_daily_menu_edit(text: str) -> DailyMenuEditIntent | None:
             slot = candidate
             break
     no_item = None
-    match = re.search(r"(?:בלי|ללא|אל תשים)\s+([^,.!?\n]+)", normalized)
+    match = re.search(
+        r"(?:בלי|ללא|אל תשים|לא אוהב(?:ת)?|לא רוצה|פחות)\s+([^,.!?\n]+)",
+        normalized,
+    )
     if match:
         no_item = match.group(1).strip()
     return DailyMenuEditIntent(
@@ -139,13 +168,53 @@ async def _remember_request(db: Any, user_id: int, intent: DailyMenuEditIntent) 
     )
 
 
+def _without_avoided_lines(text: str, avoid: str | None) -> str:
+    if not text or not avoid:
+        return text
+    avoid_norm = str(avoid).strip().lower()
+    if not avoid_norm:
+        return text
+    kept = [line for line in text.splitlines() if avoid_norm not in line.lower()]
+    return "\n".join(kept).strip() or text
+
+
+def _build_revision_text(
+    *,
+    current_text: str | None,
+    intent: DailyMenuEditIntent,
+    replacement_name: str,
+    calories: int,
+    protein: int,
+    reason: str,
+    revision: int,
+) -> str:
+    base = _without_avoided_lines(current_text or "", intent.wants_no_item)
+    replacement_block = (
+        f"<b>עדכון לתפריט היומי - גרסה {revision}</b>\n"
+        f"עודכן לפי הבקשה: {esc(intent.instruction)}\n"
+        f"עבור {esc(intent.slot_label)}: <b>{esc(replacement_name)}</b>\n"
+        f"≈{calories} קל׳ | ≈{protein} ג׳ חלבון\n"
+        f"למה זה מתאים: {esc(reason)}."
+    )
+    if intent.wants_no_item:
+        replacement_block += f"\nנשמר כאילוץ להמשך היום: בלי {esc(intent.wants_no_item)}."
+    if not base:
+        return replacement_block
+    return (
+        f"{base}\n\n"
+        f"{replacement_block}\n\n"
+        "אפשר להמשיך לכתוב לי שינויים, וכל עדכון יתבסס על הגרסה הפעילה הזו."
+    )
+
+
 async def try_build_daily_menu_edit_reply(
     db: Any,
     user_id: int,
     text: str,
 ) -> tuple[str, list[list[tuple[str, str]]]] | None:
     """Return a menu-edit reply and buttons, or None for unrelated text."""
-    intent = parse_daily_menu_edit(text)
+    active_menu = await get_active_daily_menu(db, user_id)
+    intent = parse_daily_menu_edit(text, active_menu_context=active_menu is not None)
     if intent is None:
         return None
     foods = await learned_foods_from_meals(db, user_id, limit=8, min_count=1)
@@ -159,14 +228,29 @@ async def try_build_daily_menu_edit_reply(
         name, calories, protein, reason = _fallback_suggestion(intent)
     await _remember_request(db, user_id, intent)
     avoid_line = f"\nהסרתי/נמנעתי מ: {esc(intent.wants_no_item)}" if intent.wants_no_item else ""
-    body = (
-        f"<b>עדכון לתפריט היומי</b>\n\n"
-        f"הבנתי שאתה רוצה לשנות את {esc(intent.slot_label)}.\n"
-        f"הצעה ממוקדת במקום הארוחה הזו:\n"
-        f"<b>{esc(name)}</b>\n"
-        f"≈{calories} קל׳ | ≈{protein} ג׳ חלבון{avoid_line}\n\n"
-        f"למה זה מתאים: {esc(reason)}.\n\n"
-        "זה עדיין לא נספר כאכילה בפועל. רק אם תאשר שאכלת — זה ייכנס ליומן."
+    revision = int((active_menu or {}).get("revision") or 0) + 1
+    active_text = str((active_menu or {}).get("text") or "")
+    body = _build_revision_text(
+        current_text=active_text,
+        intent=intent,
+        replacement_name=name,
+        calories=calories,
+        protein=protein,
+        reason=reason,
+        revision=revision,
+    )
+    if not active_text:
+        body += (
+            f"\n\nהצעה ממוקדת במקום הארוחה הזו:{avoid_line}\n"
+            "זה עדיין לא נספר כאכילה בפועל. רק אם תאשר שאכלת - זה ייכנס ליומן."
+        )
+    await remember_active_daily_menu(
+        db,
+        user_id,
+        text=body,
+        strategy=str((active_menu or {}).get("strategy") or "") or None,
+        revision=revision,
+        source="daily_menu_revision",
     )
     rows = [
         [("✅ אשר שאכלתי", "nextmeal:save:1")],

@@ -834,6 +834,27 @@ async def handle_plan_callback(query: Any, user_id: int, data: str) -> bool:
             f"<b>{esc(selected['title'])}</b> נבחרה כתוכנית {_plan_type_label(selected['plan_type'])} הראשית ✅{extra}",
             InlineKeyboardMarkup(rows),
         )
+        if selected["plan_type"] == "nutrition" and getattr(query, "message", None) is not None:
+            with suppress(Exception):
+                from noam_coach.services.daily_menu_state import remember_daily_menu_message
+
+                menu_text = await build_morning_menu_text(user_id)
+                menu_keyboard = InlineKeyboardMarkup([
+                    [button("🔄 רענן תפריט", "menu:refresh_daily_menu"), button("🍽 מה לאכול עכשיו", "menu:nextmeal")],
+                    [button("✏️ החלף ארוחה", "menu:replace_daily_meal"), button("📊 מצב היום", "menu:status")],
+                ])
+                sent = await query.message.reply_text(
+                    menu_text,
+                    reply_markup=menu_keyboard,
+                    parse_mode=ParseMode.HTML,
+                )
+                await remember_daily_menu_message(
+                    DB,
+                    user_id,
+                    chat_id=getattr(getattr(sent, "chat", None), "id", user_id),
+                    message_id=getattr(sent, "message_id", None),
+                    source="nutrition_strategy_selected",
+                )
         return True
 
     if data == "planv2:unify":

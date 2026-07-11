@@ -17,6 +17,7 @@ from config import TZ
 from helpers import utc_now
 
 DAILY_MENU_MESSAGE_KEY = "daily_menu_message"
+ACTIVE_DAILY_MENU_KEY = "active_daily_menu"
 
 
 async def _daily_flags(db: Any, user_id: int, local_day: str) -> dict[str, Any]:
@@ -83,4 +84,47 @@ async def get_daily_menu_message(
 ) -> dict[str, Any] | None:
     flags = await _daily_flags(db, user_id, _local_day(now))
     value = flags.get(DAILY_MENU_MESSAGE_KEY)
+    return value if isinstance(value, dict) else None
+
+
+async def remember_active_daily_menu(
+    db: Any,
+    user_id: int,
+    *,
+    text: str,
+    strategy: str | None = None,
+    revision: int | None = None,
+    now: datetime | None = None,
+    source: str = "daily_menu",
+) -> dict[str, Any]:
+    """Persist the latest full standalone menu text for revision flows."""
+    local_day = _local_day(now)
+    flags = await _daily_flags(db, user_id, local_day)
+    previous = flags.get(ACTIVE_DAILY_MENU_KEY)
+    previous_revision = (
+        int(previous.get("revision") or 0)
+        if isinstance(previous, dict)
+        else 0
+    )
+    menu_state = {
+        "text": text,
+        "strategy": strategy,
+        "revision": previous_revision + 1 if revision is None else int(revision),
+        "source": source,
+        "updated_at": datetime.now(TZ).isoformat(),
+    }
+    flags[ACTIVE_DAILY_MENU_KEY] = menu_state
+    await _save_daily_flags(db, user_id, local_day, flags)
+    return menu_state
+
+
+async def get_active_daily_menu(
+    db: Any,
+    user_id: int,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Return today's latest full standalone menu, if one exists."""
+    flags = await _daily_flags(db, user_id, _local_day(now))
+    value = flags.get(ACTIVE_DAILY_MENU_KEY)
     return value if isinstance(value, dict) else None

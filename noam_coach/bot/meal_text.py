@@ -496,10 +496,19 @@ async def handle_text_message(
     daily_menu_edit = await try_build_daily_menu_edit_reply(DB, user_id, text)
     if daily_menu_edit is not None:
         reply_text, reply_rows = daily_menu_edit
-        await update.effective_message.reply_text(
+        sent = await update.effective_message.reply_text(
             reply_text,
             reply_markup=InlineKeyboardMarkup([[button(label, cb) for label, cb in row] for row in reply_rows]),
             parse_mode=ParseMode.HTML,
+        )
+        from noam_coach.services.daily_menu_state import remember_daily_menu_message
+
+        await remember_daily_menu_message(
+            DB,
+            user_id,
+            chat_id=getattr(getattr(sent, "chat", None), "id", user_id),
+            message_id=getattr(sent, "message_id", None),
+            source="daily_menu_revision",
         )
         return
 

@@ -2421,6 +2421,17 @@ async def build_morning_menu_text(user_id: int, ctx: "DailyContext | None" = Non
     if gate.based_on_partial_info and gate.tag():
         text += f"\n\n<i>{esc(gate.tag())}</i>"
     text += _data_quality_disclaimer(ctx)
+    from noam_coach.services.daily_menu_state import remember_active_daily_menu
+
+    with suppress(Exception):
+        active_plan = await planning.get_active_plan(DB, user_id, "nutrition")
+        await remember_active_daily_menu(
+            DB,
+            user_id,
+            text=text,
+            strategy=(active_plan or {}).get("strategy"),
+            source="build_morning_menu_text",
+        )
     return text
 
 
