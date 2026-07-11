@@ -1,0 +1,1519 @@
+MASTER TASK LIST — NOAM COACH
+22 PRODUCT AND DEVELOPMENT TASKS
+
+TASK 1 — Derive Workout Days from Real HealthKit Workout History
+
+Context:
+This issue occurs during imported-data confirmation before building the workout plan.
+
+Problem:
+The bot may fill the requested number of weekly workout days using generic or consecutive weekdays instead of deriving them from the user's real HealthKit workout history.
+
+Required behavior:
+Analyze actual historical workout records and calculate workout frequency by weekday.
+
+Use this priority:
+
+1. Most recent period with sufficient workout data.
+2. Expand the analysis window backward when recent data is sparse.
+3. Use the full available workout history when necessary.
+4. Only ask the user to select preferred days when no meaningful pattern exists.
+
+Older real workout data is always preferable to guessing.
+
+Do not automatically fill missing slots with consecutive weekdays.
+
+The recommendation message must contain only conclusions supported by the imported data.
+
+Support “⏭️ Skip for now” for the training-days question. Skipping must mark only this question as pending and revisit it before plan finalization.
+
+Required tests:
+- Workout frequency is calculated by weekday.
+- Recent sufficient history is prioritized.
+- Sparse recent history expands backward.
+- Older recurring patterns are used before guessing.
+- Arbitrary consecutive weekdays are not inserted.
+- No meaningful pattern triggers manual selection.
+- Skip affects only the training-days question.
+- Skipped training days remain pending.
+- Full pytest passes.
+
+
+TASK 2 — Analyze Sleep from the Full HealthKit Sleep History
+
+Context:
+This issue occurs when the bot infers typical bedtime and wake time from imported HealthKit data.
+
+Problem:
+The sleep-analysis flow may incorrectly discard sleep records because Apple Watch wear coverage is incomplete.
+
+Sleep validity must not depend on workout-frequency or watch-wear eligibility rules.
+
+Required behavior:
+Analyze all relevant historical sleep records and their HealthKit sources.
+
+Consider valid data from:
+- Apple Health / Health app.
+- iPhone-related sources.
+- Apple Watch.
+- Sleep schedules or sleep tracking features.
+- Other valid sleep sources in the export.
+
+Normalize duplicate and overlapping intervals.
+
+Do not count fragmented sleep stages or overlapping source records as separate full nights.
+
+Use recency-weighted historical analysis.
+
+Derive when possible:
+- Typical bedtime.
+- Typical wake time.
+- Typical sleep duration.
+- Schedule variability.
+
+Use this priority:
+
+1. Recent valid sleep records.
+2. Wider recent history.
+3. Full historical sleep dataset with greater weight on newer records.
+4. Manual user input only when no meaningful pattern can be inferred.
+
+Apple Watch wear must not be a hard sleep-data eligibility filter.
+
+An inferred sleep schedule must not be presented as confirmed until the user accepts it.
+
+Support “⏭️ Skip for now” and preserve the sleep question as pending.
+
+Required tests:
+- Sleep records are not rejected because watch wear is missing.
+- Multiple sleep sources are inspected.
+- Overlapping intervals are normalized.
+- Recent sleep receives greater weight.
+- Older history is used when recent data is sparse.
+- An inferred schedule is not treated as confirmed.
+- Skipped sleep remains pending.
+- Full pytest passes.
+
+
+TASK 3 — Fix and Explain the HealthKit StepCount Planning Baseline
+
+Context:
+The imported-data confirmation flow currently derives average_steps from HealthKit.
+
+Problem:
+The previous result of approximately 4,800 steps/day cannot be accepted without a reproducible explanation from the raw StepCount records.
+
+StepCount may come from iPhone, Apple Watch, and other valid HealthKit sources.
+
+Required behavior:
+Trace the complete average_steps calculation:
+
+HealthKit XML parsing
+→ StepCount extraction
+→ source handling
+→ timezone conversion
+→ daily aggregation
+→ coverage/confidence handling
+→ historical-window selection
+→ planning baseline
+→ stored onboarding state
+→ displayed value.
+
+Inspect all HKQuantityTypeIdentifierStepCount sources.
+
+Do not discard iPhone StepCount because Apple Watch wear is missing.
+
+Watch wear may affect confidence but must not be a hard eligibility filter.
+
+Determine:
+
+dataset_end = latest timestamp actually present in the imported dataset.
+
+Exclude a partial final dataset day.
+
+For the current dataset ending on 2026-06-16:
+
+analysis_end = 2026-06-15.
+
+The primary diagnostic window is the last 28 complete local calendar days:
+
+2026-05-19 through 2026-06-15 inclusive.
+
+Aggregate using the user's local timezone.
+
+Calculate separately:
+
+A. raw_all_sources_average.
+B. dominant_or_priority_source_average.
+C. selected_planning_baseline.
+
+Do not blindly sum overlapping Apple Watch and iPhone records.
+
+Prefer interval-aware source deduplication when supported by the raw records.
+
+If overlap cannot be resolved reliably, expose an estimated range internally and use a justified rounded planning baseline.
+
+Generate a reproducible daily debug breakdown containing:
+
+- date
+- all-source steps
+- total by source
+- source coverage or intervals
+- dominant source
+- conservative steps
+- selected steps
+- watch wear
+- confidence
+- included/excluded
+- reason
+- selection reason
+
+The selected planning baseline must be mathematically reproducible from this breakdown.
+
+Do not hardcode 4,800, 6,300, 7,000, or 7,400.
+
+If the corrected result remains approximately 4,800, explain exactly why before treating it as valid.
+
+The user-facing flow should distinguish:
+- observed StepCount.
+- conservative estimate.
+- temporary planning baseline.
+
+Support numeric free-text override such as “7000”.
+
+Support “⏭️ Skip for now” for only the StepCount question.
+
+Required tests:
+- Partial final day is excluded.
+- Last 28 complete days are selected correctly.
+- Local calendar dates are used.
+- iPhone steps survive missing watch wear.
+- Watch wear affects confidence only.
+- Multiple StepCount sources appear in diagnostics.
+- Raw and conservative estimates are separate.
+- Selected baseline is reproducible.
+- Numeric override works.
+- Skip preserves average_steps as pending.
+- Full pytest passes.
+
+
+TASK 4 — Separate Imported, Inferred, Confirmed, Overridden, and Pending Planning State
+
+Context:
+This issue occurs in the final Apple Health import summary and downstream plan generation.
+
+Problem:
+Raw HealthKit data, inferred values, and user-confirmed planning values are mixed together.
+
+The previous flow produced conflicting sleep information:
+- 136 sleep records/nights.
+- Only 2 usable nights.
+- Sleep ~00:19–06:14 shown as though confirmed.
+
+Required behavior:
+Every planning field must support an explicit state such as:
+
+- raw_imported
+- inferred
+- confirmed
+- user_overridden
+- pending
+- insufficient_data
+
+The final planning summary must use confirmed or user_overridden values as accepted plan inputs.
+
+An inferred value may be shown as a suggestion but not as confirmed.
+
+Pending or insufficient values must not appear as established user routines.
+
+Investigate what the 136 sleep value actually represents:
+- raw records,
+- sleep stages,
+- intervals,
+- normalized sessions,
+- unique nights,
+- overlapping sources.
+
+Do not label raw sleep records as “sleep nights.”
+
+The final import summary should contain only:
+
+1. Import result.
+2. Planning data confirmed so far.
+3. Missing information still required.
+
+Show the stale HealthKit warning only once.
+
+The final summary and plan generator must use the same canonical planning source of truth.
+
+User overrides must take priority over original HealthKit inference.
+
+Required tests:
+- Unconfirmed sleep is not shown as confirmed.
+- Skipped sleep remains pending.
+- Insufficient sleep does not populate confirmed planning state.
+- User override wins over imported inference.
+- Updated workout frequency is displayed.
+- Confirmed training days are displayed.
+- Updated weight is displayed.
+- Selected step baseline is displayed.
+- Raw sleep-record count is not called unique nights.
+- Stale warning appears once.
+- Summary and plan generation read the same planning state.
+- Full pytest passes.
+
+
+TASK 5 — Use a Focused Post-Import Plan-Completion Menu
+
+Context:
+This issue occurs immediately after HealthKit import and imported-data confirmation.
+
+Problem:
+The bot tells the user that required planning information is missing but immediately displays the full overloaded main keyboard.
+
+The user is not given one obvious way to continue onboarding.
+
+Required behavior:
+When required planning fields remain incomplete, send a focused transition message.
+
+Explain:
+- Health data was imported.
+- Some planning information is still missing.
+- The user should complete the remaining plan questions.
+- Individual questions may be skipped and revisited.
+
+Show the missing-field count dynamically.
+
+Do not hardcode 12.
+
+When onboarding is incomplete, show a reduced menu with the primary CTA:
+
+🎯 Complete my plan
+
+The incomplete-state menu should focus on actions such as:
+- Complete my plan.
+- What should I eat now.
+- Log a meal.
+- Today's status.
+
+Do not immediately show every bot capability.
+
+“Complete my plan” must resume from the next unanswered or pending field.
+
+It must not restart onboarding.
+
+Confirmed questions must not be asked again.
+
+Skipped questions remain pending and are revisited.
+
+When onboarding is complete, restore the normal daily coach menu.
+
+Required tests:
+- Reduced menu appears after import when fields are missing.
+- Full keyboard is not shown.
+- Completion action is clearly explained.
+- Missing count is dynamic.
+- Complete my plan resumes the next pending field.
+- Confirmed questions are skipped.
+- Skipped questions are revisited.
+- Normal menu returns after completion.
+- Full pytest passes.
+
+
+TASK 6 — Unify Pain, Injury, and Medical Exercise Restrictions into One Concept
+
+Context:
+The bot currently treats active pain/injury and doctor-advised exercise avoidance as separate onboarding and planning concepts.
+
+Problem:
+This creates duplicated questions, duplicated missing fields, and multiple possible sources of truth.
+
+Required behavior:
+Use one user-facing concept:
+
+Pain, injury, or limitation
+
+Hebrew:
+
+כאב, פציעה או מגבלה
+
+Ask one combined question covering:
+- pain,
+- injury,
+- movement limitation,
+- existing physical limitation,
+- medical instruction to avoid an exercise or movement.
+
+Use one canonical planning source, conceptually:
+
+training_limitations
+
+Audit legacy fields such as:
+- active_pain
+- injury
+- pain
+- medical_restriction
+- doctor_avoidance
+- doctor_advised_avoidance
+- exercise_restriction
+
+Preserve existing stored information.
+
+Merge legacy values without duplicated text.
+
+The canonical value must be used by:
+- workout planning.
+- exercise selection.
+- pain-aware adjustments.
+- exercise substitutions.
+- safety logic.
+- AI prompts.
+- planning summaries.
+- profile editing.
+- missing-field calculation.
+
+The missing-data summary must show one item.
+
+Skipping must create one pending question.
+
+Required tests:
+- One combined question replaces both legacy questions.
+- Missing data shows one limitation item.
+- Answering prevents legacy questions from appearing.
+- Skip creates one pending item.
+- Pain-only legacy data is preserved.
+- Doctor-restriction-only data is preserved.
+- Both values merge without duplication.
+- Workout planning receives the canonical value.
+- Exercise substitution receives the same value.
+- Full pytest passes.
+
+
+TASK 7 — Make the Goal the First Step in Both Plan-Completion Flows
+
+Context:
+This issue occurs in nutrition and workout plan completion.
+
+Problem:
+The goal is treated as a separate action instead of being the first step in Complete now.
+
+Required behavior:
+Complete now must own the entire completion process.
+
+For nutrition and workout planning:
+
+1. Check whether the relevant main goal is confirmed.
+2. If missing, pending, inferred but unconfirmed, or invalid, ask the goal first.
+3. After confirmation, automatically continue to remaining questions.
+4. Do not return to the menu between questions.
+5. Skip confirmed goals.
+6. Resume skipped goals first.
+7. Remove separate Goal buttons.
+8. Keep the main goal separate from calorie, protein, step, or other numeric targets.
+9. Calculate daily targets only after goal and required profile context exist.
+
+Required flow:
+
+Goal
+→ remaining required questions
+→ calculated target confirmation
+→ plan completion
+
+Required tests:
+- Nutrition completion starts with missing goal.
+- Workout completion starts with missing goal.
+- Confirmed goal is skipped.
+- Pending goal resumes first.
+- Goal completion advances automatically.
+- Separate Goal button is absent.
+- Daily target confirmation occurs only after required context.
+- Full pytest passes.
+
+
+TASK 8 — Preserve and Resume the User's Original Action After Required Questions
+
+Context:
+The user may select Nutrition Suggestions or another action and be redirected into prerequisite completion.
+
+Problem:
+After answering the missing questions, the original action is lost and the user receives a generic menu.
+
+Required behavior:
+Implement a reusable pending/original intent mechanism.
+
+Example:
+
+Nutrition Suggestions
+→ prerequisites missing
+→ store original intent
+→ goal completion
+→ background questions
+→ prerequisites complete
+→ automatically resume Nutrition Suggestions
+
+The pending intent must survive internal state transitions.
+
+It must not be overwritten by goal or nutrition-background flows.
+
+Clear it only after:
+- successful resume, or
+- explicit cancellation.
+
+Explicit Complete my plan remains a separate journey.
+
+Complete later or deliberate return to the plan menu must intentionally cancel or close the pending intent.
+
+The mechanism should support:
+- Nutrition Suggestions.
+- Build daily menu.
+- What should I eat now?
+- Generate workout plan.
+- Workout recommendations.
+
+Do not hardcode resume behavior into the final allergy-question handler.
+
+Required tests:
+- Nutrition Suggestions intent is stored.
+- Goal completion preserves it.
+- Nutrition questions preserve it.
+- Original action resumes automatically.
+- No menu appears before resume.
+- Explicit completion has normal ending.
+- Complete later does not unexpectedly resume.
+- Intent clears after successful execution.
+- Another gated action reuses the mechanism.
+- Full pytest passes.
+
+
+TASK 9 — Collect Food Routine and Cooking Availability Before Personalizing Nutrition Strategies
+
+Context:
+The nutrition strategy screen currently uses cooking and restaurant claims before the user's food environment is confirmed.
+
+Problem:
+The bot presents assumptions as personalized findings.
+
+Required behavior:
+Collect one unified food-environment question covering:
+- cooking availability.
+- restaurant frequency.
+- delivery/takeaway use.
+- quick-meal needs.
+- schedule variability.
+- limited food access.
+
+Use one canonical nutrition-environment context.
+
+Before confirmation:
+- Do not rank according to cooking suitability.
+- Do not personalize restaurant compatibility.
+- Do not claim a strategy requires too much preparation for the user.
+- Show only objective strategy characteristics.
+- Do not invent disadvantages.
+
+After confirmation:
+The context may influence strategy ranking and personalized explanations.
+
+Clearly separate:
+- strategy characteristics.
+- personal fit analysis.
+
+The same canonical context must be reused by strategy selection and menu generation.
+
+Required tests:
+- Unconfirmed cooking context does not affect ranking.
+- Cooking-fit claims are absent before confirmation.
+- Restaurant-fit claims are absent before confirmation.
+- Unified question appears in completion.
+- Answer is stored canonically.
+- Strategy ranking reads the same context.
+- Confirmed context affects fit explanation.
+- No unsupported disadvantage is invented.
+- Full pytest passes.
+
+
+TASK 10 — Reorganize the Complete Food-Photo Analysis and Correction Pipeline
+
+Context:
+This task covers the complete food-image lifecycle.
+
+Required canonical lifecycle:
+
+PHOTO_RECEIVED
+→ INITIAL_ANALYSIS
+→ QUALITY_ASSESSMENT
+→ REFINEMENT_IF_REQUIRED
+→ WAITING_FOR_USER
+→ USER_CORRECTION
+→ REVISED_ANALYSIS
+→ USER_APPROVED
+→ MEAL_PERSISTED
+→ LEARNING_UPDATED
+
+Before changing code, map the complete runtime path from Telegram photo receipt to persistence.
+
+Identify:
+- files,
+- functions,
+- inputs,
+- outputs,
+- callers,
+- duplicated prompts,
+- conflicting validation.
+
+Use one canonical meal-analysis context containing:
+- calorie target.
+- protein target.
+- allergies.
+- sensitivities.
+- avoidances.
+- food restrictions.
+- nutrition strategy.
+- learned foods.
+- approved historical meals.
+- frequent foods/products.
+- supported Israeli food matches.
+
+Evidence precedence:
+
+1. Hard allergies and restrictions.
+2. Explicit current correction.
+3. Deterministic known-food data.
+4. Approved history and learned foods.
+5. Image inference.
+6. Generic nutrition estimation.
+
+Corrections must be cumulative.
+
+Examples:
+- בלי שמן.
+- הסר X.
+- X היה 200 גרם.
+- חצי.
+- חצי מהאורז.
+- כפול.
+- פי 2.
+- x2.
+- 2x.
+- פי 3.
+- תחלק לשניים.
+- במקום X היה Y.
+
+A later correction must use the current corrected meal.
+
+Do not restore previously removed foods.
+
+Try deterministic correction parsing before AI fallback.
+
+Analysis depth should depend on meal complexity and uncertainty.
+
+Simple meals should preferably complete with one AI call.
+
+Complex meals may require refinement or one focused clarification.
+
+Create a structured quality assessment considering:
+- overall confidence.
+- per-item confidence.
+- macro consistency.
+- unknown calorie-dense components.
+- historical anomalies.
+- restriction conflicts.
+- unresolved questions.
+- deterministic/AI disagreement.
+- meal complexity.
+
+Approval must persist exactly one meal.
+
+The approved meal must update learned-food history.
+
+Post-approval output must use the short Today Status response.
+
+Required tests:
+- Simple meal can use one AI call.
+- Complex meal triggers refinement.
+- Full nutrition context reaches initial analysis.
+- Allergies remain hard constraints.
+- Learned foods improve supported recognition.
+- History does not add absent food.
+- בלי שמן removes oil.
+- Later quantity correction does not restore oil.
+- חצי מהאורז scales rice only.
+- הכל כפול scales the meal.
+- x3 parses correctly.
+- Deterministic food match can replace unsupported estimate.
+- Macro inconsistency blocks auto approval.
+- Important low-confidence item blocks approval.
+- Historical anomalies are detected.
+- Complex meals are not blindly approved.
+- Approval persists exactly once.
+- Learning is updated.
+- Short Today Status is sent.
+- Full pytest passes.
+
+
+TASK 11 — Generate a Standalone Pinnable Daily Menu After Nutrition Strategy Selection
+
+Context:
+The user selects a nutrition strategy such as Flexible and balanced.
+
+Problem:
+The bot confirms the strategy and returns to navigation without generating a daily nutrition reference.
+
+Required behavior:
+Immediately after strategy selection:
+
+1. Save the selected strategy.
+2. Read confirmed calorie and protein targets.
+3. Read confirmed nutrition context.
+4. Generate a flexible generic daily menu.
+5. Send it as a separate standalone Telegram message.
+6. Store it as the active daily menu.
+7. Allow natural-language revisions.
+
+Use:
+- main goal.
+- current weight.
+- target weight when confirmed.
+- calorie target.
+- protein target.
+- selected strategy.
+- allergies.
+- sensitivities.
+- avoidances.
+- dietary restrictions.
+- nutrition history.
+- food environment.
+- restaurant/takeaway behavior.
+- preferences.
+- learned foods when supported.
+
+The menu must be flexible and include practical substitutions.
+
+Natural-language revisions must modify the latest active menu.
+
+Example:
+
+Initial menu
+→ remove eggs
+→ egg-free menu
+→ larger lunch
+→ larger-lunch revision based on the egg-free menu
+
+Hard restrictions must remain enforced through every revision.
+
+Every accepted revision must send a new complete standalone menu.
+
+Required tests:
+- Strategy selection sends a separate menu.
+- Calorie target is used.
+- Protein target is used.
+- Allergies are enforced.
+- Sensitivities and avoidances are enforced.
+- Strategy affects generation.
+- Active menu is stored.
+- Free text starts revision.
+- Previous menu is passed to revision.
+- Second revision uses the latest version.
+- Removed food is not reintroduced.
+- Full revised menu is sent.
+- Full pytest passes.
+
+
+TASK 12 — Show Multiple Compatible Workout-Plan Structures and Recommend Only One
+
+Context:
+The workout-plan structure selection currently presents only one predetermined option.
+
+Problem:
+This is not a real personalized selection flow.
+
+Required behavior:
+Generate multiple genuinely compatible workout structures.
+
+Use:
+- goal.
+- experience.
+- workouts per week.
+- confirmed training days.
+- session duration.
+- location.
+- equipment.
+- pain/injury/limitation.
+- recovery demands.
+- adherence preference.
+
+Only compatible candidates may be shown.
+
+Rank valid candidates.
+
+Exactly one highest-ranked candidate receives:
+
+⭐ Recommended
+
+Other valid candidates remain selectable.
+
+Every candidate must have an internal rationale.
+
+Descriptions must be dynamically consistent with the confirmed profile.
+
+Do not say “fewer training days” when the user confirmed four workouts.
+
+Selecting a structure must affect actual workout generation:
+- split type.
+- weekly structure.
+- movement distribution.
+- muscle exposure.
+- exercise allocation.
+- session-duration design.
+
+Required tests:
+- Multiple compatible structures appear.
+- Exactly one receives the star.
+- Top-ranked candidate is recommended.
+- Other candidates remain selectable.
+- Incompatible day counts are excluded.
+- Four-day availability is not described as fewer days.
+- Duration affects ranking.
+- Experience affects ranking.
+- Limitations affect suitability.
+- Equipment/location affect suitability.
+- Selected structure changes generated split.
+- Full pytest passes.
+
+
+TASK 13 — Use Day-Specific Workout Times Instead of One Global Workout Time
+
+Context:
+The weekly schedule currently applies one general workout time to all workout days.
+
+Problem:
+Friday may be scheduled in the evening even when Friday is a confirmed morning workout.
+
+Required behavior:
+Resolve workout time separately for each weekday.
+
+Priority:
+
+1. Explicit confirmed weekday time.
+2. User-overridden weekday time.
+3. Historical workout-time pattern for that weekday.
+4. General confirmed preferred workout time.
+5. General inferred workout time as fallback.
+
+Day-specific time always overrides general time.
+
+Do not special-case Friday.
+
+Preserve the resolved workout datetime in the weekly plan.
+
+Nutrition scheduling must receive the actual workout datetime.
+
+Morning workouts must produce morning-oriented meal timing.
+
+Evening workouts must produce evening-oriented timing.
+
+Required tests:
+- Day-specific time overrides global time.
+- Friday morning availability produces morning workout.
+- Different weekdays preserve different times.
+- General inferred time is fallback only.
+- Times survive weekly-plan generation.
+- Morning/evening workout meal timing differs.
+- Friday is not hardcoded.
+- Full pytest passes.
+
+
+TASK 14 — Make “What Should I Eat Now?” a Real Remaining-Day Planner
+
+Context:
+The current response focuses mainly on one immediate meal.
+
+Problem:
+It does not clearly explain the user's remaining nutrition budget or the rest of the day.
+
+Required response order:
+
+1. Remaining calories and protein.
+2. Time until expected sleep, only when sleep state is valid.
+3. Explicit workout status.
+4. Remaining-day meal timeline.
+5. Full immediate meal recommendation.
+6. One short explanation.
+
+Workout states:
+- scheduled and not started.
+- in progress.
+- completed.
+- missed.
+- no workout.
+- uncertain.
+
+A past scheduled workout without a completion record must trigger focused clarification:
+- Yes, completed.
+- Not yet, training later.
+- Not training today.
+
+Do not blindly classify the user as pre-workout.
+
+The timeline must calculate:
+- remaining meal count.
+- meal times.
+- meal roles.
+- calories per meal.
+- protein per meal.
+- workout placement.
+
+The remaining meals should approximately fit the remaining calorie and protein targets.
+
+Use:
+- local time.
+- valid sleep time.
+- consumed meals.
+- day-specific workout time.
+- workout completion state.
+- nutrition strategy.
+- active menu.
+- allergies.
+- sensitivities.
+- avoidances.
+- food environment.
+
+Required tests:
+- Remaining calories/protein calculate correctly.
+- Sleep time uses local time.
+- Unconfirmed sleep is not presented as fact.
+- Future workout is pre-workout.
+- Completed workout produces recovery guidance.
+- No-workout day is handled.
+- Past unrecorded workout triggers clarification.
+- Day-specific workout time is used.
+- Remaining meals approximately match targets.
+- Logged meals reduce budget.
+- Restrictions are enforced.
+- Full pytest passes.
+
+
+TASK 15 — Separate Morning Update from Daily Menu Generation
+
+Context:
+Morning Update currently returns a complete daily menu.
+
+Problem:
+This duplicates nutrition planning and makes Morning Update unclear.
+
+Required behavior:
+Morning Update must be a short current-day briefing.
+
+Include only relevant information:
+- weekday.
+- last valid weight when relevant.
+- step target.
+- calorie target.
+- protein target.
+- today's workout status.
+- actual day-specific workout time.
+- one or two immediate priorities.
+- reliable sleep/recovery only when valid.
+- recommended next action.
+
+Morning workout:
+Show the real morning workout time and a pre-workout focus.
+
+Evening workout:
+Explain the workout is later and preserve nutrition for it.
+
+Rest day:
+Focus on protein, calories, and activity.
+
+Morning Update may read the active menu as context but must not resend it.
+
+Keep separate responsibilities:
+- Morning Update = briefing.
+- What should I eat now? = real-time planner.
+- Active menu = pinnable framework.
+- Daily status = numeric progress.
+
+Required tests:
+- Morning Update does not render full menu.
+- Morning workout guidance differs.
+- Evening workout guidance differs.
+- Rest-day guidance differs.
+- Day-specific time is used.
+- Active menu is not resent.
+- Focused buttons are displayed.
+- Full pytest passes.
+
+
+TASK 16 — Merge “Build Unified Week” and “Show the Week” into One Action
+
+Context:
+The plan screen currently exposes two weekly-plan actions.
+
+Problem:
+Build and Show represent an internal technical distinction rather than two user tasks.
+
+Required behavior:
+Expose one action:
+
+📅 השבוע שלי
+
+When pressed:
+
+- valid current week exists → display it.
+- no week exists → build and display.
+- relevant planning inputs changed → rebuild and display.
+
+Relevant invalidators:
+- training days.
+- day-specific workout times.
+- workout structure.
+- nutrition strategy.
+- calorie target.
+- protein target.
+- limitation changes.
+
+Meal logging must not invalidate the weekly plan.
+
+Required tests:
+- One weekly-plan action appears.
+- Old Build and Show buttons are removed.
+- Existing valid week is displayed without rebuild.
+- Missing week is built.
+- Training-day change invalidates.
+- Workout-time change invalidates.
+- Workout-plan change invalidates.
+- Nutrition-strategy change invalidates.
+- Calorie/protein change invalidates.
+- Meal logging does not invalidate.
+- Full pytest passes.
+
+
+TASK 17 — Validate Goal Timeline Against the Daily Calorie Target
+
+Context:
+The user may define a target weight and timeline that do not mathematically align with the proposed calorie target.
+
+Example:
+Current weight: 101.8 kg.
+Target weight: 83 kg.
+Timeline: 3 months.
+Estimated expenditure: 2,836 kcal/day.
+Proposed intake: 2,130 kcal/day.
+
+Problem:
+The bot may present 2,130 kcal as though it will achieve 83 kg within three months without validating the projected outcome.
+
+Required behavior:
+Before presenting a calorie target as goal-compatible, calculate:
+- current weight.
+- target weight.
+- required weight loss.
+- goal duration.
+- estimated expenditure.
+- proposed intake.
+- implied daily deficit.
+- expected weekly weight-change rate.
+- projected deadline weight.
+- realistic alternative timeline.
+
+If compatible:
+Present expected rate and approximate timeline.
+
+If incompatible:
+Clearly state that the calorie target and requested deadline do not align.
+
+Show:
+- estimated deficit.
+- estimated weekly rate.
+- projected weight at deadline.
+- realistic estimated timeline.
+
+Offer:
+- keep safer target and extend timeline.
+- review target for requested deadline.
+- change target weight.
+- edit goal.
+
+Do not automatically force an extreme calorie deficit.
+
+Describe projections as estimates.
+
+Revalidate when relevant inputs change:
+- current weight.
+- target weight.
+- duration.
+- calorie target.
+- material expenditure change.
+
+Meal logging must not trigger feasibility recalculation.
+
+Required tests:
+- Feasible goal is accepted.
+- Infeasible timeline is detected.
+- Daily deficit is correct.
+- Weekly rate is calculated.
+- Projected weight is calculated.
+- Mismatched target is not called sufficient.
+- Alternative timeline is generated.
+- Adjustment options are offered.
+- Extreme target is not forced.
+- Relevant changes rerun validation.
+- Meal logging does not.
+- Full pytest passes.
+
+
+TASK 18 — Fix Workout Type Wizard Showing Only One Strategy
+
+Context:
+Runtime path:
+
+planv2:generate:workout
+→ planning.generate_candidates(...)
+→ render_workout_type_choice(...)
+
+Problem:
+The type wizard currently derives visible workout types from stored candidate rows.
+
+If only one candidate exists, only one strategy is displayed.
+
+Required behavior:
+The type-selection screen must always expose the canonical supported strategy set:
+
+- מקסימום עקביות
+- מקסימום ירידה
+- ביצועים
+
+Build the UI from the canonical strategy registry, not candidate database rows.
+
+Primary goal may determine which strategy is recommended.
+
+Recommendation must never remove other options.
+
+Exactly one strategy may receive the recommendation marker.
+
+Callbacks must preserve:
+planv2:wiz_type:<strategy>
+
+Preserve existing flow version and flow_id encoding.
+
+Audit:
+- _STRATEGY_LABELS.
+- _STRATEGY_WHY.
+- _STRATEGY_RECOMMENDATION_FOR_GOAL.
+- planning.generate_candidates.
+- planning.list_plan_candidates.
+- candidate filtering.
+- status/active/superseding behavior.
+- deduplication.
+- query ordering.
+
+Remove misleading hardcoded telemetry such as count: 3 when actual candidate count differs.
+
+Report separately:
+A. Why runtime showed only Maximum consistency.
+B. Why the existing test passed.
+C. UI architecture fix.
+D. Candidate-generation/query bug, if found.
+
+Required tests:
+- One DB candidate still shows all three strategies.
+- Three candidates show all three strategies.
+- Recommended strategy gets marker.
+- Non-recommended strategies remain selectable.
+- Callbacks encode correct strategy.
+- Duplicate candidate strategies do not duplicate buttons.
+- Full pytest passes.
+
+
+TASK 19 — Redesign “Today's Menu” Around the User's Actual Day
+
+Context:
+Today's Menu currently behaves like a static meal generator.
+
+Problem:
+The menu does not sufficiently understand the user's real schedule today.
+
+Required behavior:
+Today's Menu must become a true daily planning flow.
+
+First check whether a valid Morning Update exists for today.
+
+If it exists:
+Reuse its daily context.
+
+Do not ask the user to repeat information.
+
+If no Morning Update exists:
+Start a short planning conversation covering relevant information such as:
+- workday/day off.
+- work hours.
+- commute.
+- meetings.
+- breaks.
+- breakfast plan.
+- restaurant plans.
+- family meals.
+- travel.
+- unusual schedule.
+
+Allow at most one materially useful follow-up question.
+
+Generate today's schedule using:
+- confirmed profile.
+- nutrition strategy.
+- calories.
+- protein.
+- workout schedule.
+- workout status.
+- day-specific workout time.
+- work hours.
+- breaks.
+- restaurant plans.
+- cooking availability.
+- Morning Update.
+- today's explicit answers.
+- allergies.
+- sensitivities.
+- avoidances.
+- active menu.
+- current remaining targets when appropriate.
+
+Workout timing must directly affect meals.
+
+Breakfast is optional.
+
+If breakfast is skipped, redistribute calories naturally.
+
+Restaurant plans must affect recommendations.
+
+Family meals must reserve appropriate calories/protein.
+
+Avoid unrealistic defaults such as chicken breast at 08:00 unless supported by the user's routine.
+
+Respect:
+- Sunday-first week.
+- workdays.
+- Fridays.
+- Saturdays.
+- holidays.
+- days off.
+
+Learn from real behavior:
+- breakfast timing.
+- lunch timing.
+- dinner timing.
+- meal spacing.
+- workday patterns.
+- weekend patterns.
+- restaurant frequency.
+- breakfast skipping.
+- workout meal timing.
+- food-photo timing.
+- meal-confirmation timing.
+
+Recent behavior receives greater weight.
+
+Explicit today's information always overrides learned routine.
+
+Remove duplicate meal-time formatting.
+
+Required tests:
+- Morning Update is reused.
+- Missing Morning Update starts planning conversation.
+- Work schedule affects timing.
+- Workout time affects timing.
+- Skipped breakfast redistributes calories.
+- Restaurant day adapts.
+- Family dinner reserves calories.
+- Friday differs from weekday.
+- Saturday differs from weekday.
+- Meal time is not displayed twice.
+- Learned timing influences future plans.
+- Meal-photo timing influences routine.
+- Recent routine outweighs old routine.
+- Explicit schedule overrides learned routine.
+- Full pytest passes.
+
+
+TASK 20 — Add Natural-Language Manual Food Logging Without a Photo
+
+Context:
+The meal flow is currently centered mainly around food photos.
+
+Required behavior:
+Add a dedicated manual text food-entry action.
+
+Preferred label:
+
+✍️ הוסף מאכל במלל
+
+Flow:
+
+Manual action
+→ user describes meal naturally
+→ structured meal hypothesis
+→ identify material uncertainty
+→ focused clarification
+→ cumulative meal update
+→ complete estimate
+→ confirmation/correction
+→ persistence
+→ learning
+→ Today Status
+
+Accept free natural language.
+
+Do not require structured syntax or grams.
+
+Use the same canonical meal-analysis structure as photo analysis wherever practical.
+
+Track the source as manual text when metadata supports it.
+
+Extract:
+- food items.
+- preparation.
+- quantity.
+- unit.
+- estimated grams.
+- calories.
+- protein.
+- carbs.
+- fat.
+- per-item confidence.
+- uncertainty.
+- missing high-impact details.
+
+Ask only materially useful follow-up questions.
+
+Priority:
+1. Portion count.
+2. Portion size.
+3. Household measure.
+4. Cooking method when meaningful.
+5. Oil/sauce/tahini/mayonnaise/dressing.
+6. Nutritionally meaningful product variant.
+
+Understand household measures such as:
+- 3 כפות.
+- 2 קציצות.
+- חצי צלחת.
+- קערה קטנה.
+- כוס.
+- חצי כוס.
+- חופן.
+- פרוסה.
+- חצי פיתה.
+- בקבוק קטן.
+- פחית.
+- קצת.
+- הרבה.
+- שליש.
+- רבע.
+
+Maintain cumulative manual-meal state:
+- original description.
+- current meal analysis.
+- clarification history.
+- user answers.
+- unresolved important uncertainties.
+
+Use deterministic parsing for simple contextual answers.
+
+Example:
+Question target = meatballs.quantity.
+User = 3.
+Resolve 3 meatballs without full AI reanalysis.
+
+Complex answers may update multiple items.
+
+Example:
+2 קציצות ועוד חצי שניצל.
+
+Use:
+- known Israeli foods.
+- learned foods.
+- approved history.
+- frequent products.
+- prior corrections.
+
+History must not add unsupported foods.
+
+Restrictions remain hard constraints.
+
+Show the full meal estimate before approval.
+
+Free-text corrections must update the current meal cumulatively.
+
+Approval must reuse the normal meal pipeline:
+- persist exactly once.
+- update daily calories.
+- update daily protein.
+- update learned history.
+- send short Today Status.
+
+Photo logging and manual logging must remain clearly separate actions.
+
+Required tests:
+- Manual action starts text flow.
+- Complete description needs no unnecessary clarification.
+- Missing count triggers focused question.
+- Numeric answer resolves active quantity.
+- 3 כפות parses.
+- חצי כוס parses.
+- Mixed answer updates multiple items.
+- Meatball type correction replaces item.
+- Tahini addition adds item.
+- Later correction preserves previous quantities.
+- Remove rice/add potato works.
+- Low-impact uncertainty does not cause interrogation.
+- Known foods are reused when supported.
+- Learned foods are reused when supported.
+- History does not add unsupported food.
+- Restriction conflict can trigger focused confirmation.
+- Full estimate is shown.
+- Revised analysis is shown after correction.
+- Approval persists once.
+- Daily totals update.
+- Learning updates.
+- Today Status is sent.
+- Full pytest passes.
+
+
+TASK 21 — Simplify Meal Analysis UX
+
+Context:
+This applies to both photo and manual text meal logging.
+
+Problem:
+The meal-analysis card is too technical and contains unnecessary controls.
+
+Required behavior:
+Show a short, clean meal analysis.
+
+Example structure:
+
+🍽️ זיהיתי בארוחה
+
+• חזה עוף — כ־180 ג׳
+• אורז — כ־200 ג׳
+• סלט ירקות — כ־250 ג׳
+
+סה״כ משוער:
+כ־620 קל׳ | כ־58 ג׳ חלבון
+
+Remove unnecessary numbering from food items.
+
+Do not expose technical confidence or parser details in the normal UX.
+
+Remove the dedicated “תקן במלל” button when natural-language correction is already supported through the active meal context.
+
+The user should be able to simply type a correction.
+
+After any correction:
+Show the complete revised meal.
+
+Do not only say “Updated.”
+
+Approval controls should remain minimal and clear.
+
+Do not re-analyze the meal after Save.
+
+Required tests:
+- Food items are not numbered.
+- Technical analysis details are hidden.
+- Redundant text-correction button is absent.
+- Natural-language correction still works.
+- Full revised meal appears after correction.
+- Save does not trigger another meal analysis.
+- Full pytest passes.
+
+
+TASK 22 — Replace “Rest of Today” with a Real Activity-Aware Daily Timeline
+
+Context:
+After meal approval, the bot currently sends a short Today Status but the Rest of Today section may contain meaningless output such as:
+
+Rest of today:
+Meal
+
+Problem:
+The user does not receive a real plan for the remaining hours of the day.
+
+Required behavior:
+After meal approval, show the short Today Status containing:
+- calories added.
+- protein added.
+- consumed calories.
+- consumed protein.
+- remaining calories.
+- remaining protein.
+- current local time.
+
+Then show a real:
+
+המשך היום
+
+timeline.
+
+The timeline must use:
+- current local time.
+- valid expected sleep time.
+- active daily menu.
+- learned meal routine.
+- remaining calories.
+- remaining protein.
+- meals already logged.
+- today's workout.
+- actual day-specific workout time.
+- workout completion state.
+- today's known schedule.
+
+Show actual next events with timestamps or meaningful time ranges.
+
+Possible events:
+- next meal.
+- pre-workout food.
+- workout.
+- post-workout meal.
+- final protein-focused meal.
+- expected sleep.
+
+The timeline must adapt to the user's current point in the day.
+
+Do not show events that already passed.
+
+Do not show an evening pre-workout meal for a morning workout.
+
+Do not present unconfirmed sleep time as fact.
+
+The remaining nutrition events should approximately fit the remaining calorie and protein targets.
+
+The post-save flow must not:
+- re-analyze the approved meal.
+- resend the long meal analysis.
+- send a generic “Meal” placeholder.
+
+Reuse the same canonical remaining-day planning logic where appropriate for:
+- post-meal status.
+- What should I eat now?
+- other daily planning flows.
+
+Avoid maintaining conflicting schedule engines.
+
+Required tests:
+- Today Status shows added calories/protein.
+- Consumed totals are correct.
+- Remaining calories/protein are correct.
+- Current local time is used.
+- Real future timeline events are generated.
+- Past events are excluded.
+- Day-specific workout time is used.
+- Workout completion state affects the timeline.
+- Morning and evening workouts produce different timelines.
+- Unconfirmed sleep is not presented as fact.
+- Remaining nutrition events approximately fit remaining targets.
+- Generic “Meal” placeholder is absent.
+- Meal is not re-analyzed after Save.
+- Long analysis is not resent after approval.
+- Photo and manual meal approval use the same post-meal timeline behavior.
+- Full pytest passes.
