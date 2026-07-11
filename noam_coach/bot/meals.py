@@ -424,27 +424,63 @@ class _AlreadyDecided(Exception):
 
 @runtime_bound(RUNTIME_NAMES)
 async def check_duplicate_meal(user_id: int, analysis: MealAnalysis) -> dict[str, Any] | None:
-    """Check if a very similar meal was already saved today.
+    """Check whether this is probably the SAME consumed meal being logged twice.
 
-    Returns the existing meal row if a probable duplicate is found, else None.
-    Heuristic: same meal name (case-insensitive) OR calorie total within 10%,
-    saved in the last 30 minutes.
+    TASK-10: a duplicate warning must reflect item/product identity, not mere
+    nutritional or timing similarity. A protein drink and cottage cheese with
+    vegetables are different meals even if their calories are close or they were
+    logged minutes apart. We therefore require a strong normalized-item-identity
+    overlap between the new meal and a recent one; nutrition/time proximity
+    alone never triggers. Prefer missing a weak duplicate over warning on
+    clearly different foods.
     """
     from datetime import datetime as _dt
     from datetime import timedelta, timezone
+
+    from noam_coach.services.learned_foods import normalize_food_key
+
     cutoff = (_dt.now(timezone.utc) - timedelta(minutes=30)).isoformat()
-    totals = analysis.totals()
+
+    def _item_keys(names: "list[str]") -> set[str]:
+        keys = {normalize_food_key(n) for n in names if str(n).strip()}
+        return {k for k in keys if k}
+
+    new_keys = _item_keys([item.name for item in analysis.items])
+    if not new_keys:
+        return None
+
     recent = await DB.fetch_all(
         "SELECT * FROM meals WHERE user_id=? AND created_at > ? ORDER BY created_at DESC",
         (user_id, cutoff),
     )
+    new_totals = analysis.totals()
     for meal in recent:
-        if meal["name"].strip().lower() == analysis.meal_name.strip().lower():
-            return meal
-        if totals["calories"] > 0 and meal["calories"] > 0:
-            diff = abs(meal["calories"] - totals["calories"])
-            if diff / max(meal["calories"], totals["calories"]) < 0.1:
+        item_rows = await DB.fetch_all(
+            "SELECT name FROM meal_items WHERE meal_id=?", (meal["id"],)
+        )
+        existing_keys = _item_keys([row["name"] for row in item_rows])
+        if not existing_keys:
+            # Fall back to the stored meal title when there are no item rows.
+            existing_keys = _item_keys([meal["name"]])
+        if not existing_keys:
+            continue
+        overlap = new_keys & existing_keys
+        union = new_keys | existing_keys
+        # Strong identity overlap: the primary foods substantially match.
+        jaccard = len(overlap) / len(union) if union else 0.0
+        strong_identity = jaccard >= 0.6 or (
+            len(overlap) >= 1 and overlap == new_keys and overlap == existing_keys
+        )
+        if not strong_identity:
+            continue
+        # Given matching identity, a close quantity/calorie total confirms it is
+        # the same meal rather than a legitimate second serving of the same food.
+        if new_totals["calories"] > 0 and meal["calories"] > 0:
+            diff = abs(meal["calories"] - new_totals["calories"])
+            if diff / max(meal["calories"], new_totals["calories"]) <= 0.35:
                 return meal
+        else:
+            return meal
     return None
 
 
