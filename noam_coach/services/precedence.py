@@ -31,6 +31,7 @@ inventing its own.
 from __future__ import annotations
 
 from enum import IntEnum
+from typing import TypeVar
 
 
 class PrecedenceRank(IntEnum):
@@ -52,6 +53,12 @@ WORKOUT_SOURCE_RANK: dict[str, PrecedenceRank] = {
     "active_session": PrecedenceRank.ACTUAL_CURRENT_DAY_EVENT,
     "completed_session": PrecedenceRank.ACTUAL_CURRENT_DAY_EVENT,
     "session_status": PrecedenceRank.ACTUAL_CURRENT_DAY_EVENT,
+    # An imported HealthKit workout sample is just as much an actual
+    # current-day event as a bot-tracked session — see
+    # ``user_state._healthkit_session_candidate``, which closes the gap
+    # where ``daily_state.workout_completed_today`` knew about HealthKit
+    # workouts but the shared resolver did not.
+    "healthkit_session": PrecedenceRank.ACTUAL_CURRENT_DAY_EVENT,
     "user_clarification": PrecedenceRank.EXPLICIT_CURRENT_DAY_INPUT,
     "active_workout_plan": PrecedenceRank.CURRENT_PLAN,
     "routine_pattern": PrecedenceRank.HIGH_CONFIDENCE_ROUTINE,
@@ -59,14 +66,34 @@ WORKOUT_SOURCE_RANK: dict[str, PrecedenceRank] = {
 }
 
 
+class UnknownPrecedenceSourceError(ValueError):
+    """Raised when a ``WorkoutState.source`` has no registered rank.
+
+    A silent fallback rank here would let a newly-added source slot into the
+    ordering at an arbitrary, unaudited position — exactly the kind of
+    unnoticed policy drift this module exists to prevent. Every source must
+    be registered in ``WORKOUT_SOURCE_RANK`` explicitly before it can be
+    compared, so adding a new resolver branch that forgets to register its
+    source string fails loudly (a test/runtime error) instead of silently
+    landing at the wrong precedence.
+    """
+
+
 def workout_source_rank(source: str) -> PrecedenceRank:
     """Rank of a ``WorkoutState.source`` string in the shared precedence policy.
 
-    Unknown sources rank as WEAK_INFERENCE (better than DEFAULT, worse than
-    anything named) so a typo'd/new source never silently outranks a real
-    plan or actual event, but also never disappears below "no evidence".
+    Raises ``UnknownPrecedenceSourceError`` for any source not explicitly
+    registered in ``WORKOUT_SOURCE_RANK`` — see that error's docstring for why
+    a defaulted rank is not safe here.
     """
-    return WORKOUT_SOURCE_RANK.get(source, PrecedenceRank.WEAK_INFERENCE)
+    try:
+        return WORKOUT_SOURCE_RANK[source]
+    except KeyError as exc:
+        raise UnknownPrecedenceSourceError(
+            f"Unregistered workout state source {source!r}: add it to "
+            "WORKOUT_SOURCE_RANK with an explicit PrecedenceRank before it "
+            "can participate in workout-state precedence decisions."
+        ) from exc
 
 
 def higher_precedence_source(a: str, b: str) -> str:
@@ -77,3 +104,33 @@ def higher_precedence_source(a: str, b: str) -> str:
     is the tie-break default rather than silently flipping on equal rank).
     """
     return a if workout_source_rank(a) >= workout_source_rank(b) else b
+
+
+T = TypeVar("T")
+
+
+def select_highest_precedence(candidates: list[tuple[str, T]]) -> T:
+    """Pick the value whose source ranks highest among a list of candidates.
+
+    ``candidates`` is a list of ``(source, value)`` pairs in the order a
+    resolver discovered them (e.g. active session, completed session,
+    explicit clarification, plan, routine). This is the single place that
+    decides "which layer wins" for a resolver built around this module —
+    resolvers should gather every source they can find evidence for and let
+    this function pick the winner, rather than hand-rolling their own
+    if/elif precedence chain that can drift from the declared policy.
+
+    Earlier entries win ties (mirrors ``higher_precedence_source``'s
+    stability rule). Raises ``ValueError`` on an empty list and
+    ``UnknownPrecedenceSourceError`` (via ``workout_source_rank``) if any
+    candidate's source is unregistered.
+    """
+    if not candidates:
+        raise ValueError("select_highest_precedence requires at least one candidate")
+    best_source, best_value = candidates[0]
+    best_rank = workout_source_rank(best_source)
+    for source, value in candidates[1:]:
+        rank = workout_source_rank(source)
+        if rank > best_rank:
+            best_source, best_value, best_rank = source, value, rank
+    return best_value

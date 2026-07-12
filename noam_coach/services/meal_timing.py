@@ -24,6 +24,7 @@ function returns ``None`` rather than guessing.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from noam_coach.services.user_state import ConsumedMeal, WorkoutState
@@ -141,19 +142,33 @@ class MealTimingRecommendation:
 def recent_meal_state_from_consumed(
     meal: ConsumedMeal | None,
     *,
-    now_minutes: int | None = None,
+    now: datetime | None = None,
 ) -> RecentMealState | None:
     """Build a ``RecentMealState`` from the shared state's most recent meal.
+
+    ``now`` should be the SAME instant as the enclosing ``SharedUserState.now``
+    (never a fresh ``datetime.now()`` call) so this stays consistent with
+    every other projection built from that snapshot. ``minutes_since_eaten``
+    is computed from ``now - meal.eaten_at`` when both are known; if
+    ``meal.eaten_at`` is ``None`` (eating time was never actually captured),
+    it stays honestly ``None`` — never defaulted to 0 (which would read as
+    "just ate") or otherwise fabricated.
+
+    ``fat_g`` is sourced from ``ConsumedMeal.fat`` — the ``meals`` table
+    always populates this column (NOT NULL), so it is real data, not a
+    schema-limitation placeholder.
 
     Returns ``None`` when there is no recent meal to reason about at all.
     """
     if meal is None:
         return None
-    del now_minutes  # minutes_since is already resolved by the caller/state
+    minutes_since_eaten: int | None = None
+    if now is not None and meal.eaten_at is not None:
+        minutes_since_eaten = max(0, int((now - meal.eaten_at).total_seconds() // 60))
     return RecentMealState(
         calories=meal.calories,
-        fat_g=None,  # ConsumedMeal does not carry fat; stays honestly unknown
-        minutes_since_eaten=None,
+        fat_g=meal.fat,
+        minutes_since_eaten=minutes_since_eaten,
         time_confidence=meal.time_confidence,
     )
 

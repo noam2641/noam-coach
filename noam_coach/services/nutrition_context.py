@@ -27,6 +27,7 @@ from noam_coach.services.next_meal import (
     WorkoutPhase,
     build_workout_nutrition_context,
 )
+from noam_coach.services.user_state import SharedUserState
 from noam_coach.services.weekdays import local_weekday
 
 # Sentinel sent to the AI for a field that has no real source yet. It is
@@ -336,10 +337,27 @@ async def build_nutrition_context(
     daily_ctx: Any | None = None,
     now: datetime | None = None,
     local_now: datetime | None = None,
+    shared_state: SharedUserState | None = None,
 ) -> NutritionContext:
+    """Build the nutrition-side decision snapshot.
+
+    ``shared_state``: pass an already-built ``SharedUserState`` (REC-ARCH-01)
+    when the caller already resolved one this request (e.g. a handler that
+    also builds a next-meal recommendation or a workout view for the same
+    request) so workout state is resolved from the DB exactly once across
+    the whole request instead of once per independent caller. When ``now``
+    is also given, it must agree with ``shared_state.now`` — ``shared_state``
+    is the single source of truth for "now" whenever both are supplied.
+    """
     # `local_now` is kept as a compatibility alias for existing regression tests
     # and callers. Prefer `now` in new code. If both are provided, `now` wins.
-    resolved_now = now or local_now or getattr(daily_ctx, "now", None) or datetime.now(TZ)
+    resolved_now = (
+        (shared_state.now if shared_state is not None else None)
+        or now
+        or local_now
+        or getattr(daily_ctx, "now", None)
+        or datetime.now(TZ)
+    )
     local_now = resolved_now.astimezone(TZ)
     local_day = local_now.date().isoformat()
     flags = dict(getattr(daily_ctx, "flags", None) or await _daily_flags(db, user_id, local_day))
@@ -357,7 +375,12 @@ async def build_nutrition_context(
     expected_meals = max(1, len(planned_meals) or len(((profile.get("eating") or {}).get("typical_meal_hours") or [])) or 3)
     start_utc, end_utc = local_day_bounds_utc(local_now)
     quality = await data_quality.assess_day(db, user_id, start_utc, end_utc, expected_meals=expected_meals)
-    workout_context = await build_workout_nutrition_context(db, user_id, now=local_now)
+    workout_context = await build_workout_nutrition_context(
+        db,
+        user_id,
+        now=local_now,
+        workout_state=shared_state.workout if shared_state is not None else None,
+    )
 
     diet_value = await user_model.get_value(db, user_id, "diet_restrictions")
     allergy_value = await user_model.get_value(db, user_id, "allergies")

@@ -38,11 +38,19 @@ from noam_coach.services.learned_foods import (
     learned_foods_from_meals,
     text_matches_learned_food,
 )
+from noam_coach.services.meal_timing import (
+    evaluate_pre_workout_meal_timing,
+    recent_meal_state_from_consumed,
+    workout_demand_from_session,
+)
 from noam_coach.services.user_state import (
+    SharedUserState,
     WorkoutPhase,
     WorkoutState,
+    build_shared_state,
     resolve_workout_state,
 )
+from noam_coach.services.workout_decision_context import project_workout_decision_context
 
 __all__ = [
     "WorkoutPhase",
@@ -159,6 +167,12 @@ class NextMealRecommendation:
     notices: list[str] = field(default_factory=list)
     validation_events: list[str] = field(default_factory=list)
     decision_audit: dict[str, Any] = field(default_factory=dict)
+    # REC-ARCH-01 item 5: the pre-workout meal-timing decision (see
+    # meal_timing.evaluate_pre_workout_meal_timing), when a genuinely
+    # upcoming workout + a recent actually-consumed meal made it applicable.
+    # ``None`` means "not applicable this request", never "no delay" —
+    # presentation must not read ``None`` as a positive "no concern" signal.
+    meal_timing: Any | None = None
 
     def to_dict(self) -> dict[str, Any]:
         out = asdict(self)
@@ -453,6 +467,8 @@ async def _workout_state(
     user_id: int,
     now: datetime,
     flags: dict[str, Any],
+    *,
+    precomputed: WorkoutState | None = None,
 ) -> dict[str, Any]:
     """Thin adapter over the shared resolver (REC-ARCH-01).
 
@@ -462,8 +478,17 @@ async def _workout_state(
     dict shape the rest of this module already expects, so no other function
     here had to change. Behavior is unchanged; the resolution logic just no
     longer lives only here.
+
+    ``precomputed`` lets a caller that already built a ``SharedUserState``
+    this request (see ``build_workout_nutrition_context``'s ``workout_state``
+    param) pass its already-resolved ``WorkoutState`` straight through
+    instead of this function re-querying the DB — the whole point of
+    REC-ARCH-01's "one shared snapshot" being an actual single DB
+    resolution, not just an available-but-unused option.
     """
-    state: WorkoutState = await resolve_workout_state(db, user_id, now, daily_flags=flags)
+    state: WorkoutState = precomputed if precomputed is not None else await resolve_workout_state(
+        db, user_id, now, daily_flags=flags
+    )
     result: dict[str, Any] = {
         "phase": state.phase,
         "source": state.source,
@@ -510,12 +535,23 @@ async def build_workout_nutrition_context(
     user_id: int,
     *,
     now: datetime | None = None,
+    workout_state: WorkoutState | None = None,
 ) -> WorkoutNutritionContext:
+    """Build the workout-aware nutrition snapshot.
+
+    ``workout_state``: pass an already-resolved ``WorkoutState`` (e.g. from
+    ``user_state.build_shared_state(...).workout``) when the caller already
+    built a ``SharedUserState`` for this request, so workout state is
+    resolved from the DB exactly once per decision flow instead of once here
+    and again wherever else in the same request happens to also want it
+    (REC-ARCH-01). Omitted by existing callers that have not migrated yet —
+    this function still resolves it itself in that case, unchanged.
+    """
     local_now = (now or datetime.now(TZ)).astimezone(TZ)
     local_day = local_now.date().isoformat()
     flags = await _daily_flags(db, user_id, local_day)
     nutrition, _goal = await _nutrition_totals(db, user_id, now=local_now)
-    workout = await _workout_state(db, user_id, local_now, flags)
+    workout = await _workout_state(db, user_id, local_now, flags, precomputed=workout_state)
     recent_name, recent_minutes = await _recent_meal(db, user_id, local_now)
     hours_until_bedtime, sleep_reference = await _bedtime_hours(db, user_id, local_now)
     restrictions = await _restrictions(db, user_id)
@@ -1225,8 +1261,19 @@ async def generate_next_meal_recommendation(
     now: datetime | None = None,
     excluded_fingerprints: set[str] | None = None,
     allow_overage: bool = False,
+    shared_state: SharedUserState | None = None,
 ) -> NextMealRecommendation:
-    context = await build_workout_nutrition_context(db, user_id, now=now)
+    """Build the single "what should I eat now" recommendation.
+
+    ``shared_state``: pass an already-built ``SharedUserState`` (REC-ARCH-01)
+    when the caller already resolved one this request (e.g. a handler that
+    also needs the workout view for its own display) so workout state is
+    resolved from the DB exactly once for the whole request. When omitted
+    (the common case — most callers just want a recommendation), one is
+    built here, still exactly once for this function's own work.
+    """
+    state = shared_state if shared_state is not None else await build_shared_state(db, user_id, now=now)
+    context = await build_workout_nutrition_context(db, user_id, now=state.now, workout_state=state.workout)
     budget = allocate_next_meal_budget(context, allow_overage=allow_overage)
     restrictions = await _restrictions(db, user_id)
     flags = await _daily_flags(db, user_id, context.local_day)
@@ -1281,6 +1328,27 @@ async def generate_next_meal_recommendation(
     learned_foods = await learned_foods_from_meals(db, user_id, limit=12, min_count=2)
     options = _rank_and_recommend(options, budget, context, recent_keys, learned_food_keys(learned_foods))[:1]
 
+    # REC-ARCH-01 item 4/5: project the workout-decision context from the SAME
+    # shared snapshot (no second DB resolution) and, when there is a genuinely
+    # upcoming workout, ask whether the most recent actually-consumed meal
+    # should change the timing recommendation. This never fires for an
+    # in-progress/completed workout (evaluate_pre_workout_meal_timing guards
+    # on ``is_future_plan``) and never fabricates a delay for a planned-but-
+    # not-eaten meal (recent_meal_state_from_consumed only ever sees
+    # ``state.consumed_meals_today``, never ``planned_meal_titles``).
+    workout_decision_ctx = project_workout_decision_context(state, session_plan=state.session_plan)
+    meal_timing_recommendation = None
+    if workout_decision_ctx.is_upcoming and state.consumed_meals_today:
+        most_recent_meal = state.consumed_meals_today[0]
+        recent_meal_state = recent_meal_state_from_consumed(most_recent_meal, now=state.now)
+        demand = workout_demand_from_session(workout_decision_ctx.session_plan)
+        meal_timing_recommendation = evaluate_pre_workout_meal_timing(
+            workout=workout_decision_ctx.workout,
+            recent_meal=recent_meal_state,
+            demand=demand,
+            minutes_until_workout=workout_decision_ctx.workout.minutes_until,
+        )
+
     notices: list[str] = []
     if budget.policy == "low_remaining":
         notices.append("האפשרויות נבנו כדי להיכנס ליתרת הקלוריות שנותרה להיום.")
@@ -1310,6 +1378,8 @@ async def generate_next_meal_recommendation(
         notices.append(
             "דיווחת שאתה בצום היום. אם כבר אינך בצום, כתוב ״אני לא בצום״."
         )
+    if meal_timing_recommendation is not None and meal_timing_recommendation.should_delay:
+        notices.append(meal_timing_recommendation.reason)
     needs_clarification = context.workout_phase in {
         WorkoutPhase.WORKOUT_STATUS_UNKNOWN,
         WorkoutPhase.WORKOUT_PLANNED_TIME_PASSED,
@@ -1327,6 +1397,7 @@ async def generate_next_meal_recommendation(
         notices=notices,
         validation_events=validation_events,
         decision_audit=decision_audit.to_dict(),
+        meal_timing=meal_timing_recommendation,
     )
 
 

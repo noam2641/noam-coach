@@ -112,31 +112,19 @@ async def workout_completed_today(
     *,
     now: datetime | None = None,
 ) -> bool:
-    start, end = local_day_bounds_utc(now)
-    bot_done = await db.fetch_one(
-        """
-        SELECT 1
-        FROM sessions
-        WHERE user_id=?
-          AND status IN ('completed','partial')
-          AND ended_at>=?
-          AND ended_at<?
-        LIMIT 1
-        """,
-        (user_id, start, end),
-    )
-    if bot_done:
-        return True
-    imported = await db.fetch_one(
-        """
-        SELECT 1
-        FROM health
-        WHERE user_id=?
-          AND sample_type='workout'
-          AND start_time>=?
-          AND start_time<?
-        LIMIT 1
-        """,
-        (user_id, start, end),
-    )
-    return imported is not None
+    """True only if a workout ACTUALLY completed today (bot session or
+    HealthKit import) — never true from a plan, routine, or explicit
+    self-report alone.
+
+    REC-ARCH-01: delegates to ``user_state.has_actual_workout_completion_evidence_today``
+    (a local import — ``user_state`` imports this module, so importing it back
+    at module scope would create a cycle) so the sessions/HealthKit evidence
+    query lives in exactly one place instead of being duplicated here and in
+    ``user_state.resolve_workout_state``'s ACTUAL-tier candidates. Behavior is
+    unchanged: still strictly "did a real event happen", not "did the user
+    say so".
+    """
+    from noam_coach.services.user_state import has_actual_workout_completion_evidence_today
+
+    local_now = (now or datetime.now(TZ)).astimezone(TZ)
+    return await has_actual_workout_completion_evidence_today(db, user_id, local_now)

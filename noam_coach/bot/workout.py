@@ -139,6 +139,7 @@ async def build_daily_status(user_id: int) -> str:
     )
     from noam_coach.services.nutrition_context import build_nutrition_context
     from noam_coach.services.next_meal import build_remaining_slot_allocations
+    from noam_coach.services.user_state import build_shared_state
 
     goal = await fetch_goal(user_id)
     meals = await today_meals(user_id)
@@ -165,8 +166,16 @@ async def build_daily_status(user_id: int) -> str:
         lines.append("<i>שלח תמונה של אוכל או כתוב מה אכלת כדי להתחיל מעקב.</i>")
         return "\n".join(lines)
 
-    context = await build_nutrition_context(DB, user_id, "daily_status")
-    workout_context = await build_workout_nutrition_context(DB, user_id)
+    # REC-ARCH-01: one shared snapshot for the whole handler — nutrition
+    # context, the workout view, and the next-meal recommendation all read
+    # the SAME resolved workout state instead of each independently
+    # re-querying sessions/plan/routine (three DB round-trips for the same
+    # fact before this fix).
+    shared_state = await build_shared_state(DB, user_id)
+    context = await build_nutrition_context(DB, user_id, "daily_status", shared_state=shared_state)
+    workout_context = await build_workout_nutrition_context(
+        DB, user_id, now=shared_state.now, workout_state=shared_state.workout
+    )
 
     # TASK-13: a concise dashboard — current state, what happened, next action.
     # Remaining calories/protein appear exactly ONCE; no duplicate workout
@@ -228,7 +237,7 @@ async def build_daily_status(user_id: int) -> str:
     # 4) One actionable recommendation — the immediate meal title + macros only,
     # not the full next-meal screen (which repeats state/timeline).
     try:
-        recommendation = await generate_next_meal_recommendation(DB, user_id)
+        recommendation = await generate_next_meal_recommendation(DB, user_id, shared_state=shared_state)
     except Exception:  # noqa: BLE001 - the day summary must render even if the recommender fails
         recommendation = None
     if recommendation is not None and recommendation.options:
@@ -264,8 +273,12 @@ async def render_post_meal_confirmation_day_status(user_id: int, totals: dict[st
     """
     from noam_coach.services.next_meal import build_remaining_slot_allocations, build_workout_nutrition_context
     from noam_coach.services.nutrition_context import build_nutrition_context
+    from noam_coach.services.user_state import build_shared_state
 
-    context = await build_nutrition_context(DB, user_id, "post_meal_status")
+    # REC-ARCH-01: one shared snapshot for both the nutrition context and the
+    # workout view below, instead of two independent workout-state resolutions.
+    shared_state = await build_shared_state(DB, user_id)
+    context = await build_nutrition_context(DB, user_id, "post_meal_status", shared_state=shared_state)
 
     lines = ["נשמר ✅", "הארוחה נוספה ליומן:"]
     lines.append(f"≈{totals['calories']:.0f} קלוריות | ≈{totals['protein']:.0f} גרם חלבון")
@@ -284,7 +297,9 @@ async def render_post_meal_confirmation_day_status(user_id: int, totals: dict[st
         )
 
     try:
-        workout_context = await build_workout_nutrition_context(DB, user_id)
+        workout_context = await build_workout_nutrition_context(
+            DB, user_id, now=shared_state.now, workout_state=shared_state.workout
+        )
     except Exception:  # noqa: BLE001 - this short screen must still render on failure
         workout_context = None
 

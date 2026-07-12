@@ -471,6 +471,20 @@ async def select_todays_workout_code(user_id: int) -> str | None:
     Preference (per product): the session scheduled for *today* in the active
     weekly plan; otherwise the next one in the plan's cycle after the last
     workout actually performed (A→B→C→A...). Returns None if no active plan.
+
+    REC-ARCH-01 audit note: this answers a question orthogonal to
+    ``user_state.resolve_workout_state``'s phase resolution — "which A/B/C
+    code is today's split" (a per-CODE completion set + cycle-position
+    question), not "what's the current phase of today's workout". It reads
+    ``active_workout_plan`` from the ``user_model`` fact mirror (a different
+    source than ``planning.get_active_plan`` used by the shared resolver) and
+    needs a *set* of which codes were already done today, which the shared
+    resolver's single latest-session view does not expose. Left as its own
+    narrow helper rather than forced through the shared resolver, which would
+    lose the per-code granularity this needs without replacing anything it
+    does. Not itself a source of workout-phase disagreement with nutrition
+    (it never claims "the workout is upcoming/in-progress/done" — only "here
+    is which code to show").
     """
     plan = await user_model.get_value(DB, user_id, "active_workout_plan")
     if not plan or not plan.get("sessions"):
