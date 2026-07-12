@@ -11,7 +11,6 @@ import math
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, time, timedelta, timezone
-from enum import Enum
 from typing import Any
 
 import planning
@@ -39,21 +38,17 @@ from noam_coach.services.learned_foods import (
     learned_foods_from_meals,
     text_matches_learned_food,
 )
-from noam_coach.services.weekdays import local_weekday
+from noam_coach.services.user_state import (
+    WorkoutPhase,
+    WorkoutState,
+    resolve_workout_state,
+)
 
-
-class WorkoutPhase(str, Enum):
-    REST_DAY = "rest_day"
-    PRE_WORKOUT_EARLY = "pre_workout_early"
-    PRE_WORKOUT_NEAR = "pre_workout_near"
-    PRE_WORKOUT_IMMEDIATE = "pre_workout_immediate"
-    DURING_WORKOUT = "during_workout"
-    POST_WORKOUT_IMMEDIATE = "post_workout_immediate"
-    POST_WORKOUT_LATER = "post_workout_later"
-    WORKOUT_COMPLETED_EARLIER = "workout_completed_earlier"
-    WORKOUT_CANCELLED = "workout_cancelled"
-    WORKOUT_PLANNED_TIME_PASSED = "workout_planned_time_passed"
-    WORKOUT_STATUS_UNKNOWN = "workout_status_unknown"
+__all__ = [
+    "WorkoutPhase",
+    "WorkoutNutritionContext",
+    "build_workout_nutrition_context",
+]
 
 
 @dataclass
@@ -293,10 +288,6 @@ def _option_from_payload(payload: dict[str, Any]) -> MealOption:
     )
 
 
-def _local_weekday_index(local_dt: datetime) -> int:
-    return local_weekday(local_dt)
-
-
 async def _daily_flags(db: Any, user_id: int, local_day: str) -> dict[str, Any]:
     row = await db.fetch_one(
         "SELECT flags FROM daily_flags WHERE user_id=? AND day=?",
@@ -457,163 +448,40 @@ async def _bedtime_hours(db: Any, user_id: int, now: datetime) -> tuple[float | 
     return round((bed_dt - now).total_seconds() / 3600, 1), source
 
 
-async def _active_session(db: Any, user_id: int) -> dict[str, Any] | None:
-    return await db.fetch_one(
-        """
-        SELECT *
-        FROM sessions
-        WHERE user_id=? AND status='active'
-        ORDER BY started_at DESC, id DESC
-        LIMIT 1
-        """,
-        (user_id,),
-    )
-
-
-async def _latest_closed_session_today(db: Any, user_id: int, now: datetime) -> dict[str, Any] | None:
-    return await daily_state.latest_closed_session_today(db, user_id, now=now)
-
-
-def _planned_session_for_today(workout_plan: dict[str, Any] | None, now: datetime) -> dict[str, Any] | None:
-    if not workout_plan:
-        return None
-    sessions = (workout_plan.get("payload") or {}).get("sessions") or []
-    today = _local_weekday_index(now)
-    candidates = [session for session in sessions if int(session.get("weekday", -1)) == today]
-    if not candidates:
-        return None
-    return sorted(candidates, key=lambda item: str(item.get("time") or "23:59"))[0]
-
-
-# TASK-12: a realistic pre-workout meal window. A workout many hours away
-# (e.g. 19:09 while it is 00:49 — ~18h) must NOT make the current meal a
-# pre-workout meal. Beyond this window the meal context is a normal day/rest
-# context; the workout still appears later in the chronological timeline.
-_PRE_WORKOUT_WINDOW_MIN = 300  # 5 hours
-
-
-def _phase_from_times(now: datetime, start: datetime, end: datetime) -> tuple[WorkoutPhase, int | None, int | None]:
-    if now < start:
-        minutes_until = int((start - now).total_seconds() // 60)
-        if minutes_until <= 30:
-            return WorkoutPhase.PRE_WORKOUT_IMMEDIATE, minutes_until, None
-        if minutes_until <= 120:
-            return WorkoutPhase.PRE_WORKOUT_NEAR, minutes_until, None
-        if minutes_until <= _PRE_WORKOUT_WINDOW_MIN:
-            return WorkoutPhase.PRE_WORKOUT_EARLY, minutes_until, None
-        # Workout is later today but outside the pre-workout meal window: treat
-        # the current meal context as a normal day (not pre-workout).
-        return WorkoutPhase.REST_DAY, minutes_until, None
-    if start <= now <= end:
-        return WorkoutPhase.WORKOUT_STATUS_UNKNOWN, None, None
-    return WorkoutPhase.WORKOUT_PLANNED_TIME_PASSED, None, int((now - end).total_seconds() // 60)
-
-
 async def _workout_state(
     db: Any,
     user_id: int,
     now: datetime,
     flags: dict[str, Any],
 ) -> dict[str, Any]:
-    explicit = str(flags.get("next_meal_workout_status") or "").strip()
-    if explicit == "during":
-        return {
-            "phase": WorkoutPhase.DURING_WORKOUT,
-            "source": "user_clarification",
-            "label": "האימון מתבצע עכשיו לפי הדיווח שלך.",
-        }
-    if explicit == "completed":
-        return {
-            "phase": WorkoutPhase.POST_WORKOUT_IMMEDIATE,
-            "source": "user_clarification",
-            "label": "דיווחת שהאימון הושלם.",
-            "minutes_since": 0,
-        }
-    if explicit == "cancelled":
-        return {
-            "phase": WorkoutPhase.WORKOUT_CANCELLED,
-            "source": "user_clarification",
-            "label": "דיווחת שהאימון בוטל היום.",
-        }
+    """Thin adapter over the shared resolver (REC-ARCH-01).
 
-    active = await _active_session(db, user_id)
-    if active:
-        return {
-            "phase": WorkoutPhase.DURING_WORKOUT,
-            "source": "active_session",
-            "label": "יש אימון פעיל כרגע.",
-            "actual_start": _parse_dt(active.get("started_at")),
-        }
-
-    closed = await _latest_closed_session_today(db, user_id, now)
-    if closed:
-        ended = _parse_dt(closed.get("ended_at"))
-        if str(closed.get("status")) == "cancelled":
-            return {
-                "phase": WorkoutPhase.WORKOUT_CANCELLED,
-                "source": "session_status",
-                "label": "האימון סומן כמבוטל היום.",
-                "actual_end": ended,
-            }
-        minutes_since = int((now - ended).total_seconds() // 60) if ended else None
-        if minutes_since is not None and minutes_since <= 90:
-            phase = WorkoutPhase.POST_WORKOUT_IMMEDIATE
-        elif minutes_since is not None and minutes_since <= 360:
-            phase = WorkoutPhase.POST_WORKOUT_LATER
-        else:
-            phase = WorkoutPhase.WORKOUT_COMPLETED_EARLIER
-        return {
-            "phase": phase,
-            "source": "completed_session",
-            "label": "האימון היום כבר הושלם.",
-            "actual_start": _parse_dt(closed.get("started_at")),
-            "actual_end": ended,
-            "minutes_since": minutes_since,
-        }
-
-    workout_plan = await planning.get_active_plan(db, user_id, "workout")
-    planned = _planned_session_for_today(workout_plan, now)
-    if planned:
-        start_time = _parse_hhmm(planned.get("time")) or time(18, 0)
-        minutes = int(planned.get("minutes") or 60)
-        start = datetime.combine(now.date(), start_time, tzinfo=TZ)
-        end = start + timedelta(minutes=minutes)
-        phase, minutes_until, minutes_since = _phase_from_times(now, start, end)
-        if explicit == "later" and phase in {
-            WorkoutPhase.WORKOUT_STATUS_UNKNOWN,
-            WorkoutPhase.WORKOUT_PLANNED_TIME_PASSED,
-        }:
-            phase = WorkoutPhase.PRE_WORKOUT_NEAR
-            minutes_until = None
-        return {
-            "phase": phase,
-            "source": "active_workout_plan",
-            "label": "יש אימון מתוכנן היום לפי התוכנית.",
-            "planned_start": start,
-            "planned_end": end,
-            "minutes_until": minutes_until,
-            "minutes_since": minutes_since,
-        }
-
-    routine_pattern = await db.fetch_one("SELECT profile FROM routine_profile WHERE user_id=?", (user_id,))
-    if routine_pattern:
-        try:
-            profile = json.loads(routine_pattern["profile"] or "{}")
-            weekdays = ((profile.get("workout") or {}).get("common_weekdays") or [])
-            if now.weekday() in [int(day) for day in weekdays]:
-                return {
-                    "phase": WorkoutPhase.WORKOUT_STATUS_UNKNOWN,
-                    "source": "routine_pattern",
-                    "label": "יש דפוס אימונים היסטורי היום, אבל אין ראיה שאימון נקבע או בוצע.",
-                }
-        except (TypeError, ValueError, json.JSONDecodeError):
-            pass
-
-    return {
-        "phase": WorkoutPhase.REST_DAY,
-        "source": "no_workout_evidence",
-        "label": "לא נמצא אימון מתוכנן או פעיל היום.",
+    This used to be next_meal's own private workout-phase resolution. It now
+    delegates to ``user_state.resolve_workout_state`` — the canonical shared
+    resolver — and converts the returned ``WorkoutState`` back into the plain
+    dict shape the rest of this module already expects, so no other function
+    here had to change. Behavior is unchanged; the resolution logic just no
+    longer lives only here.
+    """
+    state: WorkoutState = await resolve_workout_state(db, user_id, now, daily_flags=flags)
+    result: dict[str, Any] = {
+        "phase": state.phase,
+        "source": state.source,
+        "label": state.label,
     }
+    if state.planned_start is not None:
+        result["planned_start"] = state.planned_start
+    if state.planned_end is not None:
+        result["planned_end"] = state.planned_end
+    if state.actual_start is not None:
+        result["actual_start"] = state.actual_start
+    if state.actual_end is not None:
+        result["actual_end"] = state.actual_end
+    if state.minutes_until is not None:
+        result["minutes_until"] = state.minutes_until
+    if state.minutes_since is not None:
+        result["minutes_since"] = state.minutes_since
+    return result
 
 
 def _meals_remaining(hours_until_bedtime: float | None, recent_minutes: int | None, flags: dict[str, Any]) -> int:
