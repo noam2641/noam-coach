@@ -328,7 +328,17 @@ async def save_next_meal_workout_status(
     local_day = local_now.date().isoformat()
     flags = await _daily_flags(db, user_id, local_day)
     flags["next_meal_workout_status"] = status
-    flags["next_meal_workout_status_at"] = utc_now()
+    # REC-ARCH-01 pass 3 fix: this used to always write the REAL wall-clock
+    # `utc_now()` here, ignoring the `now` parameter the rest of this
+    # function uses — harmless in production (callers almost always pass the
+    # real current time), but it silently broke the staleness mechanism
+    # (user_state._explicit_clarification_candidate) for any caller that
+    # passes a non-"real now" `now` (tests, backfills, or any future
+    # replay/simulation path), since the persisted timestamp would not
+    # reflect the instant the caller actually meant. Persist the SAME
+    # instant as `local_now` so "when was this clarification made" is
+    # consistent with "what day/flags row it was filed under".
+    flags["next_meal_workout_status_at"] = local_now.astimezone(timezone.utc).isoformat()
     await _save_daily_flags(db, user_id, local_day, flags)
 
 
@@ -414,6 +424,19 @@ async def _nutrition_totals(
 
 
 async def _recent_meal(db: Any, user_id: int, now: datetime) -> tuple[str | None, int | None]:
+    """Independently re-queries ``daily_state.consumed_meals`` rather than
+    reading ``SharedUserState.consumed_meals_today`` (REC-ARCH-01 pass 3
+    audit note): this is documented remaining duplicate-resolution debt, not
+    fixed in this pass — ``build_workout_nutrition_context`` (this
+    function's only caller) is used from ~10 call sites, most of which pass
+    only ``now`` (no ``SharedUserState``), so threading a shared meals list
+    through would require a wider signature change than this pass's scope.
+    Behaviorally low-risk to leave as-is: both this query and
+    ``user_state._consumed_meals_today`` read the exact same
+    ``daily_state.consumed_meals`` rows, so they cannot disagree on WHICH
+    meal is most recent — only "resolved twice" (a duplicate DB read, not a
+    duplicate/conflicting FACT).
+    """
     rows = await _today_meals(db, user_id, now)
     if not rows:
         return None, None
@@ -421,7 +444,11 @@ async def _recent_meal(db: Any, user_id: int, now: datetime) -> tuple[str | None
     eaten_at = _parse_dt(row.get("eaten_at"))
     if not eaten_at:
         return str(row.get("name") or ""), None
-    minutes = max(0, int((now - eaten_at).total_seconds() // 60))
+    delta_minutes = int((now - eaten_at).total_seconds() // 60)
+    # Same conservative handling as meal_timing.recent_meal_state_from_consumed:
+    # a future/clock-skewed eaten_at must not clamp to 0 ("just ate" is a
+    # stronger claim than an impossible timestamp supports) — stay unknown.
+    minutes = delta_minutes if delta_minutes >= 0 else None
     return str(row.get("name") or ""), minutes
 
 

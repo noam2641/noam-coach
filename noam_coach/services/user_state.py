@@ -77,6 +77,34 @@ class WorkoutPhase(str, Enum):
 # decisions (meal timing, etc.) — beyond this window it is just later-today.
 PRE_WORKOUT_WINDOW_MIN = 300  # 5 hours
 
+# --- Temporal-validity policy (REC-ARCH-01 corrective pass 3) ---------------
+#
+# Rank alone ("ACTUAL always outranks EXPLICIT") is not sufficient: a
+# candidate must also still be CURRENT to compete. These are product policy
+# thresholds, not physiological or technical constants — they encode "how
+# long can a same-day signal go unconfirmed before we stop trusting it as
+# still-true" and are picked to comfortably cover a real workout's duration
+# plus a reasonable margin, not derived from any measured distribution.
+#
+# An explicit self-report ("completed"/"during"/"cancelled") older than this
+# no longer counts as fresh current-day input — it is dropped as a candidate
+# entirely (not merely down-ranked) so a stale tap from hours ago cannot mask
+# whatever PLAN/ROUTINE evidence is actually current now. Chosen as 6 hours:
+# generous enough that a normal single-session clarification is never
+# spuriously discarded mid-day, short enough that "completed" tapped in the
+# morning cannot still be read as literally true state by evening.
+STALE_EXPLICIT_CLARIFICATION_MAX_HOURS = 6
+
+# A ``sessions`` row can be left ``status='active'`` forever if the user
+# never taps "finish" (crash, app killed, forgot) — see
+# ``_active_session_candidate``. No real workout plausibly runs this long, so
+# past this bound an "active" row is evidence of an abandoned/never-closed
+# session, not evidence that a workout is happening right now. Matches the
+# existing POST_WORKOUT_LATER cutoff used elsewhere in this module for "still
+# same-session-relevant" so the whole module uses one consistent notion of
+# "how long is too long for same-session same-day evidence".
+STALE_ACTIVE_SESSION_MAX_HOURS = 6
+
 
 @dataclass(frozen=True)
 class WorkoutState:
@@ -269,14 +297,35 @@ def _phase_from_times(now: datetime, start: datetime, end: datetime) -> tuple[Wo
     return WorkoutPhase.WORKOUT_PLANNED_TIME_PASSED, None, int((now - end).total_seconds() // 60)
 
 
-async def _explicit_clarification_candidate(explicit: str) -> WorkoutState | None:
+async def _explicit_clarification_candidate(
+    explicit: str, *, flags: dict[str, Any], now: datetime
+) -> WorkoutState | None:
     """The explicit "during"/"completed"/"cancelled" clarification, if any.
 
     Deliberately does NOT include "later" — "later" is not a claim about an
     actual event, it is a hint about how to read a *planned* session (see
     ``_planned_session_candidate``), so it stays folded into the PLAN
     candidate rather than becoming its own top-level EXPLICIT candidate.
+
+    Temporal validity (REC-ARCH-01 pass 3): ``next_meal_workout_status`` is
+    written alongside ``next_meal_workout_status_at`` (see
+    ``next_meal.save_next_meal_workout_status``), but until this fix the
+    timestamp was written and never read anywhere — an explicit clarification
+    was treated as eternally valid at its fixed EXPLICIT rank no matter how
+    old it was. A clarification older than
+    ``STALE_EXPLICIT_CLARIFICATION_MAX_HOURS`` is no longer offered as a
+    candidate at all (not merely down-ranked) — see that constant's docstring
+    for the policy reasoning. When the timestamp is missing entirely (should
+    not happen for anything written via the current save path, but the field
+    predates this fix and old rows may lack it), the clarification is treated
+    as valid rather than guessed-stale — we do not invent staleness from
+    absent data, only from data that positively shows the input is old.
     """
+    written_at = _parse_dt(flags.get("next_meal_workout_status_at"))
+    if written_at is not None:
+        age_hours = (now - written_at).total_seconds() / 3600
+        if age_hours > STALE_EXPLICIT_CLARIFICATION_MAX_HOURS:
+            return None
     if explicit == "during":
         return WorkoutState(
             phase=WorkoutPhase.DURING_WORKOUT,
@@ -299,15 +348,37 @@ async def _explicit_clarification_candidate(explicit: str) -> WorkoutState | Non
     return None
 
 
-async def _active_session_candidate(db: Any, user_id: int) -> WorkoutState | None:
+async def _active_session_candidate(db: Any, user_id: int, now: datetime) -> WorkoutState | None:
+    """A ``sessions`` row still ``status='active'`` — i.e. genuinely in
+    progress right now, structurally the strongest possible evidence.
+
+    Temporal validity (REC-ARCH-01 pass 3): ``_active_session``'s query has
+    no date bound at all, and nothing elsewhere in the app auto-closes an
+    abandoned session (confirmed by code inspection — no TTL/cleanup job
+    touches ``sessions.status``), so a session the user started and never
+    explicitly finished (crash, forgot to tap "finish") can sit at
+    ``status='active'`` indefinitely. Before this fix that row would win
+    ``DURING_WORKOUT`` at ``ACTUAL_CURRENT_DAY_EVENT`` rank forever — able to
+    permanently mask a real completed session or HealthKit import from
+    today, and the tie-break (``active`` candidate is gathered before
+    ``completed``/``healthkit`` candidates) always favored it on top of that.
+    Past ``STALE_ACTIVE_SESSION_MAX_HOURS`` (no real workout runs this long)
+    this candidate is dropped entirely rather than trusted as current truth,
+    so a same-day completed/HealthKit session is free to win instead.
+    """
     active = await _active_session(db, user_id)
     if not active:
         return None
+    started = _parse_dt(active.get("started_at"))
+    if started is not None:
+        age_hours = (now - started).total_seconds() / 3600
+        if age_hours > STALE_ACTIVE_SESSION_MAX_HOURS:
+            return None
     return WorkoutState(
         phase=WorkoutPhase.DURING_WORKOUT,
         source="active_session",
         label="יש אימון פעיל כרגע.",
-        actual_start=_parse_dt(active.get("started_at")),
+        actual_start=started,
     )
 
 
@@ -414,7 +485,7 @@ async def has_actual_workout_completion_evidence_today(db: Any, user_id: int, no
 
 
 async def _planned_session_candidate(
-    db: Any, user_id: int, now: datetime, *, explicit: str
+    db: Any, user_id: int, now: datetime, *, explicit: str, flags: dict[str, Any]
 ) -> WorkoutState | None:
     workout_plan = await planning.get_active_plan(db, user_id, "workout")
     planned = _planned_session_for_today(workout_plan, now)
@@ -425,7 +496,21 @@ async def _planned_session_candidate(
     start = datetime.combine(now.date(), start_time, tzinfo=TZ)
     end = start + timedelta(minutes=minutes)
     phase, minutes_until, minutes_since = _phase_from_times(now, start, end)
-    if explicit == "later" and phase in {
+    # Temporal validity for "later" (REC-ARCH-01 pass 3): "later" is scoped to
+    # today's flags row already (cross-day leakage is structurally impossible
+    # — flags are looked up per local_day), but WITHIN today it can still go
+    # stale: tapped at 09:00, unfollowed-up, and by 20:00 it should not keep
+    # reinterpreting a long-passed plan window as "still near". Same policy
+    # bound as the explicit-clarification staleness check, for one consistent
+    # notion of "how old is too old" across this module. Missing timestamp
+    # (rows written before this fix) is treated as valid, not guessed-stale.
+    later_is_stale = False
+    if explicit == "later":
+        later_written_at = _parse_dt(flags.get("next_meal_workout_status_at"))
+        if later_written_at is not None:
+            later_age_hours = (now - later_written_at).total_seconds() / 3600
+            later_is_stale = later_age_hours > STALE_EXPLICIT_CLARIFICATION_MAX_HOURS
+    if explicit == "later" and not later_is_stale and phase in {
         WorkoutPhase.WORKOUT_STATUS_UNKNOWN,
         WorkoutPhase.WORKOUT_PLANNED_TIME_PASSED,
     }:
@@ -490,6 +575,29 @@ async def resolve_workout_state(
     happens to have been set earlier in the day, or a PLAN that has not
     started — that ordering bug (explicit input short-circuiting before
     actual current-day events were even checked) is what this rewrite fixes.
+
+    Temporal validity (REC-ARCH-01 pass 3): rank alone is not sufficient — a
+    candidate must also still be CURRENT. Two mechanisms enforce this before
+    a candidate ever reaches ``select_highest_precedence``:
+      * ``_explicit_clarification_candidate`` / the "later" branch of
+        ``_planned_session_candidate`` drop an explicit self-report older
+        than ``STALE_EXPLICIT_CLARIFICATION_MAX_HOURS`` — it is excluded as a
+        candidate, not merely down-ranked, so it cannot mask newer PLAN or
+        ROUTINE evidence either.
+      * ``_active_session_candidate`` drops a ``status='active'`` session row
+        older than ``STALE_ACTIVE_SESSION_MAX_HOURS`` — an abandoned,
+        never-closed session must not permanently masquerade as "in progress
+        right now".
+
+    Tie-break note (``active_session`` vs ``completed_session`` /
+    ``healthkit_session``, all ``ACTUAL_CURRENT_DAY_EVENT`` rank): once both
+    candidates have passed their own validity check above, "active wins the
+    tie" is not arbitrary table order — a session that is GENUINELY active
+    right now (not stale) is, by definition, more current than any earlier
+    same-day completion, regardless of the completed session's own
+    timestamp. The gather order below (active, then closed, then healthkit)
+    only matters for this already-sound tie; it is not standing in for real
+    chronology.
     """
     local_day = now.date().isoformat()
     flags = daily_flags if daily_flags is not None else await _daily_flags(db, user_id, local_day)
@@ -497,23 +605,49 @@ async def resolve_workout_state(
 
     candidates: list[tuple[str, WorkoutState]] = []
 
-    active_candidate = await _active_session_candidate(db, user_id)
+    active_candidate = await _active_session_candidate(db, user_id, now)
     if active_candidate is not None:
         candidates.append((active_candidate.source, active_candidate))
 
     closed_candidate = await _closed_session_candidate(db, user_id, now)
-    if closed_candidate is not None:
-        candidates.append((closed_candidate.source, closed_candidate))
-
     healthkit_candidate = await _healthkit_session_candidate(db, user_id, now)
-    if healthkit_candidate is not None:
-        candidates.append((healthkit_candidate.source, healthkit_candidate))
+    # Both ``completed_session`` and ``healthkit_session`` are the same
+    # ACTUAL_CURRENT_DAY_EVENT rank (a bot-tracked completion and an
+    # imported HealthKit workout are equally "a real event today"), so
+    # ``select_highest_precedence`` cannot itself pick between them — it only
+    # knows about rank, not real chronology, and would silently favor
+    # whichever is gathered first. When a user has BOTH today (e.g. a
+    # bot-tracked session and a separate Apple Watch-tracked session), the
+    # one that actually ended more recently is the more current fact; that
+    # comparison happens here, explicitly, using real ``actual_end``
+    # timestamps rather than table/gather order. A cancelled closed-session
+    # candidate has no completion to compare chronologically and always
+    # yields to a real HealthKit completion if one exists today.
+    if closed_candidate is not None and healthkit_candidate is not None:
+        if closed_candidate.phase == WorkoutPhase.WORKOUT_CANCELLED:
+            candidates.append((healthkit_candidate.source, healthkit_candidate))
+        elif closed_candidate.actual_end is not None and healthkit_candidate.actual_end is not None:
+            more_recent = (
+                closed_candidate if closed_candidate.actual_end >= healthkit_candidate.actual_end else healthkit_candidate
+            )
+            candidates.append((more_recent.source, more_recent))
+        else:
+            # One side's completion time is unknown — cannot compare
+            # chronologically, so fall back to including both and letting
+            # deterministic (first-seen) tie-break apply, same as before.
+            candidates.append((closed_candidate.source, closed_candidate))
+            candidates.append((healthkit_candidate.source, healthkit_candidate))
+    else:
+        if closed_candidate is not None:
+            candidates.append((closed_candidate.source, closed_candidate))
+        if healthkit_candidate is not None:
+            candidates.append((healthkit_candidate.source, healthkit_candidate))
 
-    explicit_candidate = await _explicit_clarification_candidate(explicit)
+    explicit_candidate = await _explicit_clarification_candidate(explicit, flags=flags, now=now)
     if explicit_candidate is not None:
         candidates.append((explicit_candidate.source, explicit_candidate))
 
-    planned_candidate = await _planned_session_candidate(db, user_id, now, explicit=explicit)
+    planned_candidate = await _planned_session_candidate(db, user_id, now, explicit=explicit, flags=flags)
     if planned_candidate is not None:
         candidates.append((planned_candidate.source, planned_candidate))
 

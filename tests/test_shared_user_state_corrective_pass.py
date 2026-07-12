@@ -648,3 +648,241 @@ def test_no_import_cycle_between_nutrition_and_workout_modules() -> None:
     ]
     for name in modules:
         importlib.import_module(name)
+
+
+# ---------------------------------------------------------------------------
+# REC-ARCH-01 pass 3 — temporal validity / staleness. Rank alone ("ACTUAL >
+# EXPLICIT") is not sufficient: a candidate must also still be CURRENT.
+# ``next_meal_workout_status_at`` was written by ``save_next_meal_workout_status``
+# since 6b675b9 but never read anywhere in user_state.py until this pass —
+# these tests specifically exercise the staleness dimension, not just rank.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stale_explicit_completed_does_not_win_with_no_contradicting_event(db: Database) -> None:
+    """The precedence-divergence scenario this pass's primary fix addresses:
+    a stale daily clarification exists (old ``next_meal_workout_status_at``),
+    and there is NO newer actual event to out-rank it either — rank alone
+    would still let the stale explicit input win (EXPLICIT > PLAN). The
+    staleness check must reject it on its own, independent of any actual
+    event appearing, and let the plan resume being current truth."""
+    await _user(db)
+    now = datetime(2026, 7, 12, 21, 0, tzinfo=TZ)
+    # Tapped "completed" 7 hours ago — past STALE_EXPLICIT_CLARIFICATION_MAX_HOURS (6h).
+    await save_next_meal_workout_status(db, 1, "completed", now=now - timedelta(hours=7))
+    await _workout_plan(db, 1, now, time_text="18:00")  # plan window (18:00-19:00) long passed
+
+    state = await resolve_workout_state(db, 1, now)
+
+    assert state.source != "user_clarification"
+    assert state.source == "active_workout_plan"
+    assert state.phase == WorkoutPhase.WORKOUT_PLANNED_TIME_PASSED
+
+
+@pytest.mark.asyncio
+async def test_fresh_explicit_completed_still_wins_within_staleness_window(db: Database) -> None:
+    """Sanity counterpart: a clarification well within the staleness window
+    (2h old, under the 6h bound) still behaves exactly as before this pass —
+    the staleness check must not become overly aggressive."""
+    await _user(db)
+    now = datetime(2026, 7, 12, 20, 0, tzinfo=TZ)
+    await save_next_meal_workout_status(db, 1, "completed", now=now - timedelta(hours=2))
+    await _workout_plan(db, 1, now, time_text="19:30")
+
+    state = await resolve_workout_state(db, 1, now)
+
+    assert state.source == "user_clarification"
+    assert state.phase == WorkoutPhase.POST_WORKOUT_IMMEDIATE
+
+
+@pytest.mark.asyncio
+async def test_stale_later_no_longer_reinterprets_passed_plan_as_near(db: Database) -> None:
+    """"later" tapped once in the morning must not, by evening, keep forcing
+    a long-passed plan window to read as PRE_WORKOUT_NEAR. Cross-day leakage
+    was already impossible (flags are scoped per local_day); this is the
+    within-day staleness gap."""
+    await _user(db)
+    now = datetime(2026, 7, 12, 21, 0, tzinfo=TZ)
+    await _workout_plan(db, 1, now, time_text="09:00")  # long passed
+    # Tapped "later" 8 hours ago (stale) — plan time had already passed then too.
+    await save_next_meal_workout_status(db, 1, "later", now=now - timedelta(hours=8))
+
+    state = await resolve_workout_state(db, 1, now)
+
+    assert state.source == "active_workout_plan"
+    assert state.phase == WorkoutPhase.WORKOUT_PLANNED_TIME_PASSED
+
+
+@pytest.mark.asyncio
+async def test_fresh_later_still_reinterprets_passed_plan_as_near(db: Database) -> None:
+    """Counterpart: a fresh "later" (tapped 30 minutes ago) still gets the
+    existing PRE_WORKOUT_NEAR reinterpretation — behavior unchanged for the
+    common case."""
+    await _user(db)
+    now = datetime(2026, 7, 12, 21, 0, tzinfo=TZ)
+    await _workout_plan(db, 1, now, time_text="09:00")
+    await save_next_meal_workout_status(db, 1, "later", now=now - timedelta(minutes=30))
+
+    state = await resolve_workout_state(db, 1, now)
+
+    assert state.source == "active_workout_plan"
+    assert state.phase == WorkoutPhase.PRE_WORKOUT_NEAR
+
+
+@pytest.mark.asyncio
+async def test_abandoned_multiday_active_session_does_not_mask_completed_session_today(db: Database) -> None:
+    """Task B.7: a ``sessions`` row left ``status='active'`` for days (crash,
+    forgot to tap "finish" — nothing in the app auto-closes it) must not
+    permanently read as "workout in progress right now", masking a session
+    that genuinely completed today. Before this pass, ``_active_session``
+    had no staleness bound and always won ties against
+    ``completed_session``/``healthkit_session`` by gather order."""
+    await _user(db)
+    now = datetime(2026, 7, 12, 20, 0, tzinfo=TZ)
+    await _active_session(db, 1, now - timedelta(days=3))  # abandoned, never closed
+    await _completed_session(db, 1, now - timedelta(hours=1), now - timedelta(minutes=30))
+
+    state = await resolve_workout_state(db, 1, now)
+
+    assert state.source == "completed_session"
+    assert state.phase in {WorkoutPhase.POST_WORKOUT_IMMEDIATE, WorkoutPhase.POST_WORKOUT_LATER}
+
+
+@pytest.mark.asyncio
+async def test_genuinely_active_session_still_beats_completed_session_today(db: Database) -> None:
+    """Counterpart: a session that is genuinely active right now (not stale)
+    still wins over an earlier same-day completion — this is sound status
+    semantics (currently in progress is the most current possible state),
+    not the arbitrary-order bug the previous test guards against."""
+    await _user(db)
+    now = datetime(2026, 7, 12, 20, 0, tzinfo=TZ)
+    await _completed_session(db, 1, now - timedelta(hours=3), now - timedelta(hours=2), code="A")
+    await _active_session(db, 1, now - timedelta(minutes=15), code="B")
+
+    state = await resolve_workout_state(db, 1, now)
+
+    assert state.source == "active_session"
+    assert state.phase == WorkoutPhase.DURING_WORKOUT
+
+
+@pytest.mark.asyncio
+async def test_more_recent_healthkit_completion_beats_earlier_bot_session_today(db: Database) -> None:
+    """Task B.7 extension: when BOTH a bot-completed session and a
+    HealthKit-imported workout exist today (e.g. a lifting session tracked
+    via the bot, plus a run tracked on an Apple Watch), the one that
+    actually ended more recently must win the ACTUAL-rank tie — real
+    chronology, not "bot session is always gathered first"."""
+    await _user(db)
+    now = datetime(2026, 7, 12, 20, 0, tzinfo=TZ)
+    # Bot session ended 3 hours ago.
+    await _completed_session(db, 1, now - timedelta(hours=4), now - timedelta(hours=3))
+    # HealthKit workout ended 20 minutes ago — genuinely more recent.
+    await _healthkit_workout(db, 1, now - timedelta(minutes=50), now - timedelta(minutes=20))
+
+    state = await resolve_workout_state(db, 1, now)
+
+    assert state.source == "healthkit_session"
+    assert state.phase == WorkoutPhase.POST_WORKOUT_IMMEDIATE
+    assert state.minutes_since == 20
+
+
+@pytest.mark.asyncio
+async def test_earlier_bot_session_wins_when_it_is_actually_more_recent(db: Database) -> None:
+    """Counterpart: when the bot session is the one that actually ended more
+    recently, it must win — proving the comparison is real chronology in
+    both directions, not just "healthkit always wins when present"."""
+    await _user(db)
+    now = datetime(2026, 7, 12, 20, 0, tzinfo=TZ)
+    # HealthKit workout ended 3 hours ago.
+    await _healthkit_workout(db, 1, now - timedelta(hours=4), now - timedelta(hours=3))
+    # Bot session ended 20 minutes ago — genuinely more recent.
+    await _completed_session(db, 1, now - timedelta(minutes=50), now - timedelta(minutes=20))
+
+    state = await resolve_workout_state(db, 1, now)
+
+    assert state.source == "completed_session"
+    assert state.minutes_since == 20
+
+
+# ---------------------------------------------------------------------------
+# REC-ARCH-01 pass 3 — recent-meal future-timestamp safety (Task F). A
+# clock-skewed/future ``eaten_at`` must read as unknown, never clamp to 0
+# minutes ("just ate" is a stronger claim than an impossible timestamp
+# supports) — mirrors how ``_healthkit_session_candidate`` already guards a
+# future/still-syncing HealthKit end time.
+# ---------------------------------------------------------------------------
+
+
+def test_future_eaten_at_yields_unknown_minutes_not_zero() -> None:
+    now = datetime(2026, 7, 12, 17, 0, tzinfo=TZ)
+    meal = ConsumedMeal(
+        name="clock-skewed meal",
+        calories=900,
+        protein=40,
+        fat=30,
+        eaten_at=now + timedelta(minutes=15),  # future — clock skew
+        time_confidence="logged",
+    )
+
+    recent = recent_meal_state_from_consumed(meal, now=now)
+
+    assert recent is not None
+    assert recent.minutes_since_eaten is None
+
+
+@pytest.mark.asyncio
+async def test_live_recent_meal_helper_does_not_clamp_future_timestamp_to_zero(db: Database) -> None:
+    """Same guard, exercised through the live ``next_meal._recent_meal``
+    adapter (a separate, documented duplicate-resolution path that reads the
+    same ``daily_state.consumed_meals`` rows) — both paths must agree a
+    future timestamp is unknown, not "just now"."""
+    from noam_coach.services.next_meal import _recent_meal
+
+    await _user(db)
+    now = datetime(2026, 7, 12, 17, 0, tzinfo=TZ)
+    await _meal(db, 1, now, calories=900, minutes_ago=-15, name="clock-skewed meal")  # future eaten_at
+
+    name, minutes = await _recent_meal(db, 1, now)
+
+    assert name == "clock-skewed meal"
+    assert minutes is None
+
+
+# ---------------------------------------------------------------------------
+# REC-ARCH-01 pass 3 — snapshot reuse proof via call-counting (not just equal
+# timestamps): the migrated build_daily_status flow must resolve workout
+# state from the DB exactly once for the whole handler, not once per
+# projector that happens to receive the same `now`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_build_daily_status_resolves_workout_state_once(monkeypatch: pytest.MonkeyPatch, db: Database) -> None:
+    import coach_bot
+    from noam_coach.bot import workout as workout_module
+    from noam_coach.services import goals as goals_module
+
+    await _user(db)
+    await _goal(db)
+    now = datetime(2026, 7, 12, 17, 45, tzinfo=TZ)
+    await _workout_plan(db, 1, now, time_text="18:30")
+    await _meal(db, 1, now, calories=500, minutes_ago=30, name="lunch")
+
+    monkeypatch.setattr(coach_bot, "DB", db)
+    monkeypatch.setattr(workout_module, "DB", db, raising=False)
+    monkeypatch.setattr(goals_module, "DB", db, raising=False)
+
+    real_resolver = user_state_module.resolve_workout_state
+    call_count = 0
+
+    async def _counting_resolver(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return await real_resolver(*args, **kwargs)
+
+    with patch.object(user_state_module, "resolve_workout_state", side_effect=_counting_resolver):
+        text = await coach_bot.build_daily_status(1)
+
+    assert text  # renders successfully
+    assert call_count == 1, f"expected exactly one resolve_workout_state call for the whole handler, got {call_count}"

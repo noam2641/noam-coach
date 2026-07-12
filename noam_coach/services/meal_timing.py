@@ -19,6 +19,17 @@ data we actually have (planned duration + planned sets + which muscle groups
 the plan targets) — never a fabricated "digestion score" or invented
 fiber/GI data. Where the inputs are too thin to support a decision, the
 function returns ``None`` rather than guessing.
+
+Honesty note on the thresholds below (REC-ARCH-01 pass 3): every constant in
+this module is a PRODUCT/POLICY heuristic — a deliberately conservative
+"when in doubt, suggest a small buffer" rule of thumb — not a claim derived
+from digestion science, a gastric-emptying study, or any measured
+physiological data this app has access to. Comments describing what a
+threshold is FOR ("large enough that a coach would flag it", "close enough
+together that a coach would suggest spacing them out") are honest; this
+module does not, and must not, claim to model real digestion timing or
+gastric-emptying physiology with any precision. If a threshold ever needs to
+change, that is a product-policy call, not a scientific correction.
 """
 
 from __future__ import annotations
@@ -29,17 +40,27 @@ from typing import Any
 
 from noam_coach.services.user_state import ConsumedMeal, WorkoutState
 
-# A meal below this size is not "large" regardless of fat content — too small
-# to plausibly slow a workout down.
+# Policy floor, not a measured digestion threshold: below this calorie count
+# we do not treat a meal as "large" regardless of fat content — a
+# deliberately conservative product choice, not a claim about what the body
+# can or cannot handle before training.
 _LARGE_MEAL_CALORIE_FLOOR = 700
-# High-fat share (of calories) that meaningfully slows gastric emptying.
+# Policy floor, not a measured digestion threshold: above this fat-share we
+# add a cautionary note and widen the suggested buffer. This encodes "a coach
+# would flag this as a heavier, richer meal", not a specific claim about
+# gastric-emptying rate.
 _HIGH_FAT_SHARE_FLOOR = 0.35
-# Below this gap, a large recent meal is still "in digestion" for a demanding
-# session. Above it, the body has had enough time regardless of meal size.
+# Policy window, not a measured digestion threshold: below this gap we still
+# suggest spacing a large recent meal from a demanding session; above it we
+# no longer add a caution regardless of meal size. Chosen as a conservative
+# product buffer, not a claim about when digestion "finishes".
 _SHORT_GAP_MAX_MINUTES = 150
-# Session demand floor (in planned working sets) to call a session "high load".
+# Policy floor (planned working sets) for calling a session "high load" —
+# a workload proxy from data the plan carries, not a physiological demand
+# measurement.
 _HIGH_LOAD_SET_FLOOR = 12
-# Session duration floor (minutes) contributing to "high demand".
+# Policy floor (minutes) contributing to "high demand" — same caveat as
+# above.
 _HIGH_LOAD_DURATION_FLOOR = 55
 
 # Hebrew primary-muscle labels (see exercise_plans.EXERCISE_MUSCLES /
@@ -76,6 +97,7 @@ class RecentMealState:
 
     @property
     def is_high_fat(self) -> bool | None:
+        """Policy flag, not a digestion-rate measurement — see module docstring."""
         share = self.fat_share
         if share is None:
             return None  # unknown, not "no" — never silently assume low-fat
@@ -99,9 +121,11 @@ class WorkoutDemand:
     def is_high_demand(self) -> bool:
         duration_high = (self.planned_minutes or 0) >= _HIGH_LOAD_DURATION_FLOOR
         sets_high = (self.planned_sets or 0) >= _HIGH_LOAD_SET_FLOOR
-        # Lower-body sessions digest-compete with a full stomach more than
-        # upper-body-only sessions of similar duration; count it as one signal
-        # toward "high demand" alongside duration/sets, not on its own.
+        # Policy signal, not a physiological claim: a lower-body-focused
+        # session is treated as one signal toward "high demand" alongside
+        # duration/sets (never decisive on its own) — this is a coaching
+        # convention (heavy leg work + a full stomach is a combination a
+        # coach would flag), not a measured metabolic-competition effect.
         signals = sum([duration_high, sets_high, self.is_lower_body_focus])
         return signals >= 2
 
@@ -154,6 +178,15 @@ def recent_meal_state_from_consumed(
     it stays honestly ``None`` — never defaulted to 0 (which would read as
     "just ate") or otherwise fabricated.
 
+    A future/clock-skewed ``eaten_at`` (``now - eaten_at`` negative — e.g. a
+    photo log whose device clock is ahead) is handled the same conservative
+    way ``user_state._healthkit_session_candidate`` already handles a
+    future/still-syncing HealthKit end time: the result is ``None``
+    (unknown), never clamped to ``0``. Clamping to 0 would read as "just
+    ate", which is a stronger, more specific claim than an impossible
+    timestamp actually supports — false precision this module's data-quality
+    discipline explicitly rejects.
+
     ``fat_g`` is sourced from ``ConsumedMeal.fat`` — the ``meals`` table
     always populates this column (NOT NULL), so it is real data, not a
     schema-limitation placeholder.
@@ -164,7 +197,8 @@ def recent_meal_state_from_consumed(
         return None
     minutes_since_eaten: int | None = None
     if now is not None and meal.eaten_at is not None:
-        minutes_since_eaten = max(0, int((now - meal.eaten_at).total_seconds() // 60))
+        delta_minutes = int((now - meal.eaten_at).total_seconds() // 60)
+        minutes_since_eaten = delta_minutes if delta_minutes >= 0 else None
     return RecentMealState(
         calories=meal.calories,
         fat_g=meal.fat,
@@ -247,9 +281,11 @@ def evaluate_pre_workout_meal_timing(
     else:
         confidence = "high"
 
-    # Base delay window scales with how compressed the gap already is; kept
-    # as a bounded range (never a fabricated single minute count) whenever
-    # confidence is not high.
+    # Policy delay window, not a digestion-time calculation: scales with how
+    # compressed the gap already is, kept as a bounded range (never a
+    # fabricated single minute count) whenever confidence is not high. These
+    # are conservative coaching buffers, not derived from any measured
+    # gastric-emptying timeline.
     if gap <= 60:
         base_min, base_max = 45, 60
     else:
