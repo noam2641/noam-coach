@@ -97,6 +97,40 @@ async def test_every_strategy_advances_to_step2_with_ack(
 
 
 @pytest.mark.asyncio
+async def test_missing_candidate_shows_actionable_message_not_silent_bounce(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: selecting מאוזנת/ביצועים must never silently re-render step 1
+    (a dead button). When no candidate can be produced for the chosen strategy,
+    the user gets an explicit message + a retry action."""
+    db = await _ready_db(tmp_path, monkeypatch)
+    step_a = FakeTarget()
+    await onboarding_bot.render_workout_type_choice(step_a, 1)
+    cb = _wiz_type_callback(step_a.reply_markups[-1], "balanced")
+
+    # Remove the balanced candidate AND make regeneration a no-op so the
+    # strategy genuinely has no candidate row (the failure mode).
+    await db.execute(
+        "UPDATE plan_versions SET status='superseded' "
+        "WHERE user_id=1 AND plan_type='workout' AND strategy='balanced'"
+    )
+
+    async def _noop_generate(_db, _uid, _ptype):
+        return []
+
+    monkeypatch.setattr(planning, "generate_candidates", _noop_generate)
+
+    step_b = FakeTarget()
+    handled = await callback_plans_bot.handle_plan_callback(step_b, 1, cb)
+    assert handled is True
+    text = step_b.messages[-1]
+    # Not a silent step-1 refresh — an explicit message + a retry action.
+    assert "שלב 1 מתוך 3" not in text
+    labels = [btn.text for row in step_b.reply_markups[-1].inline_keyboard for btn in row]
+    assert any("בנה מחדש" in x or "בחירת סוג" in x or "השלם" in x for x in labels)
+
+
+@pytest.mark.asyncio
 async def test_type_screen_shows_abcd_explanation_for_each_strategy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

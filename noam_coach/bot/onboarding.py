@@ -1999,10 +1999,37 @@ async def render_workout_structure_choice(target: Any, user_id: int, strategy: s
             await planning.generate_candidates(DB, user_id, "workout")
             candidates = await planning.list_plan_candidates(DB, user_id, "workout")  # type: ignore[arg-type]
             candidate = next((c for c in candidates if c.get("strategy") == strategy), None)
-        except planning.PlanningBlockedError:
-            candidate = None
+        except planning.PlanningBlockedError as exc:
+            # Missing prerequisites — tell the user, do not silently refresh the
+            # type screen (which looks like a dead "מאוזנת"/"ביצועים" button).
+            LOGGER.info("wiz_type blocked for %s/%s: %s", user_id, strategy, exc)
+            await safe_edit(
+                target,
+                "כדי להמשיך עם סוג האימון הזה חסרים עוד פרטים בתוכנית.",
+                InlineKeyboardMarkup([[button("▶️ השלם עכשיו", "planv2:complete_missing:workout")],
+                                      [button("⬅️ לתוכניות", "menu:smartplan")]]),
+            )
+            return
+        except Exception:  # noqa: BLE001 - a real failure must not become a silent dead button
+            LOGGER.exception("wiz_type structure render failed for %s/%s", user_id, strategy)
+            await safe_edit(
+                target,
+                "לא הצלחתי להמשיך עם סוג האימון הזה כרגע. נסה שוב או בחר סוג אחר.",
+                InlineKeyboardMarkup([[button("⬅️ בחירת סוג אימון", "planv2:generate:workout")],
+                                      [button("⬅️ לתוכניות", "menu:smartplan")]]),
+            )
+            return
     if candidate is None:
-        await render_workout_type_choice(target, user_id)
+        # Every supported strategy should be reproducible; surface an explicit
+        # message + retry rather than silently re-rendering the type screen.
+        LOGGER.warning("wiz_type: no candidate for strategy %r (user %s)", strategy, user_id)
+        await safe_edit(
+            target,
+            f"לא נמצאה תוכנית עבור הסוג <b>{esc(_STRATEGY_LABELS.get(strategy, strategy))}</b>. "
+            "אפשר לנסות שוב.",
+            InlineKeyboardMarkup([[button("🔄 בנה מחדש", "planv2:generate:workout")],
+                                  [button("⬅️ לתוכניות", "menu:smartplan")]]),
+        )
         return
 
     flow = await conversation.get_active_flow(DB, user_id)
