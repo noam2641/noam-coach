@@ -87,12 +87,61 @@ class LearnedFood:
     slot_counts: dict[str, int] = field(default_factory=dict)
 
     @property
-    def dominant_slot(self) -> str | None:
-        """The meal slot this food is most associated with, or None if unclear."""
+    def _top_slot_and_relevance(self) -> tuple[str, int, float] | None:
         if not self.slot_counts:
             return None
         slot, count = max(self.slot_counts.items(), key=lambda kv: kv[1])
-        return slot if count > 0 else None
+        if count <= 0:
+            return None
+        return slot, count, self.slot_relevance(slot)
+
+    @property
+    def dominant_slot(self) -> str | None:
+        """The meal slot this food is most associated with, or None if unclear.
+
+        TASK-3: a slot is only "dominant" when there is real evidence behind
+        it, not merely whichever bucket happens to have the most occurrences.
+        A food with a scattered distribution (e.g. breakfast=2, lunch=2,
+        dinner=1) must NOT confidently claim a dominant slot just because
+        breakfast is nominally the max — that is false confidence from an
+        arbitrary tie-break, not a real behavioral pattern. Gate on both
+        absolute count and relative concentration (slot_relevance):
+
+        * total occurrences < 3            -> too little evidence, None
+        * relevance < 0.5 (no real majority) -> ambiguous, None
+        * otherwise                        -> the top slot
+        """
+        top = self._top_slot_and_relevance
+        if top is None:
+            return None
+        slot, _count, relevance = top
+        total = sum(self.slot_counts.values())
+        if total < 3:
+            return None
+        if relevance < 0.5:
+            return None
+        return slot
+
+    @property
+    def dominant_slot_confidence(self) -> str:
+        """Explicit confidence label for the dominant slot: none/weak/moderate/strong.
+
+        Suggested thresholds (TASK-3): count<3 -> weak/none; relevance>=0.70 ->
+        strong; relevance>=0.50 -> moderate; otherwise no reliable dominant
+        slot at all.
+        """
+        top = self._top_slot_and_relevance
+        if top is None:
+            return "none"
+        _slot, _count, relevance = top
+        total = sum(self.slot_counts.values())
+        if total < 3:
+            return "weak"
+        if relevance >= 0.70:
+            return "strong"
+        if relevance >= 0.50:
+            return "moderate"
+        return "none"
 
     def slot_relevance(self, slot: str) -> float:
         """Fraction of this food's occurrences that fell in ``slot`` (0..1)."""
@@ -122,6 +171,7 @@ class LearnedFood:
             "avg_fat": round(self.avg_fat, 1),
             "last_eaten_at": self.last_eaten_at,
             "usual_meal_slot": self.dominant_slot,
+            "usual_meal_slot_confidence": self.dominant_slot_confidence,
             "meal_slot_counts": dict(self.slot_counts),
             "source": "approved_meal_history",
         }

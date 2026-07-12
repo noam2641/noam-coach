@@ -72,13 +72,30 @@ async def test_learns_frequent_foods_from_approved_meal_items(tmp_path: Path) ->
 
 @pytest.mark.asyncio
 async def test_nutrition_context_exposes_learned_foods_to_menu_ai(tmp_path: Path) -> None:
+    # TASK-4: morning_menu personalization requires min_count>=2 (the
+    # learned_foods module's own documented default) so a single one-off meal
+    # never masquerades as reliable personalization evidence. Two occurrences
+    # is real evidence and must be exposed.
     db = await _db(tmp_path)
+    await _meal_with_item(db, "טורטיית חלבון", calories=260, protein=22)
     await _meal_with_item(db, "טורטיית חלבון", calories=260, protein=22)
 
     context = await build_nutrition_context(db, 1, "morning_menu", local_now=datetime(2026, 7, 7, 9, 0, tzinfo=TZ))
 
     assert context.learned_foods[0]["name"] == "טורטיית חלבון"
     assert context.to_ai_payload()["learned_foods"][0]["source"] == "approved_meal_history"
+
+
+@pytest.mark.asyncio
+async def test_nutrition_context_does_not_expose_one_off_food_to_menu_ai(tmp_path: Path) -> None:
+    """TASK-4/required-test-3: a single occurrence is not strong enough
+    evidence to influence daily-menu personalization."""
+    db = await _db(tmp_path)
+    await _meal_with_item(db, "טורטיית חלבון", calories=260, protein=22)
+
+    context = await build_nutrition_context(db, 1, "morning_menu", local_now=datetime(2026, 7, 7, 9, 0, tzinfo=TZ))
+
+    assert context.learned_foods == []
 
 
 def test_next_meal_ranking_prefers_learned_food_when_other_fit_is_similar() -> None:

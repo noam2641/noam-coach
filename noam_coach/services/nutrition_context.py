@@ -444,7 +444,12 @@ async def build_nutrition_context(
         medical_food_constraints=list(getattr(daily_ctx, "active_constraints", []) or []),
         disliked_foods=_list_fact(await user_model.get_value(db, user_id, "disliked_foods")),
         preferred_foods=_list_fact(await user_model.get_value(db, user_id, "preferred_foods")),
-        learned_foods=[food.ai_payload() for food in await learned_foods_from_meals(db, user_id, limit=8, min_count=1)],
+        # TASK-4: daily-menu/next-meal personalization must use the module's
+        # own documented default (min_count=2) so a single one-off meal does
+        # not masquerade as a reliable personalization signal. min_count=1 is
+        # reserved for calibration/recognition prompts (see
+        # learned_foods_prompt_block callers in profile.py), not this context.
+        learned_foods=[food.ai_payload() for food in await learned_foods_from_meals(db, user_id, limit=8, min_count=2)],
         recently_rejected_meals=_list_fact(flags.get("recently_rejected_meals")),
         appetite=flags.get("appetite"),
         hunger_level=flags.get("hunger"),
