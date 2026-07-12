@@ -2452,15 +2452,24 @@ async def build_morning_menu_text(user_id: int, ctx: "DailyContext | None" = Non
         nutrition_context,
         "Build today's standalone nutrition menu",
     )
-    menu = await recommendations.morning_menu(
-        OPENAI_CLIENT,
-        SETTINGS.openai_model,
-        ctx.profile,
-        ctx.goal,
-        _ctx_has_workout(ctx),
-        ctx.flags,
-        nutrition_request["context"],
+    # TASK-6/7: generate -> deterministically validate -> repair-or-fallback
+    # (noam_coach.services.morning_menu_pipeline) instead of showing the raw
+    # AI output. This is the operational enforcement of prompt_builder's
+    # SAFETY_CONTRACT for the daily menu.
+    from noam_coach.services.morning_menu_pipeline import build_personalized_morning_menu
+
+    pipeline_result = await build_personalized_morning_menu(
+        DB,
+        user_id,
+        profile=ctx.profile,
+        goal=ctx.goal,
+        today_has_workout=_ctx_has_workout(ctx),
+        daily_flags=ctx.flags,
+        openai_client=OPENAI_CLIENT,
+        openai_model=SETTINGS.openai_model,
+        now=ctx.now,
     )
+    menu = pipeline_result.menu
     workout_note = "יום אימון" if _ctx_has_workout(ctx) else "יום ללא אימון מתוכנן"
     target_line = f"יעד: {ctx.calorie_target:.0f} קל׳ | {ctx.protein_target:.0f} ג׳ חלבון"
     text = "\n".join([
@@ -2497,6 +2506,7 @@ async def build_morning_menu_text(user_id: int, ctx: "DailyContext | None" = Non
             text=text,
             strategy=(active_plan or {}).get("strategy"),
             source="build_morning_menu_text",
+            meals=pipeline_result.meal_records,
         )
     return text
 
