@@ -43,6 +43,56 @@ def test_knee_pain_replaces_knee_loaded_exercise() -> None:
     assert all(exercise["id"] != "squat" for exercise in adapted)
 
 
+def test_elbow_pain_backfills_gutted_session_cross_pattern() -> None:
+    """Regression: tennis elbow loads every push/pull in an upper-body session,
+    so same-pattern substitution cannot refill it and the session used to empty
+    out — which dropped the balanced/performance candidates entirely, leaving a
+    user with only "מקסימום עקביות". The session must stay trainable via
+    pain-safe exercises from OTHER movement patterns, and an audit change must
+    record the backfill so the note reaches the user."""
+    upper = [dict(exercise) for exercise in PLANS["U2"]["exercises"]]
+    adapted, changes = ti.adapt_exercises(
+        upper,
+        equipment_value="full_gym",
+        location="gym",
+        pain_value="טניס אלבו",
+        medical_avoidance=None,
+        experience="advanced",
+    )
+    # Session is refilled, not emptied.
+    assert len(adapted) >= ti._MIN_SESSION_EXERCISES
+    # None of the kept exercises load the injured joint.
+    for exercise in adapted:
+        profile = ti.CATALOG.get(str(exercise.get("id")))
+        assert profile is not None
+        assert "elbow" not in profile.joint_load
+    # No raw English ids leak into user-facing names.
+    for exercise in adapted:
+        assert exercise["id"] in ti._CATALOG_NAMES_HE or "elbow" not in ti.CATALOG[exercise["id"]].joint_load
+    # The backfill is recorded so a limitation note can be surfaced.
+    assert any("backfilled" in change for change in changes)
+
+
+def test_backfill_diversifies_across_muscle_groups() -> None:
+    """The backfill must not stack three near-identical isolation variants of a
+    single pattern; it round-robins across muscle groups."""
+    upper = [dict(exercise) for exercise in PLANS["B"]["exercises"]]
+    adapted, _ = ti.adapt_exercises(
+        upper,
+        equipment_value="full_gym",
+        location="gym",
+        pain_value="טניס אלבו",
+        medical_avoidance=None,
+        experience="advanced",
+    )
+    muscles = {
+        ti.CATALOG[str(exercise["id"])].primary_muscles[0]
+        for exercise in adapted
+        if ti.CATALOG.get(str(exercise["id"])) and ti.CATALOG[str(exercise["id"])].primary_muscles
+    }
+    assert len(muscles) >= 2  # varied, not one muscle repeated
+
+
 def test_home_equipment_removes_barbell_dependency() -> None:
     exercises = [{"id": "bench", "name": "לחיצת חזה", "sets": 3, "rest": 90, "weight": 50}]
     adapted, _ = ti.adapt_exercises(

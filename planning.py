@@ -969,6 +969,7 @@ def _workout_candidate(
     if equipment_value is None:
         assumptions.append("הונח ציוד בסיסי בלבד עד לאישור ציוד")
     adaptation_audit: list[dict[str, Any]] = []
+    pain_backfilled = False
     for session in sessions:
         adapted, changes = training_intelligence.adapt_exercises(
             session["exercises"],
@@ -983,6 +984,8 @@ def _workout_candidate(
             exercise["warmup_sets"] = training_intelligence.warmup_sets(exercise)
         if changes:
             adaptation_audit.append({"session": session["name"], "changes": changes})
+            if any("backfilled" in change for change in changes):
+                pain_backfilled = True
         # Generate a complete quick fallback rather than only exercise IDs.
         session["fast_version"] = training_intelligence.quick_session(
             session,
@@ -995,6 +998,19 @@ def _workout_candidate(
         ]
     if adaptation_audit:
         assumptions.append("התוכנית הותאמה לציוד, לניסיון ולמגבלות שדווחו")
+    # Smart backfill happened: be explicit that some exercises were swapped for
+    # pain-safe alternatives, and name the reported limitation, so the user
+    # understands why an upper-body day looks different from a textbook split.
+    if pain_backfilled:
+        pain_labels = [
+            training_intelligence.pain_region_label(region)
+            for region in sorted(training_intelligence.pain_regions(limitations, limitations))
+        ]
+        if pain_labels:
+            assumptions.append(
+                "החלפתי חלק מהתרגילים בתרגילים בטוחים בגלל המגבלה שדיווחת "
+                f"({', '.join(pain_labels)}). כך כל האימונים נשארים מלאים ובטוחים."
+            )
     payload = {
         "frequency": frequency,
         "training_profile": training_profile.public_payload(),

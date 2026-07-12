@@ -494,6 +494,90 @@ def _replacement_exercise(
     return None
 
 
+# Human-readable Hebrew names for catalog exercises used as cross-pattern
+# backfill. Kept next to the catalog so a backfilled exercise never surfaces
+# a raw English id to the user.
+_CATALOG_NAMES_HE: dict[str, str] = {
+    "squat": "סקוואט",
+    "smith_squat": "סקוואט סמית",
+    "leg_press": "לחיצת רגליים",
+    "goblet": "סקוואט גובלט",
+    "hack": "סקוואט האק",
+    "hip_thrust": "הרמת אגן (Hip Thrust)",
+    "back_ext": "יישור גב תחתון",
+    "cable_pull_through": "משיכת אגן בכבל",
+    "glute_bridge": "גשר ישבן",
+    "rdl": "מתח רומני (RDL)",
+    "lateral": "הרחקות צד",
+    "cable_lateral": "הרחקות צד בכבל",
+    "lateral_machine": "הרחקות צד במכונה",
+    "lean_lateral": "הרחקות צד בהטיה",
+    "fly": "פרפר עם דאמבל",
+    "cable_fly": "פרפר בכבל",
+    "one_arm_fly": "פרפר חד-צדדי בכבל",
+    "pec_deck": "פרפר במכונה (Pec Deck)",
+    "crossover": "קרוסאובר בכבל",
+    "dead_bug": "Dead Bug",
+}
+
+
+def _pain_safe_backfill_candidates(
+    *,
+    equipment: set[str],
+    pain: set[str],
+    experience: str,
+    present_ids: set[str],
+) -> list[dict[str, Any]]:
+    """Deterministic pain-safe, equipment-available exercises from the catalog.
+
+    When pain removes so many exercises from a session that same-pattern
+    substitution cannot refill it (e.g. tennis-elbow zeroes out every push/pull
+    in an upper-body session because they all load the elbow), the session is
+    backfilled with exercises from *other* movement patterns that are safe for
+    the injured joint. Catalog order is stable, so the selection is
+    deterministic. IDs already present in the session are skipped.
+    """
+    allowed_by_muscle: dict[str, list[dict[str, Any]]] = {}
+    for exercise_id, profile in CATALOG.items():
+        if exercise_id in present_ids:
+            continue
+        probe = {"id": exercise_id, "name": _CATALOG_NAMES_HE.get(exercise_id, exercise_id)}
+        allowed, _ = exercise_allowed(
+            probe, equipment=equipment, pain=pain, experience=experience
+        )
+        if not allowed:
+            continue
+        muscle = profile.primary_muscles[0] if profile.primary_muscles else ""
+        allowed_by_muscle.setdefault(muscle, []).append(
+            {
+                "id": exercise_id,
+                "name": _CATALOG_NAMES_HE.get(exercise_id, exercise_id),
+                "muscle": muscle,
+                "sets": 3,
+                "rmin": 8,
+                "rmax": 12,
+                "alts": [],
+                "cues": ["טווח ללא כאב", "שליטה מלאה", "עצור אם הכאב מחמיר"],
+            }
+        )
+    # Round-robin across muscle groups so a backfilled session trains varied
+    # muscles (e.g. legs + shoulders + chest) instead of three near-identical
+    # isolation variants of whichever pattern happens to sort first.
+    candidates: list[dict[str, Any]] = []
+    muscle_order = list(allowed_by_muscle.keys())
+    while any(allowed_by_muscle[m] for m in muscle_order):
+        for muscle in muscle_order:
+            bucket = allowed_by_muscle[muscle]
+            if bucket:
+                candidates.append(bucket.pop(0))
+    return candidates
+
+
+# The smallest session we are willing to present. Below this a session reads as
+# broken (the quality gate rejects an empty session), so it is backfilled.
+_MIN_SESSION_EXERCISES = 3
+
+
 def adapt_exercises(
     exercises: list[dict[str, Any]],
     *,
@@ -508,6 +592,7 @@ def adapt_exercises(
     pain = pain_regions(pain_value, medical_avoidance)
     adapted: list[dict[str, Any]] = []
     changes: list[dict[str, Any]] = []
+    removed_for_pain = False
     for original in exercises:
         allowed, reasons = exercise_allowed(
             original,
@@ -518,6 +603,8 @@ def adapt_exercises(
         if allowed:
             adapted.append(original)
             continue
+        if "עומס אפשרי על אזור כאב" in reasons:
+            removed_for_pain = True
         replacement = _replacement_exercise(
             original,
             equipment=equipment,
@@ -533,6 +620,30 @@ def adapt_exercises(
         )
         if replacement:
             adapted.append(replacement)
+
+    # Cross-pattern backfill: if pain gutted the session and same-pattern
+    # substitution could not refill it, pull pain-safe exercises from other
+    # movement patterns so the session stays trainable (and the split-heavy
+    # candidates stay buildable) rather than collapsing to an empty session.
+    if pain and removed_for_pain and len(adapted) < _MIN_SESSION_EXERCISES:
+        present_ids = {str(item.get("id") or "") for item in adapted}
+        needed = _MIN_SESSION_EXERCISES - len(adapted)
+        backfill = _pain_safe_backfill_candidates(
+            equipment=equipment,
+            pain=pain,
+            experience=experience,
+            present_ids=present_ids,
+        )[:needed]
+        for item in backfill:
+            item["warmup_sets"] = warmup_sets(item)
+            adapted.append(item)
+        if backfill:
+            changes.append(
+                {
+                    "backfilled": [item["name"] for item in backfill],
+                    "reasons": ["הושלמו תרגילים בטוחים לאזור הכאב שדיווחת"],
+                }
+            )
     return adapted, changes
 
 

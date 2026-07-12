@@ -204,6 +204,52 @@ async def test_only_buildable_strategies_are_offered_and_all_advance(
         assert "שלב 2 מתוך 3" in step_b.messages[-1]
 
 
+async def _ready_db_injured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Database:
+    """A strong profile (full gym / advanced / 4 days) with an elbow limitation
+    (tennis elbow). Every upper-body push/pull loads the elbow, so without
+    cross-pattern backfill the split-heavy candidates would empty a session and
+    be dropped — collapsing the user to only "מקסימום עקביות"."""
+    db = Database(str(tmp_path / "task3_injured.db"))
+    await db.init()
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(1,'Test',NULL,?)",
+        (utc_now(),),
+    )
+    for mod in (coach_bot, onboarding_bot, callback_plans_bot, core_services, planning):
+        monkeypatch.setattr(mod, "DB", db, raising=False)
+    facts = {
+        "weight_kg": 101, "height_cm": 174, "age": 32, "sex": "male",
+        "primary_goal": "fat_loss_muscle_retention", "diet_restrictions": "none", "allergies": "none",
+        "training_days_per_week": 4, "training_limitations": "טניס אלבו",
+        "session_minutes": 55, "training_location": "gym", "equipment": "full_gym",
+        "strength_experience": "advanced",
+        "weekly_availability": [{"weekday": d, "start": "19:00", "minutes": 55} for d in [0, 2, 5, 6]],
+    }
+    for k, v in facts.items():
+        await user_model.set_fact(db, 1, k, v, source=user_model.SOURCE_USER, confirmed=True)
+    await planning.generate_candidates(db, 1, "workout")
+    return db
+
+
+@pytest.mark.asyncio
+async def test_elbow_limitation_still_yields_all_three_strategies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for the live bug: an elbow limitation must not collapse the
+    plan choices to a single strategy. All three build, and each explains the
+    limitation-driven substitution rather than silently dropping exercises."""
+    db = await _ready_db_injured(tmp_path, monkeypatch)
+    candidates = await planning.list_plan_candidates(db, 1, "workout")
+    strategies = {c.get("strategy") for c in candidates}
+    assert strategies == {"consistency", "balanced", "performance"}
+    for candidate in candidates:
+        # Every session is trainable (no empty session dead-ends the wizard).
+        for session in candidate["payload"]["sessions"]:
+            assert session["exercises"], f"{candidate['strategy']} has an empty session"
+        # The limitation is surfaced, not hidden.
+        assert any("המגבלה שדיווחת" in a for a in candidate.get("assumptions", []))
+
+
 def test_strategy_explainer_lines_cover_all_four_dimensions() -> None:
     for strategy in ("consistency", "balanced", "performance"):
         lines = onboarding_bot._strategy_explainer_lines(strategy)
