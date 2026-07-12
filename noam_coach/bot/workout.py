@@ -173,33 +173,31 @@ async def build_daily_status(user_id: int) -> str:
     # status, no duplicate next-meal planning sections, no internal engine text.
     goal_note = " <i>(יעד זמני)</i>" if provisional else ""
 
+    # TASK-16: shared UI-format helpers keep macro/heading/time formatting
+    # consistent across the coach's nutrition/summary views.
+    from noam_coach.bot import ui_format as uf
+
     # 1) State — consumed / target / remaining, once.
-    now_label = context.current_local_time[11:16] if len(context.current_local_time) >= 16 else ""
-    lines[0] = f"<b>📊 מצב היום</b>{(' — ' + now_label) if now_label else ''}"
+    now_label = uf.local_hhmm(context.current_local_time)
+    lines[0] = uf.heading("📊", "מצב היום", suffix=now_label)
     lines.append(
-        f"{context.consumed_calories:.0f} / {goal['calories']} קל׳{goal_note}"
+        f"{context.consumed_calories:.0f} / {uf.cal(goal['calories'])}{goal_note}"
     )
-    lines.append(f"{context.consumed_protein:.0f} / {goal['protein']} ג׳ חלבון")
+    lines.append(f"{context.consumed_protein:.0f} / {uf.protein(goal['protein'])}")
     cal_remaining = context.remaining_calories
     prot_remaining = context.remaining_protein
     if cal_remaining is not None and prot_remaining is not None:
         lines.append("")
         lines.append("<b>נשאר:</b>")
-        if cal_remaining >= 0:
-            lines.append(f"{cal_remaining:.0f} קל׳")
-        else:
-            lines.append(f"חריגה של {abs(cal_remaining):.0f} קל׳")
-        if prot_remaining >= 0:
-            lines.append(f"{prot_remaining:.0f} ג׳ חלבון")
-        else:
-            lines.append(f"חריגה של {abs(prot_remaining):.0f} ג׳ חלבון")
+        lines.append(uf.cal(cal_remaining) if cal_remaining >= 0 else f"חריגה של {uf.cal(abs(cal_remaining))}")
+        lines.append(uf.protein(prot_remaining) if prot_remaining >= 0 else f"חריגה של {uf.protein(abs(prot_remaining))}")
 
     # 2) What happened — logged meals, concisely.
     lines.append("")
-    lines.append("<b>🍽️ נאכל היום</b>")
+    lines.append(uf.heading("🍽️", "נאכל היום"))
     for m in meals:
         lines.append(f"• {esc(m['name'])}")
-        lines.append(f"{float(m['calories']):.0f} קל׳ | {float(m['protein']):.0f} ג׳ חלבון")
+        lines.append(uf.macros(float(m["calories"]), float(m["protein"])))
 
     # 3) Rest of the day — only meaningful chronological next events, without a
     # duplicated macro block or internal explanation.
@@ -219,12 +217,12 @@ async def build_daily_status(user_id: int) -> str:
         prefix = f"{esc(time_hint)} · " if time_hint else ""
         timeline.append((
             time_hint or "99:99",
-            f"🍽️ {prefix}{esc(allocation.label)} — כ-{allocation.calories} קל׳ | כ-{allocation.protein} ג׳ חלבון",
+            f"🍽️ {prefix}{esc(allocation.label)} — {uf.macros(allocation.calories, allocation.protein, approx=True)}",
         ))
     if timeline:
         timeline.sort(key=lambda item: item[0])
         lines.append("")
-        lines.append("<b>⏱️ המשך היום</b>")
+        lines.append(uf.heading("⏱️", "המשך היום"))
         lines.extend(text for _t, text in timeline)
 
     # 4) One actionable recommendation — the immediate meal title + macros only,
@@ -236,8 +234,8 @@ async def build_daily_status(user_id: int) -> str:
     if recommendation is not None and recommendation.options:
         option = recommendation.options[0]
         lines.append("")
-        lines.append("<b>🍽️ מומלץ עכשיו</b>")
-        lines.append(f"{esc(option.title)} — כ-{option.calories} קל׳ | כ-{option.protein} ג׳ חלבון")
+        lines.append(uf.heading("🍽️", "מומלץ עכשיו"))
+        lines.append(f"{esc(option.title)} — {uf.macros(option.calories, option.protein, approx=True)}")
 
     return "\n".join(lines)
 
