@@ -95,6 +95,21 @@ def derive_meal_title(items: list["FoodItem"]) -> str:
     return " + ".join(names[:3])
 
 
+def _title_supported_by_items(meal_name: str, items: list["FoodItem"]) -> bool:
+    """True when every meaningful word in the title is supported by some item
+    name (TASK-9/14). An empty/meaningless title is treated as unsupported."""
+    title_words = _title_word_set(meal_name)
+    if not title_words:
+        return False
+    item_words: set[str] = set()
+    for item in items:
+        item_words |= _title_word_set(item.name)
+    return all(
+        any(word in iw or iw in word for iw in item_words)
+        for word in title_words
+    )
+
+
 class MealAnalysis(BaseModel):
     meal_name: str
     items: list[FoodItem]
@@ -112,20 +127,18 @@ class MealAnalysis(BaseModel):
         """
         if not self.items:
             return self
-        title_words = _title_word_set(self.meal_name)
-        if not title_words:
+        if not _title_supported_by_items(self.meal_name, self.items):
             object.__setattr__(self, "meal_name", derive_meal_title(self.items))
-            return self
-        item_words: set[str] = set()
-        for item in self.items:
-            item_words |= _title_word_set(item.name)
-        # Any title word that is not supported by (a substring of / superstring
-        # of) some item word is an unsupported addition.
-        def _supported(word: str) -> bool:
-            return any(word in iw or iw in word for iw in item_words)
+        return self
 
-        if not all(_supported(word) for word in title_words):
-            object.__setattr__(self, "meal_name", derive_meal_title(self.items))
+    def reconcile_title(self) -> "MealAnalysis":
+        """TASK-14: re-derive the canonical title after an in-place item edit
+        (correction/replacement/removal) so the title never contradicts the
+        current items. Correction helpers mutate items directly and bypass the
+        constructor validator, so they call this to keep identity consistent.
+        """
+        if self.items and not _title_supported_by_items(self.meal_name, self.items):
+            self.meal_name = derive_meal_title(self.items)
         return self
 
     def totals(self) -> dict[str, float]:

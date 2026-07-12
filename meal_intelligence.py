@@ -547,6 +547,8 @@ def apply_item_removal_correction(
     if note not in analysis.notes:
         analysis.notes.append(note)
 
+    # TASK-14: re-derive the canonical title after removing an item.
+    analysis.reconcile_title()
     return analysis
 
 
@@ -662,6 +664,8 @@ def apply_item_replacement_correction(
     if note not in analysis.notes:
         analysis.notes.append(note)
 
+    # TASK-14: keep the canonical title consistent with the corrected items.
+    analysis.reconcile_title()
     return analysis
 
 
