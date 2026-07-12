@@ -467,6 +467,66 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
         )
         return True
 
+    if data.startswith("dailymenu:save:"):
+        # Finding 9: this is the ONLY confirm-ate path for a daily-menu meal.
+        # It must never fall through to next-meal recommendation state — the
+        # daily menu and "what should I eat now" are different state domains
+        # (a user may have an active next-meal recommendation from an earlier
+        # tap that has nothing to do with the daily-menu meal they are
+        # confirming right now).
+        from noam_coach.services.daily_menu_state import get_active_daily_menu, is_structured_menu, structured_meals
+        from noam_coach.services.next_meal import MealIngredient, MealOption, save_chosen_meal
+
+        parts = data.split(":", 3)
+        menu_id = parts[2] if len(parts) > 2 else ""
+        meal_id = parts[3] if len(parts) > 3 else ""
+        active_menu = await get_active_daily_menu(DB, user_id)
+        if not is_structured_menu(active_menu) or str((active_menu or {}).get("menu_id") or "") != menu_id:
+            await safe_edit(
+                query,
+                "התפריט התעדכן מאז שהוצג לך — פתח את תפריט היום המעודכן ונסה שוב.",
+                InlineKeyboardMarkup([[button("📋 תפריט היום", "menu:daily_menu"), button("🏠 תפריט", "menu:home")]]),
+            )
+            return True
+        meal = next(
+            (m for m in structured_meals(active_menu) if str(m.get("meal_id") or "") == meal_id),
+            None,
+        )
+        if meal is None:
+            await safe_edit(query, "לא מצאתי את הארוחה הזו בתפריט הפעיל.", home_keyboard())
+            return True
+        ingredients = meal.get("ingredients") or []
+        ingredient_details = [
+            MealIngredient(
+                food_id=str(item.get("name") or "item"),
+                display_name=str(item.get("name") or ""),
+                quantity=float(item.get("grams") or 0) or 1.0,
+                unit="גרם" if item.get("grams") else "יחידה",
+                calories=float(item.get("calories") or 0),
+                protein_g=float(item.get("protein") or 0),
+            )
+            for item in ingredients
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        ]
+        option = MealOption(
+            title=str(meal.get("role") or "ארוחה"),
+            ingredients=[str(meal.get("note") or meal.get("role") or "ארוחה")] if not ingredient_details else [],
+            calories=int(float(meal.get("calories") or 0)),
+            protein=int(float(meal.get("protein") or 0)),
+            rationale="מהתפריט היומי הפעיל",
+            ingredient_details=ingredient_details,
+        )
+        saved = await save_chosen_meal(DB, user_id, option)
+        if not saved:
+            await safe_edit(query, "כבר שמרתי את הארוחה הזו — לא כפלתי אותה.", home_keyboard())
+            return True
+        await safe_edit(
+            query,
+            f"שמרתי את {esc(option.title)} כארוחה ✅\nמצב היום עודכן.",
+            InlineKeyboardMarkup([[button("📊 מצב היום", "menu:status"), button("🏠 תפריט", "menu:home")]]),
+        )
+        return True
+
     if data.startswith("nextmeal:qty:"):
         from noam_coach.services.next_meal import adjust_next_meal_quantity
 

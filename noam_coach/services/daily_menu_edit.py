@@ -29,7 +29,12 @@ from noam_coach.services.daily_menu_state import (
 )
 from noam_coach.services.food_preferences import record_food_preference_from_slots
 from noam_coach.services.learned_foods import learned_foods_from_meals, normalize_food_key
-from noam_coach.services.preference_profile import FAMILIARITY_MIN_COUNT
+from noam_coach.services.menu_validation import (
+    PROBLEM_DISLIKED_FOOD,
+    PROBLEM_RESTRICTION_VIOLATION,
+    validate_menu,
+)
+from noam_coach.services.preference_profile import FAMILIARITY_MIN_COUNT, build_preference_profile
 
 # TASK-10: markers that make a stated avoidance sound PERMANENT ("I don't
 # like X" / "I don't eat X") as opposed to a today-only context constraint
@@ -144,12 +149,25 @@ def parse_daily_menu_edit(text: str, *, active_menu_context: bool = False) -> Da
     )
 
 
-def _learned_choice(foods: list[Any], *, wants_protein: bool, avoid: str | None) -> Any | None:
+def _learned_choice(
+    foods: list[Any], *, wants_protein: bool, avoid: str | None, profile: Any | None = None,
+) -> Any | None:
+    """Pick the best learned-food replacement.
+
+    Bug found via the corrective-review Finding-10 test: this previously only
+    excluded the item currently being avoided ("בלי ביצים" -> exclude eggs)
+    but never checked the user's OTHER hard exclusions — so a learned food
+    the user separately dislikes/is allergic to could be suggested as the
+    replacement for an unrelated edit. ``profile`` (when supplied) is checked
+    with the same generic hard-exclusion matcher used everywhere else.
+    """
     avoid_text = str(avoid or "").lower()
     candidates = []
     for food in foods:
         name = str(getattr(food, "display_name", "") or "")
         if avoid_text and avoid_text in name.lower():
+            continue
+        if profile is not None and profile.is_hard_excluded(name):
             continue
         protein = float(getattr(food, "avg_protein", 0) or 0)
         calories = float(getattr(food, "avg_calories", 0) or 0)
@@ -260,9 +278,22 @@ async def _persist_permanent_dislike(db: Any, user_id: int, item: str, instructi
 
 
 def _meal_matches_avoided_item(meal: dict[str, Any], avoid_key: str) -> bool:
+    """TASK-10/Finding 8: check structured ingredient identities FIRST (the
+    reliable signal — "does this meal actually contain egg"), falling back to
+    free-text role/note matching only when no structured ingredients were
+    persisted (older/legacy menus, or a meal the AI didn't decompose)."""
     from noam_coach.services.next_meal import _food_word_matches
 
     if not avoid_key:
+        return False
+    ingredients = meal.get("ingredients") or []
+    if isinstance(ingredients, list) and ingredients:
+        for item in ingredients:
+            if not isinstance(item, dict):
+                continue
+            key = normalize_food_key(str(item.get("name") or ""))
+            if key and _food_word_matches(avoid_key, key):
+                return True
         return False
     texts = [str(meal.get("role") or ""), str(meal.get("note") or "")]
     for text in texts:
@@ -282,22 +313,77 @@ def _regenerate_structured_meals(
 ) -> tuple[list[dict[str, Any]], list[int]]:
     """TASK-10: replace only the meals matching the avoided item; every other
     meal is preserved byte-for-byte (same contract as the morning-menu repair
-    pipeline — no blanket regeneration for a targeted edit)."""
+    pipeline — no blanket regeneration for a targeted edit).
+
+    Finding 11: the meal's behavioral ``role`` (e.g. "ארוחת בוקר") is a
+    distinct concept from the composed food's display name/description and
+    must survive a food substitution — only ``note``/``calories``/``protein``/
+    ``ingredients`` describe the actual food. Overwriting ``role`` with a
+    food name previously destroyed the slot/intent semantics that later
+    validation and rendering rely on.
+    """
     avoid_key = normalize_food_key(avoid or "")
     updated: list[dict[str, Any]] = []
     changed_indices: list[int] = []
     for index, meal in enumerate(meals):
         if avoid_key and _meal_matches_avoided_item(meal, avoid_key):
             replaced = dict(meal)
-            replaced["role"] = replacement_name
             replaced["note"] = replacement_name
             replaced["calories"] = calories
             replaced["protein"] = protein
+            # The substitute is a single known food; represent it structurally
+            # too so a subsequent edit can reason about it the same way.
+            replaced["ingredients"] = [{"name": replacement_name, "grams": None, "calories": calories, "protein": protein}]
             updated.append(replaced)
             changed_indices.append(index)
         else:
             updated.append(dict(meal))
     return updated, changed_indices
+
+
+class _EditedMeal:
+    """Adapter so a structured-menu-edit dict can be validated by
+    ``menu_validation.validate_menu``, which expects ``recommendations.
+    MenuMeal``-shaped attribute access (``.name``/``.note``/``.calories``/...).
+    Finding 10: a targeted edit must go through the SAME validator as
+    generation/repair, not a separate unvalidated write path."""
+
+    def __init__(self, meal: dict[str, Any]) -> None:
+        self.name = str(meal.get("role") or "")
+        self.time_hint = str(meal.get("time") or "")
+        self.calories = float(meal.get("calories") or 0)
+        self.protein = float(meal.get("protein") or 0)
+        self.note = str(meal.get("note") or "")
+        self.intent_id = str(meal.get("meal_id") or "")
+
+
+class _EditedMenu:
+    def __init__(self, meals: list[dict[str, Any]]) -> None:
+        self.meals = [_EditedMeal(meal) for meal in meals]
+        self.headline = "תפריט יומי"
+        self.training_advice = ""
+        self.closing = ""
+
+
+async def _validate_edited_menu(db: Any, user_id: int, meals: list[dict[str, Any]], profile: Any | None = None) -> Any:
+    """Finding 10: run the edited structured menu through the shared
+    deterministic validator (same primitives as generation/repair) so a
+    targeted edit can never silently introduce a hard-exclusion or
+    restriction violation that generation/repair would have blocked.
+
+    ``profile`` may be passed in to reuse an already-built
+    ``NutritionPreferenceProfile`` for this same edit request instead of
+    re-querying the database a second time.
+    """
+    if profile is None:
+        profile = await build_preference_profile(db, user_id)
+    meal_slots = [str(meal.get("slot") or "") or None for meal in meals]
+    return validate_menu(
+        _EditedMenu(meals),
+        restrictions=profile.restrictions,
+        profile=profile,
+        meal_slots=meal_slots,
+    )
 
 
 def _structured_meals_to_text(meals: list[dict[str, Any]], headline: str = "תפריט יומי") -> str:
@@ -332,7 +418,10 @@ async def try_build_daily_menu_edit_reply(
     # documented min_count=2 default (a one-off meal should not drive a menu
     # substitution suggestion).
     foods = await learned_foods_from_meals(db, user_id, limit=8, min_count=FAMILIARITY_MIN_COUNT)
-    learned = _learned_choice(foods, wants_protein=intent.wants_protein, avoid=intent.wants_no_item)
+    edit_profile = await build_preference_profile(db, user_id)
+    learned = _learned_choice(
+        foods, wants_protein=intent.wants_protein, avoid=intent.wants_no_item, profile=edit_profile,
+    )
     if learned is not None:
         name = str(getattr(learned, "display_name", "הפריט המוכר") or "הפריט המוכר")
         calories = int(round(float(getattr(learned, "avg_calories", 0) or 0)))
@@ -363,32 +452,54 @@ async def try_build_daily_menu_edit_reply(
             current_meals, avoid=intent.wants_no_item, replacement_name=name, calories=calories, protein=protein,
         )
         if changed:
-            body = _structured_meals_to_text(updated_meals)
-            body += (
-                f"\n\n<b>עדכון לתפריט היומי - גרסה {revision}</b>\n"
-                f"עודכן לפי הבקשה: {esc(intent.instruction)}\n"
-                f"למה זה מתאים: {esc(reason)}."
-            )
-            if intent.wants_no_item:
-                body += f"\nנשמר כאילוץ להמשך היום: בלי {esc(intent.wants_no_item)}."
-            await remember_active_daily_menu(
-                db,
-                user_id,
-                text=body,
-                strategy=str((active_menu or {}).get("strategy") or "") or None,
-                revision=revision,
-                source="daily_menu_revision",
-                meals=updated_meals,
-                context_version=str((active_menu or {}).get("context_version") or "") or None,
-            )
-            rows = [
-                [("✅ אשר שאכלתי", "nextmeal:save:1")],
-                [("🔄 רענן תפריט", "menu:refresh_daily_menu"), ("🍽 מה לאכול עכשיו", "menu:nextmeal")],
-                [("📊 מצב היום", "menu:status")],
-            ]
-            return body, rows
-        # No structured meal actually matched the avoided item — fall through
-        # to the legacy text-based patch below so the user still gets a reply.
+            # Finding 10: the edited menu must pass the SAME deterministic
+            # validator generation/repair use — a targeted edit is not a
+            # second, unvalidated recommendation path. If the edit itself
+            # introduced a hard-fail (e.g. calorie drift is out of tolerance,
+            # or the replacement collides with another restriction), do not
+            # persist it silently; fall through to the safe legacy text patch
+            # and let the user know via the normal reply instead of shipping
+            # an invalid structured menu.
+            edit_validation = await _validate_edited_menu(db, user_id, updated_meals, profile=edit_profile)
+            hard_blocking = {PROBLEM_DISLIKED_FOOD, PROBLEM_RESTRICTION_VIOLATION}
+            if not (edit_validation.hard_fail_codes & hard_blocking):
+                body = _structured_meals_to_text(updated_meals)
+                body += (
+                    f"\n\n<b>עדכון לתפריט היומי - גרסה {revision}</b>\n"
+                    f"עודכן לפי הבקשה: {esc(intent.instruction)}\n"
+                    f"למה זה מתאים: {esc(reason)}."
+                )
+                if intent.wants_no_item:
+                    body += f"\nנשמר כאילוץ להמשך היום: בלי {esc(intent.wants_no_item)}."
+                saved_state = await remember_active_daily_menu(
+                    db,
+                    user_id,
+                    text=body,
+                    strategy=str((active_menu or {}).get("strategy") or "") or None,
+                    revision=revision,
+                    source="daily_menu_revision",
+                    meals=updated_meals,
+                    context_version=str((active_menu or {}).get("context_version") or "") or None,
+                )
+                menu_id = str(saved_state.get("menu_id") or "")
+                # Finding 9: point the confirm button at THIS exact daily-menu
+                # meal (by stable menu_id + meal_id), never at whatever the
+                # unrelated active next-meal recommendation happens to be.
+                first_meal_id = str(updated_meals[0].get("meal_id") or "") if updated_meals else ""
+                confirm_cb = (
+                    f"dailymenu:save:{menu_id}:{first_meal_id}"
+                    if menu_id and first_meal_id
+                    else "menu:daily_menu"
+                )
+                rows = [
+                    [("✅ אשר שאכלתי", confirm_cb)],
+                    [("🔄 רענן תפריט", "menu:refresh_daily_menu"), ("🍽 מה לאכול עכשיו", "menu:nextmeal")],
+                    [("📊 מצב היום", "menu:status")],
+                ]
+                return body, rows
+        # No structured meal actually matched the avoided item, or the edit
+        # failed hard validation — fall through to the safe legacy text-based
+        # patch below so the user still gets a reply.
 
     body = _build_revision_text(
         current_text=active_text,
@@ -412,9 +523,13 @@ async def try_build_daily_menu_edit_reply(
         revision=revision,
         source="daily_menu_revision",
     )
+    # Finding 9: a text-only (legacy/unstructured) revision has no exact meal
+    # identity to save against — do not expose a confirm button that would
+    # silently save an unrelated next-meal recommendation instead. Route the
+    # user to the real, correctly-scoped "what should I eat now" flow.
     rows = [
-        [("✅ אשר שאכלתי", "nextmeal:save:1")],
-        [("🔄 רענן תפריט", "menu:refresh_daily_menu"), ("🍽 מה לאכול עכשיו", "menu:nextmeal")],
+        [("🍽 מה לאכול עכשיו", "menu:nextmeal")],
+        [("🔄 רענן תפריט", "menu:refresh_daily_menu")],
         [("📊 מצב היום", "menu:status")],
     ]
     return body, rows

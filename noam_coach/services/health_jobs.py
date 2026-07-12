@@ -2456,19 +2456,36 @@ async def build_morning_menu_text(user_id: int, ctx: "DailyContext | None" = Non
     # (noam_coach.services.morning_menu_pipeline) instead of showing the raw
     # AI output. This is the operational enforcement of prompt_builder's
     # SAFETY_CONTRACT for the daily menu.
-    from noam_coach.services.morning_menu_pipeline import build_personalized_morning_menu
-
-    pipeline_result = await build_personalized_morning_menu(
-        DB,
-        user_id,
-        profile=ctx.profile,
-        goal=ctx.goal,
-        today_has_workout=_ctx_has_workout(ctx),
-        daily_flags=ctx.flags,
-        openai_client=OPENAI_CLIENT,
-        openai_model=SETTINGS.openai_model,
-        now=ctx.now,
+    from noam_coach.services.morning_menu_pipeline import (
+        MenuGenerationBlocked,
+        build_personalized_morning_menu,
     )
+
+    try:
+        pipeline_result = await build_personalized_morning_menu(
+            DB,
+            user_id,
+            profile=ctx.profile,
+            goal=ctx.goal,
+            today_has_workout=_ctx_has_workout(ctx),
+            daily_flags=ctx.flags,
+            openai_client=OPENAI_CLIENT,
+            openai_model=SETTINGS.openai_model,
+            now=ctx.now,
+            # Finding 12: reuse THIS snapshot — one authoritative
+            # NutritionContext drives remaining budget, meal intents, AI
+            # context, validation and the personalization-strength text
+            # below, instead of two independently-timed database reads.
+            nutrition_context=nutrition_context,
+        )
+    except MenuGenerationBlocked:
+        # Finding 7 hard invariant: an invalid menu must never be rendered.
+        return (
+            "<b>תפריט להיום</b>\n\n"
+            "לא הצלחתי לבנות כרגע תפריט שעומד בכל ההגבלות והיעדים שלך. "
+            "אני לא רוצה להציג לך הצעה לא אמינה.\n\n"
+            "אפשר לנסות שוב, או לבדוק \"מה לאכול עכשיו\" לארוחה בודדת בינתיים."
+        )
     menu = pipeline_result.menu
     workout_note = "יום אימון" if _ctx_has_workout(ctx) else "יום ללא אימון מתוכנן"
     target_line = f"יעד: {ctx.calorie_target:.0f} קל׳ | {ctx.protein_target:.0f} ג׳ חלבון"

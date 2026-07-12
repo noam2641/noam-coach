@@ -45,7 +45,24 @@ class MenuMealRecord:
 
 
 def menu_meal_record_from_menu_meal(meal: Any, *, slot: str, index: int) -> MenuMealRecord:
-    """Build a ``MenuMealRecord`` from a ``recommendations.MenuMeal``."""
+    """Build a ``MenuMealRecord`` from a ``recommendations.MenuMeal``.
+
+    Finding 8: real structured ingredients (when the AI populated them) are
+    persisted, not discarded — a targeted edit ("בלי ביצים") and the
+    validator both need to know a meal actually CONTAINS eggs, not guess it
+    from whether the word appears in the rendered ``note``.
+    """
+    raw_ingredients = getattr(meal, "ingredients", None) or []
+    ingredients = [
+        {
+            "name": str(getattr(item, "name", "") or ""),
+            "grams": getattr(item, "grams", None),
+            "calories": getattr(item, "calories", None),
+            "protein": getattr(item, "protein", None),
+        }
+        for item in raw_ingredients
+        if str(getattr(item, "name", "") or "").strip()
+    ]
     return MenuMealRecord(
         meal_id=f"{slot}-{index}",
         slot=slot,
@@ -53,7 +70,7 @@ def menu_meal_record_from_menu_meal(meal: Any, *, slot: str, index: int) -> Menu
         role=str(getattr(meal, "name", "") or ""),
         calories=float(getattr(meal, "calories", 0) or 0),
         protein=float(getattr(meal, "protein", 0) or 0),
-        ingredients=[],
+        ingredients=ingredients,
         note=str(getattr(meal, "note", "") or ""),
     )
 

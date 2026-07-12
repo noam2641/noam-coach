@@ -133,6 +133,7 @@ _DEBOUNCE_PREFIXES = (
     "nextmeal:save:",
     "nextmeal:plan:",
     "nextmeal:choose:",
+    "dailymenu:save:",
     # Codex audit round: sensitive single-shot writes that advance a flow —
     # a double-tap must not apply/skip TWO steps (e.g. health:skip_item
     # tapped twice would silently discard the next wizard item too).

@@ -31,12 +31,36 @@ LOGGER = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+class MenuIngredient(BaseModel):
+    """One structured food component of a MenuMeal (Finding 8).
+
+    Generation must expose real food identity, not only a free-text
+    ``note`` — the daily-menu validator and the targeted editor ("בלי ביצים")
+    need to know a meal actually CONTAINS eggs, not guess it from whether the
+    word "ביצים" happens to appear in a rendered sentence.
+    """
+
+    name: str
+    grams: float | None = None
+    calories: float | None = None
+    protein: float | None = None
+
+
 class MenuMeal(BaseModel):
     name: str
     time_hint: str = Field(description="When to eat, e.g. 'אחרי האימון'")
     calories: float = Field(ge=0, le=4000)
     protein: float = Field(ge=0, le=400)
     note: str = ""
+    # TASK-8 Finding 2: when meal_intents are supplied, the AI must echo back
+    # which code-defined intent this meal fills, so validation/repair can
+    # check the meal against the SAME intent object the generation contract
+    # gave it — never re-derived from the generated meal's free-text name.
+    intent_id: str = ""
+    # Finding 8: structured food components, in addition to (not replacing)
+    # the human-readable `note`. Empty for the deterministic (no-AI)
+    # fallback and for legacy callers that never populate it.
+    ingredients: list[MenuIngredient] = Field(default_factory=list)
 
 
 class MorningMenu(BaseModel):
@@ -173,7 +197,19 @@ async def morning_menu(
     today_has_workout: bool,
     daily_flags: dict[str, Any] | None = None,
     nutrition_context: dict[str, Any] | None = None,
+    meal_intents: list[dict[str, Any]] | None = None,
 ) -> MorningMenu:
+    """Generate the daily menu.
+
+    ``meal_intents`` (TASK-8 Finding 2), when supplied, is the CODE-defined
+    generation contract from ``noam_coach.services.meal_intent`` — one dict
+    per ``MealIntent.ai_payload()``. When present it is authoritative: the AI
+    must compose exactly one meal per intent, matched by ``intent_id``, using
+    that intent's calorie/protein target and role rather than inventing its
+    own day allocation. The deterministic (no-AI) fallback below also uses it
+    when available, instead of an arbitrary fixed 0.3/0.35/0.35 split of the
+    RAW daily target (which double-counts already-consumed calories).
+    """
     flags = daily_flags or {}
     if not _client_ready(client):
         cal = goal.get("calories", 2000)
@@ -192,6 +228,25 @@ async def morning_menu(
 
         if is_fasting:
             notes.append("יום צום — לא מציע ארוחות. שתה הרבה מים.")
+        elif meal_intents:
+            # TASK-8: build the fallback from the SAME code-defined intents
+            # (already consumed-aware remaining budget) instead of dividing
+            # the raw daily target — Finding 1 fix applies to the fallback
+            # path too, since it is what deterministic repair also uses.
+            if learned_note:
+                notes.append(learned_note)
+            if has_ritalin:
+                notes.append("ריטלין — התיאבון יורד. דגש על חלבון בארוחות קטנות.")
+            for index, intent in enumerate(meal_intents):
+                meals.append(
+                    MenuMeal(
+                        name=_with_learned_food(str(intent.get("role_label") or "ארוחה"), learned_names, index),
+                        time_hint=f"{int(intent.get('approx_hour') or 0):02d}:00",
+                        calories=max(0.0, float(intent.get("calorie_target") or 0)),
+                        protein=max(0.0, float(intent.get("protein_target") or 0)),
+                        intent_id=str(intent.get("intent_id") or ""),
+                    )
+                )
         elif has_ritalin:
             notes.append("ריטלין — התיאבון יורד. דגש על חלבון בארוחות קטנות.")
             if learned_note:
@@ -249,6 +304,25 @@ async def morning_menu(
             closing="\n".join(closing_parts),
         )
 
+    intents_block = ""
+    if meal_intents:
+        intents_block = (
+            "\n\nCODE-DEFINED MEAL INTENTS (authoritative — this is the day's "
+            "real eating-opportunity plan, already computed from the "
+            "remaining calorie/protein budget after accounting for what the "
+            "user already ate today; it is NOT the raw full-day target). You "
+            "MUST produce exactly one meal per intent below, in the same "
+            "order, each meal's 'intent_id' field set to that intent's "
+            "intent_id. Use each intent's calorie_target/protein_target "
+            "(the calorie_min/calorie_max is the acceptable range) as the "
+            "meal's nutrition — do not invent a different day-wide split. "
+            "'workout_relationship' and 'digestion_requirement' describe the "
+            "meal's role relative to today's training; 'familiar_food_names' "
+            "are foods this user actually eats around that slot — prefer "
+            "them. Do not add, drop, or reorder meals relative to this list:\n"
+            f"{json.dumps(meal_intents, ensure_ascii=False)}"
+        )
+
     try:
         response = await client.responses.parse(
             model=model,
@@ -290,10 +364,23 @@ async def morning_menu(
                         "clock time (HH:MM) in 'time_hint', a short meal-context in "
                         "'name' (e.g. 'ארוחת בוקר'/'ארוחת צהריים'/'ארוחת ביניים'/"
                         "'ארוחת ערב'/'קדם אימון'/'אחרי אימון' — never 'ארוחה 1/2/3'), "
-                        "and the actual food components in 'note'. The SUM of the "
+                        "and the actual food components in 'note'. Additionally, "
+                        "populate the structured 'ingredients' list for every meal "
+                        "with each real food component (name, and grams/calories/"
+                        "protein when known) — do not leave it empty when the meal "
+                        "is composed of identifiable foods; this is what lets "
+                        "downstream code detect e.g. 'this meal contains eggs' "
+                        "without re-parsing 'note'. The SUM of the "
                         "meals' calories must match the daily calorie target and the "
                         "SUM of protein must match the protein target (within ~5%). "
-                        "Do not add a generic closing sentence."
+                        "Do not add a generic closing sentence.\n"
+                        # TASK-8 Finding 2: when meal_intents are supplied they
+                        # are the authoritative allocation — see the user
+                        # message block below; do not re-derive your own.
+                        + ("When CODE-DEFINED MEAL INTENTS are provided in the "
+                           "user message, they override the general guidance "
+                           "above about distributing calories: follow them "
+                           "exactly, one meal per intent." if meal_intents else "")
                     ),
                 },
                 {
@@ -306,6 +393,7 @@ async def morning_menu(
                         f"יש אימון היום: {'כן' if today_has_workout else 'לא'}.\n"
                         f"אינדיקציות בוקר מהמשתמש: {flags or 'אין'}.\n"
                         "בנה תפריט מגוון להיום."
+                        f"{intents_block}"
                     ),
                 },
                 {
@@ -331,7 +419,108 @@ async def morning_menu(
             today_has_workout,
             daily_flags,
             nutrition_context,
+            meal_intents,
         )
+
+
+async def repair_menu_meals(
+    client: Any | None,
+    model: str,
+    *,
+    menu: "MorningMenu",
+    affected_meal_indices: list[int],
+    violations_by_index: dict[int, list[str]],
+    immutable_constraints: dict[str, Any],
+    meal_intents: list[dict[str, Any]] | None = None,
+) -> "MorningMenu":
+    """ONE bounded targeted AI repair call (Finding 6).
+
+    Sends ONLY the flagged meals (by intent_id/index) plus the exact
+    violation reasons and immutable constraints (hard exclusions, allergies,
+    calorie/protein target) to the model, and asks it to replace ONLY those
+    meals. Unaffected meals are never included in the request and are spliced
+    back in by the caller — this function does not touch them. If the client
+    is unavailable or the call fails, the caller is responsible for falling
+    back to the deterministic path; this function raises rather than
+    silently degrading, so "no real repair happened" is never disguised as
+    one.
+    """
+    if not _client_ready(client) or not affected_meal_indices:
+        raise RuntimeError("no AI client available or nothing to repair")
+
+    affected_meals = [
+        {
+            "index": index,
+            "intent_id": str(getattr(menu.meals[index], "intent_id", "") or ""),
+            "current": {
+                "name": menu.meals[index].name,
+                "time_hint": menu.meals[index].time_hint,
+                "calories": menu.meals[index].calories,
+                "protein": menu.meals[index].protein,
+                "note": menu.meals[index].note,
+            },
+            "violations": violations_by_index.get(index, []),
+        }
+        for index in affected_meal_indices
+        if 0 <= index < len(menu.meals)
+    ]
+    intent_by_id = {str(intent.get("intent_id")): intent for intent in (meal_intents or [])}
+    affected_intents = [
+        intent_by_id[meal["intent_id"]]
+        for meal in affected_meals
+        if meal["intent_id"] in intent_by_id
+    ]
+
+    response = await client.responses.parse(
+        model=model,
+        input=[
+            {
+                "role": "system",
+                "content": (
+                    "You are repairing SPECIFIC flagged meals in an existing "
+                    "Hebrew daily nutrition menu. You are given the exact "
+                    "meals that violated a constraint and why. Replace ONLY "
+                    "those meals (same count, same order they were given in). "
+                    "Absolutely never reintroduce any food in "
+                    "'hard_excluded_foods' or 'allergies' below, in any form "
+                    "or morphological variant. Respect each meal's original "
+                    "meal_intent (calorie_min/calorie_max/protein_target/"
+                    "role/workout_relationship) when provided. Return exactly "
+                    "one meal per input meal, in the same order, each with "
+                    "its original 'intent_id' echoed back."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "immutable_constraints": immutable_constraints,
+                        "meals_to_repair": affected_meals,
+                        "meal_intents_for_these_meals": affected_intents,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ],
+        text_format=MorningMenu,
+    )
+    if not response.output_parsed or not response.output_parsed.meals:
+        raise RuntimeError("repair call returned no meals")
+    repaired_meals = response.output_parsed.meals
+    if len(repaired_meals) != len(affected_meals):
+        raise RuntimeError("repair call returned a different meal count than requested")
+
+    result_meals = list(menu.meals)
+    for position, index in enumerate(
+        idx for idx in affected_meal_indices if 0 <= idx < len(menu.meals)
+    ):
+        result_meals[index] = repaired_meals[position]
+    return MorningMenu(
+        headline=menu.headline,
+        meals=result_meals,
+        training_advice=menu.training_advice,
+        closing=menu.closing,
+    )
 
 
 async def intraday_next_meals(
