@@ -32,6 +32,13 @@ class FoodItem(BaseModel):
     carbs: float = Field(ge=0, le=2000)
     fat: float = Field(ge=0, le=1000)
     confidence: float = Field(ge=0, le=1)
+    # TASK-17: keep VISIBLE count/unit evidence separate from the gram weight so
+    # a packaged food's "3 cookies" is not silently presented as an exact "30 g".
+    # quantity_count/unit describe what was actually seen; quantity_source tracks
+    # how the gram weight was derived and is internal (not shown to the user).
+    quantity_count: float | None = Field(default=None, ge=0, le=1000)
+    quantity_unit: str | None = None  # e.g. "עוגייה" / "יחידה" / "פרוסה"
+    quantity_source: str | None = None  # visual_count | package_label | canonical | user | estimate
 
     @field_validator("grams", "calories", "protein", "carbs", "fat", "confidence")
     @classmethod

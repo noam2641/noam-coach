@@ -679,12 +679,25 @@ async def render_meal(target: Any, user_id: int, approval_id: str, refine_count:
             return "מ״ל"
         return "גרם"
 
+    def _quantity_text(item: "FoodItem") -> str:
+        # TASK-17: when the visible evidence is a count and the gram weight is an
+        # estimate (not derived from a package label / known product / user),
+        # render the count ("3 יחידות") rather than an unsupported exact gram
+        # value. quantity_source is internal and never shown.
+        count = getattr(item, "quantity_count", None)
+        source = str(getattr(item, "quantity_source", "") or "")
+        if count and source in {"", "visual_count", "estimate"}:
+            unit = str(getattr(item, "quantity_unit", "") or "יחידות")
+            count_str = f"{count:g}"
+            return f"{count_str} {esc(unit)}"
+        return f"{item.grams:g} {_quantity_unit(item)}"
+
     def _item_line(index: int, item: "FoodItem") -> str:
         # TASK-22: meal components are not an ordered sequence — use a plain
         # bullet, not database-style "1." / "2." numbering.
         del index
         line = (
-            f"• {esc(item.name)} — {item.grams:g} {_quantity_unit(item)} | "
+            f"• {esc(item.name)} — {_quantity_text(item)} | "
             f"{item.calories:.0f} קל׳ | {item.protein:.0f} חלבון"
         )
         if item.confidence < 0.6:
@@ -697,7 +710,7 @@ async def render_meal(target: Any, user_id: int, approval_id: str, refine_count:
     if single_item:
         only = analysis.items[0]
         items = (
-            f"{only.grams:g} {_quantity_unit(only)}\n"
+            f"{_quantity_text(only)}\n"
             f"{only.calories:.0f} קל׳ | {only.protein:.0f} ג׳ חלבון"
         )
     else:

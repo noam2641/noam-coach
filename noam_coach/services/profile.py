@@ -240,7 +240,21 @@ async def analyze_meal_image(
                     "to only the foods the caption names. If a visible, "
                     "nutritionally important component is uncertain, ask ONE "
                     "targeted question about that component rather than returning "
-                    "an incomplete confident analysis.\n\n"
+                    "an incomplete confident analysis.\n"
+                    # TASK-17: packaged-food evidence must not be false precision.
+                    "For packaged foods, separate the evidence: (a) product "
+                    "identity (brand/product/flavor) only from visible text or a "
+                    "known-food match — never invented from partial packaging; "
+                    "(b) VISIBLE count — set quantity_count and quantity_unit "
+                    "(e.g. 3 / 'עוגייה') for countable units instead of guessing "
+                    "grams; (c) convert count→grams only from a readable package "
+                    "serving, a trusted known product, or user input, and set "
+                    "quantity_source accordingly (visual_count/package_label/"
+                    "canonical/estimate); (d) do not imply the nutrition came from "
+                    "a visible label when the label is not readable. When the "
+                    "per-unit weight is unknown but the count is clear, prefer the "
+                    "count and ask ONE targeted question if the weight materially "
+                    "affects the estimate.\n\n"
                     + ISRAELI_LOCALE_BLOCK
                     + safety_context_block(safety_context)
                     + learned_context
