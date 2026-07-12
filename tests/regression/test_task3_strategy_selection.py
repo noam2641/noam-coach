@@ -150,6 +150,60 @@ async def test_type_screen_shows_abcd_explanation_for_each_strategy(
     assert "גוף מלא" in text  # consistency character
 
 
+async def _ready_db_limited(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Database:
+    """A limited profile (outdoor / no equipment / short sessions) where a
+    split-heavy strategy cannot be built and would otherwise dead-end."""
+    db = Database(str(tmp_path / "task3_limited.db"))
+    await db.init()
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(1,'Test',NULL,?)",
+        (utc_now(),),
+    )
+    for mod in (coach_bot, onboarding_bot, callback_plans_bot, core_services, planning):
+        monkeypatch.setattr(mod, "DB", db, raising=False)
+    facts = {
+        "weight_kg": 90, "height_cm": 174, "age": 32, "sex": "male",
+        "primary_goal": "muscle_gain", "diet_restrictions": "none", "allergies": "none",
+        "training_days_per_week": 4, "active_pain": "none", "medical_avoidance": "none",
+        "session_minutes": 30, "training_location": "outdoor", "equipment": "none",
+        "strength_experience": "intermediate",
+        "weekly_availability": [{"weekday": d, "start": "19:00", "minutes": 30} for d in [0, 1, 2, 3]],
+    }
+    for k, v in facts.items():
+        await user_model.set_fact(db, 1, k, v, source=user_model.SOURCE_USER, confirmed=True)
+    await planning.generate_candidates(db, 1, "workout")
+    return db
+
+
+@pytest.mark.asyncio
+async def test_only_buildable_strategies_are_offered_and_all_advance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: a strategy that cannot be built for the user's profile must
+    not be offered as a dead button. Every OFFERED strategy must advance to
+    step 2 (no "לא נמצאה תוכנית" dead-end)."""
+    db = await _ready_db_limited(tmp_path, monkeypatch)
+    del db
+    step_a = FakeTarget()
+    await onboarding_bot.render_workout_type_choice(step_a, 1)
+    callbacks = [
+        btn.callback_data
+        for row in step_a.reply_markups[-1].inline_keyboard
+        for btn in row
+        if btn.callback_data.startswith("planv2:wiz_type:")
+    ]
+    offered = [cb.split(":", 2)[2].split(":", 1)[0] for cb in callbacks]
+    # consistency (full body) is always buildable; at least one split may be dropped.
+    assert "consistency" in offered
+    assert len(offered) >= 1
+    # Every offered strategy actually advances to step 2.
+    for cb in callbacks:
+        step_b = FakeTarget()
+        handled = await callback_plans_bot.handle_plan_callback(step_b, 1, cb)
+        assert handled is True
+        assert "שלב 2 מתוך 3" in step_b.messages[-1]
+
+
 def test_strategy_explainer_lines_cover_all_four_dimensions() -> None:
     for strategy in ("consistency", "balanced", "performance"):
         lines = onboarding_bot._strategy_explainer_lines(strategy)

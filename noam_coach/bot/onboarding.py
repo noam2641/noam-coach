@@ -1942,6 +1942,24 @@ async def render_workout_type_choice(target: Any, user_id: int) -> None:
     candidate generation/retrieval yields fewer rows.
     """
     candidates = await planning.list_plan_candidates(DB, user_id, "workout")  # type: ignore[arg-type]
+    # A strategy is offered only when it can ACTUALLY be built for this profile.
+    # The stored candidate set may be incomplete for two different reasons:
+    #  (a) rows were superseded after an earlier selection (TASK-19) — the
+    #      strategy is still buildable and MUST be offered again; or
+    #  (b) the strategy is genuinely unbuildable for this profile (e.g. a
+    #      split-heavy plan on outdoor/no-equipment leaves an empty session and
+    #      is dropped by the quality gate) — offering it would dead-end the
+    #      wizard ("לא נמצאה תוכנית עבור ביצועים").
+    # To tell them apart, regenerate once when the set is incomplete: a fresh
+    # generate_candidates rebuilds every strategy that CAN be built, so the
+    # resulting rows are the true buildable set.
+    present = {str(c.get("strategy") or "") for c in candidates if c.get("strategy")}
+    if len(present) < len(_SUPPORTED_WORKOUT_STRATEGIES):
+        try:
+            await planning.generate_candidates(DB, user_id, "workout")
+            candidates = await planning.list_plan_candidates(DB, user_id, "workout")  # type: ignore[arg-type]
+        except planning.PlanningBlockedError:
+            pass
     if not candidates:
         await safe_edit(
             target,
@@ -1950,8 +1968,12 @@ async def render_workout_type_choice(target: Any, user_id: int) -> None:
         )
         return
 
+    buildable = {str(c.get("strategy") or "") for c in candidates if c.get("strategy")}
+
     primary_goal = str(await user_model.get_value(DB, user_id, "primary_goal") or "")
     recommended = _STRATEGY_RECOMMENDATION_FOR_GOAL.get(primary_goal, "balanced")
+    if recommended not in buildable:
+        recommended = next((s for s in _SUPPORTED_WORKOUT_STRATEGIES if s in buildable), "")
 
     flow = await conversation.get_active_flow(DB, user_id)
     if flow.name != conversation.FlowName.workout_plan_selection:
@@ -1966,6 +1988,8 @@ async def render_workout_type_choice(target: Any, user_id: int) -> None:
     lines = ["<b>שלב 1 מתוך 3 — איזה סוג תוכנית אימונים?</b>", ""]
     rows = []
     for strategy in _SUPPORTED_WORKOUT_STRATEGIES:
+        if strategy not in buildable:
+            continue  # not buildable for this profile — do not offer a dead button
         label = _STRATEGY_LABELS[strategy]
         is_recommended = strategy == recommended
         badge = " (⭐ מומלץ עבורך)" if is_recommended else ""
@@ -1980,6 +2004,12 @@ async def render_workout_type_choice(target: Any, user_id: int) -> None:
         )
         button_label = f"{label}{' ⭐' if is_recommended else ''}"
         rows.append([button(button_label, callback)])
+    if len(buildable) < len(_SUPPORTED_WORKOUT_STRATEGIES):
+        lines.append(
+            "<i>חלק מסגנונות האימון דורשים יותר ציוד/זמן ולכן לא מוצעים "
+            "כרגע לפי מה שדיווחת. אפשר לעדכן ציוד או זמן לאימון ולנסות שוב.</i>"
+        )
+        lines.append("")
     rows.append([button("⬅️ לתוכניות", "menu:smartplan")])
     await safe_edit(target, "\n".join(lines), InlineKeyboardMarkup(rows))
 
