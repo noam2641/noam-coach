@@ -500,17 +500,32 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
             MealIngredient(
                 food_id=str(item.get("name") or "item"),
                 display_name=str(item.get("name") or ""),
-                quantity=float(item.get("grams") or 0) or 1.0,
-                unit="גרם" if item.get("grams") else "יחידה",
+                # Only claim a real gram quantity when one was actually
+                # recorded; otherwise use a neutral "1 מנה" instead of the
+                # misleading "1.0 יחידה" default, which used to make e.g.
+                # "אורז — 220 קלוריות" read back as "1 יחידה אורז" in history.
+                quantity=float(item["grams"]) if item.get("grams") else 1.0,
+                unit="גרם" if item.get("grams") else "מנה",
                 calories=float(item.get("calories") or 0),
                 protein_g=float(item.get("protein") or 0),
+                carbs_g=float(item["carbs"]) if item.get("carbs") is not None else None,
+                fat_g=float(item["fat"]) if item.get("fat") is not None else None,
             )
             for item in ingredients
             if isinstance(item, dict) and str(item.get("name") or "").strip()
         ]
+        # Meal identity fix: the saved meal's NAME must be the actual food
+        # composition (what was eaten), not the behavioral slot label — a
+        # meal saved as "ארוחת בוקר" is useless to learned_foods/repetition/
+        # routine analysis, which key off the meal name. role stays as
+        # metadata elsewhere (the structured menu record); only the
+        # composition reaches meals.name.
+        meal_note = str(meal.get("note") or "").strip()
+        meal_role = str(meal.get("role") or "ארוחה").strip()
+        display_title = meal_note or meal_role
         option = MealOption(
-            title=str(meal.get("role") or "ארוחה"),
-            ingredients=[str(meal.get("note") or meal.get("role") or "ארוחה")] if not ingredient_details else [],
+            title=display_title,
+            ingredients=[meal_note or meal_role] if not ingredient_details else [],
             calories=int(float(meal.get("calories") or 0)),
             protein=int(float(meal.get("protein") or 0)),
             rationale="מהתפריט היומי הפעיל",

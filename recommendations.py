@@ -44,6 +44,8 @@ class MenuIngredient(BaseModel):
     grams: float | None = None
     calories: float | None = None
     protein: float | None = None
+    carbs: float | None = None
+    fat: float | None = None
 
 
 class MenuMeal(BaseModel):
@@ -367,10 +369,12 @@ async def morning_menu(
                         "and the actual food components in 'note'. Additionally, "
                         "populate the structured 'ingredients' list for every meal "
                         "with each real food component (name, and grams/calories/"
-                        "protein when known) — do not leave it empty when the meal "
-                        "is composed of identifiable foods; this is what lets "
-                        "downstream code detect e.g. 'this meal contains eggs' "
-                        "without re-parsing 'note'. The SUM of the "
+                        "protein/carbs/fat when known) — do not leave it empty when "
+                        "the meal is composed of identifiable foods; this is what "
+                        "lets downstream code detect e.g. 'this meal contains eggs' "
+                        "without re-parsing 'note', and log real per-ingredient "
+                        "macros when the meal is saved as eaten, not just an "
+                        "aggregate calorie/protein total. The SUM of the "
                         "meals' calories must match the daily calorie target and the "
                         "SUM of protein must match the protein target (within ~5%). "
                         "Do not add a generic closing sentence.\n"

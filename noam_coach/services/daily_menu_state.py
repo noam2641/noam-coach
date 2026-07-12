@@ -59,6 +59,8 @@ def menu_meal_record_from_menu_meal(meal: Any, *, slot: str, index: int) -> Menu
             "grams": getattr(item, "grams", None),
             "calories": getattr(item, "calories", None),
             "protein": getattr(item, "protein", None),
+            "carbs": getattr(item, "carbs", None),
+            "fat": getattr(item, "fat", None),
         }
         for item in raw_ingredients
         if str(getattr(item, "name", "") or "").strip()

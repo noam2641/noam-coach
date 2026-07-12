@@ -2559,6 +2559,25 @@ async def save_chosen_meal(
     Only this function counts a recommendation as consumed — choosing/viewing
     never does. A short-lived per-fingerprint guard makes a fast double-tap
     idempotent. Returns False when the same option was just saved.
+
+    Eaten-time policy: ``eaten_at`` is set to the confirmation moment (``now``
+    or the current time), matching the same "photo timestamp == eating
+    moment" assumption ``routine.learn_eating_windows`` documents for the
+    photo-logging path — the confirmation tap is the closest real signal this
+    system has to when the food was actually eaten. It is NOT the meal's
+    planned/displayed time (e.g. a daily-menu slot labeled "13:00"); a user
+    confirming at 16:20 is recorded as having eaten at 16:20, not 13:00. The
+    schema has no explicit source/provenance column for this distinction
+    today — ``created_at`` == ``eaten_at`` here already signals "logged via
+    confirmation, not backfilled."
+
+    Persists real per-ingredient rows (name/grams/calories/protein/carbs/fat)
+    into ``meal_items`` from ``option.ingredient_details`` when available, and
+    real aggregate carbs/fat on the ``meals`` row — previously this always
+    wrote carbs=0/fat=0 on ``meals`` and never wrote ``meal_items`` at all, so
+    a saved recommendation was invisible to ``learned_foods_from_meals``
+    (which reads from ``meal_items``) and always looked like a 0g-carb/fat
+    meal in history.
     """
     current = (now or datetime.now(TZ)).astimezone(TZ)
     fingerprint = option_fingerprint(option)
@@ -2570,14 +2589,34 @@ async def save_chosen_meal(
         return False  # double-tap within 2 minutes -> no duplicate row
 
     iso_now = current.astimezone(timezone.utc).isoformat()
-    await db.execute(
-        """
-        INSERT INTO meals(user_id, name, calories, protein, carbs, fat,
-                          confidence, eaten_at, created_at, status)
-        VALUES(?, ?, ?, ?, 0, 0, ?, ?, ?, 'consumed')
-        """,
-        (user_id, option.title, int(option.calories), int(option.protein), 0.6, iso_now, iso_now),
-    )
+    total_carbs = _rounded_sum(i.carbs_g or 0 for i in option.ingredient_details) if option.ingredient_details else 0
+    total_fat = _rounded_sum(i.fat_g or 0 for i in option.ingredient_details) if option.ingredient_details else 0
+    async with db.transaction() as conn:
+        cursor = await conn.execute(
+            """
+            INSERT INTO meals(user_id, name, calories, protein, carbs, fat,
+                              confidence, eaten_at, created_at, status)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'consumed')
+            """,
+            (user_id, option.title, int(option.calories), int(option.protein), total_carbs, total_fat, 0.6, iso_now, iso_now),
+        )
+        meal_id = int(cursor.lastrowid or 0)
+        if option.ingredient_details:
+            await conn.executemany(
+                """
+                INSERT INTO meal_items(meal_id, name, grams, calories, protein, carbs, fat, confidence)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        meal_id, ingredient.display_name, ingredient.quantity,
+                        ingredient.calories, ingredient.protein_g,
+                        ingredient.carbs_g or 0, ingredient.fat_g or 0,
+                        ingredient.confidence if ingredient.confidence is not None else 0.6,
+                    )
+                    for ingredient in option.ingredient_details
+                ],
+            )
     if not isinstance(saved, dict):
         saved = {}
     saved[fingerprint] = current.isoformat()

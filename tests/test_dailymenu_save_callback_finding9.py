@@ -94,7 +94,12 @@ async def test_dailymenu_save_persists_the_exact_daily_menu_meal_not_next_meal_s
     assert handled is True
 
     consumed = await _consumed_meal_names(db)
-    assert "ארוחת בוקר מהתפריט היומי" in consumed
+    # Meal identity fix: the saved name is the actual composition (note),
+    # not the behavioral role label -- "ארוחת בוקר מהתפריט היומי" would be
+    # useless to learned_foods/repetition/routine analysis, which key off
+    # the meal name.
+    assert "שקשוקה עם לחם מלא" in consumed
+    assert "ארוחת בוקר מהתפריט היומי" not in consumed
     # Never fell through to a next-meal recommendation title (which would be
     # some deterministic-fallback name like "ארוחת בוקר עתירת חלבון" etc.,
     # generated fresh by generate_next_meal_recommendation with entirely

@@ -303,6 +303,58 @@ def _meal_matches_avoided_item(meal: dict[str, Any], avoid_key: str) -> bool:
     return False
 
 
+def _substitute_ingredients(
+    ingredients: list[dict[str, Any]],
+    *,
+    avoid_key: str,
+    replacement_name: str,
+    replacement_calories: int,
+    replacement_protein: int,
+) -> list[dict[str, Any]] | None:
+    """Remove only the ingredient(s) matching ``avoid_key`` and add ONE
+    replacement ingredient in their place — the unaffected ingredients are
+    preserved untouched. Returns ``None`` when nothing in ``ingredients``
+    actually matches (the caller should not treat this as a match).
+
+    This is the targeted-substitution fix: previously a meal composed of
+    "ביצים + לחם + גבינה + ירקות" would have its ENTIRE content replaced by a
+    single familiar food the moment eggs were detected, discarding the bread/
+    cheese/vegetables that had nothing to do with the request. Now only the
+    egg contribution is removed and replaced; bread/cheese/vegetables survive.
+    """
+    from noam_coach.services.next_meal import _food_word_matches
+
+    kept: list[dict[str, Any]] = []
+    any_removed = False
+    for item in ingredients:
+        if not isinstance(item, dict):
+            continue
+        key = normalize_food_key(str(item.get("name") or ""))
+        if key and _food_word_matches(avoid_key, key):
+            any_removed = True
+            continue
+        kept.append(dict(item))
+    if not any_removed:
+        return None
+    kept.append(
+        {
+            "name": replacement_name,
+            "grams": None,
+            "calories": replacement_calories,
+            "protein": replacement_protein,
+            "carbs": None,
+            "fat": None,
+        }
+    )
+    return kept
+
+
+def _meal_totals_from_ingredients(ingredients: list[dict[str, Any]]) -> tuple[int, int]:
+    calories = sum(float(item.get("calories") or 0) for item in ingredients)
+    protein = sum(float(item.get("protein") or 0) for item in ingredients)
+    return int(round(calories)), int(round(protein))
+
+
 def _regenerate_structured_meals(
     meals: list[dict[str, Any]],
     *,
@@ -311,9 +363,18 @@ def _regenerate_structured_meals(
     calories: int,
     protein: int,
 ) -> tuple[list[dict[str, Any]], list[int]]:
-    """TASK-10: replace only the meals matching the avoided item; every other
+    """TASK-10: repair only the meals matching the avoided item; every other
     meal is preserved byte-for-byte (same contract as the morning-menu repair
     pipeline — no blanket regeneration for a targeted edit).
+
+    Targeted ingredient substitution (not whole-meal replacement): when a
+    matching meal has structured ingredients, only the ingredient(s)
+    identifying the avoided item are removed and replaced — other ingredients
+    in that meal (bread, cheese, vegetables, ...) are preserved, and the
+    meal's calories/protein/note are recomputed from the resulting ingredient
+    list, not overwritten with the substitute's own totals. A meal with no
+    structured ingredients (legacy/undecomposed) falls back to whole-meal
+    replacement, since there is nothing more granular to target.
 
     Finding 11: the meal's behavioral ``role`` (e.g. "ארוחת בוקר") is a
     distinct concept from the composed food's display name/description and
@@ -326,18 +387,42 @@ def _regenerate_structured_meals(
     updated: list[dict[str, Any]] = []
     changed_indices: list[int] = []
     for index, meal in enumerate(meals):
-        if avoid_key and _meal_matches_avoided_item(meal, avoid_key):
-            replaced = dict(meal)
+        if not (avoid_key and _meal_matches_avoided_item(meal, avoid_key)):
+            updated.append(dict(meal))
+            continue
+        replaced = dict(meal)
+        existing_ingredients = meal.get("ingredients") or []
+        new_ingredients = (
+            _substitute_ingredients(
+                existing_ingredients,
+                avoid_key=avoid_key,
+                replacement_name=replacement_name,
+                replacement_calories=calories,
+                replacement_protein=protein,
+            )
+            if isinstance(existing_ingredients, list) and existing_ingredients
+            else None
+        )
+        if new_ingredients is not None:
+            # Targeted substitution: keep unaffected ingredients, recompute
+            # totals from the actual resulting ingredient list.
+            total_calories, total_protein = _meal_totals_from_ingredients(new_ingredients)
+            replaced["ingredients"] = new_ingredients
+            replaced["calories"] = total_calories
+            replaced["protein"] = total_protein
+            kept_names = [str(item.get("name") or "") for item in new_ingredients if item.get("name") != replacement_name]
+            replaced["note"] = " + ".join([*kept_names, replacement_name]) if kept_names else replacement_name
+        else:
+            # No structured ingredients to target -- whole-meal replacement
+            # is the only option (legacy menu / undecomposed meal).
             replaced["note"] = replacement_name
             replaced["calories"] = calories
             replaced["protein"] = protein
-            # The substitute is a single known food; represent it structurally
-            # too so a subsequent edit can reason about it the same way.
-            replaced["ingredients"] = [{"name": replacement_name, "grams": None, "calories": calories, "protein": protein}]
-            updated.append(replaced)
-            changed_indices.append(index)
-        else:
-            updated.append(dict(meal))
+            replaced["ingredients"] = [
+                {"name": replacement_name, "grams": None, "calories": calories, "protein": protein, "carbs": None, "fat": None}
+            ]
+        updated.append(replaced)
+        changed_indices.append(index)
     return updated, changed_indices
 
 
