@@ -1777,11 +1777,6 @@ def _after_meal_line(nutrition: NutritionTotals, option: MealOption) -> str:
     return f"<i>אחרי הארוחה: {cal_txt} להיום</i>"
 
 
-def _fit_score_label(option: MealOption) -> str:
-    score = int(round(max(0.0, min(1.0, option.score)) * 100))
-    if score <= 0:
-        return ""
-    return f" | התאמה {score}%"
 
 
 def meal_size_label_he(calories: Any) -> str:
