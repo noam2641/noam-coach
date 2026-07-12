@@ -191,6 +191,7 @@ async def analyze_meal_image(
     image_bytes: bytes,
     user_id: int | None = None,
     nutrition_context: dict[str, Any] | None = None,
+    caption: str | None = None,
 ) -> MealAnalysis:
     if not OPENAI_CLIENT:
         raise RuntimeError("OPENAI_API_KEY אינו מוגדר")
@@ -226,7 +227,20 @@ async def analyze_meal_image(
                     "in the image. Options must include concrete calorie deltas. "
                     "Use learned foods only as supporting recognition evidence; never add foods "
                     "that are not supported by the current image. "
-                    "Do not present estimates as medical advice.\n\n"
+                    "Do not present estimates as medical advice.\n"
+                    # TASK-15: the caption guides visual analysis, it does not
+                    # replace it. This instruction block is sent to the model.
+                    "A user caption (if any) GUIDES visual analysis; it does not "
+                    "replace it. Independently inspect the WHOLE image for every "
+                    "visible nutritionally relevant component (sauce/dressing, "
+                    "salad/vegetables, breading, cheese, egg, bread/pita, toppings, "
+                    "side dishes). Treat caption words as strong evidence only for "
+                    "the components they reasonably refer to; do not propagate one "
+                    "caption label to all items and do not limit the detected items "
+                    "to only the foods the caption names. If a visible, "
+                    "nutritionally important component is uncertain, ask ONE "
+                    "targeted question about that component rather than returning "
+                    "an incomplete confident analysis.\n\n"
                     + ISRAELI_LOCALE_BLOCK
                     + safety_context_block(safety_context)
                     + learned_context
@@ -240,6 +254,12 @@ async def analyze_meal_image(
                     "Evidence precedence: hard allergies/restrictions, explicit current user text, "
                     "deterministic known-food data, approved learned history, image inference, "
                     "then generic estimates. Do not count planned meals as eaten."
+                    + (
+                        f"\n\nUser caption (guidance only — verify against the image and still "
+                        f"detect every other visible component): {caption}"
+                        if caption
+                        else ""
+                    )
                 ),
             },
             {

@@ -196,18 +196,13 @@ async def analyze_duplicate_candidate(
         "meal_photo_caption" if caption else "meal_photo",
         "Analyze duplicate meal photo with user caption" if caption else "Analyze duplicate meal photo",
     )
-    if caption:
-        analysis = await reanalyze_meal_with_text_and_image(
-            image_path=image_path,
-            correction_text=caption,
-            nutrition_context=nutrition_payload,
-        )
-    else:
-        analysis = await analyze_meal_image(
-            image_bytes,
-            user_id=user_id,
-            nutrition_context=nutrition_payload,
-        )
+    # TASK-15: caption guides full image analysis; never replaces it.
+    analysis = await analyze_meal_image(
+        image_bytes,
+        user_id=user_id,
+        nutrition_context=nutrition_payload,
+        caption=caption or None,
+    )
     approval_id = await create_approval(
         user_id,
         "meal",
@@ -311,19 +306,18 @@ async def handle_photo(
             "meal_photo_caption" if caption else "meal_photo",
             "Analyze meal photo with user caption" if caption else "Analyze meal photo",
         )
+        # TASK-15: a caption GUIDES full image analysis — it must not replace it.
+        # Route captioned photos through analyze_meal_image with the caption as
+        # guidance (not through the text-correction reanalysis path, which biased
+        # the result toward the caption tokens and skipped visible components).
+        analysis = await analyze_meal_image(
+            image_bytes,
+            user_id=user_id,
+            nutrition_context=nutrition_payload,
+            caption=caption or None,
+        )
         if caption:
-            analysis = await reanalyze_meal_with_text_and_image(
-                image_path=str(path),
-                correction_text=caption,
-                nutrition_context=nutrition_payload,
-            )
             analysis.notes = (analysis.notes + [f"תיאור מהמשתמש: {caption}"])[-10:]
-        else:
-            analysis = await analyze_meal_image(
-                image_bytes,
-                user_id=user_id,
-                nutrition_context=nutrition_payload,
-            )
         if not analysis.is_meaningful():
             await progress.edit_text("לא זוהתה ארוחה (אין מזון או ערכים תזונתיים). נסה תמונה ברורה יותר.")
             return
