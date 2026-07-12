@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -22,9 +23,38 @@ from config import TZ
 from helpers import esc
 from noam_coach.services.daily_menu_state import (
     get_active_daily_menu,
+    is_structured_menu,
     remember_active_daily_menu,
+    structured_meals,
 )
-from noam_coach.services.learned_foods import learned_foods_from_meals
+from noam_coach.services.food_preferences import record_food_preference_from_slots
+from noam_coach.services.learned_foods import learned_foods_from_meals, normalize_food_key
+from noam_coach.services.preference_profile import FAMILIARITY_MIN_COUNT
+
+# TASK-10: markers that make a stated avoidance sound PERMANENT ("I don't
+# like X" / "I don't eat X") as opposed to a today-only context constraint
+# ("I don't have time to cook today"). Generic, not food-specific — the same
+# markers food_preferences.py already uses to route a fact.
+_PERMANENT_MARKERS = (
+    "לא אוהב",
+    "לא אוהבת",
+    "לא אוכל",
+    "לא אוכלת",
+    "אני לא אוהב",
+    "אני לא אוהבת",
+    "אלרגי",
+    "רגיש",
+)
+# Markers that make an avoidance sound explicitly TEMPORARY/today-scoped —
+# these must never be written to a permanent fact even if a food word is
+# also present in the same sentence.
+_TEMPORARY_MARKERS = (
+    "היום",
+    "עכשיו",
+    "כרגע",
+    "הפעם",
+    "אין לי זמן",
+)
 
 
 @dataclass(frozen=True)
@@ -207,6 +237,86 @@ def _build_revision_text(
     )
 
 
+def _is_permanent_avoidance(instruction: str, wants_no_item: str | None) -> bool:
+    """TASK-10: distinguish a permanent dislike statement from a daily
+    context constraint. Only fires when there is an actual avoided food item
+    AND permanence phrasing, and no same-sentence temporary-scope marker."""
+    if not wants_no_item:
+        return False
+    normalized = str(instruction or "").strip().lower()
+    if any(marker in normalized for marker in _TEMPORARY_MARKERS):
+        return False
+    return any(marker in normalized for marker in _PERMANENT_MARKERS)
+
+
+async def _persist_permanent_dislike(db: Any, user_id: int, item: str, instruction: str) -> None:
+    with suppress(Exception):
+        await record_food_preference_from_slots(
+            db,
+            user_id,
+            {"kind": "preference", "polarity": "avoid", "item": item},
+            instruction,
+        )
+
+
+def _meal_matches_avoided_item(meal: dict[str, Any], avoid_key: str) -> bool:
+    from noam_coach.services.next_meal import _food_word_matches
+
+    if not avoid_key:
+        return False
+    texts = [str(meal.get("role") or ""), str(meal.get("note") or "")]
+    for text in texts:
+        key = normalize_food_key(text)
+        if key and _food_word_matches(avoid_key, key):
+            return True
+    return False
+
+
+def _regenerate_structured_meals(
+    meals: list[dict[str, Any]],
+    *,
+    avoid: str | None,
+    replacement_name: str,
+    calories: int,
+    protein: int,
+) -> tuple[list[dict[str, Any]], list[int]]:
+    """TASK-10: replace only the meals matching the avoided item; every other
+    meal is preserved byte-for-byte (same contract as the morning-menu repair
+    pipeline — no blanket regeneration for a targeted edit)."""
+    avoid_key = normalize_food_key(avoid or "")
+    updated: list[dict[str, Any]] = []
+    changed_indices: list[int] = []
+    for index, meal in enumerate(meals):
+        if avoid_key and _meal_matches_avoided_item(meal, avoid_key):
+            replaced = dict(meal)
+            replaced["role"] = replacement_name
+            replaced["note"] = replacement_name
+            replaced["calories"] = calories
+            replaced["protein"] = protein
+            updated.append(replaced)
+            changed_indices.append(index)
+        else:
+            updated.append(dict(meal))
+    return updated, changed_indices
+
+
+def _structured_meals_to_text(meals: list[dict[str, Any]], headline: str = "תפריט יומי") -> str:
+    lines = [f"<b>{esc(headline)}</b>", ""]
+    for meal in meals:
+        time = str(meal.get("time") or "").strip()
+        role = str(meal.get("role") or "").strip()
+        header = f"🍽️ {esc(time)} — <b>{esc(role)}</b>" if time else f"🍽️ <b>{esc(role)}</b>"
+        lines.append(header)
+        lines.append(f"{float(meal.get('calories') or 0):.0f} קל׳ | {float(meal.get('protein') or 0):.0f} ג׳ חלבון")
+        note = str(meal.get("note") or "").strip()
+        if note and note != role:
+            lines.append(esc(note))
+        lines.append("")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return "\n".join(lines)
+
+
 async def try_build_daily_menu_edit_reply(
     db: Any,
     user_id: int,
@@ -217,7 +327,11 @@ async def try_build_daily_menu_edit_reply(
     intent = parse_daily_menu_edit(text, active_menu_context=active_menu is not None)
     if intent is None:
         return None
-    foods = await learned_foods_from_meals(db, user_id, limit=8, min_count=1)
+    # TASK-4: this picks a personalized replacement suggestion for the active
+    # menu, not a calibration/recognition prompt, so it uses the module's
+    # documented min_count=2 default (a one-off meal should not drive a menu
+    # substitution suggestion).
+    foods = await learned_foods_from_meals(db, user_id, limit=8, min_count=FAMILIARITY_MIN_COUNT)
     learned = _learned_choice(foods, wants_protein=intent.wants_protein, avoid=intent.wants_no_item)
     if learned is not None:
         name = str(getattr(learned, "display_name", "הפריט המוכר") or "הפריט המוכר")
@@ -227,9 +341,55 @@ async def try_build_daily_menu_edit_reply(
     else:
         name, calories, protein, reason = _fallback_suggestion(intent)
     await _remember_request(db, user_id, intent)
+
+    # TASK-10: an explicit PERMANENT statement ("אני לא אוהב X") also updates
+    # the durable preference fact, not just today's menu — so future menus
+    # (and next_meal) inherit the exclusion too. A same-sentence temporary
+    # marker ("היום"/"עכשיו"/"אין לי זמן") is intentionally excluded from
+    # this and stays daily-scoped only.
+    if _is_permanent_avoidance(intent.instruction, intent.wants_no_item):
+        await _persist_permanent_dislike(db, user_id, str(intent.wants_no_item), intent.instruction)
+
     avoid_line = f"\nהסרתי/נמנעתי מ: {esc(intent.wants_no_item)}" if intent.wants_no_item else ""
     revision = int((active_menu or {}).get("revision") or 0) + 1
     active_text = str((active_menu or {}).get("text") or "")
+
+    # TASK-9/10: when the active menu is structured, regenerate only the
+    # meals that actually contain the avoided item and preserve the rest,
+    # instead of doing string-line surgery on rendered text.
+    if intent.wants_no_item and is_structured_menu(active_menu):
+        current_meals = structured_meals(active_menu)
+        updated_meals, changed = _regenerate_structured_meals(
+            current_meals, avoid=intent.wants_no_item, replacement_name=name, calories=calories, protein=protein,
+        )
+        if changed:
+            body = _structured_meals_to_text(updated_meals)
+            body += (
+                f"\n\n<b>עדכון לתפריט היומי - גרסה {revision}</b>\n"
+                f"עודכן לפי הבקשה: {esc(intent.instruction)}\n"
+                f"למה זה מתאים: {esc(reason)}."
+            )
+            if intent.wants_no_item:
+                body += f"\nנשמר כאילוץ להמשך היום: בלי {esc(intent.wants_no_item)}."
+            await remember_active_daily_menu(
+                db,
+                user_id,
+                text=body,
+                strategy=str((active_menu or {}).get("strategy") or "") or None,
+                revision=revision,
+                source="daily_menu_revision",
+                meals=updated_meals,
+                context_version=str((active_menu or {}).get("context_version") or "") or None,
+            )
+            rows = [
+                [("✅ אשר שאכלתי", "nextmeal:save:1")],
+                [("🔄 רענן תפריט", "menu:refresh_daily_menu"), ("🍽 מה לאכול עכשיו", "menu:nextmeal")],
+                [("📊 מצב היום", "menu:status")],
+            ]
+            return body, rows
+        # No structured meal actually matched the avoided item — fall through
+        # to the legacy text-based patch below so the user still gets a reply.
+
     body = _build_revision_text(
         current_text=active_text,
         intent=intent,

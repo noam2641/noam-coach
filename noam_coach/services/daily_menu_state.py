@@ -10,6 +10,7 @@ screens.
 from __future__ import annotations
 
 import json
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -18,6 +19,43 @@ from helpers import utc_now
 
 DAILY_MENU_MESSAGE_KEY = "daily_menu_message"
 ACTIVE_DAILY_MENU_KEY = "active_daily_menu"
+
+# TASK-9: schema version tag for the structured ``meals`` payload. Bump this
+# if the meal-record shape changes so future readers can branch on it; old
+# text-only rows (no "schema_version" key at all) are handled separately by
+# ``is_structured``/``structured_meals`` below and never crash new readers.
+DAILY_MENU_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class MenuMealRecord:
+    """One meal inside a structured active daily menu (TASK-9)."""
+
+    meal_id: str
+    slot: str
+    time: str
+    role: str
+    calories: float
+    protein: float
+    ingredients: list[dict[str, Any]] = field(default_factory=list)
+    note: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def menu_meal_record_from_menu_meal(meal: Any, *, slot: str, index: int) -> MenuMealRecord:
+    """Build a ``MenuMealRecord`` from a ``recommendations.MenuMeal``."""
+    return MenuMealRecord(
+        meal_id=f"{slot}-{index}",
+        slot=slot,
+        time=str(getattr(meal, "time_hint", "") or ""),
+        role=str(getattr(meal, "name", "") or ""),
+        calories=float(getattr(meal, "calories", 0) or 0),
+        protein=float(getattr(meal, "protein", 0) or 0),
+        ingredients=[],
+        note=str(getattr(meal, "note", "") or ""),
+    )
 
 
 async def _daily_flags(db: Any, user_id: int, local_day: str) -> dict[str, Any]:
@@ -96,8 +134,17 @@ async def remember_active_daily_menu(
     revision: int | None = None,
     now: datetime | None = None,
     source: str = "daily_menu",
+    meals: list[MenuMealRecord] | list[dict[str, Any]] | None = None,
+    menu_id: str | None = None,
+    context_version: str | None = None,
 ) -> dict[str, Any]:
-    """Persist the latest full standalone menu text for revision flows."""
+    """Persist the latest full standalone menu for revision flows.
+
+    TASK-9: when ``meals`` is provided the canonical structured shape is
+    stored alongside ``text`` (``text`` is always kept too, so every existing
+    text-only reader keeps working unmodified). ``meals`` is a list of
+    ``MenuMealRecord`` or already-plain dicts with the same keys.
+    """
     local_day = _local_day(now)
     flags = await _daily_flags(db, user_id, local_day)
     previous = flags.get(ACTIVE_DAILY_MENU_KEY)
@@ -106,13 +153,22 @@ async def remember_active_daily_menu(
         if isinstance(previous, dict)
         else 0
     )
-    menu_state = {
+    menu_state: dict[str, Any] = {
         "text": text,
         "strategy": strategy,
         "revision": previous_revision + 1 if revision is None else int(revision),
         "source": source,
         "updated_at": datetime.now(TZ).isoformat(),
     }
+    if meals is not None:
+        menu_state["schema_version"] = DAILY_MENU_SCHEMA_VERSION
+        menu_state["menu_id"] = menu_id or f"menu-{user_id}-{local_day}-{menu_state['revision']}"
+        menu_state["generated_at"] = menu_state["updated_at"]
+        menu_state["context_version"] = context_version
+        menu_state["meals"] = [
+            item.to_dict() if isinstance(item, MenuMealRecord) else dict(item)
+            for item in meals
+        ]
     flags[ACTIVE_DAILY_MENU_KEY] = menu_state
     await _save_daily_flags(db, user_id, local_day, flags)
     return menu_state
@@ -124,7 +180,26 @@ async def get_active_daily_menu(
     *,
     now: datetime | None = None,
 ) -> dict[str, Any] | None:
-    """Return today's latest full standalone menu, if one exists."""
+    """Return today's latest full standalone menu, if one exists.
+
+    Backward compatible with the pre-TASK-9 text-only shape: a legacy row has
+    no ``schema_version``/``meals`` keys and is returned exactly as before, so
+    old callers and old persisted rows never crash new readers.
+    """
     flags = await _daily_flags(db, user_id, _local_day(now))
     value = flags.get(ACTIVE_DAILY_MENU_KEY)
     return value if isinstance(value, dict) else None
+
+
+def is_structured_menu(menu_state: dict[str, Any] | None) -> bool:
+    """True when ``menu_state`` carries the TASK-9 structured meal list."""
+    if not isinstance(menu_state, dict):
+        return False
+    return isinstance(menu_state.get("meals"), list) and bool(menu_state.get("schema_version"))
+
+
+def structured_meals(menu_state: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Return the structured meal list, or [] for a legacy text-only menu."""
+    if not is_structured_menu(menu_state):
+        return []
+    return [dict(item) for item in (menu_state or {}).get("meals") or [] if isinstance(item, dict)]
