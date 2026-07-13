@@ -138,6 +138,51 @@ async def test_strict_policy_with_three_full_weeks() -> None:
 
 
 @pytest.mark.asyncio
+async def test_strict_policy_survives_anchor_landing_on_a_sunday() -> None:
+    """Regression: a dataset-end anchor that happens to fall on a Sunday must
+    not drop the most recent complete week.
+
+    ``build_health_quality_report`` anchors ``analyze_training_weeks`` to the
+    dataset's newest sample date (not "today") so a stale export is still
+    analyzed over its own final weeks. That anchor date already has a full
+    day of data — unlike the real "today" fallback, which is still in
+    progress. ``_complete_weeks`` used to compare with a strict ``<`` for
+    both cases, so whenever the anchor happened to be a Sunday (the last day
+    of a Mon-Sun week), the week ending exactly on it was wrongly excluded —
+    silently downgrading strict->insufficient purely because of which weekday
+    the export ended on. Anchored explicitly here (independent of the actual
+    run date) so this can never regress unnoticed.
+    """
+    # Explicit anchor: a Sunday, three full Mon-Sun weeks back from it.
+    anchor = dt.date(2026, 6, 21)  # Sunday
+    assert anchor.weekday() == 6
+    mondays = [anchor - dt.timedelta(days=6) - dt.timedelta(days=7 * i) for i in range(2, -1, -1)]
+
+    wear: list[dict[str, Any]] = []
+    workouts: list[dict[str, Any]] = []
+    for monday in mondays:
+        w, k = _week_fixture(monday, worn_days=7, workout_offsets=(0, 2, 4))
+        wear += w
+        workouts += k
+
+    analysis = await routine.analyze_training_weeks(
+        QualityDB(wear=wear, workouts=workouts), 1, TZ, anchor=anchor
+    )
+    assert analysis is not None
+    assert analysis.policy == routine.POLICY_STRICT
+    assert analysis.valid_weeks_strict == 3
+    assert analysis.frequency_raw == 3.0
+
+    report = await health_quality.build_health_quality_report(
+        QualityDB(wear=wear, workouts=workouts, newest=anchor.isoformat()), 1, TZ
+    )
+    wq = report["workout_frequency"]
+    assert wq["policy"] == routine.POLICY_STRICT
+    assert wq["confidence"] == health_quality.CONFIDENCE_HIGH
+    assert wq["frequency"] == 3.0
+
+
+@pytest.mark.asyncio
 async def test_relaxed_policy_normalizes_partial_weeks() -> None:
     mondays = _last_complete_weeks(4)
     wear: list[dict[str, Any]] = []

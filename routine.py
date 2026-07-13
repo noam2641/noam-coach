@@ -403,14 +403,32 @@ async def load_wear_days(
 
 
 def _complete_weeks(
-    window_start: dt.date, today: dt.date
+    window_start: dt.date, today: dt.date, *, inclusive_end: bool = False
 ) -> list[tuple[dt.date, dt.date]]:
-    """Monday-first calendar weeks fully inside [window_start, yesterday]."""
+    """Monday-first calendar weeks fully inside [window_start, yesterday].
+
+    ``inclusive_end=False`` (default) treats ``today`` as an in-progress day
+    with no complete data yet — a week ending exactly on ``today`` is NOT
+    counted as complete. Pass ``inclusive_end=True`` when ``today`` is
+    actually an explicit anchor (e.g. a HealthKit export's dataset-end date)
+    rather than the real current day: that date already has a full day of
+    data, so a week ending exactly on it IS complete. Without this, a dataset
+    end date that happens to fall on a Sunday silently drops the most recent
+    complete week (health_quality.build_health_quality_report could
+    under-report policy/confidence purely because of which weekday the export
+    happened to end on).
+    """
     first_monday = window_start + dt.timedelta(days=(7 - window_start.weekday()) % 7)
     weeks: list[tuple[dt.date, dt.date]] = []
     week_start = first_monday
-    while week_start + dt.timedelta(days=6) < today:
-        weeks.append((week_start, week_start + dt.timedelta(days=6)))
+    while True:
+        week_end = week_start + dt.timedelta(days=6)
+        if inclusive_end:
+            if week_end > today:
+                break
+        elif week_end >= today:
+            break
+        weeks.append((week_start, week_end))
         week_start += dt.timedelta(days=7)
     return weeks
 
@@ -794,7 +812,10 @@ async def analyze_training_weeks(
     today_local = window_end
     window_start = today_local - dt.timedelta(days=window_days)
     weeks: list[WeekWearStats] = []
-    for start, end in _complete_weeks(window_start, today_local):
+    # An explicit anchor is a dataset end date (a fully-elapsed day already
+    # covered by data), unlike the real "today" fallback, which is still in
+    # progress — see `_complete_weeks`'s `inclusive_end`.
+    for start, end in _complete_weeks(window_start, today_local, inclusive_end=anchor is not None):
         days = [start + dt.timedelta(days=offset) for offset in range(7)]
         worn = [day for day in days if day in wear_days]
         in_week = [day for day in workout_days if start <= day <= end]

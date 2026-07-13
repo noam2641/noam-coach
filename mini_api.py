@@ -176,8 +176,19 @@ async def mini_next_meal_workout_status(
     status = str(payload.get("status") or "").strip()
     if status not in {"later", "during", "completed", "cancelled"}:
         raise HTTPException(status_code=400, detail="Invalid workout status")
-    await save_next_meal_workout_status(DB, user_id, status)
-    recommendation = await generate_next_meal_recommendation(DB, user_id)
+    # Resolve "now" once and reuse it for both the save and the immediately
+    #-following recommendation rebuild. save_next_meal_workout_status stamps
+    # next_meal_workout_status_at with this instant, and
+    # user_state._explicit_clarification_candidate compares that stamp
+    # against the recommendation's own "now" to decide whether the just-saved
+    # clarification is still fresh (REC-ARCH-01 pass 3). Two independent
+    # datetime.now() calls are consistent to within microseconds in real
+    # production, but callers that build the recommendation from a
+    # non-wall-clock "now" (tests, replay/simulation) need the save to use
+    # that exact same instant or the clarification can read as already stale.
+    now = datetime.now(TZ)
+    await save_next_meal_workout_status(DB, user_id, status, now=now)
+    recommendation = await generate_next_meal_recommendation(DB, user_id, now=now)
     return JSONResponse(_next_meal_payload(recommendation))
 
 

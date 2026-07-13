@@ -487,13 +487,20 @@ async def test_fasting_flag_changes_next_meal_and_not_fasting_disables_it(db: Da
 
 @pytest.mark.asyncio
 async def test_mini_api_can_persist_workout_clarification(db: Database, monkeypatch: pytest.MonkeyPatch) -> None:
-    now = datetime.now(TZ).replace(hour=21, minute=0, second=0, microsecond=0)
-    await _ready_user(db, now)
-    await _workout_plan(db, now, time_text="18:00", minutes=60)
+    fixed_now = datetime.now(TZ).replace(hour=21, minute=0, second=0, microsecond=0)
+    await _ready_user(db, fixed_now)
+    await _workout_plan(db, fixed_now, time_text="18:00", minutes=60)
     monkeypatch.setattr(mini_api, "DB", db)
 
-    async def fixed_recommendation(db_arg: Database, user_id: int):
-        return await generate_next_meal_recommendation(db_arg, user_id, now=now)
+    async def fixed_recommendation(db_arg: Database, user_id: int, *, now: datetime | None = None):
+        # Mirrors the production endpoint (mini_api.mini_next_meal_workout_status):
+        # it now resolves "now" once and threads it through both the status save
+        # and the recommendation rebuild so the just-saved clarification's
+        # timestamp and the recommendation's own "now" always agree (REC-ARCH-01
+        # pass 3 staleness check). Accept the caller's "now" when given, so this
+        # fixture behaves the same way instead of silently reverting to its own
+        # fixed time and going stale relative to what was actually persisted.
+        return await generate_next_meal_recommendation(db_arg, user_id, now=now or fixed_now)
 
     monkeypatch.setattr(mini_api, "generate_next_meal_recommendation", fixed_recommendation)
 
