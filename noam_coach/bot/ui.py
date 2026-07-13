@@ -244,8 +244,11 @@ def settings_keyboard() -> InlineKeyboardMarkup:
     """
     rows = [
         [
+            # TASK-7: no standalone "🎯 יעד" entry point — the goal is the
+            # first step of "Complete now" (planv2:complete_missing), never a
+            # separate action a user can jump to independently of that flow.
+            # menu:profile still surfaces the current goal for reference.
             button("👤 הפרופיל שלי", "menu:profile"),
-            button("🎯 יעד", "menu:goal"),
         ],
         [
             button("🍽️ תפריט להיום", "menu:daily_menu"),

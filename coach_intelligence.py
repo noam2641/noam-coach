@@ -242,7 +242,12 @@ async def next_best_action(
             "לחבר את השבוע",
             "שתי התוכניות נבחרו, אבל עדיין לא חוברו ללוח שבועי אחד.",
             72,
-            "planv2:unify",
+            # TASK-16: the canonical single action is planv2:my_week
+            # (callback_plans.py still accepts the legacy "planv2:unify" /
+            # "planv2:show:unified" strings as aliases for old keyboards, but
+            # this home-keyboard suggestion must construct the real one, not
+            # perpetuate the retired name).
+            "planv2:my_week",
         )
 
     calories_goal = float(goal.get("calories") or 0)

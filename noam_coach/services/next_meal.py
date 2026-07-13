@@ -1671,12 +1671,21 @@ def next_meal_action_rows(recommendation: NextMealRecommendation) -> list[list[t
     """TASK-03: "מה לאכול עכשיו" exposes a focused action set.
 
     The user asked for one immediate recommendation and at most 4 actions.
-    Workout ambiguity is explained in the text, not added as another button
-    cluster; otherwise the screen turns back into the overloaded menu that the
-    task is meant to remove.
+
+    When the workout state is ambiguous, the clarification buttons
+    (workout_clarification_actions) take the place of the meal-approval
+    actions: acting on a recommendation built on an unknown workout phase is
+    less useful than resolving that phase first, and the message text
+    explicitly tells the user "update the workout status with the buttons
+    below" — that promise must be real (previously these buttons only
+    rendered in the Mini App's payload, never in the actual Telegram
+    keyboard, even though the callback handler for them has always existed
+    at callback_menu.py's ``nextmeal:wkt:`` branch).
     """
     rows: list[list[tuple[str, str]]] = []
-    if recommendation.options:
+    if recommendation.needs_workout_clarification:
+        rows.extend(workout_clarification_actions(recommendation))
+    elif recommendation.options:
         rows.append([("✅ אשר שאכלתי", "nextmeal:save:1")])
         rows.append([
             ("🔄 רענן הצעה", "nextmeal:refresh"),
@@ -1978,8 +1987,11 @@ def format_next_meal_recommendation(recommendation: NextMealRecommendation) -> s
     if recommendation.options and recommendation.budget.allows_overage and recommendation.budget.overage_reason:
         lines.append(f"שים לב: ההצעה חורגת מעט מהיתרה ({esc(recommendation.budget.overage_reason)}).")
     if recommendation.needs_workout_clarification:
-        lines.append("לא אניח שהאימון קרה בלי דיווח — אפשר לעדכן את סטטוס האימון דרך ״מצב היום״.")
-        lines.append("<i>אפשר גם לכתוב: כן, סיימתי / עוד לא, אתאמן בהמשך / לא מתאמן היום.</i>")
+        # The message used to also promise a free-text fallback ("אפשר גם
+        # לכתוב: כן, סיימתי / ..."), but no NLU anywhere recognized those
+        # phrases — the buttons below (now rendered in next_meal_action_rows,
+        # not just the Mini App) are the only real way to answer this.
+        lines.append("לא אניח שהאימון קרה בלי דיווח — אפשר לעדכן את סטטוס האימון עם הכפתורים למטה.")
     return "\n".join(lines).strip()
 
 

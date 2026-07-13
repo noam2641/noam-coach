@@ -119,6 +119,43 @@ def test_menu_within_tolerance_passes() -> None:
     assert result.ok is True
 
 
+def test_two_different_meals_at_the_same_time_hint_fails_validation() -> None:
+    """TASK-19 audit correction: PROBLEM_NOT_CHRONOLOGICAL only flags an
+    out-of-order sequence — two different meals sharing the exact same
+    time_hint sort as already "chronological" (non-decreasing) and slipped
+    through undetected. This must be a distinct, explicit check."""
+    menu = recommendations.MorningMenu(
+        headline="h",
+        meals=[
+            _meal("ארוחת בוקר", 700, 55, time_hint="08:00"),
+            _meal("נשנוש", 300, 20, time_hint="08:00"),
+            _meal("ארוחת ערב", 700, 45, time_hint="19:00"),
+        ],
+    )
+    result = validate_menu(menu, restrictions=[], calorie_target=2200, protein_target=160)
+    assert result.ok is False
+    assert any(v.code == "duplicate_time_slot" for v in result.violations)
+    # The flagged meal is the SECOND occurrence (index 1) — the repair
+    # pipeline can retarget just that one meal instead of nuking the whole
+    # menu.
+    assert any(v.code == "duplicate_time_slot" and v.meal_index == 1 for v in result.violations)
+
+
+def test_same_hour_different_minutes_is_not_a_duplicate() -> None:
+    """A coarser hour-only comparison would false-positive on "08:00" vs
+    "08:45" — the check must compare the full time_hint, not just the hour."""
+    menu = recommendations.MorningMenu(
+        headline="h",
+        meals=[
+            _meal("ארוחת בוקר", 700, 55, time_hint="08:00"),
+            _meal("נשנוש", 300, 20, time_hint="08:45"),
+            _meal("ארוחת ערב", 700, 45, time_hint="19:00"),
+        ],
+    )
+    result = validate_menu(menu, restrictions=[], calorie_target=2200, protein_target=160)
+    assert not any(v.code == "duplicate_time_slot" for v in result.violations)
+
+
 @pytest.mark.asyncio
 async def test_required_10_repair_changes_only_affected_meal(tmp_path: Path) -> None:
     from noam_coach.services.menu_validation import build_repair_request

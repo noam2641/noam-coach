@@ -132,12 +132,16 @@ def test_home_keyboard_is_focused_primary_menu() -> None:
     assert "menu:goal" not in home
     assert "menu:more" not in home
 
-    # All secondary routes are preserved on the settings screen.
+    # All secondary routes are preserved on the settings screen — except
+    # menu:goal (TASK-7): the goal is only reachable as the first step of
+    # "Complete now", never as a standalone entry point anywhere, including
+    # Settings.
     settings = {btn.callback_data for row in settings_keyboard().inline_keyboard for btn in row}
     assert {
-        "menu:profile", "menu:goal", "menu:daily_menu", "menu:weekly",
+        "menu:profile", "menu:daily_menu", "menu:weekly",
         "menu:chart", "menu:evening", "menu:health", "menu:about",
     } <= settings
+    assert "menu:goal" not in settings
     assert "menu:home" in settings  # back to the primary menu
 
 

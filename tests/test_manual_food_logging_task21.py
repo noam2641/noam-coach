@@ -149,3 +149,79 @@ async def test_manual_text_creates_approval_with_manual_source(
     # The cumulative correction path is enabled (fixmeal state set).
     approval_id, _refine = await core_services.get_meal_fix(1)
     assert approval_id is not None
+
+
+@pytest.mark.asyncio
+async def test_manual_meal_correction_with_no_deterministic_match_does_not_silently_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Audit correction (TASK-20): a manual-text-logged meal has no source
+    image, so the old code path for "the deterministic parser didn't
+    recognize this correction" (image re-analysis) would raise
+    RuntimeError("לא נמצאה תמונת מקור לניתוח חוזר") and every such correction
+    silently failed with a generic "couldn't update" message, even though the
+    correction was a perfectly reasonable free-text edit
+    (e.g. "תחליף את הקציצות בחזה עוף" — not a בלי/חצי/פי-2/replace pattern the
+    deterministic parser recognizes). The fix re-describes the current meal +
+    the correction as text and re-runs analyze_meal_text (the same primitive
+    manual logging itself already uses), instead of raising.
+    """
+    from noam_coach.bot import meal_text as meal_text_bot
+
+    db = await _make_db(tmp_path)
+    _bind(monkeypatch, db)
+    monkeypatch.setattr(meal_text_bot, "DB", db, raising=False)
+    monkeypatch.setattr(coach_bot, "OPENAI_CLIENT", object(), raising=False)
+
+    async def fake_analyze(_text: str, user_id: int | None = None) -> MealAnalysis:
+        return _fake_analysis()
+
+    monkeypatch.setattr(coach_bot, "analyze_meal_text", fake_analyze, raising=False)
+
+    query = FakeQuery()
+    await callback_menu_bot.handle_menu_callback(query, 1, "menu:food_text")
+    message = FakeMessage("אכלתי 3 קציצות עם אורז")
+    await onboarding_bot.handle_onboarding_text(FakeUpdate(message), 1)
+
+    approval_id, refine_count = await core_services.get_meal_fix(1)
+    assert approval_id is not None
+
+    # A correction phrase the deterministic parser (remove/preparation/
+    # quantity/scale/replace patterns) does not recognize.
+    replacement = MealAnalysis(
+        meal_name="חזה עוף ואורז",
+        confidence=0.7,
+        items=[
+            FoodItem(name="חזה עוף", grams=180, calories=297, protein=54, carbs=0, fat=6, confidence=0.75),
+            FoodItem(name="אורז לבן מבושל", grams=150, calories=195, protein=4, carbs=42, fat=0.5, confidence=0.8),
+        ],
+    )
+
+    called_with: dict[str, Any] = {}
+
+    async def fake_analyze_correction(description: str, user_id: int | None = None) -> MealAnalysis:
+        called_with["description"] = description
+        called_with["user_id"] = user_id
+        return replacement
+
+    monkeypatch.setattr(meal_text_bot, "analyze_meal_text", fake_analyze_correction)
+
+    correction_message = FakeMessage("משהו שונה לגמרי, בוא נחליף לחזה עוף")
+    await meal_text_bot._handle_meal_correction_text(
+        FakeUpdate(correction_message), 1, approval_id, refine_count,
+    )
+
+    # The text-only fallback ran (not a raised/caught error) and produced the
+    # replacement analysis — not the original meal untouched.
+    assert called_with.get("description")
+    assert "משהו שונה לגמרי" in called_with["description"]
+    rows = await db.fetch_all(
+        "SELECT payload FROM approvals WHERE id=?", (approval_id,)
+    )
+    import json as _json
+
+    payload = rows[0]["payload"]
+    data = _json.loads(payload) if isinstance(payload, str) else payload
+    assert data["analysis"]["meal_name"] == "חזה עוף ואורז"
+    # Confirm the generic "couldn't update" failure text was NOT shown.
+    assert not any("לא הצלחתי לעדכן" in reply for reply in correction_message.replies)

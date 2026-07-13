@@ -114,3 +114,25 @@ async def test_briefing_does_not_resend_full_menu(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(health_jobs, "build_morning_menu_text", fail)
     text = await _briefing(monkeypatch, _ctx(), "07:00")
     assert "עדכון בוקר" in text
+
+
+@pytest.mark.asyncio
+async def test_weekend_briefing_shows_weekend_guidance(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TASK-19 audit correction: the briefing used to independently re-derive
+    weekday info instead of reusing nutrition_context.day_type, and had no
+    weekend-specific guidance at all. _ctx()'s default "now" is a Friday."""
+    from noam_coach.services import nutrition_context
+
+    assert nutrition_context.day_type(_ctx().now) == "friday"
+    text = await _briefing(monkeypatch, _ctx(), "07:00")
+    assert "סוף השבוע" in text
+
+
+@pytest.mark.asyncio
+async def test_weekday_briefing_has_no_weekend_guidance(monkeypatch: pytest.MonkeyPatch) -> None:
+    from noam_coach.services import nutrition_context
+
+    monday = _ctx(now=datetime(2026, 7, 6, 8, 0, tzinfo=TZ))
+    assert nutrition_context.day_type(monday.now) == "weekday"
+    text = await _briefing(monkeypatch, monday, "07:00")
+    assert "סוף השבוע" not in text

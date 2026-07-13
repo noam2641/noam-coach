@@ -955,7 +955,18 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
         # as menu:daily_menu.  (menu:morning is now the short briefing above.)
         await safe_edit(query, "רגע, מכין לך… ⏳", None)
         try:
-            if data in ("menu:today", "menu:daily_menu", "menu:refresh_daily_menu"):
+            if data in ("menu:today", "menu:daily_menu"):
+                # TASK-11: "show me today's menu" must not silently discard a
+                # standing free-text edit ("בלי ביצים היום") by regenerating
+                # from scratch — reuse today's active menu (daily_menu_state)
+                # when one already exists. Only the explicit
+                # "🔄 רענן תפריט" (menu:refresh_daily_menu) action below is
+                # allowed to build a genuinely fresh menu.
+                from noam_coach.services.daily_menu_state import get_active_daily_menu
+
+                active = await get_active_daily_menu(DB, user_id)
+                text = active["text"] if active else await build_morning_menu_text(user_id)
+            elif data == "menu:refresh_daily_menu":
                 text = await build_morning_menu_text(user_id)
             elif data == "menu:nextmeal":
                 await _render_next_meal_screen(query, user_id)

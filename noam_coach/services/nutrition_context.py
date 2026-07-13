@@ -249,6 +249,21 @@ def _day_type(local_now: datetime) -> str:
     return "weekday"
 
 
+def day_type(local_now: datetime) -> str:
+    """Public alias for ``_day_type`` (TASK-19 audit correction).
+
+    Callers outside this module (e.g. health_jobs.build_morning_briefing_text)
+    used to independently re-derive weekday info via local_weekday(...)
+    directly instead of reusing this canonical classification — harmless
+    today since both read the same underlying weekday() call, but it meant
+    "weekday"/"friday"/"saturday" was defined in exactly one place only by
+    convention, not in fact, so a future change to the classification (e.g.
+    treating a holiday as weekend-like) would need to be duplicated by hand
+    everywhere instead of being picked up automatically.
+    """
+    return _day_type(local_now)
+
+
 def _today_plan(active_plan: dict[str, Any] | None, local_now: datetime) -> dict[str, Any] | None:
     if not active_plan:
         return None

@@ -336,9 +336,16 @@ async def test_planned_time_passed_needs_clarification_not_assumption(db: Databa
     assert rec.needs_workout_clarification is True
     text = format_next_meal_recommendation(rec)
     assert "לא אניח שהאימון קרה בלי דיווח" in text
-    assert "כן, סיימתי" in text
-    assert "עוד לא, אתאמן בהמשך" in text
-    assert "לא מתאמן היום" in text
+    # The message used to also promise a free-text fallback ("אפשר גם לכתוב:
+    # כן, סיימתי / ...") that no NLU anywhere actually recognized — replaced
+    # with a pointer to the real buttons, which next_meal_action_rows now
+    # renders whenever clarification is needed (see that test below).
+    assert "עם הכפתורים למטה" in text
+    assert "כן, סיימתי" not in text
+
+    rows = next_meal_action_rows(rec)
+    flat_callbacks = {cb for row in rows for _label, cb in row}
+    assert {"nextmeal:wkt:later", "nextmeal:wkt:during", "nextmeal:wkt:done", "nextmeal:wkt:cancel"} <= flat_callbacks
 
 
 @pytest.mark.asyncio

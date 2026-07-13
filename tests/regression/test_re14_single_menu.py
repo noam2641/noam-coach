@@ -79,8 +79,11 @@ def test_single_menu_has_no_more_button() -> None:
     # "⚙️ הגדרות ועוד" (menu:settings) entry, not directly on the home menu.
     assert "menu:settings" in callbacks
     settings = _callbacks(settings_keyboard())
-    assert {"menu:profile", "menu:goal", "menu:chart", "menu:weekly",
+    assert {"menu:profile", "menu:chart", "menu:weekly",
             "menu:health", "menu:about"} <= settings
+    # TASK-7: no standalone Goal entry point anywhere, including Settings —
+    # the goal is only reachable as the first step of "Complete now".
+    assert "menu:goal" not in settings
 
 
 @pytest.mark.asyncio

@@ -105,7 +105,7 @@ from retention import (
 # ---------------------------------------------------------------------------
 
 from noam_coach.runtime_bind import runtime_bound
-from noam_coach.services.profile import get_user_plan, set_exercise_override
+from noam_coach.services.profile import analyze_meal_text, get_user_plan, set_exercise_override
 from noam_coach.services.nutrition_context import (
     build_nutrition_ai_request,
     build_nutrition_context,
@@ -202,22 +202,42 @@ async def _handle_meal_correction_text(
             # did not recognize the correction.
             # Pass all previously locked corrections so the AI respects them
             # even when re-analysing from scratch (REC-PLAN-MEAL-03-12).
-            if not image_path:
-                raise RuntimeError("לא נמצאה תמונת מקור לניתוח חוזר")
-            await progress.edit_text("מנתח מחדש את התמונה לפי מה שכתבת…")
             prior_locked: list[str] = list(row["data"].get("locked_corrections") or [])
-            nutrition_payload: dict[str, Any] | None = None
-            with suppress(Exception):
-                nutrition_payload = build_nutrition_ai_request(
-                    await build_nutrition_context(DB, user_id, "meal_correction"),
-                    "Re-analyze meal correction",
-                )["context"]
-            corrected_analysis = await reanalyze_meal_with_text_and_image(
-                image_path=image_path,
-                correction_text=correction_text,
-                locked_corrections=prior_locked,
-                nutrition_context=nutrition_payload,
-            )
+            if image_path:
+                await progress.edit_text("מנתח מחדש את התמונה לפי מה שכתבת…")
+                nutrition_payload: dict[str, Any] | None = None
+                with suppress(Exception):
+                    nutrition_payload = build_nutrition_ai_request(
+                        await build_nutrition_context(DB, user_id, "meal_correction"),
+                        "Re-analyze meal correction",
+                    )["context"]
+                corrected_analysis = await reanalyze_meal_with_text_and_image(
+                    image_path=image_path,
+                    correction_text=correction_text,
+                    locked_corrections=prior_locked,
+                    nutrition_context=nutrition_payload,
+                )
+            else:
+                # TASK-20 audit correction: a manual-text-logged meal
+                # (assistant.log_meal_from_text, source="manual_text") has no
+                # source image, so the image-reanalysis path above cannot run
+                # — this used to raise and silently fail every non-
+                # deterministic correction for such a meal (any phrase the
+                # deterministic parser didn't recognize as remove/prep/qty/
+                # scale/replace). Re-describe the CURRENT meal in text plus
+                # the correction and re-run the same text-only analyzer
+                # manual logging itself uses (analyze_meal_text), so a
+                # manually-logged meal's correction path is not silently
+                # worse than its logging path.
+                await progress.edit_text("מעדכן לפי מה שכתבת…")
+                current_description = "; ".join(
+                    f"{item.name} {item.grams:g} גרם" for item in original_analysis.items
+                )
+                locked_text = " ".join(prior_locked)
+                combined_description = " | ".join(
+                    part for part in (current_description, locked_text, correction_text) if part
+                )
+                corrected_analysis = await analyze_meal_text(combined_description, user_id=user_id)
 
         corrected_analysis.notes = (
             original_analysis.notes

@@ -75,9 +75,12 @@ async def test_menu_settings_renders_the_secondary_screen(
     assert handled is True
     assert "הגדרות ועוד" in query.messages[-1]
     callbacks = [btn.callback_data for row in query.reply_markups[-1].inline_keyboard for btn in row]
-    for expected in ("menu:profile", "menu:goal", "menu:daily_menu", "menu:weekly",
+    for expected in ("menu:profile", "menu:daily_menu", "menu:weekly",
                      "menu:chart", "menu:evening", "menu:health", "menu:about", "menu:home"):
         assert expected in callbacks
+    # TASK-7: no standalone Goal entry point — it is only the first step of
+    # "Complete now" (planv2:complete_missing), never an independent action.
+    assert "menu:goal" not in callbacks
 
 
 def test_every_settings_route_is_claimed_by_a_handler() -> None:

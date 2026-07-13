@@ -2563,7 +2563,15 @@ async def build_morning_briefing_text(user_id: int, ctx: "DailyContext | None" =
     if ctx is None:
         ctx = await build_daily_context(user_id)
 
+    # TASK-19 audit correction: reuse the canonical day-type classification
+    # (nutrition_context.day_type) instead of re-deriving weekday info from
+    # scratch — the weekday NAME shown in the headline still needs the full
+    # label, but "is today a weekend day" (for the guidance line below) is
+    # now the same single source of truth the daily menu uses.
+    from noam_coach.services.nutrition_context import day_type as _classify_day_type
+
     weekday_label = weekday_labels_he([local_weekday(ctx.now)])
+    today_type = _classify_day_type(ctx.now)
     workout_time = await _todays_workout_time(user_id, ctx.now)
     is_workout_day = ctx.is_usual_workout_day or bool(workout_time)
 
@@ -2598,6 +2606,13 @@ async def build_morning_briefing_text(user_id: int, ctx: "DailyContext | None" =
         "<b>עדיפות עכשיו</b>",
         f"• {priority}",
     ]
+    # TASK-19: weekend guidance, using the SAME day_type classification the
+    # daily menu builds around (nutrition_context.day_type) rather than a
+    # separately-maintained weekend check.
+    if today_type in {"friday", "saturday"}:
+        lines.append(
+            "• סוף השבוע — שגרת הארוחות עשויה להיות שונה; זה בסדר לסטות מהתזמון הרגיל כל עוד היעד היומי נשמר."
+        )
     text = "\n".join(lines)
     text += _data_quality_disclaimer(ctx)
     return text

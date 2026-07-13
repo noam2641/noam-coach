@@ -34,7 +34,14 @@ def test_task03_next_meal_is_one_focused_immediate_action() -> None:
     assert "nextmeal:refresh" in actions
     assert "nextmeal:editqty:1" in actions
     assert "menu:status" in actions
-    assert "nextmeal:wkt" not in actions
+    # Audit correction: workout-clarification buttons (nextmeal:wkt:*) now
+    # DO render here when needs_workout_clarification is true — they used to
+    # be built (workout_clarification_actions) but only ever reached the
+    # Mini App payload, never the real Telegram keyboard, even though the
+    # message text told the user to "update via the buttons below" and the
+    # callback handler for them has always existed. See
+    # test_rec_next_meal_05.py::test_planned_time_passed_needs_clarification_not_assumption.
+    assert "workout_clarification_actions" in actions
     assert "תכנן אפשרות" not in actions
     assert "אכלתי אפשרות 2" not in actions
     assert actions.count("rows.append") <= 4

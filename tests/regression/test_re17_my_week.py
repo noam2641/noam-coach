@@ -11,7 +11,6 @@ Covers:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -119,6 +118,51 @@ def test_smartplan_hub_has_single_weekly_button() -> None:
     # The old two-button flow is gone.
     assert 'planv2:unify")' not in src
     assert 'planv2:show:unified")' not in src
+
+
+def test_next_best_action_suggests_the_canonical_my_week_callback() -> None:
+    """Audit correction: coach_intelligence.next_best_action's "לחבר את
+    השבוע" ("build_unified_plan") suggestion used to still construct the
+    retired "planv2:unify" string instead of "planv2:my_week" — functionally
+    masked because callback_plans.py accepts it as a legacy alias, but this
+    home-keyboard suggestion (a different call site than onboarding.py,
+    which test_smartplan_hub_has_single_weekly_button above already covered)
+    was never actually checked and quietly contradicted "old callback fully
+    replaced"."""
+    src = (Path(__file__).resolve().parents[2] / "coach_intelligence.py").read_text(encoding="utf-8")
+    unify_block = src[src.index('"build_unified_plan"'):src.index('calories_goal = float')]
+    assert '"planv2:my_week",' in unify_block
+    # The NextAction(...) callback argument itself must not be the retired
+    # string (an explanatory code comment mentioning it as legacy context is
+    # fine — only the constructed value matters).
+    assert '"planv2:unify",' not in unify_block
+
+
+@pytest.mark.asyncio
+async def test_next_best_action_build_unified_plan_uses_my_week_callback(
+    tmp_path: Path,
+) -> None:
+    """Behavioral counterpart to the source check above: drive
+    next_best_action all the way to the "connect the week" suggestion with
+    both plans active but no unified week yet, and confirm the returned
+    action's callback is the canonical planv2:my_week, not the retired
+    planv2:unify."""
+    import coach_intelligence
+
+    db = await _ready_db(tmp_path)
+    # _ready_db (this file's shared fixture) already has an approved
+    # nutrition + workout profile, an active goal, and both plans selected —
+    # confirm that and that no unified week exists yet before asserting on
+    # the suggested action.
+    nutrition_plan = await planning.get_active_plan(db, 1, "nutrition")
+    workout_plan = await planning.get_active_plan(db, 1, "workout")
+    assert nutrition_plan is not None
+    assert workout_plan is not None
+    assert await planning.get_active_plan(db, 1, "unified") is None
+
+    action = await coach_intelligence.next_best_action(db, 1)
+    assert action.kind == "build_unified_plan"
+    assert action.callback == "planv2:my_week"
 
 
 def test_unified_week_is_current_helper() -> None:

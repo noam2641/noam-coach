@@ -44,6 +44,12 @@ PROBLEM_IMPLAUSIBLE_MACROS = "implausible_macros"
 PROBLEM_CALORIE_TARGET_MISS = "calorie_target_miss"
 PROBLEM_PROTEIN_TARGET_MISS = "protein_target_miss"
 PROBLEM_NOT_CHRONOLOGICAL = "not_chronological"
+# TASK-19 audit correction: PROBLEM_NOT_CHRONOLOGICAL only catches an
+# out-of-order sequence — two DIFFERENT meals sharing the exact same
+# time_hint ("08:00" for both breakfast and a second meal) sorts as already
+# "chronological" and slipped through undetected. This is menu-level (no
+# single meal is individually at fault), same as PROBLEM_NOT_CHRONOLOGICAL.
+PROBLEM_DUPLICATE_TIME_SLOT = "duplicate_time_slot"
 PROBLEM_PLANNED_TREATED_AS_CONSUMED = "planned_treated_as_consumed"
 PROBLEM_REPEATS_RECENT_MEAL = "repeats_recent_meal"
 PROBLEM_EMPTY_MENU = "empty_menu"
@@ -236,6 +242,7 @@ def validate_menu(
     consumed_keys = consumed_meal_keys or set()
 
     parsed_hours: list[int | None] = []
+    time_hints: list[str] = []
     for index, meal in enumerate(meals):
         name = str(getattr(meal, "name", "") or "")
         calories = getattr(meal, "calories", None)
@@ -273,10 +280,32 @@ def validate_menu(
 
         time_hint = str(getattr(meal, "time_hint", "") or "")
         parsed_hours.append(_parse_hour(time_hint))
+        time_hints.append(time_hint.strip())
 
     ordered_hours = [h for h in parsed_hours if h is not None]
     if len(ordered_hours) >= 2 and ordered_hours != sorted(ordered_hours):
         violations.append(MealViolation(None, "", PROBLEM_NOT_CHRONOLOGICAL, "meal times are not chronological"))
+
+    # TASK-19 audit correction: two DIFFERENT meals at the exact same
+    # time_hint sort as "chronological" (the check above only catches
+    # out-of-order sequences) and slipped through undetected. Compare the
+    # raw time strings (not the hour-only _parse_hour) so "08:00" vs "08:45"
+    # is correctly NOT flagged as a collision.
+    seen_time_hints: dict[str, int] = {}
+    for index, hint in enumerate(time_hints):
+        if not hint:
+            continue
+        if hint in seen_time_hints:
+            violations.append(
+                MealViolation(
+                    index,
+                    str(getattr(meals[index], "name", "") or ""),
+                    PROBLEM_DUPLICATE_TIME_SLOT,
+                    f"same time_hint ({hint}) as meal {seen_time_hints[hint]}",
+                )
+            )
+        else:
+            seen_time_hints[hint] = index
 
     total_calories, total_protein = _meal_totals(meals)
     if calorie_target and calorie_target > 0:
