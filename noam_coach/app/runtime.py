@@ -200,6 +200,7 @@ def build_telegram_app() -> Application:
     # interaction envelope (interaction_id + trace scope + pre-routing flow
     # snapshot + interaction.received), and ConversationRouter.route is
     # observed caller-side — the pure policy itself stays untouched.
+    from noam_coach.observability.ai_invocation import install_ai_observability
     from noam_coach.observability.telegram_egress import install_telegram_egress
     from noam_coach.observability.telegram_ingress import (
         install_routing_observer,
@@ -210,6 +211,8 @@ def build_telegram_app() -> Application:
     # Observability O3: render/delivery instrumentation for safe_edit,
     # FreeTextContext.send, send_to_user, and the ExtBot transport catch-all.
     install_telegram_egress()
+    # Observability O4: observable OpenAI boundary + per-call-site purposes.
+    install_ai_observability()
     for command_name, command_handler in (
         ("start", command_start),
         ("import", command_import),
