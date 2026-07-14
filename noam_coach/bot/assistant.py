@@ -111,11 +111,52 @@ RUNTIME_NAMES = ('Any', 'ContextTypes', 'DB', 'Exception', 'InlineKeyboardMarkup
 
 @runtime_bound(RUNTIME_NAMES)
 async def assistant_profile_summary(user_id: int) -> str:
-    """Compact context handed to the intent classifier."""
+    """Compact context handed to the intent classifier.
+
+    FIX 53 (partial): the classifier previously received only goal/weight/
+    training-frequency -- no active daily menu identity, active
+    recommendation, pain state, or workout-today status, so it could not
+    ground references like "make it smaller" (which object?) or "I did
+    that" (did what?) in anything except the bare current message text.
+    Adds a bounded set of the highest-value signals the addendum names.
+    Full deterministic reference resolution (a structured AssistantTurnContext
+    the router consults directly, rather than a text summary an LLM must
+    re-interpret) is a larger project tracked as remaining FIX 53 work;
+    this closes the concrete, low-risk gap of the classifier having almost
+    no situational awareness at all.
+    """
     goal = await user_model.get_value(DB, user_id, "primary_goal", "—")
     weight = await user_model.get_value(DB, user_id, "weight_kg", "—")
     freq = await user_model.get_value(DB, user_id, "training_days_per_week", "—")
-    return f"מטרה={goal}, משקל={weight}, אימונים/שבוע={freq}"
+    parts = [f"מטרה={goal}", f"משקל={weight}", f"אימונים/שבוע={freq}"]
+
+    with suppress(Exception):
+        from noam_coach.services.next_meal import get_active_recommendation_state
+
+        active_rec = await get_active_recommendation_state(DB, user_id)
+        if active_rec:
+            titles = active_rec.get("option_titles") or []
+            if titles:
+                parts.append(f"המלצת ארוחה פעילה כרגע: {', '.join(str(t) for t in titles[:3])}")
+
+    with suppress(Exception):
+        from noam_coach.services.daily_menu_state import get_active_daily_menu, is_structured_menu
+
+        active_menu = await get_active_daily_menu(DB, user_id)
+        if is_structured_menu(active_menu):
+            stale_note = " (מיושן, יתעדכן בקריאה הבאה)" if active_menu.get("stale") else ""
+            parts.append(f"יש תפריט יומי פעיל{stale_note}")
+
+    with suppress(Exception):
+        from noam_coach.bot.onboarding import active_constraints
+
+        constraints = await active_constraints(user_id)
+        pain_rows = [c for c in constraints if c.get("kind") == "pain"]
+        if pain_rows:
+            locations = ", ".join(str(c.get("location") or "") for c in pain_rows if c.get("location"))
+            parts.append(f"כאב פעיל מדווח{': ' + locations if locations else ''}")
+
+    return ", ".join(parts)
 
 
 _DEFAULT_REPLY_KEYBOARD = object()
