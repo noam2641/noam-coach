@@ -1696,6 +1696,19 @@ async def import_health_export_file(
         inserted, duplicates = await upsert_health_rows(user_id, rows)
         await sync_health_measurements_to_facts(user_id)
         profile = await save_routine_profile(user_id)
+        if inserted > 0:
+            # FIX 54: a HealthKit import (e.g. today's workout) can change
+            # the current-day reality (workout completion, weight, sleep
+            # routine) while old decisions -- the active daily menu, an
+            # active next-meal recommendation built from pre-import state --
+            # remain actionable. Reuse the same invalidation contract meal
+            # events already trigger (Batch A/E). Gated on inserted>0 so a
+            # duplicate-only import (nothing new) causes no invalidation,
+            # matching the addendum's explicit required behavior.
+            with suppress(Exception):
+                from noam_coach.services.day_state_invalidation import invalidate_day_projections
+
+                await invalidate_day_projections(DB, user_id, reason="health_import")
         dataset_end = await routine.newest_health_sample_date(DB, user_id, TZ)
         dataset_end_date = dataset_end.isoformat() if dataset_end else summary.max_date
         import_completed = datetime.now(timezone.utc).isoformat()
