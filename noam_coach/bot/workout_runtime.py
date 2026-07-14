@@ -556,24 +556,31 @@ async def update_rest_message(
 
     timer_data["last_remaining"] = remaining
 
+    # Observability O3 exemption: countdown ticks are high-frequency,
+    # zero-decision-value edits of the same card — recording each one would
+    # flood the trace. The rest lifecycle itself (started/restored/finished)
+    # is observed at the state layer instead.
+    from noam_coach.observability.telegram_egress import unobserved_delivery
+
     try:
-        await context.bot.edit_message_text(
-            chat_id=timer_data["chat_id"],
-            message_id=timer_data["message_id"],
-            text=rest_text(
-                timer_data["weight"],
-                timer_data["reps"],
-                timer_data["rir"],
-                remaining,
-                timer_data["total_seconds"],
-                timer_data.get("summary_line"),
-            ),
-            reply_markup=rest_keyboard(
-                timer_data["session_step"],
-                finished=remaining <= 0,
-            ),
-            parse_mode=ParseMode.HTML,
-        )
+        with unobserved_delivery():
+            await context.bot.edit_message_text(
+                chat_id=timer_data["chat_id"],
+                message_id=timer_data["message_id"],
+                text=rest_text(
+                    timer_data["weight"],
+                    timer_data["reps"],
+                    timer_data["rir"],
+                    remaining,
+                    timer_data["total_seconds"],
+                    timer_data.get("summary_line"),
+                ),
+                reply_markup=rest_keyboard(
+                    timer_data["session_step"],
+                    finished=remaining <= 0,
+                ),
+                parse_mode=ParseMode.HTML,
+            )
     except RetryAfter as exc:
         LOGGER.warning("Telegram rate limit during rest timer: %s", exc)
     except (TimedOut, NetworkError) as exc:

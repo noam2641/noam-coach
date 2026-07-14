@@ -468,25 +468,61 @@ async def deliver_proactive_message(
     if claim is None:
         return False
 
-    try:
-        await sender()
-    except Exception as exc:  # noqa: BLE001
-        delay_seconds = await fail_job_delivery(claim, exc)
-        LOGGER.exception("Proactive delivery failed: %s", key)
-        await notify_admin(
-            context.bot,
-            f"Proactive delivery failed ({key}): {exc!r}",
-        )
-        if retry_callback is not None and claim.attempt_count < SETTINGS.proactive_max_attempts:
-            schedule_job_retry(
-                context,
-                retry_callback,
-                key,
-                delay_seconds,
-            )
-        return False
+    # Observability O3: one trace per proactive delivery — the job-level
+    # attempt/outcome (operation="proactive_job") plus every message-level
+    # render/delivery event the sender produces correlate to the same trace.
+    from noam_coach.observability import emit_event, interaction_scope, taxonomy
 
-    await complete_job_delivery(claim)
+    with interaction_scope(user_id=user_id):
+        await emit_event(
+            DB, user_id, taxonomy.DELIVERY_ATTEMPTED,
+            entity="proactive_job", entity_id=key,
+            source="job", surface="telegram", status="attempted",
+            properties={
+                "operation": "proactive_job", "key": key,
+                "priority": priority, "attempt": claim.attempt_count,
+            },
+        )
+        try:
+            await sender()
+        except Exception as exc:  # noqa: BLE001
+            delay_seconds = await fail_job_delivery(claim, exc)
+            LOGGER.exception("Proactive delivery failed: %s", key)
+            await emit_event(
+                DB, user_id, taxonomy.DELIVERY_FAILED,
+                entity="proactive_job", entity_id=key,
+                source="job", surface="telegram", status="failed",
+                outcome=type(exc).__name__,
+                properties={
+                    "operation": "proactive_job", "key": key,
+                    "error_type": type(exc).__name__,
+                    "retry_scheduled": bool(
+                        retry_callback is not None
+                        and claim.attempt_count < SETTINGS.proactive_max_attempts
+                    ),
+                },
+            )
+            await notify_admin(
+                context.bot,
+                f"Proactive delivery failed ({key}): {exc!r}",
+            )
+            if retry_callback is not None and claim.attempt_count < SETTINGS.proactive_max_attempts:
+                schedule_job_retry(
+                    context,
+                    retry_callback,
+                    key,
+                    delay_seconds,
+                )
+            return False
+
+        await complete_job_delivery(claim)
+        await emit_event(
+            DB, user_id, taxonomy.DELIVERY_SUCCEEDED,
+            entity="proactive_job", entity_id=key,
+            source="job", surface="telegram", status="succeeded",
+            outcome="delivered",
+            properties={"operation": "proactive_job", "key": key},
+        )
     return True
 
 

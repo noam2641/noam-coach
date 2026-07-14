@@ -75,15 +75,19 @@ async def _pre_routing_flow_snapshot(db: Any, user_id: int) -> dict[str, Any] | 
         return None
 
 
-async def _trace_for_callback(db: Any, user_id: int, callback_data: str | None) -> str | None:
+async def _trace_for_callback(
+    db: Any, user_id: int, source_message_id: Any
+) -> str | None:
     """Continuation lookup: trace of the render that presented this control.
 
-    Batch O2 ships the policy hook; batch O3 (render/delivery correlation)
-    supplies the actual source-render evidence. Returning ``None`` means
-    "cannot prove" → the callback starts a fresh trace.
+    Batch O3: resolved from the render registry (the latest successfully
+    delivered render on the callback's source message). Returning ``None``
+    means "cannot prove" → the callback starts a fresh trace.
     """
-    del db, user_id, callback_data
-    return None
+    from noam_coach.observability.render_registry import find_render_for_message
+
+    render = await find_render_for_message(db, user_id, source_message_id)
+    return render.trace_id if render is not None else None
 
 
 def _media_identity(message: Any) -> dict[str, Any] | None:
@@ -170,6 +174,20 @@ async def _emit_interaction_received(
     )
 
     if kind == "callback" and callback_data is not None:
+        source_render_id = None
+        label = None
+        correlation = "unresolved"
+        source_message_id = properties.get("source_message_id")
+        try:
+            from noam_coach.observability.render_registry import resolve_control
+
+            resolved = await resolve_control(db, user_id, source_message_id, callback_data)
+            if resolved is not None:
+                source_render_id = resolved.render_id
+                label = resolved.label
+                correlation = "resolved"
+        except Exception:  # noqa: BLE001 — unresolved stays explicit.
+            pass
         await emit_event(
             db,
             user_id,
@@ -180,12 +198,12 @@ async def _emit_interaction_received(
             status="activated",
             properties={
                 "callback_data": callback_data,
-                "source_message_id": properties.get("source_message_id"),
-                # O3 resolves these from the render registry; unresolved
-                # correlation is explicit, never inferred.
-                "source_render_id": None,
-                "label": None,
-                "correlation": "unresolved",
+                "source_message_id": source_message_id,
+                # Resolved from the render registry when evidence exists;
+                # unresolved correlation is explicit, never inferred.
+                "source_render_id": source_render_id,
+                "label": label,
+                "correlation": correlation,
             },
         )
 
@@ -210,11 +228,13 @@ def observed_handler(
         db = _facade_db()
 
         callback_query = getattr(update, "callback_query", None)
-        callback_data = getattr(callback_query, "data", None) if callback_query else None
         trace_id: str | None = None
-        if kind == "callback":
+        if kind == "callback" and callback_query is not None:
+            source_message = getattr(callback_query, "message", None)
             with suppress(Exception):
-                trace_id = await _trace_for_callback(db, user_id, callback_data)
+                trace_id = await _trace_for_callback(
+                    db, user_id, getattr(source_message, "message_id", None)
+                )
 
         with interaction_scope(trace_id=trace_id, user_id=user_id):
             with suppress(Exception):
