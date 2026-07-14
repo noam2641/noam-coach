@@ -81,7 +81,25 @@ async def append_event(
     status: str | None = None,
     outcome: str | None = None,
 ) -> int:
-    """Append one immutable event and return its id."""
+    """Append one immutable event and return its id.
+
+    Correlation defaulting (Observability O5): when the caller passes no
+    correlation at all — every pre-observability domain call site — the
+    ambient interaction scope (if one is open) supplies trace/interaction/
+    span identity, so legacy domain events like ``meal_saved`` join the
+    trace of the interaction that caused them. Rows written outside any
+    scope keep NULL correlation and stay explicitly legacy/uncorrelated.
+    """
+    if trace_id is None and interaction_id is None and span_id is None:
+        try:
+            from noam_coach.observability import obs_context as _obs_context
+
+            trace_id = _obs_context.current_trace_id()
+            interaction_id = _obs_context.current_interaction_id()
+            span_id = _obs_context.current_span_id()
+            parent_span_id = parent_span_id or _obs_context.current_parent_span_id()
+        except Exception:  # noqa: BLE001 — correlation is best-effort here.
+            pass
     return await db.execute(
         """
         INSERT INTO product_events(

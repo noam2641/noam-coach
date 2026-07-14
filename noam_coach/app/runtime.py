@@ -213,6 +213,11 @@ def build_telegram_app() -> Application:
     install_telegram_egress()
     # Observability O4: observable OpenAI boundary + per-call-site purposes.
     install_ai_observability()
+    # Observability O5: meal photo/correction end-to-end trace (media
+    # identity, deterministic overrides, locked-quantity decisions).
+    from noam_coach.observability.meal_trace import install_meal_trace
+
+    install_meal_trace()
     for command_name, command_handler in (
         ("start", command_start),
         ("import", command_import),

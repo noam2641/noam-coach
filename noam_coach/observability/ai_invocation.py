@@ -57,6 +57,20 @@ from noam_coach.observability.obs_context import current_user_id, span_scope
 
 _ai_purpose: ContextVar[str | None] = ContextVar("obs_ai_purpose", default=None)
 _media_refs: ContextVar[tuple[str, ...]] = ContextVar("obs_media_refs", default=())
+_raw_output_sink: ContextVar[list | None] = ContextVar("obs_raw_output_sink", default=None)
+
+
+@contextmanager
+def capture_ai_outputs() -> Iterator[list]:
+    """Collect the RAW (pre-deterministic-processing) AI outputs produced
+    inside this scope — the meal trace (O5) uses this to diff "what the AI
+    said" against "what the product decided" without re-parsing events."""
+    sink: list = []
+    token = _raw_output_sink.set(sink)
+    try:
+        yield sink
+    finally:
+        _raw_output_sink.reset(token)
 
 
 @contextmanager
@@ -206,6 +220,9 @@ class _ObservedResponses:
                 )
                 raise
             output_content, output_kind = _output_snapshot(operation, response)
+            sink = _raw_output_sink.get()
+            if sink is not None:
+                sink.append(output_content.get("output"))
             usage = getattr(response, "usage", None)
             await emit_event(
                 db, user_id, taxonomy.AI_CALL_COMPLETED,
