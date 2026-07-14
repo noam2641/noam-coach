@@ -219,4 +219,7 @@ async def test_invalidate_day_projections_no_op_when_nothing_active(tmp_path: Pa
     coach_bot.DB.path = db.path
 
     result = await invalidate_day_projections(db, 1, reason="meal_created")
-    assert result == {"active_daily_menu": False, "active_recommendation": False}
+    # routine_profile refresh (FIX 42, added in Batch E) is unconditional --
+    # it does not depend on an active menu/recommendation existing.
+    assert result["active_daily_menu"] is False
+    assert result["active_recommendation"] is False

@@ -121,7 +121,7 @@ async def test_manual_text_creates_approval_with_manual_source(
     # coach_bot facade — patch both there.
     monkeypatch.setattr(coach_bot, "OPENAI_CLIENT", object(), raising=False)
 
-    async def fake_analyze(_text: str, user_id: int | None = None) -> MealAnalysis:
+    async def fake_analyze(_text: str, user_id: int | None = None, nutrition_context: Any = None) -> MealAnalysis:
         return _fake_analysis()
 
     monkeypatch.setattr(coach_bot, "analyze_meal_text", fake_analyze, raising=False)
@@ -173,7 +173,7 @@ async def test_manual_meal_correction_with_no_deterministic_match_does_not_silen
     monkeypatch.setattr(meal_text_bot, "DB", db, raising=False)
     monkeypatch.setattr(coach_bot, "OPENAI_CLIENT", object(), raising=False)
 
-    async def fake_analyze(_text: str, user_id: int | None = None) -> MealAnalysis:
+    async def fake_analyze(_text: str, user_id: int | None = None, nutrition_context: Any = None) -> MealAnalysis:
         return _fake_analysis()
 
     monkeypatch.setattr(coach_bot, "analyze_meal_text", fake_analyze, raising=False)
@@ -199,7 +199,7 @@ async def test_manual_meal_correction_with_no_deterministic_match_does_not_silen
 
     called_with: dict[str, Any] = {}
 
-    async def fake_analyze_correction(description: str, user_id: int | None = None) -> MealAnalysis:
+    async def fake_analyze_correction(description: str, user_id: int | None = None, nutrition_context: Any = None) -> MealAnalysis:
         called_with["description"] = description
         called_with["user_id"] = user_id
         return replacement

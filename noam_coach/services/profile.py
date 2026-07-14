@@ -299,8 +299,24 @@ async def analyze_meal_image(
 
 
 @runtime_bound(RUNTIME_NAMES)
-async def analyze_meal_text(description: str, user_id: int | None = None) -> MealAnalysis:
-    """Estimate a meal from a text description only (no photo)."""
+async def analyze_meal_text(
+    description: str,
+    user_id: int | None = None,
+    nutrition_context: dict[str, Any] | None = None,
+) -> MealAnalysis:
+    """Estimate a meal from a text description only (no photo).
+
+    FIX 46 (partial): ``nutrition_context`` is optional and additive --
+    existing callers that don't pass it keep the prior behavior unchanged.
+    When provided (the same structured context ``analyze_meal_image``
+    already receives, including ``planned_meals``), it lets the model
+    resolve a reference like "אכלתי מה שתכננו" against an actual planned
+    meal instead of guessing from the bare words. Full context-model
+    unification between the manual and photo paths (a single
+    ``MealInterpretationContext``) is a larger project tracked as
+    remaining FIX 46 work; this closes the specific, concretely evidenced
+    gap: manual text could not resolve planned-meal references at all.
+    """
     if not OPENAI_CLIENT:
         raise RuntimeError("OPENAI_API_KEY אינו מוגדר")
 
@@ -309,6 +325,14 @@ async def analyze_meal_text(description: str, user_id: int | None = None) -> Mea
 
     safety_context = await _meal_safety_context(user_id)
     learned_context = await learned_foods_prompt_block(DB, user_id)
+    context_block = (
+        "\n\nStructured nutrition context for this user and day (use "
+        "planned_meals only to resolve references like 'what we planned' -- "
+        "never invent food items not implied by the user's own text):\n"
+        + json.dumps(nutrition_context, ensure_ascii=False)
+        if nutrition_context
+        else ""
+    )
     response = await OPENAI_CLIENT.responses.parse(
         model=SETTINGS.openai_model,
         input=[
@@ -329,6 +353,7 @@ async def analyze_meal_text(description: str, user_id: int | None = None) -> Mea
                     + ISRAELI_LOCALE_BLOCK
                     + safety_context_block(safety_context)
                     + learned_context
+                    + context_block
                 ),
             },
             {

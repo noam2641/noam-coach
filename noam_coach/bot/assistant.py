@@ -894,7 +894,19 @@ async def log_meal_from_text(
         return
     progress = await message.reply_text("רושם את הארוחה… ⏳")
     try:
-        analysis = await analyze_meal_text(text, user_id=user_id)
+        # FIX 46 (partial): give manual text the same planned-meal/day
+        # context photo analysis already receives, so "אכלתי מה שתכננו" can
+        # resolve against an actual planned meal instead of being guessed
+        # from bare words alone. Best-effort -- a context-build failure must
+        # never block manual logging, which worked fine before this without it.
+        nutrition_payload = None
+        with suppress(Exception):
+            from noam_coach.bot.meals import _meal_analysis_context
+
+            nutrition_payload = await _meal_analysis_context(
+                user_id, "manual text meal log", "Analyze manually described meal text"
+            )
+        analysis = await analyze_meal_text(text, user_id=user_id, nutrition_context=nutrition_payload)
         if not analysis.is_meaningful():
             await progress.edit_text(
                 "זה לא נראה כמו ארוחה שאפשר לרשום (אין מזון או ערכים תזונתיים).\n"

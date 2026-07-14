@@ -15,8 +15,10 @@ invalidatable state.
 
 from __future__ import annotations
 
+from contextlib import suppress
 from typing import Any
 
+import health_service
 from noam_coach.services import daily_menu_state
 from noam_coach.services import next_meal as next_meal_service
 
@@ -30,10 +32,14 @@ async def invalidate_day_projections(
 ) -> dict[str, bool]:
     """Invalidate every day-scoped projection that depends on meal state.
 
-    Currently covers: active daily menu (marked stale, not deleted) and
-    active next-meal recommendation (cleared -- it will regenerate fresh on
-    next request). Returns a dict of which projections were actually present
-    and invalidated, for logging/testing.
+    Covers: active daily menu (marked stale, not deleted), active next-meal
+    recommendation (cleared -- it will regenerate fresh on next request),
+    and the learned routine profile's eating-window component (FIX 42:
+    recomputed eagerly, reusing the same save_routine_profile() path the
+    evening job and HealthKit import already call, rather than inventing a
+    separate lazy-staleness mechanism for a projection with few, well-known
+    readers). Returns a dict of which projections were actually
+    present/refreshed, for logging/testing.
     """
     menu_invalidated = await daily_menu_state.mark_daily_menu_stale(
         db, user_id, reason=reason, now=now
@@ -45,7 +51,13 @@ async def invalidate_day_projections(
     if had_recommendation:
         await next_meal_service.clear_active_recommendation(db, user_id)
 
+    routine_refreshed = False
+    with suppress(Exception):
+        await health_service.save_routine_profile(user_id)
+        routine_refreshed = True
+
     return {
         "active_daily_menu": menu_invalidated,
         "active_recommendation": had_recommendation,
+        "routine_profile": routine_refreshed,
     }

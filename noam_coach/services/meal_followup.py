@@ -34,6 +34,29 @@ def _norm(value: Any) -> str:
     return " ".join(str(value or "").strip().lower().split())
 
 
+def _meal_matches_any_consumed(planned_name: str, consumed_names: set[str]) -> bool:
+    """FIX 49 (partial): exact-string equality between a planned meal's name
+    and a consumed meal's logged name is not a sufficient resolver -- a
+    consumed meal is very often logged with a slightly different title than
+    the plan's ("חזה עוף עם אורז" planned, "חזה עוף" or "עוף ואורז" logged),
+    so the follow-up would incorrectly nag about a meal the user already
+    ate. Full durable planned-meal identity (a persisted ID with lifecycle
+    transitions, matched by confirmed user action rather than text) is
+    tracked as remaining FIX 49 work; this widens the heuristic from exact
+    match to substring containment either direction, which catches the
+    common "same meal, shorter/longer logged title" case without inventing
+    new persisted identity.
+    """
+    if not planned_name:
+        return False
+    for consumed in consumed_names:
+        if not consumed:
+            continue
+        if planned_name == consumed or planned_name in consumed or consumed in planned_name:
+            return True
+    return False
+
+
 def planned_meal_followup(
     nutrition_context: Any,
     *,
@@ -49,7 +72,7 @@ def planned_meal_followup(
         if not isinstance(meal, dict) or meal.get("source") != "next_meal_plan":
             continue
         name = _norm(meal.get("name"))
-        if not name or name in consumed_names:
+        if not name or _meal_matches_any_consumed(name, consumed_names):
             continue
         planned_at = _parse_local_dt(meal.get("planned_at"))
         if not planned_at:
