@@ -32,6 +32,7 @@ Action = Literal[
     "set_dietary_pref",  # "אני לא שותה אלכוהול" / "אני צמחוני" / "אלרגי לבוטנים"
     "morning_flag",  # "לקחתי ריטלין" / "היום צום"
     "report_pain",  # "כואבת לי הברך"
+    "pain_resolved",  # "הכאב עבר" / "הברך כבר לא כואבת" (FIX 48)
     "update_measurement",  # "המשקל שלי 89"
     "request_progress",  # "מה ההתקדמות שלי"
     "show_profile",  # "מה אתה יודע עליי"
@@ -78,6 +79,10 @@ SYSTEM_PROMPT = (
     "(e.g. Ritalin, fasting); slot 'flag' in {ritalin, fasting, other} and "
     "'note'.\n"
     "- report_pain: reports pain/injury/limitation; slot 'location' if given.\n"
+    "- pain_resolved: says a previously reported pain/injury is gone/healed/"
+    "over. Examples: 'הכאב עבר', 'הברך כבר לא כואבת', 'זה נגמר, אני בסדר', "
+    "'החלמתי'. Slot 'location' if a specific body part is named. NOT the same "
+    "as report_pain -- this is the pain going AWAY, not appearing.\n"
     "- update_measurement: states a body measurement; slots like 'weight_kg', "
     "'height_cm', 'body_fat_pct'.\n"
     "- request_progress: asks about progress/trends.\n"
@@ -184,6 +189,12 @@ def keyword_fallback(text: str) -> Intent:
     # "המכשיר תפוס" / "העמדה תפוסה" / "הספסל תפוס" → equipment, not pain
     if _equipment_occupied(t):
         return Intent(action="smalltalk_or_help", slots={"note": t, "equipment_occupied": True}, confidence=0.6)
+    # FIX 48: pain going AWAY must be checked before the generic pain-report
+    # rule below, since both share keywords like "כאב"/"כואב".
+    if has("הכאב עבר", "כבר לא כואב", "כבר לא כואבת", "הכאב נעלם", "החלמתי",
+           "זה נגמר", "אני בסדר עכשיו", "הברך בסדר", "כבר לא כואבת לי",
+           "כבר לא כואב לי"):
+        return Intent(action="pain_resolved", slots={"note": t}, confidence=0.75)
     if has_positive("כואב", "כאב", "פציעה", "נתפס", "תפוס"):
         return Intent(action="report_pain", slots={"note": t}, confidence=0.8)
     # REC-PLAN-MEAL-03-17: Detect user challenging a redundant question

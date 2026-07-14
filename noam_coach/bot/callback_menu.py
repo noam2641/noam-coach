@@ -441,6 +441,7 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
 
     if data.startswith("nextmeal:save:"):
         from noam_coach.services.next_meal import (
+            MealSafetyRejected,
             clear_active_recommendation,
             generate_next_meal_recommendation,
             get_active_recommendation_options,
@@ -455,7 +456,19 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
         except (TypeError, ValueError, IndexError):
             await safe_edit(query, "לא מצאתי את האפשרות לשמירה.", home_keyboard())
             return True
-        saved = await save_chosen_meal(DB, user_id, option)
+        try:
+            saved = await save_chosen_meal(DB, user_id, option)
+        except MealSafetyRejected as exc:
+            # FIX 55: a safety fact changed since this option was generated
+            # (e.g. a new allergy) -- reject the stale save instead of
+            # silently persisting food that now violates a restriction.
+            await clear_active_recommendation(DB, user_id)
+            await safe_edit(
+                query,
+                f"לא שמרתי את הארוחה הזו: {esc(str(exc))}\nהתפריט התעדכן — בדוק אפשרות חדשה.",
+                InlineKeyboardMarkup([[button("🍽️ אפשרות חדשה", "nextmeal:refresh"), button("🏠 תפריט", "menu:home")]]),
+            )
+            return True
         await clear_active_recommendation(DB, user_id)
         if not saved:
             await safe_edit(query, "כבר שמרתי את הארוחה הזו — לא כפלתי אותה.", home_keyboard())
@@ -475,7 +488,7 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
         # tap that has nothing to do with the daily-menu meal they are
         # confirming right now).
         from noam_coach.services.daily_menu_state import get_active_daily_menu, is_structured_menu, structured_meals
-        from noam_coach.services.next_meal import MealIngredient, MealOption, save_chosen_meal
+        from noam_coach.services.next_meal import MealIngredient, MealOption, MealSafetyRejected, save_chosen_meal
 
         parts = data.split(":", 3)
         menu_id = parts[2] if len(parts) > 2 else ""
@@ -531,7 +544,18 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
             rationale="מהתפריט היומי הפעיל",
             ingredient_details=ingredient_details,
         )
-        saved = await save_chosen_meal(DB, user_id, option)
+        try:
+            saved = await save_chosen_meal(DB, user_id, option)
+        except MealSafetyRejected as exc:
+            # FIX 55: a safety fact changed since this daily menu was
+            # generated -- reject the stale save instead of persisting food
+            # that now violates a restriction.
+            await safe_edit(
+                query,
+                f"לא שמרתי את הארוחה הזו: {esc(str(exc))}\nפתח את תפריט היום המעודכן ונסה שוב.",
+                InlineKeyboardMarkup([[button("🏠 תפריט", "menu:home")]]),
+            )
+            return True
         if not saved:
             await safe_edit(query, "כבר שמרתי את הארוחה הזו — לא כפלתי אותה.", home_keyboard())
             return True

@@ -1214,6 +1214,52 @@ async def active_constraints(user_id: int) -> list[dict[str, Any]]:
     )
 
 
+@runtime_bound(RUNTIME_NAMES)
+async def resolve_medical_constraints(
+    user_id: int,
+    *,
+    location: str | None = None,
+    kind: str = "pain",
+) -> int:
+    """Mark active constraint(s) resolved (FIX 48's missing lifecycle
+    transition). ``active_pain_regions()`` already skips any row whose
+    status is not 'active' ("the resolved/cleared decision from elsewhere
+    always wins" -- see training_intelligence.py's docstring); this was the
+    writer that never existed to make that branch reachable.
+
+    When ``location`` is given, only constraints whose location contains
+    that text are resolved (a case-insensitive substring match, since
+    locations are free text like "ברך ימין"); otherwise every active
+    constraint of ``kind`` is resolved. Returns the number of rows updated.
+    """
+    now = utc_now()
+    if location:
+        rows = await DB.fetch_all(
+            "SELECT id, location FROM medical_constraints "
+            "WHERE user_id=? AND status='active' AND kind=?",
+            (user_id, kind),
+        )
+        matching_ids = [
+            row["id"] for row in rows
+            if row.get("location") and location.strip() in str(row["location"])
+        ]
+        if not matching_ids:
+            return 0
+        resolved = 0
+        for constraint_id in matching_ids:
+            resolved += await DB.execute_rowcount(
+                "UPDATE medical_constraints SET status='resolved', resolved_at=? "
+                "WHERE id=? AND user_id=? AND status='active'",
+                (now, constraint_id, user_id),
+            )
+        return resolved
+    return await DB.execute_rowcount(
+        "UPDATE medical_constraints SET status='resolved', resolved_at=? "
+        "WHERE user_id=? AND status='active' AND kind=?",
+        (now, user_id, kind),
+    )
+
+
 @dataclass
 class PlanConstraint:
     """A constraint that affects plan generation."""

@@ -229,6 +229,7 @@ from noam_coach.bot.onboarding import (
     context_pending_fix,
     handle_safety_answer,
     save_medical_constraint,
+    resolve_medical_constraints,
     active_constraints,
     PlanConstraint,
     gather_plan_constraints,

@@ -1121,6 +1121,50 @@ async def get_value(db: SupportsDB, user_id: int, key: str, default: Any = None)
     return fact["value"] if fact else default
 
 
+async def get_decision_value(
+    db: SupportsDB, user_id: int, key: str, default: Any = None,
+) -> Any:
+    """Read a fact's value only if it passes ``fact_is_usable_for_decision``
+    (FIX 47): fresh, and not an unconfirmed estimate/derived fact.
+
+    Use this instead of ``get_value`` for anything that drives a plan,
+    safety check, restriction filter, or other live decision. A stale or
+    unconfirmed fact returns ``default`` here even though ``get_value``
+    would still happily return its (not-yet-trustworthy) value -- that gap
+    is exactly what let onboarding correctly show a fact as "needs
+    confirmation" while a planning/safety reader used it as authoritative
+    anyway.
+    """
+    fact = (
+        await get_training_limitations_fact(db, user_id)
+        if key == "training_limitations"
+        else await get_fact(db, user_id, key)
+    )
+    if fact is None or not fact_is_usable_for_decision(key, fact):
+        return default
+    return fact["value"]
+
+
+async def get_display_value(db: SupportsDB, user_id: int, key: str, default: Any = None) -> Any:
+    """Read a fact's value for display/prompt purposes regardless of
+    confirmation/freshness policy. Equivalent to ``get_value`` -- kept as a
+    distinctly-named alias so call sites can declare intent (FIX 47:
+    "all fact reads must declare their intended policy: decision-grade,
+    draft, display, or raw audit").
+    """
+    return await get_value(db, user_id, key, default)
+
+
+async def get_raw_fact(db: SupportsDB, user_id: int, key: str) -> dict[str, Any] | None:
+    """Return the complete raw fact row (kind/source/confidence/confirmed/
+    valid), for audit trails and debugging -- never for a decision path."""
+    return (
+        await get_training_limitations_fact(db, user_id)
+        if key == "training_limitations"
+        else await get_fact(db, user_id, key)
+    )
+
+
 def is_fact_fresh(fact: dict[str, Any] | None, key: str) -> bool:
     """Check if a fact is still within its expiry window (if one is defined)."""
     return fact_is_fresh(key, fact)

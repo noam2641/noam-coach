@@ -24,6 +24,18 @@ def test_keyword_pain() -> None:
     assert intent.action == "report_pain"
 
 
+def test_keyword_pain_resolved() -> None:
+    """FIX 48: 'the pain is gone' must classify distinctly from a new
+    pain report, even though both share the root word כאב/כואב."""
+    intent = assistant.keyword_fallback("הכאב עבר, אני בסדר")
+    assert intent.action == "pain_resolved"
+
+
+def test_keyword_pain_resolved_specific_location() -> None:
+    intent = assistant.keyword_fallback("כבר לא כואב לי בברך")
+    assert intent.action == "pain_resolved"
+
+
 def test_keyword_next_meal() -> None:
     intent = assistant.keyword_fallback("מה לאכול עכשיו?")
     assert intent.action == "next_meal"

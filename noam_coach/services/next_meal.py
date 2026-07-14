@@ -2525,6 +2525,41 @@ async def _log_event(db: Any, user_id: int, name: str, properties: dict[str, Any
         pass
 
 
+class MealSafetyRejected(Exception):
+    """Raised when a save/plan action is rejected because the option violates
+    a safety fact (allergy/restriction) that changed since generation
+    (FIX 55). Carries the human-readable reason for the caller's UI message.
+    """
+
+
+async def _violates_current_safety_facts(db: Any, user_id: int, option: MealOption) -> str | None:
+    """Revalidate ``option`` against *current* diet/allergy facts.
+
+    Returns a human-readable violation reason, or None if the option is
+    still safe. Only "block"-severity violations (allergy/sensitivity/
+    intolerance) reject the save; warn/substitute-level restrictions do not,
+    matching ``validate_meal_analysis``'s existing severity policy for the
+    photo/manual meal path so both entry paths enforce the same bar.
+    """
+    diet_restrictions = await user_model.get_decision_value(db, user_id, "diet_restrictions")
+    allergies = await user_model.get_decision_value(db, user_id, "allergies")
+    if not diet_restrictions and not allergies:
+        return None
+    restrictions = load_restrictions_from_facts(
+        str(diet_restrictions) if diet_restrictions not in (None, "", "none") else None,
+        str(allergies) if allergies not in (None, "", "none") else None,
+    )
+    if not restrictions:
+        return None
+    items = [{"item_name": name} for name in (option.ingredients or [option.title])]
+    violations = validate_meal_restrictions(items, restrictions)
+    blocking = [v for v in violations if v.get("action") == "block"]
+    if not blocking:
+        return None
+    names = ", ".join(dict.fromkeys(v["item_name"] for v in blocking))
+    return f"האפשרות הזו מכילה {names}, שמסומן כאלרגיה/הגבלה פעילה."
+
+
 async def save_chosen_meal(
     db: Any,
     user_id: int,
@@ -2565,6 +2600,15 @@ async def save_chosen_meal(
     last_at = _parse_dt(saved.get(fingerprint)) if isinstance(saved, dict) else None
     if last_at is not None and (current - last_at).total_seconds() < 120:
         return False  # double-tap within 2 minutes -> no duplicate row
+
+    # FIX 55: an option was validated against restrictions at *generation*
+    # time (option.restriction_validated), but a safety fact (allergy/diet
+    # restriction) can change between generation and this save tap. Every
+    # final food mutation must revalidate current restrictions, not trust a
+    # flag set minutes or hours earlier.
+    violation = await _violates_current_safety_facts(db, user_id, option)
+    if violation:
+        raise MealSafetyRejected(violation)
 
     iso_now = current.astimezone(timezone.utc).isoformat()
     total_carbs = _rounded_sum(i.carbs_g or 0 for i in option.ingredient_details) if option.ingredient_details else 0
