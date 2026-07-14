@@ -572,6 +572,32 @@ class DailyContext:
     profile: dict[str, Any] = field(default_factory=dict)
     goal: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def workout_self_reported(self) -> bool:
+        """FIX 39: True when the user tapped an explicit "I finished the
+        workout" clarification today, regardless of whether ``workout_completed``
+        (strict bot-session/HealthKit evidence) agrees. ``workout_completed``
+        intentionally stays evidence-only (see daily_state.workout_completed_today's
+        docstring) -- this property does not change that policy, it only
+        exposes the self-report so a consumer CAN acknowledge it instead of
+        flatly contradicting what the user just told the coach.
+        """
+        return str(self.flags.get("next_meal_workout_status") or "") in (
+            "during", "completed",
+        )
+
+    @property
+    def workout_cancelled_today(self) -> bool:
+        """FIX 39: True when the user explicitly cancelled today's workout
+        via the next-meal clarification buttons. Unlike a simple "not yet
+        completed" state, a cancellation is a claim about the whole day, not
+        an open question -- consumers (workout prompts, motivation nudges)
+        should suppress "you still haven't worked out" framing entirely
+        rather than nag about something the user already said is not
+        happening today.
+        """
+        return str(self.flags.get("next_meal_workout_status") or "") == "cancelled"
+
 
 @runtime_bound(RUNTIME_NAMES)
 async def build_daily_context(user_id: int) -> DailyContext:

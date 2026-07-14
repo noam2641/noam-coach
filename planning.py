@@ -1605,6 +1605,16 @@ async def adherence_snapshot(db: Any, user_id: int, start_utc: str, end_utc: str
         protein_ratio = min(1.2, protein / max(1, float(goal["protein"])))
         nutrition_adherence = round(max(0.0, 1 - abs(1 - calorie_ratio)) * 0.6 + min(1.0, protein_ratio) * 0.4, 2)
     completed = sum(1 for row in sessions if row["status"] == "completed")
+
+    # FIX 52: workouts_completed above stays bot-sessions-only (existing
+    # meaning, existing consumers may already depend on that). Add a
+    # reconciled count alongside it so a HealthKit-only workout (imported,
+    # never started via the bot) is not invisible to adherence reporting --
+    # a day with evidence from either source counts once, not twice.
+    from noam_coach.services.workout_reconciliation import reconciled_workout_days
+
+    reconciled_days = await reconciled_workout_days(db, user_id, start_utc, end_utc)
+
     return {
         "nutrition_adherence": nutrition_adherence,
         "reporting_completeness": min(1.0, len(meals) / 3),
@@ -1613,4 +1623,5 @@ async def adherence_snapshot(db: Any, user_id: int, start_utc: str, end_utc: str
         "protein": round(protein, 1),
         "workouts_completed": completed,
         "workouts_started": len(sessions),
+        "workout_days_reconciled": len(reconciled_days),
     }

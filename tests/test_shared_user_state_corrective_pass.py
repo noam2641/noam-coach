@@ -715,10 +715,17 @@ async def test_stale_later_no_longer_reinterprets_passed_plan_as_near(db: Databa
 
 
 @pytest.mark.asyncio
-async def test_fresh_later_still_reinterprets_passed_plan_as_near(db: Database) -> None:
-    """Counterpart: a fresh "later" (tapped 30 minutes ago) still gets the
-    existing PRE_WORKOUT_NEAR reinterpretation — behavior unchanged for the
-    common case."""
+async def test_fresh_later_no_longer_fabricates_a_near_term_time(db: Database) -> None:
+    """FIX 40 (Batch D): "postpone" collects no new time, so it must not
+    silently retain the original (now-passed) plan time as though the
+    workout were still imminent. This test previously asserted the OLD,
+    now-confirmed-buggy behavior (PRE_WORKOUT_NEAR, docstring said
+    "behavior unchanged for the common case") -- updated per the Master
+    Correction Backlog Addendum's explicit instruction not to preserve a
+    test that encodes contradicted behavior. A fresh "later" now resolves
+    to WORKOUT_STATUS_UNKNOWN with no planned_start/planned_end, so
+    nutrition timing (next_meal.py's pre-workout budget allocation) cannot
+    treat the stale original time as a live near-term signal."""
     await _user(db)
     now = datetime(2026, 7, 12, 21, 0, tzinfo=TZ)
     await _workout_plan(db, 1, now, time_text="09:00")
@@ -727,7 +734,9 @@ async def test_fresh_later_still_reinterprets_passed_plan_as_near(db: Database) 
     state = await resolve_workout_state(db, 1, now)
 
     assert state.source == "active_workout_plan"
-    assert state.phase == WorkoutPhase.PRE_WORKOUT_NEAR
+    assert state.phase == WorkoutPhase.WORKOUT_STATUS_UNKNOWN
+    assert state.planned_start is None
+    assert state.planned_end is None
 
 
 @pytest.mark.asyncio

@@ -2412,7 +2412,19 @@ def _evening_coach_review_lines(ctx: "DailyContext") -> list[str]:
         if calorie_delta >= 0
         else f"חריגה של {abs(calorie_delta):.0f} קלוריות"
     )
-    workout_line = "התאמנת" if ctx.workout_completed else "לא תועד אימון"
+    # FIX 39: strict evidence (ctx.workout_completed) stays authoritative for
+    # the checkmark, but an explicit self-report or cancellation must not be
+    # flatly contradicted by the wording -- "no workout recorded" when the
+    # user said "I finished" minutes earlier reads as the coach forgetting
+    # what it was just told.
+    if ctx.workout_completed:
+        workout_line = "התאמנת"
+    elif ctx.workout_cancelled_today:
+        workout_line = "האימון בוטל היום"
+    elif ctx.workout_self_reported:
+        workout_line = "דיווחת שהתאמנת (עדיין ללא אישוש מהשעון/מהאפליקציה)"
+    else:
+        workout_line = "לא תועד אימון"
     tomorrow = (
         "מחר כדאי לפתוח עם חלבון מוקדם כדי לשמור על הקצב."
         if not protein_done

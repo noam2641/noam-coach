@@ -1019,6 +1019,16 @@ async def build_weekly_summary_text(user_id: int) -> str:
         (user_id, start_utc, end_utc),
     )
     actual_workouts = len(workout_rows)
+    # FIX 52: actual_workouts above stays bot-sessions-only (existing meaning
+    # in the "X out of Y planned" line below). Separately compute the
+    # reconciled day count (bot OR HealthKit evidence, deduplicated) so a
+    # HealthKit-only week is not silently reported as zero workouts when the
+    # user genuinely trained and imported the data.
+    from noam_coach.services.workout_reconciliation import reconciled_workout_days
+
+    reconciled_days = await reconciled_workout_days(DB, user_id, start_utc, end_utc)
+    healthkit_only_workouts = max(0, len(reconciled_days) - actual_workouts)
+
     workout_plan = await planning.get_active_plan(DB, user_id, "workout")
     planned_workouts = 0
     if workout_plan:
@@ -1084,6 +1094,12 @@ async def build_weekly_summary_text(user_id: int) -> str:
         lines.append(f"אימונים: <b>{actual_workouts} מתוך {planned_workouts} מתוכננים</b>")
     else:
         lines.append(f"אימונים שבוצעו: <b>{actual_workouts}</b>")
+    if healthkit_only_workouts:
+        # FIX 52: acknowledge HealthKit-only workouts instead of letting the
+        # bot-sessions-only count above silently imply they never happened.
+        lines.append(
+            f"<i>+{healthkit_only_workouts} אימונים נוספים תועדו רק דרך HealthKit</i>"
+        )
     lines.append("")
 
     if complete_day_count >= 4 and not duplicate_rows:

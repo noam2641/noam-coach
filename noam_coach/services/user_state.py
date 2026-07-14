@@ -510,16 +510,34 @@ async def _planned_session_candidate(
         if later_written_at is not None:
             later_age_hours = (now - later_written_at).total_seconds() / 3600
             later_is_stale = later_age_hours > STALE_EXPLICIT_CLARIFICATION_MAX_HOURS
+    label = "יש אימון מתוכנן היום לפי התוכנית."
     if explicit == "later" and not later_is_stale and phase in {
         WorkoutPhase.WORKOUT_STATUS_UNKNOWN,
         WorkoutPhase.WORKOUT_PLANNED_TIME_PASSED,
     }:
-        phase = WorkoutPhase.PRE_WORKOUT_NEAR
-        minutes_until = None
+        # FIX 40: "postpone" collects no new time -- it is a claim that the
+        # ORIGINAL plan time (``start``/``end``, unchanged above) is no
+        # longer accurate, not a claim that the workout is imminent. Treating
+        # this as PRE_WORKOUT_NEAR (as a prior version of this function did)
+        # fed a stale planned_start into meal-timing decisions (next_meal.py's
+        # pre-workout budget allocation), making nutrition act as though the
+        # workout were still about to start at the old time. WORKOUT_STATUS_UNKNOWN
+        # already exists precisely for "a workout is expected today but we
+        # cannot currently place it in time" -- reuse it instead of inventing
+        # a false near-term signal. minutes_until/minutes_since and the stale
+        # planned_start/planned_end are dropped so no downstream consumer can
+        # accidentally treat the old time as current.
+        phase = WorkoutPhase.WORKOUT_STATUS_UNKNOWN
+        label = "דחית את האימון של היום, אבל לא צוין זמן חדש — לא אניח שהוא קרוב."
+        return WorkoutState(
+            phase=phase,
+            source="active_workout_plan",
+            label=label,
+        )
     return WorkoutState(
         phase=phase,
         source="active_workout_plan",
-        label="יש אימון מתוכנן היום לפי התוכנית.",
+        label=label,
         planned_start=start,
         planned_end=end,
         minutes_until=minutes_until,
