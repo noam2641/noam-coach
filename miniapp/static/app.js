@@ -251,6 +251,36 @@ loadProfile();
 loadNextMeal();
 loadTodayMeals();
 
+// FIX 44 (partial): the Mini App was a static snapshot -- Telegram meal
+// logs, goal/allergy/pain changes, plan activation, workout completion,
+// and HealthKit imports were all invisible in an already-open Mini App
+// until the user manually tapped a refresh button. Refresh the read-only
+// panels whenever the page regains focus/visibility (the tab was
+// switched away and back, or the Mini App window was minimized and
+// reopened), so a user who left Telegram open and came back sees current
+// state without a manual action. Debounced so rapid focus/blur toggling
+// (e.g. quickly switching between Telegram and the Mini App) does not
+// spam the API. Does NOT touch mutation endpoints or add a revision/
+// optimistic-concurrency protocol -- that is a larger project tracked as
+// remaining FIX 44 work; this closes the specific, low-risk read-refresh
+// gap.
+let lastFocusRefresh = 0;
+const FOCUS_REFRESH_MIN_INTERVAL_MS = 5000;
+
+function refreshOnRegainedFocus() {
+  const now = Date.now();
+  if (now - lastFocusRefresh < FOCUS_REFRESH_MIN_INTERVAL_MS) return;
+  lastFocusRefresh = now;
+  loadDashboard();
+  loadNextMeal();
+  loadTodayMeals();
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') refreshOnRegainedFocus();
+});
+window.addEventListener('focus', refreshOnRegainedFocus);
+
 document.getElementById('saveProfileBtn').addEventListener('click', saveProfile);
 document.getElementById('refreshNextMealBtn').addEventListener('click', loadNextMeal);
 document.getElementById('refreshMealsBtn').addEventListener('click', loadTodayMeals);
