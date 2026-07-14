@@ -37,7 +37,7 @@ brief (precedence.py operational, not decorative).
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -552,26 +552,127 @@ async def test_planned_meal_never_enters_consumed_recency_logic(db: Database) ->
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_select_todays_workout_code_still_picks_todays_session(db: Database, monkeypatch: pytest.MonkeyPatch) -> None:
-    import user_model
+def _patch_workout_selector_db(monkeypatch: pytest.MonkeyPatch, db: Database) -> None:
+    """Bind the selector's DB deterministically, surviving @runtime_bound.
+
+    Patching only ``ui_module.DB`` is NOT enough: every ``@runtime_bound``
+    callable re-copies ``coach_bot.DB`` into its own module namespace at call
+    time, so once any earlier test has imported ``coach_bot``, a ui-module-only
+    patch is silently overwritten with the default global Database
+    (``./noam_coach.db``) and the selector reads the wrong database. That was
+    the real mechanism behind this file's order-dependent CI failure
+    (``assert None == "A"`` after 1,316 passing tests) — the facade is the
+    patch point the runtime_bind bridge is documented to honor.
+    """
+    import coach_bot
     from noam_coach.bot import ui as ui_module
 
-    await _user(db)
+    monkeypatch.setattr(coach_bot, "DB", db)
     monkeypatch.setattr(ui_module, "DB", db)
-    today_wd = datetime.now(TZ).weekday()
+
+
+async def _selector_plan(db: Database, today_wd: int) -> None:
+    """Active plan whose TODAY session is deliberately not first in the cycle:
+    if the weekday match ever breaks, the first-not-done-today fallback would
+    return "A", so a "B" assertion proves the selector genuinely matched
+    today's weekday instead of silently falling through."""
+    import user_model
+
     plan = {
         "sessions": [
-            {"code": "A", "weekday": today_wd},
-            {"code": "B", "weekday": (today_wd + 1) % 7},
+            {"code": "A", "weekday": (today_wd + 1) % 7},
+            {"code": "B", "weekday": today_wd},
             {"code": "C", "weekday": (today_wd + 2) % 7},
         ]
     }
     await user_model.set_fact(db, 1, "active_workout_plan", plan, source=user_model.SOURCE_SYSTEM)
 
-    code = await ui_module.select_todays_workout_code(1)
 
-    assert code == "A"
+@pytest.mark.asyncio
+async def test_select_todays_workout_code_still_picks_todays_session(db: Database, monkeypatch: pytest.MonkeyPatch) -> None:
+    from noam_coach.bot import ui as ui_module
+
+    await _user(db)
+    _patch_workout_selector_db(monkeypatch, db)
+    # One fixed injected instant — no wall-clock read anywhere in the test,
+    # so neither the day of the run nor a midnight rollover mid-test can
+    # change the outcome.
+    now = datetime(2026, 7, 12, 17, 0, tzinfo=TZ)  # Sunday
+    await _selector_plan(db, local_weekday(now))
+
+    code = await ui_module.select_todays_workout_code(1, now=now)
+
+    assert code == "B"
+
+
+@pytest.mark.asyncio
+async def test_select_todays_workout_code_skips_completed_and_advances_cycle(db: Database, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Intended product contract, stated explicitly: a session code already
+    completed today is not offered again — the selector advances to the next
+    code in the cycle. (This is deliberate skip-forward, not a session
+    "disappearing".)"""
+    from noam_coach.bot import ui as ui_module
+
+    await _user(db)
+    _patch_workout_selector_db(monkeypatch, db)
+    now = datetime(2026, 7, 12, 17, 0, tzinfo=TZ)
+    await _selector_plan(db, local_weekday(now))
+    # Today's session "B" was genuinely completed earlier today.
+    await _completed_session(db, 1, now - timedelta(hours=3), now - timedelta(hours=2), code="B")
+
+    code = await ui_module.select_todays_workout_code(1, now=now)
+
+    assert code == "C"
+
+
+@pytest.mark.asyncio
+async def test_select_todays_workout_code_other_completion_does_not_hide_todays_session(db: Database, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Completing a DIFFERENT code today must not make today's still-planned
+    session disappear."""
+    from noam_coach.bot import ui as ui_module
+
+    await _user(db)
+    _patch_workout_selector_db(monkeypatch, db)
+    now = datetime(2026, 7, 12, 17, 0, tzinfo=TZ)
+    await _selector_plan(db, local_weekday(now))
+    await _completed_session(db, 1, now - timedelta(hours=3), now - timedelta(hours=2), code="C")
+
+    code = await ui_module.select_todays_workout_code(1, now=now)
+
+    assert code == "B"
+
+
+@pytest.mark.asyncio
+async def test_select_todays_workout_code_day_boundary_is_local_calendar_midnight(db: Database, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Day-boundary semantics, explicit: the selector's "done today" window is
+    the LOCAL CALENDAR day (daily_state.local_day_bounds_utc), so a session
+    that ended before last midnight does not count against today and today's
+    planned session is still offered."""
+    from noam_coach.bot import ui as ui_module
+
+    await _user(db)
+    _patch_workout_selector_db(monkeypatch, db)
+    now = datetime(2026, 7, 12, 9, 0, tzinfo=TZ)
+    await _selector_plan(db, local_weekday(now))
+    # Same code "B" completed yesterday at 23:30 local — 9.5h ago, but on the
+    # other side of the calendar-midnight boundary. Stored in UTC isoformat,
+    # exactly as production writes sessions.ended_at (utc_now()): the
+    # selector compares these as strings in SQL, so the test must use the
+    # production timestamp format for the boundary comparison to be real.
+    await db.execute(
+        """
+        INSERT INTO sessions(user_id, code, name, plan, status, exercise_index, set_number, started_at, ended_at)
+        VALUES(1, 'B', 'Workout', '{}', 'completed', 0, 0, ?, ?)
+        """,
+        (
+            datetime(2026, 7, 11, 22, 30, tzinfo=TZ).astimezone(timezone.utc).isoformat(),
+            datetime(2026, 7, 11, 23, 30, tzinfo=TZ).astimezone(timezone.utc).isoformat(),
+        ),
+    )
+
+    code = await ui_module.select_todays_workout_code(1, now=now)
+
+    assert code == "B"
 
 
 # ---------------------------------------------------------------------------
@@ -874,6 +975,12 @@ async def test_build_daily_status_resolves_workout_state_once(monkeypatch: pytes
 
     await _user(db)
     await _goal(db)
+    # The whole dashboard is anchored to this one injected instant. The
+    # fixture data below is written relative to it, so the test no longer
+    # depends on the real wall clock at all — previously build_daily_status
+    # read datetime.now() internally, the fixed-date meal was never "today",
+    # and the handler early-returned before resolving workout state at all
+    # (call_count == 0 on any day after the day this test was written).
     now = datetime(2026, 7, 12, 17, 45, tzinfo=TZ)
     await _workout_plan(db, 1, now, time_text="18:30")
     await _meal(db, 1, now, calories=500, minutes_ago=30, name="lunch")
@@ -891,7 +998,8 @@ async def test_build_daily_status_resolves_workout_state_once(monkeypatch: pytes
         return await real_resolver(*args, **kwargs)
 
     with patch.object(user_state_module, "resolve_workout_state", side_effect=_counting_resolver):
-        text = await coach_bot.build_daily_status(1)
+        text = await coach_bot.build_daily_status(1, now=now)
 
     assert text  # renders successfully
+    assert "lunch" in text  # the seeded meal really was "today" for the handler
     assert call_count == 1, f"expected exactly one resolve_workout_state call for the whole handler, got {call_count}"

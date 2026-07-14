@@ -111,9 +111,13 @@ RUNTIME_NAMES = ('Any', 'DB', 'Exception', 'InlineKeyboardMarkup', 'KeyError', '
 
 
 @runtime_bound(RUNTIME_NAMES)
-async def today_meals(user_id: int) -> list[dict[str, Any]]:
-    """Return today's saved meals (the rows that make up the daily total)."""
-    return await daily_state.consumed_meals(DB, user_id)
+async def today_meals(user_id: int, *, now: datetime | None = None) -> list[dict[str, Any]]:
+    """Return today's saved meals (the rows that make up the daily total).
+
+    ``now`` pins the local-day window to one explicit instant (injectable for
+    tests); ``None`` keeps the default real-clock behavior.
+    """
+    return await daily_state.consumed_meals(DB, user_id, now=now)
 
 
 def _goal_source_line(goal: dict[str, Any]) -> str:
@@ -128,10 +132,15 @@ def _goal_source_line(goal: dict[str, Any]) -> str:
 
 
 @runtime_bound(RUNTIME_NAMES)
-async def build_daily_status(user_id: int) -> str:
+async def build_daily_status(user_id: int, *, now: datetime | None = None) -> str:
     """RE10-13: rich "מצב היום" built from the single nutrition-context source
     of truth (D4/D9/D10), with NO stale Apple Health activity section (that
     freshness warning belongs to the Health screens, not here).
+
+    ``now`` is the single instant the whole dashboard is anchored to — the
+    meal window, the shared workout/nutrition state, and every projection
+    derived from it all see the same effective day. ``None`` (every
+    production call site) means the real current time.
     """
     from noam_coach.services.next_meal import (
         build_workout_nutrition_context,
@@ -142,7 +151,7 @@ async def build_daily_status(user_id: int) -> str:
     from noam_coach.services.user_state import build_shared_state
 
     goal = await fetch_goal(user_id)
-    meals = await today_meals(user_id)
+    meals = await today_meals(user_id, now=now)
     meal_count = len(meals)
     provisional = bool(goal.get("provisional"))
 
@@ -171,7 +180,7 @@ async def build_daily_status(user_id: int) -> str:
     # the SAME resolved workout state instead of each independently
     # re-querying sessions/plan/routine (three DB round-trips for the same
     # fact before this fix).
-    shared_state = await build_shared_state(DB, user_id)
+    shared_state = await build_shared_state(DB, user_id, now=now)
     context = await build_nutrition_context(DB, user_id, "daily_status", shared_state=shared_state)
     workout_context = await build_workout_nutrition_context(
         DB, user_id, now=shared_state.now, workout_state=shared_state.workout

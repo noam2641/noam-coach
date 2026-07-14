@@ -468,12 +468,22 @@ def exercise_params_keyboard(code: str, exercise_index: int) -> InlineKeyboardMa
 
 
 @runtime_bound(RUNTIME_NAMES)
-async def select_todays_workout_code(user_id: int) -> str | None:
+async def select_todays_workout_code(user_id: int, *, now: datetime | None = None) -> str | None:
     """Pick the workout to show when the user taps 'אימון'.
 
     Preference (per product): the session scheduled for *today* in the active
     weekly plan; otherwise the next one in the plan's cycle after the last
     workout actually performed (A→B→C→A...). Returns None if no active plan.
+
+    Time semantic (explicit): "today" here is the LOCAL CALENDAR day — plan
+    sessions are keyed by calendar weekday (``date.weekday()``, Monday-first,
+    see ``noam_coach.services.weekdays``), so the split rotation follows the
+    calendar week, not the sleep-anchored coaching day of
+    ``noam_coach.services.coaching_day`` (FIX 41), whose consumers are
+    day-KEY subsystems (meals/flags/menus). Both the weekday match and the
+    done-today window derive from the single ``now`` instant (injectable for
+    tests; defaults to the real clock), so a midnight rollover mid-call
+    cannot make the two disagree.
 
     REC-ARCH-01 audit note: this answers a question orthogonal to
     ``user_state.resolve_workout_state``'s phase resolution — "which A/B/C
@@ -489,6 +499,7 @@ async def select_todays_workout_code(user_id: int) -> str | None:
     (it never claims "the workout is upcoming/in-progress/done" — only "here
     is which code to show").
     """
+    current = (now or datetime.now(TZ)).astimezone(TZ)
     plan = await user_model.get_value(DB, user_id, "active_workout_plan")
     if not plan or not plan.get("sessions"):
         return None
@@ -496,7 +507,7 @@ async def select_todays_workout_code(user_id: int) -> str | None:
     cycle = [s["code"] for s in sessions]
 
     # Which codes were already completed today? Don't offer those again.
-    start, end = daily_state.local_day_bounds_utc()
+    start, end = daily_state.local_day_bounds_utc(current)
     done_today_rows = await DB.fetch_all(
         "SELECT DISTINCT code FROM sessions WHERE user_id=? "
         "AND status IN ('completed','partial') AND ended_at>=? AND ended_at<?",
@@ -505,7 +516,7 @@ async def select_todays_workout_code(user_id: int) -> str | None:
     done_today = {r["code"] for r in done_today_rows}
 
     # 1) A session scheduled for today's weekday that wasn't done yet.
-    today_wd = datetime.now(TZ).weekday()
+    today_wd = current.weekday()
     for session in sessions:
         if session.get("weekday") == today_wd and session["code"] not in done_today:
             return session["code"]
