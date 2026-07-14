@@ -507,7 +507,18 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
         menu_id = parts[2] if len(parts) > 2 else ""
         meal_id = parts[3] if len(parts) > 3 else ""
         active_menu = await get_active_daily_menu(DB, user_id)
-        if not is_structured_menu(active_menu) or str((active_menu or {}).get("menu_id") or "") != menu_id:
+        # FIX 43/50 (Batch F): day_state_invalidation.invalidate_day_projections
+        # (Batch A) already marks the active menu ``stale`` after a meal
+        # create/edit/undo, but this handler previously only checked menu_id
+        # equality -- a menu invalidated by a meal event minutes ago, with
+        # the SAME menu_id (nothing regenerated it yet), was still accepted.
+        # Reject a stale menu the same way an outright missing/mismatched
+        # one is already rejected.
+        if (
+            not is_structured_menu(active_menu)
+            or str((active_menu or {}).get("menu_id") or "") != menu_id
+            or bool((active_menu or {}).get("stale"))
+        ):
             await safe_edit(
                 query,
                 "התפריט התעדכן מאז שהוצג לך — פתח את תפריט היום המעודכן ונסה שוב.",
