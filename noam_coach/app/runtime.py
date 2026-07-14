@@ -196,19 +196,44 @@ def build_telegram_app() -> Application:
             builder = builder.base_file_url(SETTINGS.telegram_base_file_url)
 
     application = builder.build()
-    application.add_handler(CommandHandler("start", command_start))
-    application.add_handler(CommandHandler("import", command_import))
-    application.add_handler(CommandHandler("importpath", command_import_path))
-    application.add_handler(CommandHandler("flags", command_flags))
-    application.add_handler(CommandHandler("profile", command_profile))
-    application.add_handler(CommandHandler("weekly", command_weekly))
-    application.add_handler(CommandHandler("chart", command_chart))
-    application.add_handler(CommandHandler("app", command_app))
-    application.add_handler(CommandHandler("cancel", command_cancel))
-    application.add_handler(CallbackQueryHandler(handle_callback))
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+    # Observability O2: every Telegram ingress boundary is wrapped with the
+    # interaction envelope (interaction_id + trace scope + pre-routing flow
+    # snapshot + interaction.received), and ConversationRouter.route is
+    # observed caller-side — the pure policy itself stays untouched.
+    from noam_coach.observability.telegram_ingress import (
+        install_routing_observer,
+        observed_handler,
+    )
+
+    install_routing_observer()
+    for command_name, command_handler in (
+        ("start", command_start),
+        ("import", command_import),
+        ("importpath", command_import_path),
+        ("flags", command_flags),
+        ("profile", command_profile),
+        ("weekly", command_weekly),
+        ("chart", command_chart),
+        ("app", command_app),
+        ("cancel", command_cancel),
+    ):
+        application.add_handler(
+            CommandHandler(
+                command_name,
+                observed_handler("command", command_handler, command=command_name),
+            )
+        )
+    application.add_handler(CallbackQueryHandler(observed_handler("callback", handle_callback)))
+    application.add_handler(MessageHandler(filters.PHOTO, observed_handler("photo", handle_photo)))
+    application.add_handler(
+        MessageHandler(filters.Document.ALL, observed_handler("document", handle_document))
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            observed_handler("text", handle_text_message),
+        )
+    )
     application.add_error_handler(on_error)
     schedule_jobs(application)
     return application

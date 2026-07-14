@@ -36,6 +36,7 @@ from noam_coach.observability.obs_context import (
     correlation_kwargs,
     current_interaction_id,
     current_trace_id,
+    current_user_id,
     interaction_scope,
     span_scope,
 )
@@ -46,6 +47,7 @@ __all__ = [
     "correlation_kwargs",
     "current_interaction_id",
     "current_trace_id",
+    "current_user_id",
     "emit_event",
     "get_mode",
     "interaction_scope",

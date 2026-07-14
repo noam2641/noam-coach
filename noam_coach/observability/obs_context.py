@@ -23,6 +23,13 @@ _trace_id: ContextVar[str | None] = ContextVar("obs_trace_id", default=None)
 _interaction_id: ContextVar[str | None] = ContextVar("obs_interaction_id", default=None)
 _span_id: ContextVar[str | None] = ContextVar("obs_span_id", default=None)
 _parent_span_id: ContextVar[str | None] = ContextVar("obs_parent_span_id", default=None)
+_user_id: ContextVar[int | None] = ContextVar("obs_user_id", default=None)
+
+
+def current_user_id() -> int | None:
+    """The user the active interaction belongs to (for boundaries whose
+    signatures don't carry a user id, e.g. safe_edit)."""
+    return _user_id.get()
 
 
 def current_trace_id() -> str | None:
@@ -62,6 +69,7 @@ def interaction_scope(
     *,
     trace_id: str | None = None,
     interaction_id: str | None = None,
+    user_id: int | None = None,
 ) -> Iterator[InteractionScope]:
     """Open the correlation scope for one user-originated interaction.
 
@@ -75,6 +83,7 @@ def interaction_scope(
     t2 = _interaction_id.set(resolved_interaction)
     t3 = _span_id.set(None)
     t4 = _parent_span_id.set(None)
+    t5 = _user_id.set(user_id if user_id is not None else _user_id.get())
     try:
         yield InteractionScope(trace_id=resolved_trace, interaction_id=resolved_interaction)
     finally:
@@ -82,6 +91,7 @@ def interaction_scope(
         _interaction_id.reset(t2)
         _span_id.reset(t3)
         _parent_span_id.reset(t4)
+        _user_id.reset(t5)
 
 
 @dataclass(frozen=True)
