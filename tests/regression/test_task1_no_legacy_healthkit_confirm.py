@@ -75,7 +75,7 @@ async def _db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Database:
 async def test_onboarding_path_shows_new_summary_not_legacy_confirmation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    db = await _db(tmp_path, monkeypatch)
+    await _db(tmp_path, monkeypatch)
     # The post-wizard flow remembers we came from onboarding.
     await onboarding_bot.set_flow_state(
         1, health_jobs.HEALTH_POST_WIZARD_FLOW, "onboarding",

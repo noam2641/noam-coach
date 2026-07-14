@@ -8,11 +8,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-import pytest
-
 from config import TZ
-from noam_coach.services.food_preferences import parse_restrictions
 from noam_coach.services import next_meal as nm
+from noam_coach.services.food_preferences import parse_restrictions
 from noam_coach.services.next_meal import WorkoutPhase
 from noam_coach.services.user_state import _phase_from_times
 

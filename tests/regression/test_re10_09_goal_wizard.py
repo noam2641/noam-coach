@@ -238,7 +238,6 @@ async def _goal_screen_text_and_buttons(
     target = FakeTarget()
     await callback_plans_bot.handle_workout_setup_callback(target, None, 1, "menu:goal")
     text = target.messages[-1]
-    labels = [btn.text for row in target.reply_markups[-1].inline_keyboard for btn in row]
     callbacks = [btn.callback_data for row in target.reply_markups[-1].inline_keyboard for btn in row]
     return text, callbacks
 

@@ -11,7 +11,6 @@ from pathlib import Path
 import pytest
 
 import coach_bot
-import user_model
 from db import Database
 from helpers import utc_now
 

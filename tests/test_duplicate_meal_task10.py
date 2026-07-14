@@ -8,7 +8,6 @@ macros; the same product logged twice within minutes must.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import pytest
 

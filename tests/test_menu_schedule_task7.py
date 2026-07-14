@@ -6,11 +6,6 @@ when a confirmed goal exists; no generic closing text.
 """
 from __future__ import annotations
 
-from pathlib import Path
-
-import pytest
-
-import coach_bot
 from noam_coach.services import health_jobs
 from noam_coach.services.goals import format_morning_menu
 from recommendations import MenuMeal, MorningMenu

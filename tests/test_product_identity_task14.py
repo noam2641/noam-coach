@@ -6,7 +6,11 @@ all downstream representations stay consistent.
 """
 from __future__ import annotations
 
-from meal_intelligence import MealCorrection, apply_item_removal_correction, apply_item_replacement_correction
+from meal_intelligence import (
+    MealCorrection,
+    apply_item_removal_correction,
+    apply_item_replacement_correction,
+)
 from models import FoodItem, MealAnalysis
 
 

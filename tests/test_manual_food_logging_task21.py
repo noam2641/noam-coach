@@ -15,7 +15,6 @@ from typing import Any
 import pytest
 
 import coach_bot
-import user_model
 from db import Database
 from helpers import utc_now
 from models import FoodItem, MealAnalysis
