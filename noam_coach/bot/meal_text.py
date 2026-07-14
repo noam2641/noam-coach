@@ -501,15 +501,42 @@ async def handle_text_message(
             return
         await conversation.clear_active_flow(DB, user_id)
 
-    # re7 P1-13/14: when a next-meal recommendation is active, interpret a
-    # correction ("אבל נשאר לי 269", "זה גדול מדי", "אין לי ביצים") against it
-    # FIRST, before generic intent routing.
+    # re7 P1-13/14 (FIX 50): when a next-meal recommendation is active,
+    # interpret a correction ("אבל נשאר לי 269", "זה גדול מדי", "אין לי
+    # ביצים") against it FIRST, before the daily-menu editor. The comment
+    # above always said this was the intended precedence, but the code
+    # called try_build_daily_menu_edit_reply() first -- so with an active
+    # daily menu AND an active next-meal card, a correction meant for the
+    # next-meal card could be silently applied to the menu's snack slot
+    # instead. handle_recommendation_correction() already returns None
+    # immediately when there is no active recommendation, so trying it
+    # first never swallows text that should reach the menu editor.
     from noam_coach.services.next_meal import (
         format_next_meal_recommendation,
         handle_recommendation_correction,
         next_meal_action_rows,
         remember_active_recommendation,
     )
+
+    correction = await handle_recommendation_correction(DB, user_id, text)
+    if correction is not None:
+        prefix, recommendation = correction
+        keyboard_rows = [
+            [button(label, cb) for label, cb in row]
+            for row in next_meal_action_rows(recommendation)
+        ]
+        body = format_next_meal_recommendation(recommendation)
+        if prefix:
+            body = f"{prefix}\n\n{body}"
+        sent = await update.effective_message.reply_text(
+            body,
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+            parse_mode=ParseMode.HTML,
+        )
+        await remember_active_recommendation(
+            DB, user_id, recommendation, message_id=getattr(sent, "message_id", None)
+        )
+        return
 
     from noam_coach.services.daily_menu_edit import try_build_daily_menu_edit_reply
 
@@ -529,26 +556,6 @@ async def handle_text_message(
             chat_id=getattr(getattr(sent, "chat", None), "id", user_id),
             message_id=getattr(sent, "message_id", None),
             source="daily_menu_revision",
-        )
-        return
-
-    correction = await handle_recommendation_correction(DB, user_id, text)
-    if correction is not None:
-        prefix, recommendation = correction
-        keyboard_rows = [
-            [button(label, cb) for label, cb in row]
-            for row in next_meal_action_rows(recommendation)
-        ]
-        body = format_next_meal_recommendation(recommendation)
-        if prefix:
-            body = f"{prefix}\n\n{body}"
-        sent = await update.effective_message.reply_text(
-            body,
-            reply_markup=InlineKeyboardMarkup(keyboard_rows),
-            parse_mode=ParseMode.HTML,
-        )
-        await remember_active_recommendation(
-            DB, user_id, recommendation, message_id=getattr(sent, "message_id", None)
         )
         return
 

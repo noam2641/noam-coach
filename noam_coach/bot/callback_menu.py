@@ -443,16 +443,29 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
         from noam_coach.services.next_meal import (
             MealSafetyRejected,
             clear_active_recommendation,
-            generate_next_meal_recommendation,
             get_active_recommendation_options,
             save_chosen_meal,
         )
 
         try:
             option_number = int(data.rsplit(":", 1)[1])
-            recommendation = await generate_next_meal_recommendation(DB, user_id)
             active_options = await get_active_recommendation_options(DB, user_id)
-            option = (active_options or recommendation.options)[option_number - 1]
+            if not active_options:
+                # FIX 51: this button belongs to a recommendation message
+                # that is no longer the active one (expired TTL, cleared by
+                # a newer recommendation, or a safety/meal event). Falling
+                # back to freshly generated options here would let a stale
+                # "save option 2" button save whatever option 2 happens to
+                # be in a brand-new list -- a different meal than the one
+                # actually displayed under that button. Refuse instead of
+                # silently substituting.
+                await safe_edit(
+                    query,
+                    "האפשרות הזו כבר לא פעילה — התפריט התעדכן. בדוק אפשרות חדשה.",
+                    InlineKeyboardMarkup([[button("🍽️ אפשרות חדשה", "nextmeal:refresh"), button("🏠 תפריט", "menu:home")]]),
+                )
+                return True
+            option = active_options[option_number - 1]
         except (TypeError, ValueError, IndexError):
             await safe_edit(query, "לא מצאתי את האפשרות לשמירה.", home_keyboard())
             return True

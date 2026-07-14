@@ -322,6 +322,7 @@ from noam_coach.bot.workout_runtime import (
     _MessageEditTarget,
     rest_timer_tick,
     start_rest_timer,
+    restore_rest_timers_on_startup,
 )
 
 

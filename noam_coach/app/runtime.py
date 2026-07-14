@@ -106,7 +106,7 @@ from retention import (
 
 from noam_coach.runtime_bind import runtime_bound
 
-RUNTIME_NAMES = ('AIORateLimiter', 'Application', 'ApplicationBuilder', 'CallbackContext', 'CallbackQueryHandler', 'CommandHandler', 'DB', 'Exception', 'JOB_PRIORITY_COACHING', 'JOB_PRIORITY_SCHEDULED', 'LOGGER', 'MessageHandler', 'Path', 'RUNTIME_STATE', 'RuntimeError', 'SETTINGS', 'TZ', 'api', 'application', 'asyncio', 'build_telegram_app', 'build_weekly_summary_text', 'build_workout_prompt_text', 'builder', 'cleaner', 'cleanup_photos', 'command_app', 'command_cancel', 'command_chart', 'command_flags', 'command_import', 'command_import_path', 'command_profile', 'command_start', 'command_weekly', 'context', 'datetime', 'deliver_proactive_message', 'dttime', 'ensure_user_record', 'evening', 'exc', 'expected', 'filters', 'handle_callback', 'handle_document', 'handle_photo', 'handle_text_message', 'job_calorie_watch', 'job_evening', 'job_morning', 'job_motivation', 'job_weekly_summary', 'job_workout_prompt', 'jq', 'load_pending_state', 'me', 'morning', 'on_error', 'reconcile_onboarding_stage', 'schedule_jobs', 'send_prompt', 'send_to_user', 'send_weekly', 'server', 'suppress', 'telegram', 'text', 'type', 'user_id', 'uvicorn', 'verify_bot_identity')
+RUNTIME_NAMES = ('AIORateLimiter', 'Application', 'ApplicationBuilder', 'CallbackContext', 'CallbackQueryHandler', 'CommandHandler', 'DB', 'Exception', 'JOB_PRIORITY_COACHING', 'JOB_PRIORITY_SCHEDULED', 'LOGGER', 'MessageHandler', 'Path', 'RUNTIME_STATE', 'RuntimeError', 'SETTINGS', 'TZ', 'api', 'application', 'asyncio', 'build_telegram_app', 'build_weekly_summary_text', 'build_workout_prompt_text', 'builder', 'cleaner', 'cleanup_photos', 'command_app', 'command_cancel', 'command_chart', 'command_flags', 'command_import', 'command_import_path', 'command_profile', 'command_start', 'command_weekly', 'context', 'datetime', 'deliver_proactive_message', 'dttime', 'ensure_user_record', 'evening', 'exc', 'expected', 'filters', 'handle_callback', 'handle_document', 'handle_photo', 'handle_text_message', 'job_calorie_watch', 'job_evening', 'job_morning', 'job_motivation', 'job_weekly_summary', 'job_workout_prompt', 'jq', 'load_pending_state', 'me', 'morning', 'on_error', 'reconcile_onboarding_stage', 'restore_rest_timers_on_startup', 'schedule_jobs', 'send_prompt', 'send_to_user', 'send_weekly', 'server', 'suppress', 'telegram', 'text', 'type', 'user_id', 'uvicorn', 'verify_bot_identity')
 
 
 @runtime_bound(RUNTIME_NAMES)
@@ -290,6 +290,16 @@ async def run() -> None:
                 await telegram.start()
                 # Fail fast if the token belongs to the wrong bot (identity guard).
                 await verify_bot_identity(telegram)
+                if getattr(telegram, "job_queue", None) is not None:
+                    # FIX 45: rest timers live only in the in-memory JobQueue,
+                    # keyed off time.monotonic() -- a restart destroys them
+                    # while the durable session silently advances. Restore
+                    # or resolve every persisted timer before accepting
+                    # traffic so no card is left frozen/abandoned.
+                    with suppress(Exception):
+                        restored = await restore_rest_timers_on_startup(telegram.job_queue)
+                        if restored:
+                            LOGGER.info("Restored %d rest timer(s) after restart", restored)
                 if telegram.updater is None:
                     raise RuntimeError("Telegram updater is not available")
                 await telegram.updater.start_polling(drop_pending_updates=False)

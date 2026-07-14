@@ -367,11 +367,160 @@ def rest_text(
 
 
 @runtime_bound(RUNTIME_NAMES)
+async def persist_rest_timer(timer_data: dict[str, Any]) -> None:
+    """Persist the rest deadline as wall-clock time (FIX 45).
+
+    The JobQueue's in-memory ``ends_at`` is a ``time.monotonic()`` value that
+    a process restart destroys, while the durable session silently advances
+    to the next set underneath it (the timer freezes but the DB has already
+    moved on). Storing a wall-clock deadline lets a restart tell the
+    difference between "still resting" and "rest already ended while we were
+    down" and react accordingly instead of leaving an abandoned card.
+    """
+    now = datetime.now(timezone.utc)
+    ends_at = now + timedelta(seconds=timer_data["total_seconds"])
+    step = timer_data["session_step"]
+    await DB.execute(
+        """
+        INSERT INTO rest_timers(
+            session_id, user_id, chat_id, message_id, exercise_index,
+            set_number, weight, reps, rir, total_seconds, ends_at_utc,
+            summary_line, created_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+            chat_id=excluded.chat_id, message_id=excluded.message_id,
+            exercise_index=excluded.exercise_index, set_number=excluded.set_number,
+            weight=excluded.weight, reps=excluded.reps, rir=excluded.rir,
+            total_seconds=excluded.total_seconds, ends_at_utc=excluded.ends_at_utc,
+            summary_line=excluded.summary_line, created_at=excluded.created_at
+        """,
+        (
+            timer_data["session_id"], timer_data["user_id"], timer_data["chat_id"],
+            timer_data["message_id"], int(step["exercise_index"]), int(step["set_number"]),
+            timer_data["weight"], timer_data["reps"], timer_data["rir"],
+            timer_data["total_seconds"], ends_at.isoformat(),
+            timer_data.get("summary_line"), now.isoformat(),
+        ),
+    )
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def clear_persisted_rest_timer(session_id: int) -> None:
+    await DB.execute("DELETE FROM rest_timers WHERE session_id=?", (session_id,))
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def restore_rest_timers_on_startup(job_queue: Any) -> int:
+    """Restore or resolve every persisted rest timer at process startup (FIX 45).
+
+    For each row still pointing at an active session, on the current step:
+      * If the wall-clock deadline is still in the future, re-arm a real
+        JobQueue tick so the card keeps counting down and auto-advances.
+      * If the deadline already passed while the process was down, edit the
+        stale card directly into the "rest ended" resume state instead of
+        leaving it frozen at whatever remaining time it last showed.
+    A row whose session is no longer active/current (finished, or the
+    session moved past this step) is simply dropped -- the card's own
+    session-step-embedded callback data already prevents a stale card from
+    advancing the wrong step, so no action is needed on it here.
+    Returns the number of timers processed (restored + resolved).
+    """
+    rows = await DB.fetch_all("SELECT * FROM rest_timers")
+    if not rows:
+        return 0
+
+    processed = 0
+    now = datetime.now(timezone.utc)
+    for row in rows:
+        session_id = int(row["session_id"])
+        session = await DB.fetch_one(
+            """
+            SELECT id, user_id, exercise_index, set_number
+            FROM sessions
+            WHERE id=? AND status='active'
+            """,
+            (session_id,),
+        )
+        if not session:
+            await clear_persisted_rest_timer(session_id)
+            continue
+        current_step_matches = (
+            int(session["exercise_index"]) == int(row["exercise_index"])
+            and int(session["set_number"]) == int(row["set_number"])
+        )
+        if not current_step_matches:
+            # The session already advanced past this rest -- the card, if
+            # still visible, is stale; its own embedded step data already
+            # blocks it from mutating the current step further.
+            await clear_persisted_rest_timer(session_id)
+            continue
+
+        try:
+            ends_at = datetime.fromisoformat(str(row["ends_at_utc"]))
+        except ValueError:
+            await clear_persisted_rest_timer(session_id)
+            continue
+
+        session_step = {
+            "id": session_id,
+            "exercise_index": int(row["exercise_index"]),
+            "set_number": int(row["set_number"]),
+        }
+        remaining = (ends_at - now).total_seconds()
+        target = _MessageEditTarget(
+            job_queue.application.bot, int(row["chat_id"]), int(row["message_id"])
+        )
+        if remaining > 0:
+            timer_data = {
+                "user_id": int(row["user_id"]),
+                "session_id": session_id,
+                "session_step": session_step,
+                "chat_id": int(row["chat_id"]),
+                "message_id": int(row["message_id"]),
+                "weight": float(row["weight"]),
+                "reps": int(row["reps"]),
+                "rir": int(row["rir"]),
+                "total_seconds": int(row["total_seconds"]),
+                "ends_at": time.monotonic() + remaining,
+                "last_remaining": None,
+                "cancelled": False,
+                "summary_line": row.get("summary_line"),
+            }
+            job_queue.run_repeating(
+                rest_timer_tick,
+                interval=1,
+                first=1,
+                name=rest_job_name(int(row["user_id"]), session_id),
+                data=timer_data,
+                chat_id=int(row["chat_id"]),
+                user_id=int(row["user_id"]),
+            )
+        else:
+            # Rest already ended while the process was down -- resolve the
+            # stale card into the resume state instead of leaving it frozen.
+            with suppress(Exception):
+                await target.edit_message_text(
+                    rest_text(
+                        float(row["weight"]), int(row["reps"]), int(row["rir"]),
+                        0, int(row["total_seconds"]), row.get("summary_line"),
+                    ),
+                    reply_markup=rest_keyboard(session_step, finished=True),
+                    parse_mode=ParseMode.HTML,
+                )
+            await clear_persisted_rest_timer(session_id)
+        processed += 1
+    return processed
+
+
+@runtime_bound(RUNTIME_NAMES)
 async def cancel_rest_timer(
     context: ContextTypes.DEFAULT_TYPE,
     user_id: int,
     session_id: int,
 ) -> None:
+    with suppress(Exception):
+        await clear_persisted_rest_timer(session_id)
+
     if context.job_queue is None:
         return
 
@@ -453,6 +602,11 @@ class _MessageEditTarget:
             **kwargs,
         )
 
+    async def send_new(self, text: str, **kwargs: Any) -> None:
+        """DEBUG_APPEND_ONLY_MESSAGES support: send a new message to the same
+        chat instead of editing the existing one (see ui.safe_edit)."""
+        await self._bot.send_message(chat_id=self._chat_id, text=text, **kwargs)
+
 
 @runtime_bound(RUNTIME_NAMES)
 async def rest_timer_tick(context: CallbackContext) -> None:
@@ -468,6 +622,8 @@ async def rest_timer_tick(context: CallbackContext) -> None:
     remaining = await update_rest_message(context, timer_data)
     if remaining <= 0:
         job.schedule_removal()
+        with suppress(Exception):
+            await clear_persisted_rest_timer(timer_data["session_id"])
         # Auto-advance: when rest ends, show the next set in the same card —
         # no need to tap "הצג סט הבא". Skip if a pain stop cancelled the flow.
         with suppress(Exception):
@@ -527,6 +683,8 @@ async def start_rest_timer(
         "cancelled": False,
         "summary_line": summary_line,
     }
+    with suppress(Exception):
+        await persist_rest_timer(timer_data)
 
     await safe_edit(
         query,

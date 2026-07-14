@@ -102,6 +102,24 @@ CREATE TABLE IF NOT EXISTS sessions(
     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS rest_timers(
+    session_id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    exercise_index INTEGER NOT NULL,
+    set_number INTEGER NOT NULL,
+    weight REAL NOT NULL,
+    reps INTEGER NOT NULL,
+    rir INTEGER NOT NULL,
+    total_seconds INTEGER NOT NULL,
+    ends_at_utc TEXT NOT NULL,
+    summary_line TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS sets(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id INTEGER NOT NULL,
