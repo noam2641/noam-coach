@@ -137,7 +137,17 @@ def _meal_slots_for(menu: recommendations.MorningMenu, intents: list[MealIntent]
     return slots
 
 
+async def _emit_menu_event(db: Any, user_id: int, event: str, **kwargs: Any) -> None:
+    """Observability O6: canonical decision-chain events, emitted alongside
+    the legacy _log_event names (which are kept for compatibility)."""
+    from noam_coach.observability.emit import emit_event
+
+    await emit_event(db, user_id, event, entity="daily_menu", source="menu_pipeline", **kwargs)
+
+
 async def _repair_menu(
+    db: Any,
+    user_id: int,
     *,
     menu: recommendations.MorningMenu,
     result: MenuValidationResult,
@@ -175,6 +185,13 @@ async def _repair_menu(
 
     if not affected:
         # Menu-level problem only: one full regeneration attempt.
+        from noam_coach.observability import taxonomy
+
+        await _emit_menu_event(
+            db, user_id, taxonomy.DECISION_FALLBACK_SELECTED,
+            status="selected", outcome="menu_level_regeneration",
+            properties={"reason": "menu_level_regeneration", "deterministic": True},
+        )
         return await recommendations.morning_menu(
             None,  # deterministic path: menu-level repairs must not loop through AI again
             "repair",
@@ -207,6 +224,21 @@ async def _repair_menu(
 
     # AI repair unavailable/failed: keep unaffected meals, replace only
     # flagged ones with the deterministic fallback's corresponding slot.
+    from noam_coach.observability import taxonomy
+
+    await _emit_menu_event(
+        db, user_id, taxonomy.DECISION_FALLBACK_SELECTED,
+        status="selected",
+        outcome="meal_splice",
+        properties={
+            "reason": (
+                "ai_repair_failed_meal_splice" if openai_client is not None
+                else "no_ai_client_meal_splice"
+            ),
+            "affected_meal_indices": sorted(affected),
+            "deterministic": True,
+        },
+    )
     fallback = await recommendations.morning_menu(
         None,
         "repair",
@@ -305,9 +337,31 @@ async def build_personalized_morning_menu(
             consumed_meal_keys=consumed_keys,
         )
 
+    from noam_coach.observability import taxonomy
+
     result = _validate(menu)
     used_fallback = False
     repaired = False
+
+    if result.ok:
+        await _emit_menu_event(
+            db, user_id, taxonomy.VALIDATION_COMPLETED,
+            status="completed", outcome="ok",
+            properties={"stage": "initial", "violations": []},
+        )
+    else:
+        await _emit_menu_event(
+            db, user_id, taxonomy.VALIDATION_FAILED,
+            status="failed", outcome="violations",
+            properties={
+                "stage": "initial",
+                "violations": [
+                    {"meal_index": v.meal_index, "code": v.code, "detail": v.detail}
+                    for v in result.violations
+                ],
+                "affected_meal_indices": sorted(result.affected_meal_indices),
+            },
+        )
 
     if not result.ok:
         for code in sorted(result.hard_fail_codes):
@@ -322,6 +376,8 @@ async def build_personalized_morning_menu(
         await _log_event(db, user_id, "menu_repair_requested", {"affected_meals": len(result.affected_meal_indices)})
         try:
             repaired_menu = await _repair_menu(
+                db,
+                user_id,
                 menu=menu,
                 result=result,
                 profile=pref_profile,
@@ -343,6 +399,13 @@ async def build_personalized_morning_menu(
         repaired_result = _validate(repaired_menu) if repaired_menu is not None else None
         if repaired_menu is not None and repaired_result is not None and repaired_result.ok:
             await _log_event(db, user_id, "menu_repair_succeeded", {})
+            await _emit_menu_event(
+                db, user_id, taxonomy.DECISION_REPAIRED,
+                status="repaired", outcome="ok",
+                properties={
+                    "affected_meal_indices": sorted(result.affected_meal_indices),
+                },
+            )
             menu = repaired_menu
             result = repaired_result
             repaired = True
@@ -356,6 +419,15 @@ async def build_personalized_morning_menu(
             )
             fallback_result = _validate(fallback_menu)
             await _log_event(db, user_id, "deterministic_menu_fallback_used", {"still_has_violations": not fallback_result.ok})
+            await _emit_menu_event(
+                db, user_id, taxonomy.DECISION_FALLBACK_SELECTED,
+                status="selected", outcome="deterministic_menu",
+                properties={
+                    "reason": "menu_repair_failed",
+                    "deterministic": True,
+                    "still_has_violations": not fallback_result.ok,
+                },
+            )
             menu = fallback_menu
             result = fallback_result
             used_fallback = True
@@ -368,7 +440,32 @@ async def build_personalized_morning_menu(
     # unsafe menu.
     if not result.ok:
         await _log_event(db, user_id, "menu_generation_blocked", {"codes": sorted(result.hard_fail_codes)})
+        await _emit_menu_event(
+            db, user_id, taxonomy.VALIDATION_FAILED,
+            status="failed", outcome="blocked",
+            properties={
+                "stage": "final",
+                "codes": sorted(result.hard_fail_codes),
+            },
+        )
         raise MenuGenerationBlocked(result)
+
+    await _emit_menu_event(
+        db, user_id, taxonomy.DECISION_FINALIZED,
+        status="finalized",
+        outcome=(
+            "repaired" if repaired
+            else "deterministic_fallback" if used_fallback
+            else "deterministic" if openai_client is None
+            else "ai"
+        ),
+        properties={
+            "meal_count": len(menu.meals),
+            "repaired": repaired,
+            "used_fallback": used_fallback,
+        },
+        content={"final_menu": menu.model_dump()},
+    )
 
     final_slots = _meal_slots_for(menu, intents)
     meal_records = [

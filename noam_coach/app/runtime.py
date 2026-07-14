@@ -218,6 +218,11 @@ def build_telegram_app() -> Application:
     from noam_coach.observability.meal_trace import install_meal_trace
 
     install_meal_trace()
+    # Observability O6: coaching decision chains (intent resolution,
+    # evening-summary flags vs prose, routine-extraction fallback).
+    from noam_coach.observability.decision_trace import install_decision_trace
+
+    install_decision_trace()
     for command_name, command_handler in (
         ("start", command_start),
         ("import", command_import),
