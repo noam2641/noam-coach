@@ -1010,9 +1010,23 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
                 # when one already exists. Only the explicit
                 # "🔄 רענן תפריט" (menu:refresh_daily_menu) action below is
                 # allowed to build a genuinely fresh menu.
+                #
+                # The reuse lookup is best-effort, mirroring the same
+                # suppress(Exception)-guarded pattern menu:morning's
+                # build_daily_context lookup already uses one branch above:
+                # if the active-menu lookup itself cannot complete (e.g. the
+                # day-state store is not reachable for a reason unrelated to
+                # "no menu exists yet"), fall through to building a fresh
+                # menu instead of aborting the whole on-demand-menu action.
+                # A genuine DB outage still surfaces loudly through
+                # build_morning_menu_text's own (unguarded) queries below,
+                # caught by this block's outer except -- this only protects
+                # the optional reuse step, not menu generation itself.
                 from noam_coach.services.daily_menu_state import get_active_daily_menu
 
-                active = await get_active_daily_menu(DB, user_id)
+                active = None
+                with suppress(Exception):
+                    active = await get_active_daily_menu(DB, user_id)
                 text = active["text"] if active else await build_morning_menu_text(user_id)
             elif data == "menu:refresh_daily_menu":
                 text = await build_morning_menu_text(user_id)
