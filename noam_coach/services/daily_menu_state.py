@@ -210,6 +210,34 @@ async def get_active_daily_menu(
     return value if isinstance(value, dict) else None
 
 
+async def mark_daily_menu_stale(
+    db: Any,
+    user_id: int,
+    *,
+    reason: str,
+    now: datetime | None = None,
+) -> bool:
+    """Mark today's active daily menu stale after a day-state change (FIX 43).
+
+    Does not delete the menu (old messages/history stay intact); instead sets
+    a ``stale`` flag and ``stale_reason`` so readers (save/edit handlers) can
+    reject or refresh actions against it instead of silently applying them to
+    a menu built from pre-change state. Returns False when there was no
+    active menu to invalidate.
+    """
+    local_day = _local_day(now)
+    flags = await _daily_flags(db, user_id, local_day)
+    menu_state = flags.get(ACTIVE_DAILY_MENU_KEY)
+    if not isinstance(menu_state, dict):
+        return False
+    menu_state["stale"] = True
+    menu_state["stale_reason"] = reason
+    menu_state["stale_at"] = datetime.now(TZ).isoformat()
+    flags[ACTIVE_DAILY_MENU_KEY] = menu_state
+    await _save_daily_flags(db, user_id, local_day, flags)
+    return True
+
+
 def is_structured_menu(menu_state: dict[str, Any] | None) -> bool:
     """True when ``menu_state`` carries the TASK-9 structured meal list."""
     if not isinstance(menu_state, dict):

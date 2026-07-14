@@ -158,6 +158,7 @@ CREATE TABLE IF NOT EXISTS daily_flags(
     day TEXT NOT NULL,
     flags TEXT NOT NULL,
     created_at TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY(user_id, day),
     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
@@ -564,6 +565,7 @@ SCHEMA_MIGRATIONS: tuple[tuple[int, str], ...] = (
     (9, "single_active_goal_version"),
     (10, "clean_polluted_gap_values"),
     (11, "meal_status_column"),
+    (12, "daily_flags_revision"),
 )
 
 FK_MIGRATION_TABLES: tuple[str, ...] = (
@@ -1227,6 +1229,22 @@ async def _migration_meal_status_column(db: Database) -> None:
         await _record_migration(connection, 11, "meal_status_column")
 
 
+async def _migration_daily_flags_revision(db: Database) -> None:
+    """Migration 12 (FIX 57/22): add daily_flags.revision so the shared JSON
+    document supports compare-and-swap writes instead of unconditional
+    last-writer-wins upserts. Existing rows start at revision 1 -- they were
+    already written at least once.
+    """
+    async with db.transaction() as connection:
+        cursor = await connection.execute("PRAGMA table_info(daily_flags)")
+        present = {row["name"] for row in await cursor.fetchall()}
+        if "revision" not in present:
+            await connection.execute(
+                "ALTER TABLE daily_flags ADD COLUMN revision INTEGER NOT NULL DEFAULT 1"
+            )
+        await _record_migration(connection, 12, "daily_flags_revision")
+
+
 async def run_migrations(
     db: Database,
     *,
@@ -1267,6 +1285,8 @@ async def run_migrations(
             await _migration_clean_polluted_gap_values(db)
         elif version == 11:
             await _migration_meal_status_column(db)
+        elif version == 12:
+            await _migration_daily_flags_revision(db)
         else:
             raise RuntimeError(f"Unknown schema migration {version}")
         LOGGER.info("Applied schema migration %s: %s", version, name)

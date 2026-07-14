@@ -405,6 +405,13 @@ async def _handle_meal_decision_actions(
             source="user",
             properties={"draft_approval_id": edit_approval_id},
         )
+        with suppress(Exception):
+            # FIX 43: undo is a domain event just like create/edit -- the
+            # menu/recommendation built while this meal still counted toward
+            # totals is no longer valid.
+            from noam_coach.services.day_state_invalidation import invalidate_day_projections
+
+            await invalidate_day_projections(DB, user_id, reason="meal_undone")
         rows = [[button("⬅️ תפריט", "menu:home")]]
         if edit_approval_id:
             rows.insert(0, [button("✏️ תקן ושמור מחדש", f"backmeal:{edit_approval_id}")])

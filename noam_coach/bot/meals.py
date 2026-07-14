@@ -587,6 +587,15 @@ async def persist_meal(user_id: int, approval_id: str) -> int | None:
         return None
 
     with suppress(Exception):
+        # FIX 43: meal create/edit is one domain event that must invalidate
+        # every dependent day-state projection (active menu, active
+        # next-meal recommendation), not just update the meals table.
+        from noam_coach.services.day_state_invalidation import invalidate_day_projections
+
+        await invalidate_day_projections(
+            DB, user_id, reason="meal_edited" if edited_existing else "meal_created"
+        )
+    with suppress(Exception):
         await meal_intelligence.register_meal_fingerprint(
             DB,
             user_id=user_id,

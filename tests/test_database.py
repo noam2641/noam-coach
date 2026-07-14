@@ -119,10 +119,11 @@ async def test_database_initialization_is_idempotent(tmp_path: Path) -> None:
     await db.init()
     await db.init()
     rows = await db.fetch_all("SELECT version FROM schema_migrations ORDER BY version")
-    # Migration 11 (meal_status_column) was added for the consumed/planned/
-    # recommended split; bump the expected range whenever a new schema
-    # migration is registered in db.SCHEMA_MIGRATIONS.
-    assert [row["version"] for row in rows] == list(range(1, 12))
+    # Migration 12 (daily_flags_revision, FIX 57/22: compare-and-swap support
+    # for the daily_flags JSON document) was added most recently; bump the
+    # expected range whenever a new schema migration is registered in
+    # db.SCHEMA_MIGRATIONS.
+    assert [row["version"] for row in rows] == list(range(1, 13))
 
 
 @pytest.mark.asyncio
