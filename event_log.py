@@ -4,6 +4,20 @@ The Telegram transcript alone is not enough to understand why a flow broke.
 This module records every important state transition and domain action with the
 algorithm/prompt version that produced it.  It is intentionally independent of
 Telegram so it can be reused by the bot, Mini App and tests.
+
+Observability O1: ``product_events`` is the CANONICAL interaction trace
+stream.  The envelope carries correlation identity (``trace_id`` /
+``interaction_id`` / ``span_id`` / ``parent_span_id``), the surface the user
+experienced, and status/outcome semantics, in addition to the original
+entity/flow fields.  All correlation fields are optional so the 40+
+pre-existing ``append_event`` call sites keep working unchanged; historical
+rows read back with ``trace_id is None`` and are thereby explicitly
+identifiable as legacy/uncorrelated — they are never silently reinterpreted
+as if they carried correlation.
+
+Higher-level policy (redaction, observability modes, safe-write behavior)
+lives in ``noam_coach.observability``; this module stays the thin canonical
+store boundary.
 """
 
 from __future__ import annotations
@@ -29,6 +43,20 @@ class ProductEvent:
     before: dict[str, Any] | None
     after: dict[str, Any] | None
     created_at: str
+    # Observability O1 envelope (None on legacy/uncorrelated rows).
+    event_version: int = 1
+    trace_id: str | None = None
+    interaction_id: str | None = None
+    span_id: str | None = None
+    parent_span_id: str | None = None
+    surface: str | None = None
+    status: str | None = None
+    outcome: str | None = None
+
+    @property
+    def is_legacy_uncorrelated(self) -> bool:
+        """True when the row predates (or bypassed) trace correlation."""
+        return self.trace_id is None and self.interaction_id is None
 
 
 async def append_event(
@@ -44,14 +72,24 @@ async def append_event(
     properties: dict[str, Any] | None = None,
     before: dict[str, Any] | None = None,
     after: dict[str, Any] | None = None,
+    event_version: int = 1,
+    trace_id: str | None = None,
+    interaction_id: str | None = None,
+    span_id: str | None = None,
+    parent_span_id: str | None = None,
+    surface: str | None = None,
+    status: str | None = None,
+    outcome: str | None = None,
 ) -> int:
     """Append one immutable event and return its id."""
     return await db.execute(
         """
         INSERT INTO product_events(
             user_id, event, entity, entity_id, flow_id, flow_version,
-            source, properties, before_state, after_state, created_at
-        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            source, properties, before_state, after_state, created_at,
+            event_version, trace_id, interaction_id, span_id,
+            parent_span_id, surface, status, outcome
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             user_id,
@@ -65,6 +103,14 @@ async def append_event(
             json.dumps(before, ensure_ascii=False) if before is not None else None,
             json.dumps(after, ensure_ascii=False) if after is not None else None,
             utc_now(),
+            int(event_version),
+            trace_id,
+            interaction_id,
+            span_id,
+            parent_span_id,
+            surface,
+            status,
+            outcome,
         ),
     )
 
@@ -83,6 +129,14 @@ def _decode(row: dict[str, Any]) -> ProductEvent:
         before=json.loads(row["before_state"]) if row.get("before_state") else None,
         after=json.loads(row["after_state"]) if row.get("after_state") else None,
         created_at=row["created_at"],
+        event_version=int(row.get("event_version") or 1),
+        trace_id=row.get("trace_id"),
+        interaction_id=row.get("interaction_id"),
+        span_id=row.get("span_id"),
+        parent_span_id=row.get("parent_span_id"),
+        surface=row.get("surface"),
+        status=row.get("status"),
+        outcome=row.get("outcome"),
     )
 
 
@@ -93,6 +147,8 @@ async def list_events(
     limit: int = 200,
     event: str | None = None,
     flow_id: str | None = None,
+    trace_id: str | None = None,
+    interaction_id: str | None = None,
 ) -> list[ProductEvent]:
     clauses = ["user_id=?"]
     params: list[Any] = [user_id]
@@ -102,6 +158,12 @@ async def list_events(
     if flow_id:
         clauses.append("flow_id=?")
         params.append(flow_id)
+    if trace_id:
+        clauses.append("trace_id=?")
+        params.append(trace_id)
+    if interaction_id:
+        clauses.append("interaction_id=?")
+        params.append(interaction_id)
     params.append(max(1, min(limit, 2000)))
     rows = await db.fetch_all(
         f"""
@@ -116,7 +178,12 @@ async def list_events(
 
 
 async def replay_summary(db: Any, user_id: int, *, limit: int = 100) -> str:
-    """Return a compact human-readable timeline for debugging."""
+    """Return a compact human-readable timeline for debugging.
+
+    Kept for backward compatibility; the structured replacement is
+    ``noam_coach.observability.trace_reader`` (machine-readable grouping)
+    and the batch-O9 timeline renderer.
+    """
     events = await list_events(db, user_id, limit=limit)
     if not events:
         return "לא נמצאו אירועים."

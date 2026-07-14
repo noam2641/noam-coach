@@ -346,6 +346,14 @@ CREATE TABLE IF NOT EXISTS product_events(
     before_state TEXT,
     after_state TEXT,
     created_at TEXT NOT NULL,
+    event_version INTEGER NOT NULL DEFAULT 1,
+    trace_id TEXT,
+    interaction_id TEXT,
+    span_id TEXT,
+    parent_span_id TEXT,
+    surface TEXT,
+    status TEXT,
+    outcome TEXT,
     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
@@ -354,6 +362,12 @@ ON product_events(user_id, id DESC);
 
 CREATE INDEX IF NOT EXISTS idx_product_events_flow
 ON product_events(user_id, flow_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_product_events_trace
+ON product_events(user_id, trace_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_product_events_interaction
+ON product_events(user_id, interaction_id, id);
 
 CREATE TABLE IF NOT EXISTS plan_versions(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -584,6 +598,7 @@ SCHEMA_MIGRATIONS: tuple[tuple[int, str], ...] = (
     (10, "clean_polluted_gap_values"),
     (11, "meal_status_column"),
     (12, "daily_flags_revision"),
+    (13, "observability_correlation"),
 )
 
 FK_MIGRATION_TABLES: tuple[str, ...] = (
@@ -1263,6 +1278,43 @@ async def _migration_daily_flags_revision(db: Database) -> None:
         await _record_migration(connection, 12, "daily_flags_revision")
 
 
+async def _migration_observability_correlation(db: Database) -> None:
+    """Migration 13 (Observability O1): evolve product_events into the
+    canonical interaction-trace stream. Adds correlation columns
+    (trace_id / interaction_id / span_id / parent_span_id), an envelope
+    version, and surface/status/outcome semantics.
+
+    Backward compatible by construction: pure ADD COLUMN with NULL (or
+    versioned DEFAULT) semantics — historical rows remain readable and are
+    explicitly identifiable as legacy/uncorrelated by their NULL trace_id.
+    """
+    column_ddl: tuple[tuple[str, str], ...] = (
+        ("event_version", "ALTER TABLE product_events ADD COLUMN event_version INTEGER NOT NULL DEFAULT 1"),
+        ("trace_id", "ALTER TABLE product_events ADD COLUMN trace_id TEXT"),
+        ("interaction_id", "ALTER TABLE product_events ADD COLUMN interaction_id TEXT"),
+        ("span_id", "ALTER TABLE product_events ADD COLUMN span_id TEXT"),
+        ("parent_span_id", "ALTER TABLE product_events ADD COLUMN parent_span_id TEXT"),
+        ("surface", "ALTER TABLE product_events ADD COLUMN surface TEXT"),
+        ("status", "ALTER TABLE product_events ADD COLUMN status TEXT"),
+        ("outcome", "ALTER TABLE product_events ADD COLUMN outcome TEXT"),
+    )
+    async with db.transaction() as connection:
+        cursor = await connection.execute("PRAGMA table_info(product_events)")
+        present = {row["name"] for row in await cursor.fetchall()}
+        for column, ddl in column_ddl:
+            if column not in present:
+                await connection.execute(ddl)
+        await connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_product_events_trace "
+            "ON product_events(user_id, trace_id, id)"
+        )
+        await connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_product_events_interaction "
+            "ON product_events(user_id, interaction_id, id)"
+        )
+        await _record_migration(connection, 13, "observability_correlation")
+
+
 async def run_migrations(
     db: Database,
     *,
@@ -1305,6 +1357,8 @@ async def run_migrations(
             await _migration_meal_status_column(db)
         elif version == 12:
             await _migration_daily_flags_revision(db)
+        elif version == 13:
+            await _migration_observability_correlation(db)
         else:
             raise RuntimeError(f"Unknown schema migration {version}")
         LOGGER.info("Applied schema migration %s: %s", version, name)

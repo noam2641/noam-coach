@@ -119,11 +119,11 @@ async def test_database_initialization_is_idempotent(tmp_path: Path) -> None:
     await db.init()
     await db.init()
     rows = await db.fetch_all("SELECT version FROM schema_migrations ORDER BY version")
-    # Migration 12 (daily_flags_revision, FIX 57/22: compare-and-swap support
-    # for the daily_flags JSON document) was added most recently; bump the
-    # expected range whenever a new schema migration is registered in
-    # db.SCHEMA_MIGRATIONS.
-    assert [row["version"] for row in rows] == list(range(1, 13))
+    # Migration 13 (observability_correlation, Observability O1: trace/
+    # interaction/span correlation columns on product_events) was added most
+    # recently; bump the expected range whenever a new schema migration is
+    # registered in db.SCHEMA_MIGRATIONS.
+    assert [row["version"] for row in rows] == list(range(1, 14))
 
 
 @pytest.mark.asyncio
