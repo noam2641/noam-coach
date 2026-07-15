@@ -228,6 +228,16 @@ def build_telegram_app() -> Application:
     from noam_coach.observability.state_trace import install_state_trace
 
     install_state_trace()
+    # B2 (ARCH-04/05): strict callback grammar — ordinary payload segments
+    # can no longer be misread as flow/version identity — and the
+    # entity-addressed confirmation gate for confirm:* callbacks.
+    from noam_coach.services.callback_grammar import (
+        install_callback_grammar,
+        install_confirmation_gate,
+    )
+
+    install_callback_grammar()
+    install_confirmation_gate()
     for command_name, command_handler in (
         ("start", command_start),
         ("import", command_import),
