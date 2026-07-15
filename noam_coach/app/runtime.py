@@ -252,6 +252,13 @@ def build_telegram_app() -> Application:
     from noam_coach.services.flow_resume import install_restart_resume
 
     install_restart_resume()
+    # B7 (ARCH-01 phase 1): canonical flow convergence — goal-wizard
+    # scratchpad liveness derives from the active_flow lifecycle (expiry
+    # cleanup, orphan-answer refusal) and Home suspends meaningful wizard
+    # work instead of destroying it.
+    from noam_coach.services.flow_convergence import install_flow_convergence
+
+    install_flow_convergence()
     for command_name, command_handler in (
         ("start", command_start),
         ("import", command_import),
