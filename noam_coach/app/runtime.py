@@ -262,6 +262,13 @@ def build_telegram_app() -> Application:
     )
 
     install_flow_convergence()
+    # B9 (ARCH-08/16): AssistantTurnContext — free-text turns build a bounded
+    # context, deterministic references (כן/השני/תשמור את זה/תחזור) dispatch
+    # through the gated canonical handlers, unresolved candidates go to the
+    # classifier as structured context.
+    from noam_coach.services.turn_context import install_turn_context
+
+    install_turn_context()
     for command_name, command_handler in (
         ("start", command_start),
         ("import", command_import),

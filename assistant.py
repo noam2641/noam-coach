@@ -13,10 +13,20 @@ unknown input falls back to a friendly help reply (never silence).
 
 from __future__ import annotations
 
+import json
 import re
+from contextvars import ContextVar
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
+
+# B9/ARCH-16: bounded unresolved-reference candidates for the CURRENT turn,
+# set by the turn-context pipeline (noam_coach.services.turn_context) before
+# delegating an unresolved turn to classification. The classifier includes
+# them as structured context instead of guessing references blind.
+REFERENCE_CANDIDATES: ContextVar[dict[str, Any] | None] = ContextVar(
+    "REFERENCE_CANDIDATES", default=None
+)
 
 # All actions the assistant can route to. Each maps to an existing builder.
 Action = Literal[
@@ -280,6 +290,21 @@ def keyword_fallback(text: str) -> Intent:
     return Intent(action="smalltalk_or_help", confidence=0.3)
 
 
+def _reference_candidates_block() -> str:
+    """Bounded turn-context candidates (identities only) for the prompt."""
+    candidates = REFERENCE_CANDIDATES.get()
+    if not candidates:
+        return ""
+    try:
+        payload = json.dumps(candidates, ensure_ascii=False)[:800]
+    except (TypeError, ValueError):
+        return ""
+    return (
+        "\nמצב שיחה (לפענוח רפרנסים כמו 'כן', 'השני', 'תשמור את זה'): "
+        + payload
+    )
+
+
 async def classify_intent(
     client: Any | None,
     model: str,
@@ -306,7 +331,8 @@ async def classify_intent(
                 {
                     "role": "user",
                     "content": (
-                        f"הקשר על המשתמש: {profile_summary or 'אין'}\n\nהודעת המשתמש: {text}"
+                        f"הקשר על המשתמש: {profile_summary or 'אין'}"
+                        f"{_reference_candidates_block()}\n\nהודעת המשתמש: {text}"
                     ),
                 },
             ],
