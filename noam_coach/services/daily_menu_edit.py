@@ -194,8 +194,11 @@ async def _remember_request(db: Any, user_id: int, intent: DailyMenuEditIntent) 
     ``daily_menu_last_edit_request`` and must never rewrite (and thereby
     race) the rest of the day's flags document."""
     from noam_coach.services.daily_flags_cas import patch_daily_flags
+    from noam_coach.services.daily_state import coaching_day_key
 
-    day = datetime.now(TZ).date().isoformat()
+    # B4/ARCH-02: menu-edit memory is nutrition day state → coaching day
+    # (one instant drives both the key and the saved_at stamp).
+    day = await coaching_day_key(db, user_id, datetime.now(TZ))
     request = {
         "slot": intent.slot,
         "instruction": intent.instruction,
