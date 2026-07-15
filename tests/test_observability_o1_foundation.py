@@ -87,8 +87,19 @@ CREATE TABLE product_events(
 @pytest.mark.asyncio
 async def test_migration_13_upgrades_legacy_db_and_keeps_old_rows_readable(tmp_path: Path) -> None:
     """A real pre-O1 database (old product_events shape, migrations 1-12
-    recorded) gains the correlation columns via migration 13, its historical
-    row stays readable, and it is explicitly identifiable as legacy."""
+    recorded) must upgrade through the REAL startup path ``Database.init()``
+    — not by calling run_migrations() directly.
+
+    Regression (production startup failure): the base SCHEMA briefly
+    contained CREATE INDEX statements on migration-13 columns
+    (idx_product_events_trace/interaction). ``init()`` runs
+    ``executescript(SCHEMA)`` BEFORE ``run_migrations()``, and on an
+    existing database ``CREATE TABLE IF NOT EXISTS`` keeps the old table
+    shape — so startup aborted with "no such column: trace_id" before the
+    migration could ever add the column. Base-SCHEMA indexes must never
+    reference migration-added columns; the correlation indexes belong to
+    migration 13.
+    """
     path = tmp_path / "legacy.db"
     async with aiosqlite.connect(path) as conn:
         await conn.executescript(_LEGACY_PRODUCT_EVENTS_DDL)
@@ -109,12 +120,20 @@ async def test_migration_13_upgrades_legacy_db_and_keeps_old_rows_readable(tmp_p
         await conn.commit()
 
     database = Database(str(path))
-    await db_module.run_migrations(database, backup_existing=False)
+    # THE regression assertion: real startup on the legacy file succeeds.
+    await database.init()
 
     rows = await database.fetch_all("PRAGMA table_info(product_events)")
     columns = {row["name"] for row in rows}
     assert {"trace_id", "interaction_id", "span_id", "parent_span_id",
             "event_version", "surface", "status", "outcome"} <= columns
+    index_rows = await database.fetch_all(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='product_events'"
+    )
+    index_names = {row["name"] for row in index_rows}
+    assert {"idx_product_events_trace", "idx_product_events_interaction"} <= index_names
+    # Startup must be idempotent on the upgraded file too.
+    await database.init()
 
     events = await event_log.list_events(database, 1)
     assert len(events) == 1
