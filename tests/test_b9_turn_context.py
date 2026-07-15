@@ -376,6 +376,7 @@ async def test_context_built_is_bounded(db: Database) -> None:
     assert set(sections) == {
         "active_flow", "suspended_flow", "pending_confirmation",
         "recommendation_options", "selected_option", "resumable_stores",
+        "coaching_memory",  # B10/ARCH-12
     }
     for option in sections["recommendation_options"]:
         assert set(option) == {"number", "title", "fingerprint"}

@@ -299,12 +299,29 @@ async def learned_foods_prompt_block(
 ) -> str:
     if not user_id:
         return ""
+    # B10/ARCH-12: decision-grade coaching memory first — confirmed food
+    # identities and explicit terminology aliases carry a stronger contract
+    # than behavioral history (which stays calibration-only below).
+    memory_block = ""
+    try:
+        from noam_coach.services.coaching_memory import food_identity_prompt_lines
+
+        memory_lines = await food_identity_prompt_lines(db, user_id)
+        if memory_lines:
+            memory_block = (
+                "\n\nUser coaching memory (portions/terms the user established "
+                "about their own foods; confirmed entries are decision-grade):\n"
+                + "\n".join(memory_lines)
+            )
+    except Exception:  # noqa: BLE001 — memory must never break analysis
+        memory_block = ""
     foods = await learned_foods_from_meals(db, user_id, limit=limit, min_count=min_count)
     if not foods:
-        return ""
+        return memory_block
     lines = "\n".join(f"- {food.prompt_line()}" for food in foods)
     return (
-        "\n\nUser-learned foods/products from approved meal history. "
+        memory_block
+        + "\n\nUser-learned foods/products from approved meal history. "
         "Use this as calibration and recognition context when visually/textually plausible; "
         "do not force these foods if the photo/text clearly shows something else:\n"
         f"{lines}"

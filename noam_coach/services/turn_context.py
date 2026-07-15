@@ -49,6 +49,8 @@ class AssistantTurnContext:
     selected_option: int | None = None
     # resumable continuation stores present for this user
     resumable_stores: list[str] = field(default_factory=list)
+    # decision-grade coaching memory (B10/ARCH-12 bounded snapshot)
+    coaching_memory: dict[str, Any] = field(default_factory=dict)
 
     def bounded(self) -> dict[str, Any]:
         """The trace/prompt-safe projection (identities, never full payloads)."""
@@ -80,6 +82,7 @@ class AssistantTurnContext:
             ],
             "selected_option": self.selected_option,
             "resumable_stores": list(self.resumable_stores),
+            "coaching_memory": self.coaching_memory,
         }
 
 
@@ -164,6 +167,10 @@ async def build_turn_context(db: Any, user_id: int, text: str) -> AssistantTurnC
     )
     ctx.resumable_stores = [str(row["flow"]) for row in rows]
 
+    from noam_coach.services.coaching_memory import coaching_memory_snapshot
+
+    ctx.coaching_memory = await coaching_memory_snapshot(db, user_id)
+
     from noam_coach.observability import taxonomy
     from noam_coach.observability.emit import emit_event
 
@@ -199,6 +206,12 @@ _ORDINALS = {
 }
 
 _SAVE_PATTERNS = ("תשמור את זה", "שמור את זה", "תשמור לי את זה", "זה מתאים לי, תשמור")
+
+# B10: the explicit food-identity confirmation phrase offered after a
+# repeated-correction proposal ("קבע קוטג' 250 גרם").
+_CONFIRM_IDENTITY_RE = re.compile(
+    r"^(?:קבע|תקבע)\s+(?P<food>.+?)\s+(?P<grams>\d+(?:\.\d+)?)\s*(?:גרם|גר)'?$"
+)
 _RETURN_PATTERNS = ("תחזור", "חזור למה שהיינו", "תחזיר אותי", "נמשיך מאיפה שהיינו")
 
 
@@ -252,6 +265,14 @@ def resolve_reference(ctx: AssistantTurnContext) -> ResolvedReference | None:
                 entity_id=str(option.get("fingerprint") or option.get("title")),
                 dispatch=f"nextmeal:choose:{ordinal}",
             )
+
+    identity_match = _CONFIRM_IDENTITY_RE.match(text)
+    if identity_match:
+        return ResolvedReference(
+            kind="confirm_food_identity", entity="coaching_memory",
+            entity_id=identity_match.group("food").strip(),
+            dispatch="memory_confirm:" + identity_match.group("grams"),
+        )
 
     if ctx.suspended_flow and any(pattern in text for pattern in _RETURN_PATTERNS):
         return ResolvedReference(
@@ -315,6 +336,22 @@ async def dispatch_resolved_reference(
         },
     )
     message = update.effective_message
+
+    if ref.kind == "confirm_food_identity":
+        from noam_coach.services.coaching_memory import confirm_food_identity
+
+        grams = float(ref.dispatch.split(":", 1)[1])
+        confirmed = await confirm_food_identity(
+            db, user_id, ref.entity_id, grams=grams,
+            provenance="explicit_confirmation",
+        )
+        if confirmed is None:
+            return False
+        await message.reply_text(
+            f"נרשם ✅ מעכשיו {ref.entity_id} אצלך זה {grams:g} גרם כברירת מחדל. "
+            "אפשר לשנות בכל רגע באותה צורה."
+        )
+        return True
 
     if ref.kind == "return_to_suspended":
         import conversation

@@ -269,6 +269,12 @@ def build_telegram_app() -> Application:
     from noam_coach.services.turn_context import install_turn_context
 
     install_turn_context()
+    # B10 (ARCH-12): coaching-memory capture — explicit gram corrections on a
+    # meal instance accumulate toward food-identity proposals; decision-grade
+    # only after the explicit "קבע ..." confirmation (turn_context resolves it).
+    from noam_coach.services.coaching_memory import install_coaching_memory_capture
+
+    install_coaching_memory_capture()
     for command_name, command_handler in (
         ("start", command_start),
         ("import", command_import),
