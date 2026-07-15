@@ -17,7 +17,7 @@ import planning
 import user_model
 from config import SETTINGS, TZ
 from helpers import utc_now
-from noam_coach.services.daily_state import local_day_bounds_utc
+from noam_coach.services.daily_state import coaching_day_bounds_utc, coaching_day_key
 from noam_coach.services.dietary_restrictions import (
     load_restrictions_from_facts,
 )
@@ -209,7 +209,7 @@ async def _routine_profile(db: Any, user_id: int) -> dict[str, Any]:
 
 
 async def _reported_meals(db: Any, user_id: int, local_now: datetime | None = None) -> list[MealSnapshot]:
-    start_utc, end_utc = local_day_bounds_utc(local_now)
+    start_utc, end_utc = await coaching_day_bounds_utc(db, user_id, local_now)
     rows = await db.fetch_all(
         """
         SELECT id, name, calories, protein, carbs, fat, confidence, eaten_at, COALESCE(status, 'consumed') AS status
@@ -374,7 +374,7 @@ async def build_nutrition_context(
         or datetime.now(TZ)
     )
     local_now = resolved_now.astimezone(TZ)
-    local_day = local_now.date().isoformat()
+    local_day = await coaching_day_key(db, user_id, local_now)
     flags = dict(getattr(daily_ctx, "flags", None) or await _daily_flags(db, user_id, local_day))
     profile = dict(getattr(daily_ctx, "profile", None) or await _routine_profile(db, user_id))
     meals = await _reported_meals(db, user_id, local_now)
@@ -388,7 +388,7 @@ async def build_nutrition_context(
     today_plan = _today_plan(nutrition_plan, local_now)
     planned_meals = [*_planned_meals(today_plan), *_planned_next_meals(flags)]
     expected_meals = max(1, len(planned_meals) or len(((profile.get("eating") or {}).get("typical_meal_hours") or [])) or 3)
-    start_utc, end_utc = local_day_bounds_utc(local_now)
+    start_utc, end_utc = await coaching_day_bounds_utc(db, user_id, local_now)
     quality = await data_quality.assess_day(db, user_id, start_utc, end_utc, expected_meals=expected_meals)
     workout_context = await build_workout_nutrition_context(
         db,

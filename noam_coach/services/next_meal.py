@@ -324,7 +324,8 @@ async def save_next_meal_workout_status(
 ) -> None:
     """Persist today's explicit workout clarification from a Telegram button."""
     local_now = (now or datetime.now(TZ)).astimezone(TZ)
-    local_day = local_now.date().isoformat()
+    # B3/ARCH-02: nutrition day = canonical coaching day.
+    local_day = await daily_state.coaching_day_key(db, user_id, local_now)
     flags = await _daily_flags(db, user_id, local_day)
     flags["next_meal_workout_status"] = status
     # REC-ARCH-01 pass 3 fix: this used to always write the REAL wall-clock
@@ -572,7 +573,8 @@ async def build_workout_nutrition_context(
     this function still resolves it itself in that case, unchanged.
     """
     local_now = (now or datetime.now(TZ)).astimezone(TZ)
-    local_day = local_now.date().isoformat()
+    # B3/ARCH-02: nutrition day = canonical coaching day.
+    local_day = await daily_state.coaching_day_key(db, user_id, local_now)
     flags = await _daily_flags(db, user_id, local_day)
     nutrition, _goal = await _nutrition_totals(db, user_id, now=local_now)
     workout = await _workout_state(db, user_id, local_now, flags, precomputed=workout_state)
@@ -1612,11 +1614,15 @@ async def regenerate_with_size(
     now: datetime | None = None,
 ) -> NextMealRecommendation:
     """"קטן יותר"/"גדול יותר": rebuild with a size hint, respecting the budget cap."""
-    flags = await _daily_flags(db, user_id, (now or datetime.now(TZ)).astimezone(TZ).date().isoformat())
+    # B3/ARCH-02: nutrition day = canonical coaching day (one key for the
+    # read and the write — a midnight crossing between them must not split
+    # the state across two rows).
+    local_day = await daily_state.coaching_day_key(db, user_id, now)
+    flags = await _daily_flags(db, user_id, local_day)
     # A "bigger" request may justify an explicit overage; "smaller" never does.
     allow_overage = not smaller and bool(flags.get("next_meal_size_pref") == "bigger")
     flags["next_meal_size_pref"] = "smaller" if smaller else "bigger"
-    await _save_daily_flags(db, user_id, (now or datetime.now(TZ)).astimezone(TZ).date().isoformat(), flags)
+    await _save_daily_flags(db, user_id, local_day, flags)
     return await generate_next_meal_recommendation(db, user_id, now=now, allow_overage=allow_overage)
 
 
@@ -2626,7 +2632,8 @@ async def save_chosen_meal(
     """
     current = (now or datetime.now(TZ)).astimezone(TZ)
     fingerprint = option_fingerprint(option)
-    local_day = current.date().isoformat()
+    # B3/ARCH-02: nutrition day = canonical coaching day.
+    local_day = await daily_state.coaching_day_key(db, user_id, current)
     flags = await _daily_flags(db, user_id, local_day)
     saved = flags.get("next_meal_saved") or {}
     last_at = _parse_dt(saved.get(fingerprint)) if isinstance(saved, dict) else None
@@ -2695,7 +2702,8 @@ async def plan_chosen_meal(
     """
     current = (now or datetime.now(TZ)).astimezone(TZ)
     fingerprint = option_fingerprint(option)
-    local_day = current.date().isoformat()
+    # B3/ARCH-02: nutrition day = canonical coaching day.
+    local_day = await daily_state.coaching_day_key(db, user_id, current)
     flags = await _daily_flags(db, user_id, local_day)
     planned = flags.get("next_meal_planned")
     if not isinstance(planned, list):
@@ -2726,7 +2734,8 @@ async def invalidate_daily_nutrition_cache(
     The budget is always recomputed live from the active goal, but stale recent
     titles / size preference could bias the next recommendation, so clear them.
     """
-    local_day = (now or datetime.now(TZ)).astimezone(TZ).date().isoformat()
+    # B3/ARCH-02: nutrition day = canonical coaching day.
+    local_day = await daily_state.coaching_day_key(db, user_id, now)
     flags = await _daily_flags(db, user_id, local_day)
     for key in ("next_meal_recent_titles", "next_meal_recent_titles_at", "next_meal_size_pref"):
         flags.pop(key, None)

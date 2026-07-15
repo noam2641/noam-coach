@@ -98,8 +98,12 @@ async def _save_daily_flags(db: Any, user_id: int, local_day: str, flags: dict[s
     await commit_flags_update(db, user_id, local_day, flags, owner="daily_menu")
 
 
-def _local_day(now: datetime | None = None) -> str:
-    return (now or datetime.now(TZ)).astimezone(TZ).date().isoformat()
+async def _nutrition_day(db: Any, user_id: int, now: datetime | None = None) -> str:
+    """B3/ARCH-02: the daily menu is nutrition state — its day identity is
+    the canonical coaching day (calendar fallback without a bedtime fact)."""
+    from noam_coach.services.daily_state import coaching_day_key
+
+    return await coaching_day_key(db, user_id, now)
 
 
 async def remember_daily_menu_message(
@@ -117,7 +121,7 @@ async def remember_daily_menu_message(
     """
     if message_id is None:
         return
-    local_day = _local_day(now)
+    local_day = await _nutrition_day(db, user_id, now)
     flags = await _daily_flags(db, user_id, local_day)
     flags[DAILY_MENU_MESSAGE_KEY] = {
         "chat_id": chat_id,
@@ -134,7 +138,7 @@ async def get_daily_menu_message(
     *,
     now: datetime | None = None,
 ) -> dict[str, Any] | None:
-    flags = await _daily_flags(db, user_id, _local_day(now))
+    flags = await _daily_flags(db, user_id, await _nutrition_day(db, user_id, now))
     value = flags.get(DAILY_MENU_MESSAGE_KEY)
     return value if isinstance(value, dict) else None
 
@@ -159,7 +163,7 @@ async def remember_active_daily_menu(
     text-only reader keeps working unmodified). ``meals`` is a list of
     ``MenuMealRecord`` or already-plain dicts with the same keys.
     """
-    local_day = _local_day(now)
+    local_day = await _nutrition_day(db, user_id, now)
     flags = await _daily_flags(db, user_id, local_day)
     previous = flags.get(ACTIVE_DAILY_MENU_KEY)
     previous_revision = (
@@ -200,7 +204,7 @@ async def get_active_daily_menu(
     no ``schema_version``/``meals`` keys and is returned exactly as before, so
     old callers and old persisted rows never crash new readers.
     """
-    flags = await _daily_flags(db, user_id, _local_day(now))
+    flags = await _daily_flags(db, user_id, await _nutrition_day(db, user_id, now))
     value = flags.get(ACTIVE_DAILY_MENU_KEY)
     return value if isinstance(value, dict) else None
 
@@ -220,7 +224,7 @@ async def mark_daily_menu_stale(
     a menu built from pre-change state. Returns False when there was no
     active menu to invalidate.
     """
-    local_day = _local_day(now)
+    local_day = await _nutrition_day(db, user_id, now)
     flags = await _daily_flags(db, user_id, local_day)
     menu_state = flags.get(ACTIVE_DAILY_MENU_KEY)
     if not isinstance(menu_state, dict):

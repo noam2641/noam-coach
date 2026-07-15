@@ -447,7 +447,9 @@ async def deliver_proactive_message(
     nutrition_sensitive = key in NUTRITION_DAY_QUALITY_KEYS
     start_utc = end_utc = None
     if nutrition_sensitive:
-        start_utc, end_utc = daily_state.local_day_bounds_utc()
+        # B3/ARCH-02: proactive NUTRITION-quality gating reads the coaching
+        # day's window (send-time scheduling itself stays wall-clock).
+        start_utc, end_utc = await daily_state.coaching_day_bounds_utc(DB, user_id)
     allowed, reason = await data_quality.can_send_proactive(
         DB,
         user_id,

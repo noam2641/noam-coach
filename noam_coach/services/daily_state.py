@@ -1,4 +1,23 @@
-"""Single source of truth for today's consumed and completed state."""
+"""Single source of truth for today's consumed and completed state.
+
+DAY-SEMANTICS POLICY (B3 / ARCH-02 — resolved product decision):
+
+- NUTRITION state (meals windows, daily flags day key, daily menu day,
+  next-meal context/budget, nutrition summaries) uses the CANONICAL
+  COACHING DAY (``noam_coach.services.coaching_day``): sleep/wake-anchored —
+  a meal at 00:30 with a 23:00 bedtime still belongs to the evening's day.
+  This module owns the accessors (:func:`coaching_day_key` /
+  :func:`coaching_day_bounds_utc`); other nutrition modules must derive day
+  identity through them, never independently.
+- WORKOUT completion semantics and the weekly split selector remain LOCAL
+  CALENDAR DAY by explicit product decision (a weekly training schedule is
+  calendar-anchored). ``workout_completed_today`` /
+  ``latest_closed_session_today`` below intentionally keep
+  ``local_day_bounds_utc``.
+- With no confirmed ``sleep_schedule`` fact the coaching day falls back to
+  the calendar day, so users (and tests) without a bedtime see identical
+  behavior on both models.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +28,8 @@ from config import TZ
 
 
 def local_day_bounds_utc(local_now: datetime | None = None) -> tuple[str, str]:
-    """Return UTC bounds for the user's current local day."""
+    """UTC bounds for the LOCAL CALENDAR day (workout semantics; nutrition
+    uses :func:`coaching_day_bounds_utc` instead — see module docstring)."""
     current = (local_now or datetime.now(TZ)).astimezone(TZ)
     start_local = current.replace(hour=0, minute=0, second=0, microsecond=0)
     end_local = start_local + timedelta(days=1)
@@ -19,13 +39,36 @@ def local_day_bounds_utc(local_now: datetime | None = None) -> tuple[str, str]:
     )
 
 
+async def coaching_day_for(db: Any, user_id: int, local_now: datetime | None = None):
+    """The canonical coaching day (FIX 41 service) for one instant."""
+    from noam_coach.services.coaching_day import resolve_coaching_day
+
+    return await resolve_coaching_day(db, user_id, local_now=local_now)
+
+
+async def coaching_day_key(
+    db: Any, user_id: int, local_now: datetime | None = None
+) -> str:
+    """Canonical nutrition day key (YYYY-MM-DD of the coaching day)."""
+    return (await coaching_day_for(db, user_id, local_now)).day_key
+
+
+async def coaching_day_bounds_utc(
+    db: Any, user_id: int, local_now: datetime | None = None
+) -> tuple[str, str]:
+    """Canonical UTC bounds of the nutrition (coaching) day."""
+    day = await coaching_day_for(db, user_id, local_now)
+    return day.start_utc, day.end_utc
+
+
 async def consumed_totals(
     db: Any,
     user_id: int,
     *,
     now: datetime | None = None,
 ) -> tuple[float, float]:
-    start, end = local_day_bounds_utc(now)
+    # B3/ARCH-02: nutrition day = canonical coaching day.
+    start, end = await coaching_day_bounds_utc(db, user_id, now)
     # Only consumed meals count toward daily totals (TASK-04): a planned or
     # recommended row must never reduce the calorie/protein balance.
     row = await db.fetch_one(
@@ -48,7 +91,8 @@ async def consumed_meals(
     now: datetime | None = None,
     descending: bool = False,
 ) -> list[dict[str, Any]]:
-    start, end = local_day_bounds_utc(now)
+    # B3/ARCH-02: nutrition day = canonical coaching day.
+    start, end = await coaching_day_bounds_utc(db, user_id, now)
     direction = "DESC" if descending else "ASC"
     return await db.fetch_all(
         f"""
@@ -68,7 +112,8 @@ async def consumed_meal_items(
     *,
     now: datetime | None = None,
 ) -> list[dict[str, Any]]:
-    start, end = local_day_bounds_utc(now)
+    # B3/ARCH-02: nutrition day = canonical coaching day.
+    start, end = await coaching_day_bounds_utc(db, user_id, now)
     return await db.fetch_all(
         """
         SELECT mi.name, mi.grams, mi.calories, mi.protein
@@ -88,6 +133,8 @@ async def latest_closed_session_today(
     now: datetime | None = None,
     include_cancelled: bool = True,
 ) -> dict[str, Any] | None:
+    # WORKOUT semantics: intentionally LOCAL CALENDAR DAY (product decision;
+    # see module docstring) — do NOT migrate to the coaching day.
     start, end = local_day_bounds_utc(now)
     statuses = ("completed", "partial", "cancelled") if include_cancelled else ("completed", "partial")
     placeholders = ",".join("?" for _ in statuses)

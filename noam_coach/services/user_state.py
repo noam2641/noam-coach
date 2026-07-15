@@ -617,8 +617,10 @@ async def resolve_workout_state(
     only matters for this already-sound tie; it is not standing in for real
     chronology.
     """
-    local_day = now.date().isoformat()
-    flags = daily_flags if daily_flags is not None else await _daily_flags(db, user_id, local_day)
+    # B3/ARCH-02: the explicit clarification flag is coaching-day state.
+    flags = daily_flags if daily_flags is not None else await _daily_flags(
+        db, user_id, await daily_state.coaching_day_key(db, user_id, now)
+    )
     explicit = str(flags.get("next_meal_workout_status") or "").strip()
 
     candidates: list[tuple[str, WorkoutState]] = []
@@ -721,7 +723,10 @@ async def build_shared_state(
     never observe two different "current times" mid-flow.
     """
     local_now = (now or datetime.now(TZ)).astimezone(TZ)
-    local_day = local_now.date().isoformat()
+    # B3/ARCH-02: day-scoped nutrition/clarification flags live on the
+    # canonical coaching day (workout EVIDENCE stays calendar — see
+    # daily_state module docstring).
+    local_day = await daily_state.coaching_day_key(db, user_id, local_now)
     flags = await _daily_flags(db, user_id, local_day)
     workout = await resolve_workout_state(db, user_id, local_now, daily_flags=flags)
     consumed = await _consumed_meals_today(db, user_id, local_now)

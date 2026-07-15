@@ -291,13 +291,23 @@ def local_day_str() -> str:
     return datetime.now(TZ).date().isoformat()
 
 
+async def _flags_day(user_id: int) -> str:
+    """B3/ARCH-02: day check-in flags are nutrition/day state — their day
+    identity is the canonical coaching day (calendar fallback without a
+    confirmed bedtime fact). ``local_day_str`` remains calendar-only for
+    Health-import date attribution."""
+    from noam_coach.services.daily_state import coaching_day_key
+
+    return await coaching_day_key(_current_db(), user_id)
+
+
 async def get_daily_flags(user_id: int, day: str | None = None) -> dict[str, Any]:
     """Read the day's flags, remembering (task-locally) what was read so a
     following ``set_daily_flags`` in the same handler patches only the keys
     it actually changed (ARCH-03 canonical write contract)."""
     from noam_coach.services.daily_flags_cas import read_flags_for_update
 
-    day = day or local_day_str()
+    day = day or await _flags_day(user_id)
     return await read_flags_for_update(_current_db(), user_id, day)
 
 
@@ -314,7 +324,7 @@ async def set_daily_flags(user_id: int, flags: dict[str, Any]) -> None:
     from noam_coach.services.daily_flags_cas import commit_flags_update
 
     await commit_flags_update(
-        _current_db(), user_id, local_day_str(), flags, owner="day_checkin"
+        _current_db(), user_id, await _flags_day(user_id), flags, owner="day_checkin"
     )
 
 

@@ -36,9 +36,10 @@ B1 makes this module the SINGLE write boundary. The canonical contract:
    Observability failure never alters the CAS outcome (safe emit boundary
    plus a local guard).
 
-Day-key semantics are intentionally untouched in B1: every caller keeps the
-exact day key it used before (calendar ``local_day_str``/``_local_day``).
-"which day is authoritative" is ARCH-02, not this module.
+Day-key policy (B3 / ARCH-02): callers derive the day key through
+``daily_state.coaching_day_key`` (canonical coaching day for nutrition/day
+state; calendar fallback when no confirmed bedtime exists). This module
+stays day-key agnostic — it patches whatever row key the caller addresses.
 """
 
 from __future__ import annotations

@@ -204,9 +204,11 @@ async def test_unknown_fields_survive_all_migrated_writer_families(
     )
 
     # 3) day_checkin family (health_service.get/set) — real production shape.
-    monkeypatch.setattr(
-        health_service, "local_day_str", lambda: DAY, raising=False,
-    )
+    # B3: the flags day comes from the coaching-day seam; pin it to DAY.
+    async def _fixed_day(_user_id: int) -> str:
+        return DAY
+
+    monkeypatch.setattr(health_service, "_flags_day", _fixed_day, raising=False)
     flags = await health_service.get_daily_flags(USER_ID, DAY)
     flags["fasting"] = True
     await health_service.set_daily_flags(USER_ID, flags)
@@ -376,7 +378,13 @@ async def test_cross_surface_journey_telegram_status_vs_health_flag(
     row, and the traces prove two different interactions converged there."""
     fixed_now = datetime(2026, 6, 28, 13, 0, tzinfo=TZ)
     day = fixed_now.date().isoformat()
-    monkeypatch.setattr(health_service, "local_day_str", lambda: day, raising=False)
+
+    # B3: the flags day comes from the coaching-day seam; pin it to the
+    # fixed instant's day for the health/job surface.
+    async def _fixed_day(_user_id: int) -> str:
+        return day
+
+    monkeypatch.setattr(health_service, "_flags_day", _fixed_day, raising=False)
 
     from noam_coach.services.next_meal import save_next_meal_workout_status
 
