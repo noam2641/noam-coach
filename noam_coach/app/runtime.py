@@ -246,6 +246,12 @@ def build_telegram_app() -> Application:
     )
 
     install_recommendation_identity_gate()
+    # B6 (ARCH-11): restart-safe resume — preserve live deferred-plan
+    # continuation rows across load_pending_state and offer to continue the
+    # interrupted flow on the first menu interaction after a restart.
+    from noam_coach.services.flow_resume import install_restart_resume
+
+    install_restart_resume()
     for command_name, command_handler in (
         ("start", command_start),
         ("import", command_import),
