@@ -23,13 +23,17 @@ def test_app_js_registers_window_focus_listener() -> None:
 
 
 def test_app_js_focus_refresh_calls_the_read_only_loaders() -> None:
-    """The refresh must re-run the actual data loaders, not just a stub."""
+    """The refresh must re-run the actual data loaders, not just a stub.
+
+    Observability O8: the loaders take a trigger argument so a focus refresh
+    is distinguishable from a user action in the semantic view telemetry —
+    the assertion accepts the call with its trigger."""
     js = (miniapp.STATIC_DIR / "app.js").read_text(encoding="utf-8")
     refresh_fn_start = js.index("function refreshOnRegainedFocus")
     refresh_fn_body = js[refresh_fn_start:refresh_fn_start + 400]
-    assert "loadDashboard()" in refresh_fn_body
-    assert "loadNextMeal()" in refresh_fn_body
-    assert "loadTodayMeals()" in refresh_fn_body
+    assert "loadDashboard('focus_refresh')" in refresh_fn_body
+    assert "loadNextMeal('focus_refresh')" in refresh_fn_body
+    assert "loadTodayMeals('focus_refresh')" in refresh_fn_body
 
 
 def test_app_js_focus_refresh_is_debounced() -> None:

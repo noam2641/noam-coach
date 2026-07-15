@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import secrets
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Body, Cookie, Depends, HTTPException, UploadFile
+from fastapi import APIRouter, Body, Cookie, Depends, Header, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 import coach_intelligence
@@ -61,12 +62,164 @@ async def mini_session_user(
 
 
 # ---------------------------------------------------------------------------
+# Observability O8 — client/server correlation + semantic view telemetry
+# ---------------------------------------------------------------------------
+
+_CLIENT_INTERACTION_RE = re.compile(r"^ci_[a-z0-9]{6,40}$")
+_CLIENT_RENDER_RE = re.compile(r"^rn_[a-z0-9]{6,40}$")
+
+# Only these semantic views/actions/events may be reported by the browser.
+_MINI_VIEWS = frozenset({
+    "dashboard", "operations", "next_meal", "today_meals",
+    "plan_candidates", "profile", "health_upload",
+})
+_MINI_ACTIONS = frozenset({
+    "next_meal_workout_status", "refresh_next_meal", "refresh_today_meals",
+    "generate_plans", "activate_plan", "build_unified_plan", "save_profile",
+    "health_file_selected", "health_import_submitted",
+})
+_MINI_TRIGGERS = frozenset({
+    "initial_load", "user_action", "focus_refresh",
+    "visibility_refresh", "post_mutation_refresh", "unknown",
+})
+_MAX_OBS_EVENTS_PER_BATCH = 20
+_MAX_OBS_EVENT_CHARS = 4000
+
+
+def _safe_client_interaction_id(raw: Any) -> str | None:
+    if isinstance(raw, str) and _CLIENT_INTERACTION_RE.match(raw):
+        return raw
+    return None
+
+
+def _client_trace_id(client_interaction_id: str) -> str:
+    """Deterministic trace id for one Mini App client action — the action
+    event, the API-side processing, and the resulting view render all derive
+    the same trace without server-side state (never clock matching)."""
+    return "tr_mini_" + client_interaction_id[3:]
+
+
+async def mini_obs_scope(
+    user_id: int = Depends(mini_session_user),
+    x_obs_client_interaction: str | None = Header(default=None),
+):
+    """Session dependency that additionally joins the server-side trace to
+    the client action that triggered this request (when the header carries a
+    valid client interaction id)."""
+    from noam_coach.observability.obs_context import interaction_scope
+
+    client_id = _safe_client_interaction_id(x_obs_client_interaction)
+    if client_id is None:
+        with interaction_scope(user_id=user_id):
+            yield user_id
+    else:
+        with interaction_scope(
+            trace_id=_client_trace_id(client_id),
+            interaction_id=client_id,
+            user_id=user_id,
+        ):
+            yield user_id
+
+
+@router.post("/mini/api/obs/events", include_in_schema=False)
+async def mini_obs_events(
+    payload: dict[str, Any] = Body(...),
+    user_id: int = Depends(mini_session_user),
+) -> JSONResponse:
+    """Allowlisted, bounded, authenticated semantic view/action reporting.
+
+    The browser may only report the two client event kinds, with allowlisted
+    view/action/trigger vocabulary and a hard per-event size bound; anything
+    else is rejected (counted, never persisted). Failures never break the
+    Mini App — the endpoint always answers 200 with accept/reject counts.
+    """
+    from noam_coach.observability import taxonomy
+    from noam_coach.observability.emit import emit_event
+
+    raw_events = payload.get("events")
+    if not isinstance(raw_events, list) or len(raw_events) > _MAX_OBS_EVENTS_PER_BATCH:
+        raise HTTPException(status_code=422, detail="invalid events batch")
+
+    accepted = 0
+    rejected = 0
+    for item in raw_events:
+        try:
+            if not isinstance(item, dict) or len(json.dumps(item, ensure_ascii=False)) > _MAX_OBS_EVENT_CHARS:
+                rejected += 1
+                continue
+            kind = item.get("event")
+            client_id = _safe_client_interaction_id(
+                item.get("client_interaction_id")
+                or item.get("caused_by_client_interaction_id")
+            )
+            trace_id = _client_trace_id(client_id) if client_id else None
+            render_id = item.get("render_id")
+            if not (isinstance(render_id, str) and _CLIENT_RENDER_RE.match(render_id)):
+                render_id = None
+            trigger = item.get("trigger")
+            if trigger not in _MINI_TRIGGERS:
+                trigger = "unknown"
+
+            if kind == "ui.view.rendered":
+                view = item.get("view")
+                if view not in _MINI_VIEWS:
+                    rejected += 1
+                    continue
+                await emit_event(
+                    DB, user_id, taxonomy.UI_VIEW_RENDERED,
+                    entity="mini_view", entity_id=view,
+                    source="mini_app", surface="mini_app", status="rendered",
+                    outcome=trigger,
+                    trace_id=trace_id, interaction_id=client_id,
+                    properties={
+                        "view": view,
+                        "render_id": render_id,
+                        "trigger": trigger,
+                        "caused_by_client_interaction_id": client_id,
+                        "client_ts": item.get("client_ts"),
+                    },
+                    content={"state": item.get("state")} if item.get("state") else None,
+                )
+                accepted += 1
+            elif kind == "ui.action.activated":
+                action = item.get("action")
+                source_view = item.get("source_view")
+                if action not in _MINI_ACTIONS or source_view not in _MINI_VIEWS:
+                    rejected += 1
+                    continue
+                source_render_id = item.get("source_render_id")
+                if not (isinstance(source_render_id, str) and _CLIENT_RENDER_RE.match(source_render_id)):
+                    source_render_id = None
+                await emit_event(
+                    DB, user_id, taxonomy.UI_ACTION_ACTIVATED,
+                    entity="mini_action", entity_id=action,
+                    source="mini_app", surface="mini_app", status="activated",
+                    outcome=action,
+                    trace_id=trace_id, interaction_id=client_id,
+                    properties={
+                        "action": action,
+                        "source_view": source_view,
+                        "source_render_id": source_render_id,
+                        "client_interaction_id": client_id,
+                        "client_ts": item.get("client_ts"),
+                    },
+                    content={"payload": item.get("payload")} if item.get("payload") else None,
+                )
+                accepted += 1
+            else:
+                rejected += 1
+        except Exception:  # noqa: BLE001 — telemetry must not break the app.
+            rejected += 1
+    return JSONResponse({"accepted": accepted, "rejected": rejected})
+
+
+# ---------------------------------------------------------------------------
 # Dashboard & Profile
 # ---------------------------------------------------------------------------
 
 
 @router.get("/mini/api/dashboard", include_in_schema=False)
-async def mini_dashboard(user_id: int = Depends(mini_session_user)) -> JSONResponse:
+async def mini_dashboard(user_id: int = Depends(mini_obs_scope)) -> JSONResponse:
     import coach_bot
 
     snapshot = await planning.profile_snapshot(DB, user_id)
@@ -163,7 +316,7 @@ async def _operational_snapshot(user_id: int) -> dict[str, Any]:
 
 
 @router.get("/mini/api/next-meal", include_in_schema=False)
-async def mini_next_meal(user_id: int = Depends(mini_session_user)) -> JSONResponse:
+async def mini_next_meal(user_id: int = Depends(mini_obs_scope)) -> JSONResponse:
     recommendation = await generate_next_meal_recommendation(DB, user_id)
     return JSONResponse(_next_meal_payload(recommendation))
 
@@ -171,7 +324,7 @@ async def mini_next_meal(user_id: int = Depends(mini_session_user)) -> JSONRespo
 @router.post("/mini/api/next-meal/workout-status", include_in_schema=False)
 async def mini_next_meal_workout_status(
     payload: dict[str, Any] = Body(default_factory=dict),
-    user_id: int = Depends(mini_session_user),
+    user_id: int = Depends(mini_obs_scope),
 ) -> JSONResponse:
     status = str(payload.get("status") or "").strip()
     if status not in {"later", "during", "completed", "cancelled"}:
@@ -218,7 +371,7 @@ def _next_meal_payload(recommendation: Any) -> dict[str, Any]:
 
 
 @router.get("/mini/api/profile", include_in_schema=False)
-async def mini_profile(user_id: int = Depends(mini_session_user)) -> JSONResponse:
+async def mini_profile(user_id: int = Depends(mini_obs_scope)) -> JSONResponse:
     snapshot = await planning.profile_snapshot(DB, user_id)
     public = await user_model.get_profile_view(DB, user_id)
     availability = await resolve_availability(DB, user_id)
@@ -252,7 +405,7 @@ async def mini_profile(user_id: int = Depends(mini_session_user)) -> JSONRespons
 @router.patch("/mini/api/profile", include_in_schema=False)
 async def mini_update_profile(
     payload: MiniProfileUpdate,
-    user_id: int = Depends(mini_session_user),
+    user_id: int = Depends(mini_obs_scope),
 ) -> JSONResponse:
     """Update only whitelisted user facts and keep plans versioned."""
     values = payload.model_dump(exclude_unset=True)
@@ -357,7 +510,7 @@ async def mini_update_profile(
 @router.get("/mini/api/plans/{plan_type}", include_in_schema=False)
 async def mini_list_plans(
     plan_type: str,
-    user_id: int = Depends(mini_session_user),
+    user_id: int = Depends(mini_obs_scope),
 ) -> JSONResponse:
     if plan_type not in {"nutrition", "workout", "unified"}:
         raise HTTPException(status_code=400, detail="Invalid plan type")
@@ -369,7 +522,7 @@ async def mini_list_plans(
 @router.post("/mini/api/plans/{plan_type}/generate", include_in_schema=False)
 async def mini_generate_plans(
     plan_type: str,
-    user_id: int = Depends(mini_session_user),
+    user_id: int = Depends(mini_obs_scope),
 ) -> JSONResponse:
     if plan_type not in {"nutrition", "workout"}:
         raise HTTPException(status_code=400, detail="Invalid plan type")
@@ -394,7 +547,7 @@ async def mini_generate_plans(
 @router.post("/mini/api/plans/{plan_id}/activate", include_in_schema=False)
 async def mini_activate_plan(
     plan_id: int,
-    user_id: int = Depends(mini_session_user),
+    user_id: int = Depends(mini_obs_scope),
 ) -> JSONResponse:
     try:
         selected = await planning.activate_plan(DB, user_id, plan_id)
@@ -419,7 +572,7 @@ async def mini_activate_plan(
 
 @router.post("/mini/api/plans/unified/build", include_in_schema=False)
 async def mini_build_unified_plan(
-    user_id: int = Depends(mini_session_user),
+    user_id: int = Depends(mini_obs_scope),
 ) -> JSONResponse:
     try:
         candidate = await planning.build_unified_week(DB, user_id)
@@ -434,7 +587,7 @@ async def mini_build_unified_plan(
 
 
 @router.get("/mini/api/meals/today", include_in_schema=False)
-async def mini_today_meals(user_id: int = Depends(mini_session_user)) -> JSONResponse:
+async def mini_today_meals(user_id: int = Depends(mini_obs_scope)) -> JSONResponse:
     start, end = today_bounds_utc()
     rows = await DB.fetch_all(
         "SELECT * FROM meals WHERE user_id=? AND eaten_at>=? AND eaten_at<? ORDER BY eaten_at",
