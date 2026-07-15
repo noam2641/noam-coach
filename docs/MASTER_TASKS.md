@@ -53,12 +53,10 @@ the 2026-07-11 final audit (not accepted on commit message alone).
 
 ## Open Backlog
 
-No open **product-code** backlog items. Every requirement discovered in the
-screenshot backlog, the 22-task master spec, the CHATGPT_PATCH reports, and the
-audit reports was verified against the current repository and is implemented
-and tested (see the table above and the 2026-07-11 audit). Items that older
-TODO/handoff documents still listed as open were checked and found already
-implemented.
+| # | Title | Context | Verified gap | Required behavior | Source | Suggested acceptance criteria |
+|---|-------|---------|--------------|-------------------|--------|-------------------------------|
+| 58 | Meal image identity correction and portion estimation | Production incident where a user rejected "טחינה" and confirmed "חציל במיונז", but the corrected draft still restored raw tahini and broadly re-estimated unrelated items. | Food identity corrections are not enforced as hard item-scoped constraints; ambiguous Israeli food overrides can canonicalize generic tahini to raw tahini; portion estimates may lack sufficient visual evidence. | Implement structured identity correction, evidence precedence, safer canonicalization, improved portion evidence, bone-in handling, and high-impact uncertainty gates while preserving FIX 1-57 behavior. | [`tasks/TASK_58_MEAL_IMAGE_IDENTITY_CORRECTION_AND_PORTION_ESTIMATION.md`](../tasks/TASK_58_MEAL_IMAGE_IDENTITY_CORRECTION_AND_PORTION_ESTIMATION.md) | Rejected identities cannot return; unrelated items remain unchanged; corrections survive lifecycle; generic tahini does not canonicalize to raw tahini; explicit raw tahini still matches; high-impact ambiguous items trigger targeted clarification. |
+| 59 | Remaining-day chronological timeline | Post-meal continuation currently renders a generic remaining-day block that can repeat the full remaining budget for each meal and include redundant prose. | Remaining-day surfaces do not consistently render one chronological action timeline with allocated per-meal calories/protein. | Reuse canonical planner semantics to render all remaining-day events in chronological order, allocate remaining nutrition budget across planned meals, and recalculate after state-changing events. | [`tasks/TASK_59_REMAINING_DAY_CHRONOLOGICAL_TIMELINE.md`](../tasks/TASK_59_REMAINING_DAY_CHRONOLOGICAL_TIMELINE.md) | Timeline covers workout/non-workout days, meal approval/correction, workout completed/postponed, chronological ordering, and per-meal protein allocation rather than repeated full remaining target. |
 
 New backlog items should be appended here with: unique ID, title, context,
 verified gap, required behavior, source, and suggested acceptance criteria.
