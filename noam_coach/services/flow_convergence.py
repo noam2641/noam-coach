@@ -53,7 +53,68 @@ from noam_coach.services.flow_resume import RESUMABLE_CONVERSATION_FLOWS
 
 _WIZARD_SCRATCHPAD_FLOW = "goal_wizard"
 
+# B8/ARCH-10 store policies (the explicit per-store contract):
+# - FLOW-SCOPED scratchpads live and die with their owning flow: suspended
+#   with it (Home on meaningful work), cleared when it expires, invalidated
+#   by terminal cancel and by Home when trivial/orphaned.
+# - RESUMABLE continuations (ARCH-11) survive Home and restart; only a
+#   terminal cancel invalidates them.
+# - health_confirm owns its own step lifecycle (done/deferred payload) and
+#   is preserved except on terminal cancel.
+_FLOW_SCOPED_SCRATCHPADS = ("goal_wizard", "profile_field_edit")
+_ALL_CONTINUATION_STORES = (
+    "goal_wizard",
+    "profile_field_edit",
+    "deferred_plan",
+    "plan_completion",
+    "health_confirm",
+)
+
 _HOME_CALLBACKS = ("menu:home", "menu:more")
+
+
+async def _invalidate_store(db: Any, user_id: int, store: str, reason: str) -> bool:
+    """Clear one continuation store row, tracing the invalidation. Returns
+    True when a row actually existed."""
+    from noam_coach.services import core as core_services
+
+    state = await core_services.get_flow_state(user_id, store)
+    if state is None:
+        return False
+    await core_services.clear_flow_state(user_id, store)
+    from noam_coach.observability import taxonomy
+    from noam_coach.observability.emit import emit_event
+
+    await emit_event(
+        db, user_id, taxonomy.STATE_MUTATED,
+        entity="conversation_state", entity_id=store,
+        source="flow_convergence", status="mutated", outcome="invalidated",
+        properties={"reason": reason, "step": str(state.get("step") or "")},
+    )
+    return True
+
+
+async def terminal_cancel_command(update: Any, context: Any) -> None:
+    """/cancel — the terminal escape hatch (B8/ARCH-10).
+
+    Runs the protected command_cancel (pending + meal-fix + active_flow)
+    and then invalidates EVERY continuation store, so no orphan row remains
+    actionable after a terminal cancellation. Registered in runtime.py in
+    place of the bare command_cancel.
+    """
+    import coach_bot as facade
+
+    await facade.command_cancel(update, context)
+    user = getattr(update, "effective_user", None)
+    user_id = getattr(user, "id", None)
+    if user_id is None or not await facade.is_allowed(update):
+        return
+    db = facade.DB
+    for store in _ALL_CONTINUATION_STORES:
+        await _invalidate_store(db, user_id, store, "user_cancel")
+    from noam_coach.services import flow_resume as flow_resume_module
+
+    flow_resume_module._pending_resume_offers.discard(user_id)
 
 
 async def _scratchpad_flows(db: Any, user_id: int) -> list[str]:
@@ -83,10 +144,10 @@ def install_flow_convergence() -> None:
         before = await conversation.get_active_flow(db, user_id)
         result = await original_expire(db, user_id)
         if before.is_expired and not before.is_idle:
-            # The flow just expired: its wizard scratchpad must not outlive it.
-            from noam_coach.services import core as core_services
-
-            await core_services.clear_flow_state(user_id, _WIZARD_SCRATCHPAD_FLOW)
+            # The flow just expired: flow-scoped scratchpads must not
+            # outlive it (goal wizard, single-field profile edit).
+            for store in _FLOW_SCOPED_SCRATCHPADS:
+                await _invalidate_store(db, user_id, store, "flow_expired")
         return result
 
     conversation.expire_if_needed = convergent_expire_if_needed
@@ -110,6 +171,13 @@ def install_flow_convergence() -> None:
             wizard_row = await core_services.get_flow_state(
                 user_id, _WIZARD_SCRATCHPAD_FLOW
             )
+            if flow.is_idle and not flow.suspended:
+                # An orphaned single-field edit row must not hijack the
+                # answer chain: clear it silently (text-driven flow — this
+                # qa answer was never its control).
+                await _invalidate_store(
+                    db, user_id, "profile_field_edit", "orphan_cleared"
+                )
             if wizard_row is not None and flow.is_idle:
                 if flow.suspended:
                     # Suspended to Home: tapping the wizard's own answer button
@@ -216,6 +284,16 @@ def install_flow_convergence() -> None:
                         keyboard,
                     )
                     return True
+        if isinstance(data, str) and data in _HOME_CALLBACKS:
+            # Delegating to the protected Home (which clears active_flow):
+            # flow-scoped scratchpads must not stay alive behind the cleared
+            # flow (trivial single-field edits, orphaned wizard rows).
+            # Resumable continuations (deferred_plan/plan_completion) and
+            # health_confirm are preserved by policy.
+            import coach_bot as facade
+
+            for store in _FLOW_SCOPED_SCRATCHPADS:
+                await _invalidate_store(facade.DB, user_id, store, "home_exit")
         return await original_menu(query, user_id, data)
 
     coach_bot.handle_menu_callback = home_preserving_handle_menu_callback

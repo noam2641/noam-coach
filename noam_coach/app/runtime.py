@@ -256,7 +256,10 @@ def build_telegram_app() -> Application:
     # scratchpad liveness derives from the active_flow lifecycle (expiry
     # cleanup, orphan-answer refusal) and Home suspends meaningful wizard
     # work instead of destroying it.
-    from noam_coach.services.flow_convergence import install_flow_convergence
+    from noam_coach.services.flow_convergence import (
+        install_flow_convergence,
+        terminal_cancel_command,
+    )
 
     install_flow_convergence()
     for command_name, command_handler in (
@@ -268,7 +271,9 @@ def build_telegram_app() -> Application:
         ("weekly", command_weekly),
         ("chart", command_chart),
         ("app", command_app),
-        ("cancel", command_cancel),
+        # B8 (ARCH-10): /cancel is terminal — it must invalidate every
+        # continuation store, not only active_flow (see flow_convergence).
+        ("cancel", terminal_cancel_command),
     ):
         application.add_handler(
             CommandHandler(
