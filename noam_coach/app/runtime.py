@@ -223,6 +223,11 @@ def build_telegram_app() -> Application:
     from noam_coach.observability.decision_trace import install_decision_trace
 
     install_decision_trace()
+    # Observability O7: meaningful domain state transitions (flows, facts,
+    # goals/plans, recommendations, daily menu, workout sets, health import).
+    from noam_coach.observability.state_trace import install_state_trace
+
+    install_state_trace()
     for command_name, command_handler in (
         ("start", command_start),
         ("import", command_import),

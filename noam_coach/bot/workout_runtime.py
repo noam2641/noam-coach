@@ -495,6 +495,12 @@ async def restore_rest_timers_on_startup(job_queue: Any) -> int:
                 chat_id=int(row["chat_id"]),
                 user_id=int(row["user_id"]),
             )
+            with suppress(Exception):
+                await _emit_rest_event(
+                    int(row["user_id"]), session_id, "restored",
+                    remaining_seconds=int(remaining),
+                    total_seconds=int(row["total_seconds"]),
+                )
         else:
             # Rest already ended while the process was down -- resolve the
             # stale card into the resume state instead of leaving it frozen.
@@ -529,6 +535,9 @@ async def cancel_rest_timer(
         if isinstance(job.data, dict):
             job.data["cancelled"] = True
         job.schedule_removal()
+    if jobs:
+        with suppress(Exception):
+            await _emit_rest_event(user_id, session_id, "cancelled")
 
 
 @runtime_bound(RUNTIME_NAMES)
@@ -615,6 +624,21 @@ class _MessageEditTarget:
         await self._bot.send_message(chat_id=self._chat_id, text=text, **kwargs)
 
 
+async def _emit_rest_event(user_id: int, session_id: int, action: str, **props: Any) -> None:
+    """Observability O7: rest-timer lifecycle (started/restored/finished/
+    cancelled) — the countdown TICKS themselves stay unobserved by design."""
+    import coach_bot
+    from noam_coach.observability import taxonomy
+    from noam_coach.observability.emit import emit_event
+
+    await emit_event(
+        coach_bot.DB, user_id, taxonomy.STATE_MUTATED,
+        entity="rest_timer", entity_id=session_id,
+        source="workout", status="mutated", outcome=action,
+        properties={"domain": "rest_timer", "action": action, "session_id": session_id, **props},
+    )
+
+
 @runtime_bound(RUNTIME_NAMES)
 async def rest_timer_tick(context: CallbackContext) -> None:
     job = context.job
@@ -629,6 +653,11 @@ async def rest_timer_tick(context: CallbackContext) -> None:
     remaining = await update_rest_message(context, timer_data)
     if remaining <= 0:
         job.schedule_removal()
+        with suppress(Exception):
+            await _emit_rest_event(
+                int(timer_data["user_id"]), int(timer_data["session_id"]), "finished",
+                total_seconds=timer_data.get("total_seconds"),
+            )
         with suppress(Exception):
             await clear_persisted_rest_timer(timer_data["session_id"])
         # Auto-advance: when rest ends, show the next set in the same card —
@@ -718,3 +747,8 @@ async def start_rest_timer(
         chat_id=query.message.chat_id,
         user_id=user_id,
     )
+    with suppress(Exception):
+        await _emit_rest_event(
+            user_id, session_id, "started",
+            total_seconds=rest_seconds, weight=weight, reps=reps,
+        )
