@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -7,13 +8,16 @@ import pytest
 
 import coach_bot
 import user_model
+from config import TZ
 from db import Database
 from helpers import utc_now
 from noam_coach.bot import callback_menu as callback_menu_bot
+from noam_coach.services import next_meal as next_meal_service
 from noam_coach.services.availability import parse_hebrew_availability_answer
 from noam_coach.services.next_meal import (
     generate_next_meal_recommendation,
     get_active_recommendation_options,
+    remember_active_recommendation,
     validate_meal_option,
 )
 
@@ -98,15 +102,50 @@ async def test_quantity_edit_recalculates_option_totals_through_callback(
     monkeypatch.setattr(coach_bot, "DB", db)
     monkeypatch.setattr(callback_menu_bot, "DB", db)
 
-    before = await generate_next_meal_recommendation(db, 1)
+    # Recommendation generation genuinely depends on the time of day (budget
+    # slot, candidate set, pre-sleep filtering against the 23:00 bedtime), so
+    # the whole journey runs against ONE fixed instant instead of the wall
+    # clock. The callback handler cannot receive `now`, so the service's own
+    # deterministic-time parameter is injected at its module seam — the REAL
+    # adjust_next_meal_quantity still runs.
+    fixed_now = datetime(2026, 6, 28, 13, 0, tzinfo=TZ)
+    real_adjust = next_meal_service.adjust_next_meal_quantity
+
+    async def adjust_with_fixed_now(
+        db_: Any, user_id: int, option_number: int, scale: float, *, now: Any = None,
+    ) -> Any:
+        del now
+        return await real_adjust(db_, user_id, option_number, scale, now=fixed_now)
+
+    monkeypatch.setattr(next_meal_service, "adjust_next_meal_quantity", adjust_with_fixed_now)
+
+    # The buttons the user presses belong to a rendered, ACTIVE recommendation
+    # (nextmeal:editqty renders them from the active state) — mirror that.
+    before = await generate_next_meal_recommendation(db, 1, now=fixed_now)
+    await remember_active_recommendation(db, 1, before, now=fixed_now)
     first_before = before.options[0]
 
     query = FakeQuery()
     handled = await callback_menu_bot.handle_menu_callback(query, 1, "nextmeal:qty:1:0.8")
 
-    active_options = await get_active_recommendation_options(db, 1)
-    first_after = active_options[0]
+    active_options = await get_active_recommendation_options(db, 1, now=fixed_now)
     assert handled is True
+    # Identity: the quantity edit must adjust the SAME semantic option the
+    # user was looking at — never swap the meal (list position is only
+    # trusted because _replace_selected_option preserves positions; the
+    # title check pins the semantic identity explicitly).
+    first_after = active_options[0]
+    assert first_after.title == first_before.title
+    assert len(active_options) == len(before.options)
+    # ➖20%: quantities scale down with unit-appropriate rounding
+    # (_round_quantity_by_unit: gram items shrink ~20%; count units like
+    # eggs round to whole pieces and may stay put — never grow).
+    assert len(first_after.ingredient_details) == len(first_before.ingredient_details)
+    for item_before, item_after in zip(
+        first_before.ingredient_details, first_after.ingredient_details
+    ):
+        assert item_after.display_name == item_before.display_name
+        assert item_after.quantity <= item_before.quantity
     assert first_after.calories < first_before.calories
     assert first_after.protein < first_before.protein
     assert first_after.calories == round(sum(item.calories for item in first_after.ingredient_details))

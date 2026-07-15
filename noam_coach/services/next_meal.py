@@ -1635,11 +1635,26 @@ async def adjust_next_meal_quantity(
 
     The scale is keyed by option fingerprint, so choose/save callbacks that
     regenerate the recommendation still use the adjusted ingredient quantities.
+
+    Option identity is preserved: the ➖/➕ buttons address the option the
+    user is LOOKING AT (the active stored recommendation), and the returned
+    recommendation contains that SAME semantic option with rescaled
+    quantities — exactly like the free-text quantity-override path
+    (handle_recommendation_correction, kind="quantity_override"). Previously
+    this function answered with a full regeneration; because generation
+    exposes only the single top-RANKED option (TASK-03) and rescaling
+    changes an option's score, pressing "➖ 20%" could silently swap the
+    user's meal for a different one while the UI claimed "עדכנתי כמויות" —
+    the meal the user adjusted must be the meal they get back.
     """
     recommendation = await generate_next_meal_recommendation(db, user_id, now=now)
-    if option_number < 1 or option_number > len(recommendation.options):
+    active_options = await get_active_recommendation_options(db, user_id, now=now)
+    addressed = active_options or recommendation.options
+    if option_number < 1 or option_number > len(addressed):
         raise ValueError("Unknown next-meal option")
-    option = recommendation.options[option_number - 1]
+    option = addressed[option_number - 1]
+    # Persist the compound scale so later regenerations (choose/save flows)
+    # keep using the adjusted quantities for the matching candidate.
     fingerprint = option_fingerprint(option)
     local_day = recommendation.context.local_day
     flags = await _daily_flags(db, user_id, local_day)
@@ -1648,6 +1663,26 @@ async def adjust_next_meal_quantity(
     scales[fingerprint] = max(0.25, min(2.0, current * scale))
     flags["next_meal_quantity_scales"] = scales
     await _save_daily_flags(db, user_id, local_day, flags)
+
+    if active_options:
+        # Identity-preserving path: rescale the displayed option in place
+        # and re-remember the active recommendation with it.
+        updated = _scale_option_ingredients(option, scale)
+        refreshed_context = await build_workout_nutrition_context(db, user_id, now=now)
+        refreshed_budget = allocate_next_meal_budget(refreshed_context)
+        refreshed = _replace_selected_option(
+            NextMealRecommendation(
+                context=refreshed_context,
+                budget=refreshed_budget,
+                options=list(active_options),
+            ),
+            option_number,
+            updated,
+        )
+        await remember_active_recommendation(db, user_id, refreshed, now=now)
+        return refreshed
+    # No active recommendation to anchor to (stale/expired callback):
+    # regenerate — the persisted scale applies to the matching candidate.
     return await generate_next_meal_recommendation(db, user_id, now=now)
 
 

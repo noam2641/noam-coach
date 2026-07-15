@@ -236,21 +236,28 @@ async def test_selected_option_quantity_text_recalculates_without_saving(
 ) -> None:
     db = await _ready_db(tmp_path)
     _bind(monkeypatch, db)
-    rec = await generate_next_meal_recommendation(db, 1)
-    await remember_active_recommendation(db, 1, rec)
+    # The candidate set genuinely depends on the time of day (near the 23:00
+    # bedtime the pre-sleep filtering drops the turkey option entirely, which
+    # made the turkey lookup below StopIteration on evening CI runs), so the
+    # whole journey runs against the recording's own fixed instant instead of
+    # the wall clock — the same pattern the neighboring tests in this file
+    # already use.
+    fixed_now = datetime(2026, 6, 28, 20, 11, tzinfo=TZ)
+    rec = await generate_next_meal_recommendation(db, 1, now=fixed_now)
+    await remember_active_recommendation(db, 1, rec, now=fixed_now)
     # Ranking (RE9-053) can reorder options; select the turkey option by content.
     turkey_number = next(
         i for i, option in enumerate(rec.options, 1)
         if any("הודו" in ing for ing in option.ingredients)
     )
-    await mark_active_recommendation_selection(db, 1, turkey_number)
+    await mark_active_recommendation_selection(db, 1, turkey_number, now=fixed_now)
 
     before = await db.fetch_one("SELECT COUNT(*) AS c FROM meals WHERE user_id=1")
-    correction = await handle_recommendation_correction(db, 1, "חזה הודו 100 גרם")
+    correction = await handle_recommendation_correction(db, 1, "חזה הודו 100 גרם", now=fixed_now)
     after = await db.fetch_one("SELECT COUNT(*) AS c FROM meals WHERE user_id=1")
     assert correction is not None
     assert int(before["c"]) == int(after["c"]) == 0
-    active_options = await get_active_recommendation_options(db, 1)
+    active_options = await get_active_recommendation_options(db, 1, now=fixed_now)
     selected = active_options[turkey_number - 1]
     turkey = [
         item
