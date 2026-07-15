@@ -26,6 +26,7 @@ from noam_coach.services.next_meal import (
     generate_next_meal_recommendation,
     next_meal_action_rows,
     record_next_meal_served,
+    remember_active_recommendation,
     save_next_meal_option_feedback,
     save_next_meal_workout_status,
 )
@@ -416,14 +417,21 @@ async def test_options_respect_disliked_foods(db: Database) -> None:
 
 
 @pytest.mark.asyncio
-async def test_next_meal_feedback_is_temporary_rejection_and_regenerates(db: Database) -> None:
+async def test_next_meal_feedback_is_temporary_rejection_and_regenerates(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """re7 P1-7/8: 'לא מתאים לי' temporarily rejects the option (no permanent
     dislike) and returns a genuinely different alternative. TASK-03: there is
     only ever one exposed option, so this rejects/replaces option 1."""
+    import coach_bot
+
+    monkeypatch.setattr(coach_bot, "DB", db)  # active-state store binds via coach_bot
     now = datetime.now(TZ).replace(hour=17, minute=0, second=0, microsecond=0)
     await _ready_user(db, now)
     initial = await generate_next_meal_recommendation(db, 1, now=now)
     rejected_title = initial.options[0].title
+    # B5/ARCH-06: the rejection targets the DISPLAYED (active) option.
+    await remember_active_recommendation(db, 1, initial, now=now)
 
     saved_item, refreshed = await save_next_meal_option_feedback(db, 1, 1, now=now)
     refreshed_titles = [option.title for option in refreshed.options]

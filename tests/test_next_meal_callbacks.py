@@ -130,6 +130,9 @@ async def test_next_meal_not_suitable_is_temporary_not_permanent_dislike(
     monkeypatch.setattr(callback_menu_bot, "DB", db)
 
     query = FakeQuery()
+    # B5/ARCH-06: the dislike anchor resolves against the ACTIVE displayed
+    # card, so render it first — exactly the production sequence.
+    await callback_menu_bot.handle_menu_callback(query, 1, "menu:nextmeal")
     handled = await callback_menu_bot.handle_menu_callback(query, 1, "nextmeal:dislike:1")
 
     assert handled is True

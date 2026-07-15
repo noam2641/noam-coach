@@ -238,6 +238,14 @@ def build_telegram_app() -> Application:
 
     install_callback_grammar()
     install_confirmation_gate()
+    # B5 (ARCH-06): next-meal option controls are honored only for the LIVE
+    # active recommendation card; controls from superseded/expired cards are
+    # refused instead of silently acting on a regenerated meal.
+    from noam_coach.services.recommendation_identity import (
+        install_recommendation_identity_gate,
+    )
+
+    install_recommendation_identity_gate()
     for command_name, command_handler in (
         ("start", command_start),
         ("import", command_import),

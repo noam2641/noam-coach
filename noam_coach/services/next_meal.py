@@ -1547,19 +1547,27 @@ async def save_next_meal_option_feedback(
     fingerprint with an expiry, exclude it (and near-identical options) from the
     next generation, and return a genuinely different alternative. The user's
     standing preferences are untouched.
-    """
-    recommendation = await generate_next_meal_recommendation(db, user_id, now=now)
-    if option_number < 1 or option_number > len(recommendation.options):
-        raise ValueError("Unknown next-meal option")
-    option = recommendation.options[option_number - 1]
-    fingerprint = option_fingerprint(option)
 
-    await _record_temporary_rejection(
-        db, user_id, recommendation, fingerprint, now=now, reason="not_suitable_now"
-    )
+    B5/ARCH-06 identity anchor: the rejected option is resolved from the
+    ACTIVE stored recommendation — the card the user is looking at — never
+    from a fresh regeneration (TASK-03 exposes one top-ranked option and
+    re-ranking/rotation can swap it, so "לא מתאים לי 1" against a
+    regenerated list could reject a different meal than the one displayed).
+    With no active recommendation the action is refused (ValueError → the
+    callback layer renders the safe refresh message) instead of silently
+    acting on a regenerated meal.
+    """
+    active_options = await get_active_recommendation_options(db, user_id, now=now)
+    if not active_options or option_number < 1 or option_number > len(active_options):
+        raise ValueError("Unknown next-meal option")
+    option = active_options[option_number - 1]
+    fingerprint = option_fingerprint(option)
     # Regenerate excluding the rejected fingerprint -> a truly different option.
     refreshed = await generate_next_meal_recommendation(
         db, user_id, now=now, excluded_fingerprints={fingerprint}
+    )
+    await _record_temporary_rejection(
+        db, user_id, refreshed, fingerprint, now=now, reason="not_suitable_now"
     )
     return option.title, refreshed
 
@@ -1613,7 +1621,14 @@ async def regenerate_with_size(
     smaller: bool,
     now: datetime | None = None,
 ) -> NextMealRecommendation:
-    """"קטן יותר"/"גדול יותר": rebuild with a size hint, respecting the budget cap."""
+    """"קטן יותר"/"גדול יותר": rebuild with a size hint, respecting the budget cap.
+
+    B5/ARCH-06: the rebuild semantics are the documented product contract
+    (unlike ➖/➕ qty, which rescales the SAME option in place). Staleness is
+    enforced at the callback layer (recommendation_identity gate): the
+    control is honored only for the live active card, so the size hint is
+    always an instruction about the recommendation the user is looking at.
+    """
     # B3/ARCH-02: nutrition day = canonical coaching day (one key for the
     # read and the write — a midnight crossing between them must not split
     # the state across two rows).
