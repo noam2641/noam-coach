@@ -303,14 +303,13 @@ def _option_from_payload(payload: dict[str, Any]) -> MealOption:
 
 
 async def _daily_flags(db: Any, user_id: int, local_day: str) -> dict[str, Any]:
-    row = await db.fetch_one(
-        "SELECT flags FROM daily_flags WHERE user_id=? AND day=?",
-        (user_id, local_day),
-    )
-    if not row:
-        return {}
+    """Read the day's flags via the canonical CAS boundary (ARCH-03): the
+    snapshot is remembered task-locally so a following ``_save_daily_flags``
+    patches only the keys this writer actually changed."""
+    from noam_coach.services.daily_flags_cas import read_flags_for_update
+
     try:
-        data = json.loads(row["flags"] or "{}")
+        data = await read_flags_for_update(db, user_id, local_day)
     except (TypeError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
@@ -343,14 +342,12 @@ async def save_next_meal_workout_status(
 
 
 async def _save_daily_flags(db: Any, user_id: int, local_day: str, flags: dict[str, Any]) -> None:
-    await db.execute(
-        """
-        INSERT INTO daily_flags(user_id, day, flags, created_at)
-        VALUES(?, ?, ?, ?)
-        ON CONFLICT(user_id, day) DO UPDATE SET flags=excluded.flags
-        """,
-        (user_id, local_day, json.dumps(flags, ensure_ascii=False), utc_now()),
-    )
+    """ARCH-03: per-key CAS patch instead of the historical full-JSON upsert
+    (which silently dropped concurrent writers' keys). Diffs against the
+    snapshot this task read via ``_daily_flags``."""
+    from noam_coach.services.daily_flags_cas import commit_flags_update
+
+    await commit_flags_update(db, user_id, local_day, flags, owner="next_meal")
 
 
 async def _today_meals(db: Any, user_id: int, now: datetime | None = None) -> list[dict[str, Any]]:
