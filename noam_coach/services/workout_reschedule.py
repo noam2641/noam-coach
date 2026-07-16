@@ -35,6 +35,17 @@ from config import TZ
 
 RESCHEDULE_FLOW = "workout_reschedule"
 
+
+async def _render_next_meal(query: Any, user_id: int, prefix: str) -> None:
+    """Render via the protected screen builder with its facade globals
+    synced first — _render_next_meal_screen is undecorated, so a wrap
+    calling it on a cold path would NameError on names like `button`."""
+    from noam_coach.bot import callback_menu as callback_menu_bot
+    from noam_coach.runtime_bind import _sync
+
+    _sync(callback_menu_bot._render_next_meal_screen, callback_menu_bot.RUNTIME_NAMES)
+    await callback_menu_bot._render_next_meal_screen(query, user_id, prefix=prefix)
+
 _TIME_PATTERN = re.compile(r"^\s*([01]?\d|2[0-3])(?:[:.]([0-5]\d))?\s*$")
 _RELATIVE_PATTERNS = (
     (re.compile(r"בעוד\s+חצי\s+שעה"), 30),
@@ -133,16 +144,12 @@ async def _persist_and_confirm(query_or_message: Any, user_id: int, expected: da
     db = facade.DB
     await save_workout_reschedule_time(db, user_id, expected)
     await core_services.clear_flow_state(user_id, RESCHEDULE_FLOW)
-    from noam_coach.bot import callback_menu as callback_menu_bot
-
     prefix = (
         f"סגור — האימון בסביבות {expected.astimezone(TZ):%H:%M}. "
         "התאמתי את התזונה בהתאם."
     )
     if edit:
-        await callback_menu_bot._render_next_meal_screen(
-            query_or_message, user_id, prefix=prefix
-        )
+        await _render_next_meal(query_or_message, user_id, prefix)
     else:
         await query_or_message.reply_text(prefix)
 
@@ -171,15 +178,14 @@ def install_workout_reschedule() -> None:
             await _render_time_card(query, user_id)
             return True
         if isinstance(data, str) and data.startswith("wktat:"):
-            from noam_coach.bot import callback_menu as callback_menu_bot
             from noam_coach.services import core as core_services
 
             arg = data.split(":", 1)[1]
             if arg == "skip":
                 await core_services.clear_flow_state(user_id, RESCHEDULE_FLOW)
-                await callback_menu_bot._render_next_meal_screen(
+                await _render_next_meal(
                     query, user_id,
-                    prefix="בסדר, נשאיר את זה פתוח — עדכן אותי כשתדע מתי.",
+                    "בסדר, נשאיר את זה פתוח — עדכן אותי כשתדע מתי.",
                 )
                 return True
             if arg == "text":

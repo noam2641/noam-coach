@@ -42,6 +42,9 @@ _GATED_PREFIXES = (
     "nextmeal:qty:",
     "nextmeal:choose:",
     "nextmeal:save:",
+    # B13 audit: legacy plan controls (old cards — TASK-03 no longer renders
+    # them) silently planned a REGENERATED meal when no active card existed.
+    "nextmeal:plan:",
 )
 
 # Prefixes whose handlers already refuse the NO-ACTIVE case with dedicated
@@ -77,6 +80,48 @@ async def _refuse(query: Any, user_id: int, data: str, reason: str) -> None:
         "הכפתור הזה שייך להמלצה קודמת שכבר לא פעילה — רענן כדי לקבל את ההמלצה הנוכחית.",
         InlineKeyboardMarkup([[button("🍽️ אפשרות חדשה", "nextmeal:refresh"), button("🏠 תפריט", "menu:home")]]),
     )
+
+
+async def _dislikeitem_anchored(
+    facade: Any, query: Any, user_id: int, data: str, state: dict[str, Any]
+) -> bool:
+    """Persist the standing dislike for the DISPLAYED option (B13 audit).
+
+    Mirrors the protected handler's outcome (permanent preference + refreshed
+    recommendation render) with the option title resolved from the stored
+    active card instead of a regeneration. Returns False when the option
+    number cannot be resolved — the original handler's safe fallback then
+    renders the refresh message.
+    """
+    titles = state.get("option_titles") or []
+    try:
+        option_number = int(data.rsplit(":", 1)[1])
+    except (TypeError, ValueError):
+        return False
+    if not (0 < option_number <= len(titles)):
+        return False
+    title = str(titles[option_number - 1])
+    if not title:
+        return False
+    from noam_coach.services.food_preferences import record_food_preference_from_slots
+
+    await record_food_preference_from_slots(
+        facade.DB, user_id,
+        {"kind": "preference", "polarity": "avoid", "item": title, "note": title},
+        title,
+    )
+    from noam_coach.bot import callback_menu as callback_menu_bot
+    from noam_coach.runtime_bind import _sync
+
+    # _render_next_meal_screen is undecorated: its module globals sync only
+    # when a runtime_bound sibling runs first. Calling from a wrap, sync
+    # explicitly or a cold path NameErrors on facade names like `button`.
+    _sync(callback_menu_bot._render_next_meal_screen, callback_menu_bot.RUNTIME_NAMES)
+    await callback_menu_bot._render_next_meal_screen(
+        query, user_id,
+        prefix="שמרתי את ההעדפה הקבועה והחלפתי את ההצעה.",
+    )
+    return True
 
 
 _original_handler: Any = None
@@ -117,6 +162,17 @@ def install_recommendation_identity_gate() -> None:
                 ):
                     await _refuse(query, user_id, data, reason="control_from_superseded_card")
                     return True
+                if data.startswith("nextmeal:dislikeitem:"):
+                    # B13 audit finding: the protected handler resolves the
+                    # PERMANENT avoid-preference from a fresh regeneration —
+                    # under ranking rotation it could persist a dislike for a
+                    # meal the user never saw. Resolve from the ACTIVE card
+                    # (the B5 anchor) and render the handler's own outcome.
+                    handled = await _dislikeitem_anchored(
+                        facade, query, user_id, data, state
+                    )
+                    if handled:
+                        return True
         return await original(query, user_id, data)
 
     coach_bot.handle_menu_callback = identity_gated_handle_menu_callback
