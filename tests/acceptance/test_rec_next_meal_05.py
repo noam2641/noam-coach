@@ -163,11 +163,20 @@ async def test_next_meal_explains_each_option(db: Database) -> None:
 
     assert "למה עכשיו:" in text
     assert text.count("למה עכשיו:") == len(rec.options)
-    assert "נרשמה ארוחה אחת היום" in text
+    # TASK-65: the meals-logged status line moved off the first screen —
+    # day status lives behind the detail surfaces.
+    assert "נרשמה ארוחה אחת היום" not in text
+    explanation = format_next_meal_explanation(rec)
+    assert "מצב היום" in explanation
 
 
 @pytest.mark.asyncio
-async def test_next_meal_main_screen_is_remaining_day_planner(db: Database) -> None:
+async def test_next_meal_main_screen_is_answer_first_planner_behind_details(
+    db: Database,
+) -> None:
+    """TASK-65 (supersedes the earlier planner-first contract): the first
+    screen leads with the immediate answer only; the remaining-day planner
+    content stays complete behind the 'why it fits' detail surface."""
     now = datetime.now(TZ).replace(hour=16, minute=30, second=0, microsecond=0)
     await _ready_user(db, now)
     await _workout_plan(db, now, time_text="18:00")
@@ -175,17 +184,19 @@ async def test_next_meal_main_screen_is_remaining_day_planner(db: Database) -> N
     rec = await generate_next_meal_recommendation(db, 1, now=now)
     text = format_next_meal_recommendation(rec)
 
-    remaining_idx = text.index("נשארו")
-    sleep_idx = text.index("עד השינה")
-    workout_idx = text.index("סטטוס אימון")
-    timeline_idx = text.index("תכנון שאר היום")
-    immediate_idx = text.index("הארוחה המומלצת עכשיו")
-    why_idx = text.index("למה עכשיו:")
+    assert text.startswith("<b>הארוחה המומלצת עכשיו</b>")
+    assert "סטטוס אימון" not in text
+    assert "תכנון שאר היום" not in text
+    assert "נשארו" not in text.splitlines()[0]
 
-    assert remaining_idx < sleep_idx < workout_idx < timeline_idx < immediate_idx < why_idx
-    assert "18:00" in text
-    assert "אימון מתוכנן" in text
-    assert "סך התכנון" in text
+    explanation = format_next_meal_explanation(rec)
+    # The planner details remain complete one tap away.
+    assert "מצב היום" in explanation
+    assert "המשך היום" in explanation
+    assert "אימון" in explanation
+    assert "18:00" in explanation
+    assert "אימון מתוכנן" in explanation
+    assert "סך התכנון" in explanation
 
 
 @pytest.mark.asyncio
@@ -195,10 +206,11 @@ async def test_next_meal_timeline_respects_remaining_budget(db: Database) -> Non
 
     rec = await generate_next_meal_recommendation(db, 1, now=now)
     allocations = build_remaining_slot_allocations(rec.context)
-    text = format_next_meal_recommendation(rec)
+    # TASK-65: the timeline totals render on the DETAIL surface.
+    explanation = format_next_meal_explanation(rec)
 
     assert sum(slot.calories for slot in allocations) <= rec.context.nutrition.calorie_balance
-    assert f"סך התכנון: כ-{sum(slot.calories for slot in allocations)}" in text
+    assert f"סך התכנון: כ-{sum(slot.calories for slot in allocations)}" in explanation
 
 
 @pytest.mark.asyncio
@@ -227,8 +239,8 @@ async def test_rest_day_balances_are_signed_and_reasonable(db: Database) -> None
     assert rec.context.workout_phase == WorkoutPhase.REST_DAY
     assert rec.context.nutrition.calorie_balance == 1300
     assert rec.context.nutrition.protein_balance == 95
-    # Answer-first message leads with the remaining balance (re7 P1-10).
-    assert "1300" in text
+    # TASK-65: the remaining balance is DETAIL, not the first answer.
+    assert "1300" not in text
     # Full signed-balance detail lives in the 'why it fits' view.
     assert "נותר להיום: 1300" in format_next_meal_explanation(rec)
     assert rec.budget.calories_max <= 750
@@ -251,10 +263,10 @@ async def test_next_meal_explanation_shows_remaining_calculation(db: Database) -
 
 @pytest.mark.asyncio
 async def test_next_meal_actions_are_the_task03_four_buttons(db: Database) -> None:
-    """TASK-03: at most 4 actions on the single recommendation — confirm
-    eaten, refresh, change quantities, back to status. No per-option "plan"
-    button and no separate "why" button (the reason is already inline in the
-    recommendation text itself).
+    """TASK-03 (evolved by TASK-65): a compact action set on the single
+    recommendation — confirm eaten, refresh, change quantities, "why it
+    fits" (the detail surface for the day status/timeline the first screen
+    no longer shows) and day status. No per-option "plan" button.
     """
     now = datetime.now(TZ).replace(hour=14, minute=0, second=0, microsecond=0)
     await _ready_user(db, now)
@@ -263,7 +275,8 @@ async def test_next_meal_actions_are_the_task03_four_buttons(db: Database) -> No
     rows = next_meal_action_rows(rec)
     callbacks = [callback for row in rows for _label, callback in row]
 
-    assert len(callbacks) <= 4
+    assert len(callbacks) <= 5
+    assert "nextmeal:why" in callbacks
     assert any(callback.startswith("nextmeal:save:") for callback in callbacks)
     assert "nextmeal:refresh" in callbacks
     assert any(callback.startswith("nextmeal:editqty:") for callback in callbacks)

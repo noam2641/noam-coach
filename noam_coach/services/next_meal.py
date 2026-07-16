@@ -1776,6 +1776,13 @@ def next_meal_action_rows(recommendation: NextMealRecommendation) -> list[list[t
             ("🔄 רענן הצעה", "nextmeal:refresh"),
             ("✏️ שנה כמויות", "nextmeal:editqty:1"),
         ])
+        # TASK-65: the first screen is answer-only — the calculation, day
+        # status and remaining-day details live one tap away.
+        rows.append([
+            ("❓ למה זה מתאים", "nextmeal:why"),
+            ("📊 מצב היום", "menu:status"),
+        ])
+        return rows
     rows.append([("📊 חזור לסיכום היום", "menu:status")])
     return rows
 
@@ -2024,58 +2031,46 @@ def _natural_ingredients(option: "MealOption") -> str:
 
 
 def format_next_meal_recommendation(recommendation: NextMealRecommendation) -> str:
-    """Answer-first message (re7 P1-10): remaining + options first, short note,
-    and the long explanation only via the 'why it fits' detail view."""
-    context = recommendation.context
-    nutrition = context.nutrition
-    goal_note = ""
-    if nutrition.goal_status == "active_provisional":
-        goal_note = " (יעד זמני)"
-    elif nutrition.goal_status == "default":
-        goal_note = " (ברירת מחדל עד לאישור יעד)"
+    """TASK-65: the first screen answers ONLY "what should I eat now".
 
-    lines = [_remaining_headline(nutrition) + goal_note, _nutrition_status_line(nutrition)]
-    sleep_line = _sleep_status_line(context)
-    if sleep_line:
-        lines.append(f"<i>{esc(sleep_line)}</i>")
-    lines += [
-        "",
-        "<b>סטטוס אימון</b>",
-        f"• {esc(_workout_status_line(context))}",
-        "",
-    ]
-    timeline = _remaining_day_timeline_lines(context)
-    if timeline:
-        lines += ["<b>תכנון שאר היום</b>", *timeline, ""]
-
+    One immediate recommendation with its macros and a short reason, plus
+    caveats that qualify THIS meal (safety notices, budget overage, a
+    provisional/default goal, the workout-clarification hint). The daily
+    status, workout-status section, remaining-day timeline and after-meal
+    projections all moved behind the detail surfaces (nextmeal:why →
+    format_next_meal_explanation, menu:status) — the buttons render them
+    one tap away, never inside the first answer.
+    """
+    nutrition = recommendation.context.nutrition
+    lines = ["<b>הארוחה המומלצת עכשיו</b>"]
     # TASK-03: a single immediate suggestion, not a numbered list to compare —
-    # no "אפשרות N" label, no per-option "recommended" star (there is nothing
-    # else here to be recommended over).
-    lines.append("<b>הארוחה המומלצת עכשיו</b>")
+    # no "אפשרות N" label, no per-option "recommended" star. TASK-8: no
+    # internal scoring in user-facing UX; render the food naturally.
     for option in recommendation.options:
-        after = _after_meal_line(nutrition, option)
         reason = option.recommended_reason or option.rationale or recommendation.budget.rationale
-        # TASK-8: no internal scoring / match percentages in user-facing UX;
-        # render the food naturally (combine items, no exact side-veg grams).
         lines += [
             f"<b>{esc(option.title)}</b>",
             f"{esc(_natural_ingredients(option))}",
             f"כ-{option.calories} קל׳ | כ-{option.protein} גרם חלבון | "
             f"ארוחה {meal_size_label_he(option.calories)}",
+            f"<i>למה עכשיו: {esc(reason)}</i>",
+            "",
         ]
-        lines.append(f"<i>למה עכשיו: {esc(reason)}</i>")
-        if after:
-            lines.append(after)
-        lines.append("")
+    if nutrition.meals_logged_count == 0:
+        # Honesty caveat about THIS suggestion (not a status dump): with
+        # nothing logged, the budget assumes this is the first meal.
+        lines.append("<i>עוד לא נרשמו ארוחות היום — ההצעה מניחה שזו הארוחה הראשונה.</i>")
+    if nutrition.goal_status == "active_provisional":
+        lines.append("<i>היעד זמני — ההצעה שמרנית בהתאם.</i>")
+    elif nutrition.goal_status == "default":
+        lines.append("<i>היעד בערכי ברירת מחדל עד לאישור יעד.</i>")
     for notice in recommendation.notices[:2]:
         lines.append(f"<i>{esc(notice)}</i>")
     if recommendation.options and recommendation.budget.allows_overage and recommendation.budget.overage_reason:
         lines.append(f"שים לב: ההצעה חורגת מעט מהיתרה ({esc(recommendation.budget.overage_reason)}).")
     if recommendation.needs_workout_clarification:
-        # The message used to also promise a free-text fallback ("אפשר גם
-        # לכתוב: כן, סיימתי / ..."), but no NLU anywhere recognized those
-        # phrases — the buttons below (now rendered in next_meal_action_rows,
-        # not just the Mini App) are the only real way to answer this.
+        # The buttons below (workout_clarification_actions) are the only real
+        # way to answer this — the hint must match the rendered keyboard.
         lines.append("לא אניח שהאימון קרה בלי דיווח — אפשר לעדכן את סטטוס האימון עם הכפתורים למטה.")
     return "\n".join(lines).strip()
 
@@ -2111,7 +2106,17 @@ def format_next_meal_explanation(recommendation: NextMealRecommendation) -> str:
     ]
     if context.meals_remaining_estimate:
         lines.append(f"• הערכת ארוחות שנותרו היום: {context.meals_remaining_estimate}")
-    timeline = build_day_timeline(context)
+    # TASK-65: the after-meal projection and workout-status line moved here
+    # from the first screen (the first answer is answer-only).
+    for option in recommendation.options[:1]:
+        after = _after_meal_line(nutrition, option)
+        if after:
+            lines.append(after)
+    lines.append(f"• {esc(_workout_status_line(context))}")
+    sleep_line = _sleep_status_line(context)
+    if sleep_line:
+        lines.append(f"<i>{esc(sleep_line)}</i>")
+    timeline = _remaining_day_timeline_lines(context) or build_day_timeline(context)
     if timeline:
         lines += ["", "<b>המשך היום</b>", *timeline]
     for notice in recommendation.notices:

@@ -43,10 +43,14 @@ async def _db(tmp_path: Path, *, calories: int = 2100, protein: int = 160) -> Da
 
 @pytest.mark.asyncio
 async def test_re9_recommendation_shows_after_meal_remaining(tmp_path: Path) -> None:
-    """RE9-020: the recommendation list shows 'after the meal' remaining per option."""
+    """RE9-020 (evolved by TASK-65): the 'after the meal' remaining
+    projection lives on the detail surface — the first screen is
+    answer-only."""
+    from noam_coach.services.next_meal import format_next_meal_explanation
+
     db = await _db(tmp_path)
     rec = await generate_next_meal_recommendation(db, 1)
-    text = format_next_meal_recommendation(rec)
+    text = format_next_meal_explanation(rec)
     assert "אחרי הארוחה" in text
     # The number equals consumed-based balance minus the option calories.
     option = rec.options[0]
