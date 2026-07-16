@@ -451,6 +451,8 @@ async def _recent_meal(db: Any, user_id: int, now: datetime) -> tuple[str | None
 
 
 async def _restrictions(db: Any, user_id: int) -> list[DietaryRestriction]:
+    # B11/ARCH-15: deliberate RAW reads — restrictions fail closed (an
+    # unconfirmed allergy estimate must still restrict the options).
     diet = await user_model.get_value(db, user_id, "diet_restrictions")
     allergies = await user_model.get_value(db, user_id, "allergies")
     base = load_restrictions_from_facts(

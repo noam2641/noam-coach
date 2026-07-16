@@ -397,6 +397,8 @@ async def build_nutrition_context(
         workout_state=shared_state.workout if shared_state is not None else None,
     )
 
+    # B11/ARCH-15: deliberate RAW reads — an unconfirmed restriction failing
+    # CLOSED (over-restricting) is the safe direction for diet/allergy data.
     diet_value = await user_model.get_value(db, user_id, "diet_restrictions")
     allergy_value = await user_model.get_value(db, user_id, "allergies")
     restrictions = load_restrictions_from_facts(
@@ -404,7 +406,11 @@ async def build_nutrition_context(
         str(allergy_value) if allergy_value not in (None, "", "none") else None,
     )
     allergies, intolerances, dietary_rules = _restriction_groups(restrictions)
-    food_environment_value = await user_model.get_value(db, user_id, "food_environment_context")
+    # B11/ARCH-15: menu-style decisions are confirmed-only — an unconfirmed
+    # derived environment profile must not silently steer menu generation.
+    food_environment_value = await user_model.get_decision_value(
+        db, user_id, "food_environment_context"
+    )
     food_environment_context = (
         normalize_food_environment_context(food_environment_value)
         if food_environment_value not in (None, "", "none")
@@ -480,6 +486,7 @@ async def build_nutrition_context(
         intolerances=intolerances,
         dietary_rules=dietary_rules,
         medical_food_constraints=list(getattr(daily_ctx, "active_constraints", []) or []),
+        # RAW by policy: avoiding a maybe-disliked food is failing safe.
         disliked_foods=_list_fact(await user_model.get_value(db, user_id, "disliked_foods")),
         preferred_foods=_list_fact(await user_model.get_value(db, user_id, "preferred_foods")),
         # TASK-4: daily-menu/next-meal personalization must use the module's

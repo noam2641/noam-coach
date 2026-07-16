@@ -305,7 +305,10 @@ async def build_preference_profile(
     recently_rejected = split_fact_list(day_flags.get("recently_rejected_meals"))
     temporarily_avoided = split_fact_list(day_flags.get("temporarily_avoided_foods"))
 
-    food_environment_value = await user_model.get_value(db, user_id, "food_environment_context")
+    # B11/ARCH-15: confirmed-only (menu/recommendation style decision).
+    food_environment_value = await user_model.get_decision_value(
+        db, user_id, "food_environment_context"
+    )
     food_environment = None
     if food_environment_value not in (None, "", "none"):
         from noam_coach.services.food_environment import normalize_food_environment_context

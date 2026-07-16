@@ -1113,6 +1113,12 @@ async def ensure_training_limitations_fact(db: SupportsDB, user_id: int) -> dict
 
 
 async def get_value(db: SupportsDB, user_id: int, key: str, default: Any = None) -> Any:
+    """Raw/draft read — returns the stored value regardless of confirmation
+    or freshness. B11/ARCH-15 read policy: decision-grade consumers (plan,
+    goal targets, safety gates, menu-style decisions) must use
+    ``get_decision_value``; display flows use ``get_display_value``; raw
+    reads remain only where the semantics demand them (e.g. restrictions
+    that must fail closed, audit trails via ``get_raw_fact``)."""
     fact = (
         await get_training_limitations_fact(db, user_id)
         if key == "training_limitations"
