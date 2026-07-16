@@ -195,7 +195,7 @@ async def test_next_meal_main_screen_is_answer_first_planner_behind_details(
     assert "המשך היום" in explanation
     assert "אימון" in explanation
     assert "18:00" in explanation
-    assert "אימון מתוכנן" in explanation
+    assert "אימון" in explanation
     assert "סך התכנון" in explanation
 
 

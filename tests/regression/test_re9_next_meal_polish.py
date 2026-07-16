@@ -114,14 +114,16 @@ async def test_re9_options_sorted_by_score_desc(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_re9_timeline_in_detail_view(tmp_path: Path) -> None:
-    """RE9-002: the 'why it fits' detail view includes a rest-of-day timeline."""
+    """RE9-002 (evolved by TASK-59): the 'why it fits' detail view includes
+    the SHARED chronological rest-of-day timeline with allocation totals."""
     db = await _db(tmp_path)
     rec = await generate_next_meal_recommendation(db, 1)
     steps = build_day_timeline(rec.context)
-    assert steps  # non-empty
+    assert steps  # the legacy fallback stays available
     detail = format_next_meal_explanation(rec)
     assert "המשך היום" in detail
-    assert "סוף היום" in detail
+    assert "סך התכנון" in detail
+    assert "🍽️" in detail  # chronological meal events, not prose steps
 
 
 @pytest.mark.asyncio

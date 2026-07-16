@@ -1953,27 +1953,26 @@ def _slot_time_hint(context: WorkoutNutritionContext, allocation: RemainingSlotA
 
 
 def _remaining_day_timeline_lines(context: WorkoutNutritionContext) -> list[str]:
+    """TASK-59: the detail-view timeline reuses the SHARED chronological
+    builder (noam_coach.services.day_timeline) — the same event semantics
+    the post-meal continuation renders — plus the allocation total line."""
+    from noam_coach.services.day_timeline import build_remaining_day_events
+
     allocations = build_remaining_slot_allocations(context)
     if not allocations:
         return []
-    lines: list[str] = []
+    events = build_remaining_day_events(context)
+    lines = [f"• {event.line()}" for event in events]
     planned = _hhmm_from_iso(context.planned_workout_start)
-    for index, allocation in enumerate(allocations):
-        time_hint = _slot_time_hint(context, allocation, index)
-        lines.append(
-            f"• {esc(time_hint)} · {esc(allocation.label)}: "
-            f"כ-{allocation.calories} קל׳ | כ-{allocation.protein} ג׳ חלבון"
-        )
-        if (
-            planned
-            and index == 0
-            and context.workout_phase in {
-                WorkoutPhase.PRE_WORKOUT_EARLY,
-                WorkoutPhase.PRE_WORKOUT_NEAR,
-                WorkoutPhase.PRE_WORKOUT_IMMEDIATE,
-            }
-        ):
-            lines.append(f"• {esc(planned)} · אימון מתוכנן")
+    if planned and not any("אימון" in line and "🏋️" in line for line in lines):
+        # Keep the planned-workout marker visible in pre-workout phases even
+        # when the shared builder classified the phase as non-future.
+        if context.workout_phase in {
+            WorkoutPhase.PRE_WORKOUT_EARLY,
+            WorkoutPhase.PRE_WORKOUT_NEAR,
+            WorkoutPhase.PRE_WORKOUT_IMMEDIATE,
+        }:
+            lines.append(f"• 🏋️ {esc(planned)} אימון מתוכנן")
     total_calories = sum(item.calories for item in allocations)
     total_protein = sum(item.protein for item in allocations)
     lines.append(f"<i>סך התכנון: כ-{total_calories} קל׳ | כ-{total_protein} ג׳ חלבון.</i>")
