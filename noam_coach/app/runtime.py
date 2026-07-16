@@ -282,6 +282,12 @@ def build_telegram_app() -> Application:
     from noam_coach.services.coaching_memory import install_coaching_memory_capture
 
     install_coaching_memory_capture()
+    # TASK-58: deterministic item-identity enforcement after AI reanalysis
+    # (a rejected identity can never return) + the high-impact uncertainty
+    # gate on first-pass image analysis.
+    from noam_coach.services.meal_identity import install_meal_identity_enforcement
+
+    install_meal_identity_enforcement()
     for command_name, command_handler in (
         ("start", command_start),
         ("import", command_import),

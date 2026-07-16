@@ -216,16 +216,38 @@ def _parse_removal_corrections(text: str) -> list[MealCorrection]:
 # NOTE: "אין X" is intentionally NOT handled here; it is a removal, already
 # covered by _REMOVAL_PATTERNS above.
 
-_HEB = r"[\u0590-\u05FF][\u0590-\u05FF\s]{0,40}"  # one or more Hebrew words
+_HEB = r"[\u0590-\u05FF][\u0590-\u05FF\s'\u05F3]{0,40}"  # Hebrew words (incl. geresh: \u05E7\u05D5\u05D8\u05D2')
 
 _REPLACEMENT_PATTERNS: list[re.Pattern[str]] = [
-    # "זה X לא Y" – "it's X not Y"
+    # TASK-58: negation-FIRST identity corrections — the production incident
+    # form "לא טחינה חציל במיונז" ("not tahini; eggplant with mayonnaise").
+    # These must parse as ITEM_IDENTITY replacements (rejected → confirmed),
+    # not fall through to whole-meal AI reinterpretation.
+    # Comma/dash-separated: "לא Y, X" / "זה לא Y - X"
     re.compile(
-        r"^זה\s+(?P<replacement>" + _HEB + r")\s+ולא\s+(?P<target>" + _HEB + r")$",
+        r"^(?:זה|זו|זאת)?\s*לא\s+(?P<target>" + _HEB + r"?)\s*[,;–—-]\s*"
+        r"(?:זה|זו|זאת)?\s*(?P<replacement>" + _HEB + r")$",
+        re.IGNORECASE,
+    ),
+    # "לא Y אלא X"
+    re.compile(
+        r"^(?:זה|זו|זאת)?\s*לא\s+(?P<target>" + _HEB + r"?)\s+אלא\s+"
+        r"(?P<replacement>" + _HEB + r")$",
+        re.IGNORECASE,
+    ),
+    # Space-separated with a single-word rejected identity: "לא טחינה חציל במיונז"
+    re.compile(
+        r"^(?:זה|זו|זאת)?\s*לא\s+(?P<target>[֐-׿]+)\s+"
+        r"(?P<replacement>" + _HEB + r")$",
+        re.IGNORECASE,
+    ),
+    # "זה/זו/זאת X לא Y" – "it's X not Y"
+    re.compile(
+        r"^(?:זה|זו|זאת)\s+(?P<replacement>" + _HEB + r")\s*,?\s+ולא\s+(?P<target>" + _HEB + r")$",
         re.IGNORECASE,
     ),
     re.compile(
-        r"^זה\s+(?P<replacement>" + _HEB + r")\s+לא\s+(?P<target>" + _HEB + r")$",
+        r"^(?:זה|זו|זאת)\s+(?P<replacement>" + _HEB + r")\s*,?\s+לא\s+(?P<target>" + _HEB + r")$",
         re.IGNORECASE,
     ),
     # "X במקום Y" – "X instead of Y"
@@ -645,10 +667,29 @@ def apply_item_replacement_correction(
                 return kcal
         return None
 
+    # TASK-58: prefer the curated Israeli-foods catalog for the NEW identity —
+    # when the confirmed food has trusted per-100g values, recalculate the
+    # replaced item's macros from them at the preserved gram weight instead of
+    # ratio-scaling the (possibly very wrong) rejected identity's macros.
+    curated_applied = False
+    try:
+        import israeli_foods
+
+        new_match = israeli_foods.lookup(replacement_name)
+        if new_match is not None and best.grams > 0:
+            scaled = israeli_foods.scaled_macros(new_match, best.grams)
+            best.calories = scaled["calories"]
+            best.protein = scaled["protein"]
+            best.carbs = scaled["carbs"]
+            best.fat = scaled["fat"]
+            curated_applied = True
+    except Exception:  # noqa: BLE001 — deterministic fallback below
+        curated_applied = False
+
     old_kcal = _lookup_kcal(old_name)
     new_kcal = _lookup_kcal(replacement_name)
 
-    if old_kcal is not None and new_kcal is not None and old_kcal > 0:
+    if not curated_applied and old_kcal is not None and new_kcal is not None and old_kcal > 0:
         ratio = new_kcal / old_kcal
         best.calories = round(best.calories * ratio, 1)
         best.protein = round(best.protein * ratio, 1)
@@ -769,6 +810,136 @@ def requires_cooked_raw_clarification(constraints: Iterable[LockedQuantity]) -> 
         c.measurement_state is None and any(food in c.food_text for food in sensitive)
         for c in constraints
     )
+
+
+# ---------------------------------------------------------------------------
+# TASK-58: deterministic item-identity constraints
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class IdentityConstraint:
+    """A user-locked item identity: *rejected* must never return; when
+    *confirmed* is set, the item the user was correcting IS that food."""
+
+    rejected: str
+    confirmed: str
+    source_text: str
+
+
+def identity_constraints_from_texts(texts: Iterable[str]) -> list[IdentityConstraint]:
+    """Parse identity corrections out of the current + locked correction texts.
+
+    This is the deterministic mirror of the prompt rule "the user's text is
+    authoritative": every replacement-form correction ("לא טחינה חציל במיונז",
+    "זה עוף לא הודו", "X במקום Y") becomes a hard constraint that outlives
+    the current AI call — TASK-58's invariant is that a rejected identity
+    cannot reappear in ANY later reanalysis of the same meal lifecycle.
+    """
+    constraints: list[IdentityConstraint] = []
+    seen: set[tuple[str, str]] = set()
+    for text in texts:
+        for correction in _parse_replacement_corrections(str(text or "")):
+            key = (correction.item_hint.casefold(), correction.value.casefold())
+            if key in seen:
+                continue
+            seen.add(key)
+            constraints.append(
+                IdentityConstraint(
+                    rejected=correction.item_hint,
+                    confirmed=correction.value,
+                    source_text=correction.original_text,
+                )
+            )
+    return constraints
+
+
+def _matches_rejected_identity(item_name: str, rejected: str) -> bool:
+    """True when *item_name* is the rejected identity or a canonical alias of
+    it (e.g. rejected "טחינה" must also catch "טחינה גולמית" restored by the
+    curated-food override)."""
+    name_tokens = _tokens(item_name)
+    rejected_tokens = _tokens(rejected)
+    if not name_tokens or not rejected_tokens:
+        return False
+    if rejected_tokens <= name_tokens:
+        return True
+    if _similarity(rejected, item_name) >= 0.5:
+        return True
+    # Canonical-family check: both names resolve to the same curated food.
+    try:
+        import israeli_foods
+
+        rejected_match = israeli_foods.lookup(rejected)
+        item_match = israeli_foods.lookup(item_name)
+        if (
+            rejected_match is not None
+            and item_match is not None
+            and rejected_match.canonical_name == item_match.canonical_name
+        ):
+            return True
+    except Exception:  # noqa: BLE001 — enforcement must never crash analysis
+        pass
+    return False
+
+
+def enforce_identity_constraints(
+    analysis: MealAnalysis, constraints: Iterable[IdentityConstraint]
+) -> tuple[MealAnalysis, list[dict[str, str]]]:
+    """Deterministically enforce identity constraints AFTER AI parsing and
+    AFTER deterministic food normalization (TASK-58 section A).
+
+    For every item still carrying a rejected identity: rename it to the
+    confirmed identity (item-scoped — grams preserved, macros adjusted via
+    the same conservative mechanism as apply_item_replacement_correction),
+    or drop it when the confirmed food already exists as another item.
+    Returns the analysis plus a machine-readable list of enforcement actions
+    for tracing. Unrelated items are never touched.
+    """
+    enforced: list[dict[str, str]] = []
+    for constraint in constraints:
+        matching = [
+            item for item in analysis.items
+            if _matches_rejected_identity(item.name, constraint.rejected)
+        ]
+        if not matching:
+            continue
+        confirmed_exists = any(
+            _similarity(constraint.confirmed, item.name) >= 0.6
+            for item in analysis.items
+            if item not in matching
+        )
+        for item in matching:
+            old_name = item.name
+            if confirmed_exists:
+                analysis.items.remove(item)
+                action = "removed_rejected_duplicate"
+            else:
+                analysis = apply_item_replacement_correction(
+                    analysis,
+                    MealCorrection(
+                        kind="replace",
+                        item_hint=old_name,
+                        value=constraint.confirmed,
+                        original_text=constraint.source_text,
+                    ),
+                )
+                action = "renamed_to_confirmed"
+                confirmed_exists = True
+            enforced.append(
+                {
+                    "action": action,
+                    "rejected": constraint.rejected,
+                    "confirmed": constraint.confirmed,
+                    "item_was": old_name,
+                }
+            )
+        note = f"אכיפת זהות: {constraint.rejected} → {constraint.confirmed}"
+        if enforced and note not in analysis.notes:
+            analysis.notes.append(note)
+    if enforced:
+        analysis.reconcile_title()
+    return analysis, enforced
 
 
 def sha256_bytes(data: bytes) -> str:
