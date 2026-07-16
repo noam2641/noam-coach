@@ -83,6 +83,9 @@ FIELD_OWNERS: dict[str, dict[str, Any]] = {
     #    save_next_meal_workout_status, so one owner, multiple surfaces.
     "next_meal_workout_status": {"owner": "next_meal", "clearers": ["next_meal"]},
     "next_meal_workout_status_at": {"owner": "next_meal", "clearers": ["next_meal"]},
+    # B12/ARCH-14: the CONCRETE rescheduled time collected by the reschedule
+    # flow (save_workout_reschedule_time) — never a vague "later".
+    "next_meal_workout_expected_at": {"owner": "next_meal", "clearers": ["next_meal"]},
     "next_meal_quantity_scales": {"owner": "next_meal", "clearers": ["next_meal"]},
     "next_meal_recent_titles": {"owner": "next_meal", "clearers": ["next_meal"]},
     "next_meal_recent_titles_at": {"owner": "next_meal", "clearers": ["next_meal"]},

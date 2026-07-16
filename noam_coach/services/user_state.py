@@ -302,10 +302,13 @@ async def _explicit_clarification_candidate(
 ) -> WorkoutState | None:
     """The explicit "during"/"completed"/"cancelled" clarification, if any.
 
-    Deliberately does NOT include "later" — "later" is not a claim about an
-    actual event, it is a hint about how to read a *planned* session (see
-    ``_planned_session_candidate``), so it stays folded into the PLAN
-    candidate rather than becoming its own top-level EXPLICIT candidate.
+    Vague "later" is deliberately NOT an explicit candidate — it is not a
+    claim about an actual event, only a hint about how to read a *planned*
+    session (see ``_planned_session_candidate``). B12/ARCH-14 adds the
+    CONCRETE case: when the reschedule flow collected an actual time
+    (``next_meal_workout_expected_at``), "later at 19:30" IS a real user
+    claim about timing and becomes the explicit candidate, with phase
+    derived from the user-stated time.
 
     Temporal validity (REC-ARCH-01 pass 3): ``next_meal_workout_status`` is
     written alongside ``next_meal_workout_status_at`` (see
@@ -344,6 +347,24 @@ async def _explicit_clarification_candidate(
             phase=WorkoutPhase.WORKOUT_CANCELLED,
             source="user_clarification",
             label="דיווחת שהאימון בוטל היום.",
+        )
+    if explicit == "later":
+        # B12/ARCH-14: only a CONCRETE rescheduled time is a claim; a vague
+        # "later" (no collected time) stays folded into the plan candidate.
+        expected = _parse_dt(flags.get("next_meal_workout_expected_at"))
+        if expected is None:
+            return None
+        expected = expected.astimezone(TZ)
+        end = expected + timedelta(minutes=60)
+        phase, minutes_until, minutes_since = _phase_from_times(now, expected, end)
+        return WorkoutState(
+            phase=phase,
+            source="user_clarification",
+            label=f"דחית את האימון לסביבות {expected:%H:%M} לפי הדיווח שלך.",
+            planned_start=expected,
+            planned_end=end,
+            minutes_until=minutes_until,
+            minutes_since=minutes_since,
         )
     return None
 
@@ -701,11 +722,18 @@ async def _consumed_meals_today(db: Any, user_id: int, now: datetime) -> tuple[C
 
 
 def _planned_meal_titles(flags: dict[str, Any]) -> tuple[str, ...]:
+    # B12/ARCH-13: only effectively planned entries (not consumed/expired).
+    from noam_coach.services.next_meal import planned_meal_view_status
+
+    now = datetime.now(TZ)
     planned = flags.get("next_meal_planned") or []
     titles: list[str] = []
     for meal in planned:
-        if isinstance(meal, dict) and meal.get("name"):
-            titles.append(str(meal["name"]))
+        if not (isinstance(meal, dict) and meal.get("name")):
+            continue
+        if planned_meal_view_status(meal, now) != "planned":
+            continue
+        titles.append(str(meal["name"]))
     return tuple(titles)
 
 

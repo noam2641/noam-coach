@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, time, timedelta, timezone
 from typing import Any
@@ -340,6 +341,35 @@ async def save_next_meal_workout_status(
     # consistent with "what day/flags row it was filed under".
     flags["next_meal_workout_status_at"] = local_now.astimezone(timezone.utc).isoformat()
     await _save_daily_flags(db, user_id, local_day, flags)
+
+
+async def save_workout_reschedule_time(
+    db: Any,
+    user_id: int,
+    expected: datetime,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Persist a CONCRETE rescheduled workout time (B12/ARCH-14).
+
+    The resolved product contract: reschedule must collect an actual time —
+    a vague "later" is never persisted as if it were a scheduling decision.
+    This is the only writer of ``next_meal_workout_expected_at``; the
+    canonical resolver (user_state._explicit_clarification_candidate) turns
+    it into a real user-clarification candidate with phase derived from the
+    user-stated time.
+    """
+    local_now = (now or datetime.now(TZ)).astimezone(TZ)
+    local_day = await daily_state.coaching_day_key(db, user_id, local_now)
+    flags = await _daily_flags(db, user_id, local_day)
+    flags["next_meal_workout_status"] = "later"
+    flags["next_meal_workout_status_at"] = local_now.astimezone(timezone.utc).isoformat()
+    flags["next_meal_workout_expected_at"] = expected.astimezone(TZ).isoformat()
+    await _save_daily_flags(db, user_id, local_day, flags)
+    await _log_event(
+        db, user_id, "next_meal_workout_rescheduled",
+        {"expected_at": expected.astimezone(TZ).isoformat()},
+    )
 
 
 async def _save_daily_flags(db: Any, user_id: int, local_day: str, flags: dict[str, Any]) -> None:
@@ -2699,8 +2729,37 @@ async def save_chosen_meal(
         saved = {}
     saved[fingerprint] = current.isoformat()
     flags["next_meal_saved"] = saved
+    # B12/ARCH-13: a planned meal saved as eaten transitions planned →
+    # consumed by FINGERPRINT identity (same flags write; the durable link
+    # is the created meals row id).
+    planned_entries = flags.get("next_meal_planned")
+    consumed_plan_id: str | None = None
+    if isinstance(planned_entries, list):
+        for planned_meal in planned_entries:
+            if (
+                isinstance(planned_meal, dict)
+                and planned_meal.get("fingerprint") == fingerprint
+                and str(planned_meal.get("status") or "planned") == "planned"
+            ):
+                planned_meal["status"] = "consumed"
+                planned_meal["status_at"] = current.isoformat()
+                planned_meal["meal_id"] = meal_id
+                consumed_plan_id = str(
+                    planned_meal.get("plan_id") or planned_meal.get("fingerprint") or ""
+                )
+                break
     await _save_daily_flags(db, user_id, local_day, flags)
     await _log_event(db, user_id, "next_meal_saved_as_meal", {"title": option.title, "calories": option.calories})
+    if consumed_plan_id:
+        with suppress(Exception):
+            from noam_coach.observability import emit_event, taxonomy
+
+            await emit_event(
+                db, user_id, taxonomy.STATE_MUTATED,
+                entity="planned_meal", entity_id=consumed_plan_id,
+                source="next_meal", status="mutated", outcome="consumed",
+                properties={"transition": "consumed", "meal_id": meal_id},
+            )
     return True
 
 
@@ -2727,7 +2786,15 @@ async def plan_chosen_meal(
         planned = []
     if any(isinstance(m, dict) and m.get("fingerprint") == fingerprint for m in planned):
         return False  # already planned -> no duplicate
+    # B12/ARCH-13: durable identity + lifecycle. Every planned meal carries a
+    # stable plan_id and an explicit status (planned → consumed/expired);
+    # consumption is matched by fingerprint/plan_id, never by title text.
+    import secrets as _secrets
+
     planned.append({
+        "plan_id": f"pm-{user_id}-{_secrets.token_hex(4)}",
+        "status": "planned",
+        "status_at": current.isoformat(),
         "fingerprint": fingerprint,
         "name": option.title,
         "calories": int(option.calories),
@@ -2738,6 +2805,77 @@ async def plan_chosen_meal(
     await _save_daily_flags(db, user_id, local_day, flags)
     await _log_event(db, user_id, "next_meal_planned_for_later", {"title": option.title, "calories": option.calories})
     return True
+
+
+_PLANNED_MEAL_EXPIRY_HOURS = 6
+
+
+def planned_meal_view_status(meal: dict[str, Any], now: datetime) -> str:
+    """The EFFECTIVE lifecycle status of a planned-meal entry (B12/ARCH-13).
+
+    Persisted transitions (consumed/replaced) always win; an entry still
+    "planned" whose planned_at is older than the expiry window reads as
+    expired without requiring a write on the read path. Legacy entries
+    (pre-B12, no status) behave as planned.
+    """
+    status = str(meal.get("status") or "planned")
+    if status != "planned":
+        return status
+    planned_at = _parse_dt(meal.get("planned_at"))
+    if planned_at is not None and now - planned_at > timedelta(hours=_PLANNED_MEAL_EXPIRY_HOURS):
+        return "expired"
+    return "planned"
+
+
+async def transition_planned_meal(
+    db: Any,
+    user_id: int,
+    *,
+    fingerprint: str | None = None,
+    plan_id: str | None = None,
+    status: str,
+    meal_id: int | None = None,
+    now: datetime | None = None,
+) -> str | None:
+    """Persist a lifecycle transition on a planned meal, addressed by its
+    durable identity (plan_id) or fingerprint. Returns the plan_id when an
+    entry transitioned, None when nothing matched."""
+    current = (now or datetime.now(TZ)).astimezone(TZ)
+    local_day = await daily_state.coaching_day_key(db, user_id, current)
+    flags = await _daily_flags(db, user_id, local_day)
+    planned = flags.get("next_meal_planned")
+    if not isinstance(planned, list):
+        return None
+    matched_id: str | None = None
+    for meal in planned:
+        if not isinstance(meal, dict):
+            continue
+        if plan_id is not None and meal.get("plan_id") != plan_id:
+            continue
+        if plan_id is None and (fingerprint is None or meal.get("fingerprint") != fingerprint):
+            continue
+        if str(meal.get("status") or "planned") != "planned":
+            continue
+        meal["status"] = status
+        meal["status_at"] = current.isoformat()
+        if meal_id is not None:
+            meal["meal_id"] = meal_id
+        matched_id = str(meal.get("plan_id") or meal.get("fingerprint") or "")
+        break
+    if matched_id is None:
+        return None
+    flags["next_meal_planned"] = planned
+    await _save_daily_flags(db, user_id, local_day, flags)
+    with suppress(Exception):
+        from noam_coach.observability import emit_event, taxonomy
+
+        await emit_event(
+            db, user_id, taxonomy.STATE_MUTATED,
+            entity="planned_meal", entity_id=matched_id,
+            source="next_meal", status="mutated", outcome=status,
+            properties={"transition": status, "meal_id": meal_id},
+        )
+    return matched_id
 
 
 async def invalidate_daily_nutrition_cache(

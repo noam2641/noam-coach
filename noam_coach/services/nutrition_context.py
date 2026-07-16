@@ -287,19 +287,31 @@ def _planned_next_meals(flags: dict[str, Any]) -> list[dict[str, Any]]:
 
     Stored in daily_flags by next_meal.plan_chosen_meal. Surfaced as planned —
     never folded into consumed, preserving the planned/consumed separation.
+
+    B12/ARCH-13: entries carry a durable lifecycle now — only EFFECTIVELY
+    planned entries (status=planned and not view-expired) surface here;
+    consumed entries already live in the meals table, expired ones must not
+    keep steering "expected meals" hours after their moment passed.
     """
+    from noam_coach.services.next_meal import planned_meal_view_status
+
+    now = datetime.now(TZ)
     planned = flags.get("next_meal_planned") or []
     result: list[dict[str, Any]] = []
     for meal in planned:
-        if isinstance(meal, dict) and meal.get("name"):
-            result.append({
-                "fingerprint": meal.get("fingerprint"),
-                "name": str(meal.get("name")),
-                "calories": int(meal.get("calories") or 0),
-                "protein": int(meal.get("protein") or 0),
-                "planned_at": meal.get("planned_at"),
-                "source": "next_meal_plan",
-            })
+        if not (isinstance(meal, dict) and meal.get("name")):
+            continue
+        if planned_meal_view_status(meal, now) != "planned":
+            continue
+        result.append({
+            "plan_id": meal.get("plan_id"),
+            "fingerprint": meal.get("fingerprint"),
+            "name": str(meal.get("name")),
+            "calories": int(meal.get("calories") or 0),
+            "protein": int(meal.get("protein") or 0),
+            "planned_at": meal.get("planned_at"),
+            "source": "next_meal_plan",
+        })
     return result
 
 

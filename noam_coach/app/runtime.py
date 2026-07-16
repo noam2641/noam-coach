@@ -262,6 +262,13 @@ def build_telegram_app() -> Application:
     )
 
     install_flow_convergence()
+    # B12 (ARCH-14): "the workout is later" collects a CONCRETE time (slots +
+    # text input) before anything is persisted as a scheduling decision.
+    # Installed BEFORE turn_context so its free-text time parsing sits under
+    # the B9 pipeline (deterministic reference resolution first).
+    from noam_coach.services.workout_reschedule import install_workout_reschedule
+
+    install_workout_reschedule()
     # B9 (ARCH-08/16): AssistantTurnContext — free-text turns build a bounded
     # context, deterministic references (כן/השני/תשמור את זה/תחזור) dispatch
     # through the gated canonical handlers, unresolved candidates go to the
