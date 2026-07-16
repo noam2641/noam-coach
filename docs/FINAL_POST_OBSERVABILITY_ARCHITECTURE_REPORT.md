@@ -298,9 +298,15 @@ dereference a torn-down global).
   wrap without syncing its facade globals — a cold-path NameError the B13
   audit caught and fixed (explicit `runtime_bind._sync`) before any deploy;
   noted here because it shows the wrap seams' one sharp edge.
-- Two evening-flaky re8 tests identified during the observability program
-  remain unfixed (pre-existing, tracked separately; they did not appear in any
-  batch verification run of this program).
+- (Correction of an earlier stale claim:) the two evening-deterministic re8
+  test failures identified during the observability program were fixed BEFORE
+  this program, in the baseline commit `8233abe` itself
+  (`test_quantity_edit_recalculates_option_totals_through_callback` — a real
+  product defect in quantity adjustment plus a positional-identity test
+  defect; `test_selected_option_quantity_text_recalculates_without_saving` —
+  a wall-clock test defect). Both tests are included in the current full
+  suite, both pass, nothing is skipped/xfailed/deselected — they are NOT a
+  remaining limitation of this program.
 
 ## 26. Explicitly unresolved architecture gaps
 
