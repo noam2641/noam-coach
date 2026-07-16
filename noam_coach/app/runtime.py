@@ -288,6 +288,12 @@ def build_telegram_app() -> Application:
     from noam_coach.services.meal_identity import install_meal_identity_enforcement
 
     install_meal_identity_enforcement()
+    # TASK-63: plan-completion answer invariant — a saved answer never
+    # re-renders the same question; dietary classification is a real,
+    # resumable pending sub-question (text-answerable, restart-safe).
+    from noam_coach.services.question_dedup import install_plan_question_dedup
+
+    install_plan_question_dedup()
     for command_name, command_handler in (
         ("start", command_start),
         ("import", command_import),
