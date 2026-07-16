@@ -294,6 +294,12 @@ def build_telegram_app() -> Application:
     from noam_coach.services.question_dedup import install_plan_question_dedup
 
     install_plan_question_dedup()
+    # TASK-64: multi-fact free-text updates during active flows — installed
+    # AFTER question_dedup so the multi-fact check runs first and single-fact
+    # answers fall through to the dedup/classification layer unchanged.
+    from noam_coach.services.multi_fact import install_multi_fact_updates
+
+    install_multi_fact_updates()
     for command_name, command_handler in (
         ("start", command_start),
         ("import", command_import),
