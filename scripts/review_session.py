@@ -23,6 +23,8 @@ Usage:
     python scripts/review_session.py list            [--reviews-dir DIR]
     python scripts/review_session.py show REVIEW_ID  [--reviews-dir DIR]
     python scripts/review_session.py validate REVIEW_ID
+    python scripts/review_session.py show-finding REVIEW_ID FINDING_ID
+    python scripts/review_session.py advance --review REVIEW_ID
 """
 
 from __future__ import annotations
@@ -197,6 +199,69 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_show_finding(args: argparse.Namespace) -> int:
+    """Evidence navigation: one finding + the exact events it cites."""
+    from noam_coach.observability.review_package import package_dir
+    from scripts.review_findings import load_findings
+
+    directory = package_dir(args.reviews_dir, args.review_id)
+    findings = load_findings(directory)
+    matched = [f for f in findings if f.get("finding_id") == args.finding_id]
+    if not matched:
+        known = ", ".join(f.get("finding_id", "?") for f in findings) or "none"
+        raise SystemExit(f"error: no finding {args.finding_id!r} (known: {known})")
+    finding = matched[0]
+    print(json.dumps(finding, ensure_ascii=False, indent=2))
+
+    events_path = directory / "events.jsonl"
+    wanted: set[int] = set()
+    for reference in finding.get("evidence_references") or []:
+        wanted.update(int(item) for item in reference.get("event_ids") or [])
+    if wanted and events_path.exists():
+        print("\n--- referenced evidence events ---")
+        with events_path.open(encoding="utf-8") as handle:
+            for line in handle:
+                row = json.loads(line)
+                if row.get("id") in wanted:
+                    print(json.dumps(row, ensure_ascii=False))
+    elif wanted:
+        print("\n(events.jsonl not present locally — raw evidence is gitignored)")
+    return 0
+
+
+def _cmd_advance(args: argparse.Namespace) -> int:
+    """Move the last-review cursor — ONLY once the review truly completed:
+    intact package, findings.json present AND valid, report.md generated."""
+    from noam_coach.observability.review_package import load_manifest, package_dir, verify_package
+    from noam_coach.observability.review_window import advance_cursor
+    from scripts.review_findings import validate_findings_file
+
+    reviews_dir = Path(args.reviews_dir)
+    review_id = args.review
+    problems = verify_package(reviews_dir, review_id)
+    directory = package_dir(reviews_dir, review_id)
+    findings_path = directory / "findings.json"
+    report_path = directory / "report.md"
+    if not findings_path.exists():
+        problems.append("findings.json missing — the review analysis has not completed")
+    else:
+        problems.extend(validate_findings_file(findings_path))
+    if not report_path.exists():
+        problems.append("report.md missing — the review report has not been generated")
+    if problems:
+        for problem in problems:
+            print(f"NOT ADVANCED: {problem}")
+        return 1
+    manifest = load_manifest(reviews_dir, review_id)
+    last_id = manifest.get("last_event_id")
+    if last_id is None:
+        # Empty window: keep the cursor where the resolution left it.
+        last_id = manifest["resolved_selection"].get("after_event_id") or 0
+    state = advance_cursor(reviews_dir, last_reviewed_event_id=int(last_id), review_id=review_id)
+    print(f"cursor advanced to event {state['last_reviewed_event_id']} (review {review_id})")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Noam Coach session-review workflow")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -229,6 +294,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_validate = sub.add_parser("validate", help="verify package integrity/hashes")
     p_validate.add_argument("review_id")
     _common(p_validate)
+
+    p_finding = sub.add_parser("show-finding", help="print one finding + its evidence events")
+    p_finding.add_argument("review_id")
+    p_finding.add_argument("finding_id")
+    _common(p_finding)
+
+    p_advance = sub.add_parser(
+        "advance", help="advance the last-review cursor (only after a COMPLETE review)"
+    )
+    p_advance.add_argument("--review", required=True)
+    _common(p_advance)
     return parser
 
 
@@ -240,6 +316,8 @@ def main(argv: list[str] | None = None) -> int:
         "list": _cmd_list,
         "show": _cmd_show,
         "validate": _cmd_validate,
+        "show-finding": _cmd_show_finding,
+        "advance": _cmd_advance,
     }[args.command]
     return handler(args)
 
