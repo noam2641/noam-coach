@@ -51,3 +51,11 @@ compileall.log
 ruff.log
 eval.log
 *.tmp
+
+# Review workflow (R4): raw evidence stays local — committable artifacts are
+# manifest/stats/signals/findings/report only (see docs/CONTINUOUS_IMPROVEMENT_WORKFLOW.md)
+reviews/state.json
+reviews/state.json.tmp
+reviews/.building_*
+reviews/*/events.jsonl
+reviews/*/timeline.md
