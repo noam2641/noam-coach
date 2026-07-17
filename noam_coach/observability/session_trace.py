@@ -282,6 +282,21 @@ def _group_interactions(events: list[ProductEvent]) -> tuple[InteractionTrace, .
     )
 
 
+def build_session_trace(user_id: int, events: list[ProductEvent]) -> SessionTrace:
+    """SessionTrace over an ALREADY-SELECTED event list (Review batch R2).
+
+    The events must be in canonical append order (ascending id) — exactly
+    what the R2 window pagination yields. This lets multi-day review
+    windows reuse the existing trace model without routing every selection
+    through the bounded ``list_events`` loaders.
+    """
+    return SessionTrace(
+        user_id=user_id,
+        events=tuple(events),
+        interactions=_group_interactions(list(events)),
+    )
+
+
 async def load_session_trace(db: Any, user_id: int, *, limit: int = 2000) -> SessionTrace:
     events = await event_log.list_events(db, user_id, limit=limit)
     return SessionTrace(

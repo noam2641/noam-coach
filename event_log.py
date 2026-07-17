@@ -195,6 +195,96 @@ async def list_events(
     return [_decode(row) for row in reversed(rows)]
 
 
+async def max_event_id(db: Any, user_id: int) -> int | None:
+    """Highest canonical event id for one user (None when no events exist)."""
+    rows = await db.fetch_all(
+        "SELECT MAX(id) AS max_id FROM product_events WHERE user_id=?",
+        (user_id,),
+    )
+    value = rows[0]["max_id"] if rows else None
+    return int(value) if value is not None else None
+
+
+async def event_id_range_for_window(
+    db: Any,
+    user_id: int,
+    *,
+    start: str | None = None,
+    end: str | None = None,
+) -> tuple[int, int] | None:
+    """MIN/MAX event id whose ``created_at`` falls in ``[start, end)``.
+
+    Review batch R2: timestamps define the REQUESTED window only — they are
+    resolved to a canonical id range once, and all further selection pages
+    by id, so ordering authority stays the append order (monotonic row
+    ids), never wall-clock comparison. Bounds are UTC ISO strings in the
+    same format ``utc_now`` writes; start is inclusive, end is exclusive.
+    Returns None for an empty window.
+    """
+    clauses = ["user_id=?"]
+    params: list[Any] = [user_id]
+    if start is not None:
+        clauses.append("created_at >= ?")
+        params.append(start)
+    if end is not None:
+        clauses.append("created_at < ?")
+        params.append(end)
+    rows = await db.fetch_all(
+        f"""
+        SELECT MIN(id) AS min_id, MAX(id) AS max_id FROM product_events
+        WHERE {' AND '.join(clauses)}
+        """,
+        tuple(params),
+    )
+    if not rows or rows[0]["min_id"] is None:
+        return None
+    return int(rows[0]["min_id"]), int(rows[0]["max_id"])
+
+
+async def list_events_after(
+    db: Any,
+    user_id: int,
+    *,
+    after_id: int,
+    until_id: int | None = None,
+    trace_ids: list[str] | None = None,
+    interaction_ids: list[str] | None = None,
+    limit: int = 500,
+) -> list[ProductEvent]:
+    """One ascending page of events with ``id > after_id`` (R2 pagination).
+
+    The additive window-query primitive: unlike :func:`list_events` (newest
+    N, bounded at 2000) this pages FORWARD in canonical append order, so a
+    multi-day window is read in deterministic chunks of ``limit`` without
+    ever loading unbounded history. ``until_id`` is inclusive. Optional
+    trace/interaction filters select exactly those groups' events (legacy
+    uncorrelated rows never match a filter — callers include them by
+    omitting filters).
+    """
+    clauses = ["user_id=?", "id > ?"]
+    params: list[Any] = [user_id, int(after_id)]
+    if until_id is not None:
+        clauses.append("id <= ?")
+        params.append(int(until_id))
+    if trace_ids:
+        clauses.append(f"trace_id IN ({','.join('?' * len(trace_ids))})")
+        params.extend(trace_ids)
+    if interaction_ids:
+        clauses.append(f"interaction_id IN ({','.join('?' * len(interaction_ids))})")
+        params.extend(interaction_ids)
+    params.append(max(1, min(limit, 2000)))
+    rows = await db.fetch_all(
+        f"""
+        SELECT * FROM product_events
+        WHERE {' AND '.join(clauses)}
+        ORDER BY id ASC
+        LIMIT ?
+        """,
+        tuple(params),
+    )
+    return [_decode(row) for row in rows]
+
+
 async def replay_summary(db: Any, user_id: int, *, limit: int = 100) -> str:
     """Return a compact human-readable timeline for debugging.
 
