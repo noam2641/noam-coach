@@ -309,6 +309,11 @@ def build_telegram_app() -> Application:
     from noam_coach.services.morning_policy import install_morning_policy
 
     install_morning_policy()
+    # TASK-60: per-weekday workout-time evidence in the Health wizard's hour
+    # step + entity-addressed outlier-day approvals.
+    from noam_coach.services.workout_hours import install_workout_hour_evidence
+
+    install_workout_hour_evidence()
     for command_name, command_handler in (
         ("start", command_start),
         ("import", command_import),

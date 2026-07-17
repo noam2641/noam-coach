@@ -318,6 +318,13 @@ async def test_health_reconciliation_start_result_failure(db: Database, monkeypa
     with interaction_scope(user_id=USER_ID):
         with pytest.raises(RuntimeError):
             await health_jobs.run_post_import_reconciliation(None, USER_ID)
+    # Unwrap while the bad stub is still the monkeypatched attribute: the
+    # autouse teardown's uninstall would otherwise run AFTER monkeypatch's
+    # restore and re-plant bad_reconciliation as the module attribute,
+    # leaking a raising reconciliation into every later test that finishes
+    # the health wizard.
+    uninstall_state_trace()
+    install_state_trace()
 
     events = await event_log.list_events(db, USER_ID)
     health_events = _mutations(events, "health_import")
