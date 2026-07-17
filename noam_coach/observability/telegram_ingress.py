@@ -241,7 +241,73 @@ def observed_handler(
                 await _ensure_user_row(user)
             flow_before = await _pre_routing_flow_snapshot(db, user_id)
             await _emit_interaction_received(db, user_id, kind, update, command, flow_before)
-            return await handler(update, context)
+            try:
+                return await handler(update, context)
+            except Exception as exc:
+                # R1: an unhandled crash becomes correlated trace evidence.
+                # Cancellation is a BaseException and passes through untouched;
+                # the exception is ALWAYS re-raised so PTB's error handling
+                # (on_error) behaves exactly as before.
+                from noam_coach.observability.error_capture import capture_unhandled
+
+                await capture_unhandled(
+                    db,
+                    user_id,
+                    exc,
+                    boundary=f"telegram_handler:{kind}",
+                    source="telegram",
+                    surface=SURFACE_TELEGRAM,
+                    properties={"command": command} if command else None,
+                )
+                raise
+
+    return wrapper
+
+
+def observed_error_callback(error_handler: TelegramHandler) -> TelegramHandler:
+    """Wrap the PTB error handler with the R1 safety-net capture.
+
+    This is the boundary python-telegram-bot routes EVERY dispatch failure
+    to — including scheduled JobQueue callbacks, which never pass through
+    ``observed_handler``. Exceptions already recorded at a nested boundary
+    are skipped (the exception object is marked); transient/stale Telegram
+    conditions are expected operational noise, not crashes, and are never
+    recorded. The wrapped ``on_error`` always runs unchanged.
+    """
+
+    @functools.wraps(error_handler)
+    async def wrapper(update: Any, context: Any) -> Any:
+        exc = getattr(context, "error", None)
+        if isinstance(exc, Exception):
+            from noam_coach.observability.error_capture import already_captured, capture_unhandled
+            from noam_coach.services.telegram_errors import classify_telegram_error
+
+            if not already_captured(exc):
+                shutting_down = False
+                with suppress(Exception):
+                    from config import RUNTIME_STATE
+
+                    shutting_down = bool(getattr(RUNTIME_STATE, "shutting_down", False))
+                decision = classify_telegram_error(
+                    exc, shutting_down=shutting_down, update=update
+                )
+                if not decision.transient:
+                    user = getattr(update, "effective_user", None)
+                    user_id = int(user.id) if user is not None else _allowed_user_id()
+                    if user_id is not None:
+                        with suppress(Exception):
+                            await capture_unhandled(
+                                _facade_db(),
+                                user_id,
+                                exc,
+                                boundary="telegram_dispatch",
+                                source="telegram",
+                                surface=SURFACE_TELEGRAM,
+                                properties={
+                                    "has_update": update is not None,
+                                },
+                            )
+        return await error_handler(update, context)
 
     return wrapper
 

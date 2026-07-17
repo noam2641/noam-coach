@@ -110,15 +110,34 @@ async def mini_obs_scope(
 
     client_id = _safe_client_interaction_id(x_obs_client_interaction)
     if client_id is None:
-        with interaction_scope(user_id=user_id):
-            yield user_id
+        scope = interaction_scope(user_id=user_id)
     else:
-        with interaction_scope(
+        scope = interaction_scope(
             trace_id=_client_trace_id(client_id),
             interaction_id=client_id,
             user_id=user_id,
-        ):
+        )
+    with scope:
+        # R1: an unhandled endpoint exception (thrown back into this
+        # dependency at the yield point) becomes correlated evidence.
+        # HTTPException is an expected domain rejection, never a crash;
+        # cancellation is a BaseException and passes through untouched.
+        try:
             yield user_id
+        except HTTPException:
+            raise
+        except Exception as exc:
+            from noam_coach.observability.error_capture import capture_unhandled
+
+            await capture_unhandled(
+                DB,
+                user_id,
+                exc,
+                boundary="mini_api",
+                source="mini_app",
+                surface="mini_app",
+            )
+            raise
 
 
 @router.post("/mini/api/obs/events", include_in_schema=False)

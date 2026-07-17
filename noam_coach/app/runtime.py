@@ -209,6 +209,7 @@ def build_telegram_app() -> Application:
     from noam_coach.observability.telegram_egress import install_telegram_egress
     from noam_coach.observability.telegram_ingress import (
         install_routing_observer,
+        observed_error_callback,
         observed_handler,
     )
 
@@ -344,7 +345,10 @@ def build_telegram_app() -> Application:
             observed_handler("text", handle_text_message),
         )
     )
-    application.add_error_handler(on_error)
+    # R1: the dispatch/error boundary is the safety net for scheduled jobs
+    # and every other path PTB routes to error handling; on_error itself is
+    # unchanged (wrapped at registration, not edited).
+    application.add_error_handler(observed_error_callback(on_error))
     schedule_jobs(application)
     return application
 
