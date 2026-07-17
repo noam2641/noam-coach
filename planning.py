@@ -927,6 +927,7 @@ def _workout_candidate(
     resolved_session_minutes: int | None = None,
     resolved_preferred_days: list[int] | None = None,
     resolved_preferred_time: str | None = None,
+    pain_detail: dict[str, Any] | None = None,
 ) -> PlanCandidate:
     # REC-PROGRAM-04-01: Use resolved availability when provided
     minutes = resolved_session_minutes or int(_fact_value(facts, "session_minutes", 50) or 50)
@@ -978,13 +979,16 @@ def _workout_candidate(
             pain_value=limitations,
             medical_avoidance=limitations,
             experience=experience,
+            # TASK-61: reported severities drive the KEEP/REDUCE/REPLACE/OMIT
+            # decision (high severity never keeps a loading exercise).
+            pain_detail=pain_detail,
         )
         session["exercises"] = adapted
         for exercise in session["exercises"]:
             exercise["warmup_sets"] = training_intelligence.warmup_sets(exercise)
         if changes:
             adaptation_audit.append({"session": session["name"], "changes": changes})
-            if any("backfilled" in change for change in changes):
+            if any("backfilled" in change or "region" in change for change in changes):
                 pain_backfilled = True
         # Generate a complete quick fallback rather than only exercise IDs.
         session["fast_version"] = training_intelligence.quick_session(
@@ -998,9 +1002,9 @@ def _workout_candidate(
         ]
     if adaptation_audit:
         assumptions.append("התוכנית הותאמה לציוד, לניסיון ולמגבלות שדווחו")
-    # Smart backfill happened: be explicit that some exercises were swapped for
-    # pain-safe alternatives, and name the reported limitation, so the user
-    # understands why an upper-body day looks different from a textbook split.
+    # Pain-driven adaptation happened (replacement, load reduction or
+    # backfill): name the reported limitation so the user understands why the
+    # plan looks different from a textbook split.
     if pain_backfilled:
         pain_labels = [
             training_intelligence.pain_region_label(region)
@@ -1008,7 +1012,7 @@ def _workout_candidate(
         ]
         if pain_labels:
             assumptions.append(
-                "החלפתי חלק מהתרגילים בתרגילים בטוחים בגלל המגבלה שדיווחת "
+                "התאמתי חלק מהתרגילים (החלפה או הפחתת עומס) בגלל המגבלה שדיווחת "
                 f"({', '.join(pain_labels)}). כך כל האימונים נשארים מלאים ובטוחים."
             )
     payload = {
@@ -1180,11 +1184,21 @@ async def build_workout_candidates(db: Any, user_id: int) -> list[PlanCandidate]
     # split/volume, not by silently dropping a training day.
     consistency_freq = desired
     performance_freq = min(MAX_FREQUENCY, performance_ceiling, desired + 1)
+    # TASK-61: reported pain severities feed the adaptation decisions —
+    # region alone chooses the operation family, severity escalates it
+    # (high severity never keeps a loading exercise).
+    pain_rows = await db.fetch_all(
+        "SELECT * FROM medical_constraints WHERE user_id=? AND kind='pain'",
+        (user_id,),
+    )
+    pain_detail = training_intelligence.active_pain_regions(pain_rows)
+
     # REC-PROGRAM-04-01: Pass resolved availability to candidates
     _avail_kwargs = {
         "resolved_session_minutes": avail.session_minutes,
         "resolved_preferred_days": avail.preferred_days,
         "resolved_preferred_time": avail.preferred_time,
+        "pain_detail": pain_detail,
     }
     strategy_inputs = {
         strategy: _workout_strategy_score(

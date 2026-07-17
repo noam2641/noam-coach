@@ -274,3 +274,121 @@ Verified after every task commit and once more after this report: **PASS** —
 no protected file was edited, staged, restored, or deleted; all product fixes
 in protected paths are install-time wraps registered in
 `noam_coach/app/runtime.py`.
+
+---
+
+# TASK 61 — Implementation Addendum (pain-aware substitution and load adjustment)
+
+Implemented after user acceptance of tasks 58–65 and approval of DECISIONS 1–4
+from the decision packet above. One logical commit; no previously completed
+behaviour was reopened.
+
+## Pre-implementation architecture review (reported before any code)
+1. **No partial TASK_61 implementation existed** — every `elbow_flexion` hit
+   was the movement-name string, not adaptation logic.
+2. **No TODOs / dead code** left by tasks 58–65 in the seven touched modules.
+3. **No duplicated adaptation logic** — `training_intelligence.adapt_exercises`
+   is the single adaptation pipeline.
+4. **Exactly one exercise-selection path performs pain adaptation** —
+   `planning.py::_workout_candidate` → `adapt_exercises`; every other
+   `active_pain_regions` consumer is display-only.
+5. **No stale comments/docs**; noted gap: constraint severity was recorded but
+   never plumbed into adaptation (closed by this task).
+
+## Files changed
+- `training_intelligence.py` — DECISION 1 metadata + the adaptation engine.
+- `planning.py` — severity plumbing (`pain_detail`) + limitation-note trigger.
+- `tests/test_task61_pain_adaptation.py` — new, 15 tests.
+- `tests/test_training_intelligence.py` — one regression test updated to the
+  new contract (see "Contract updates").
+
+## Architectural decisions (as approved)
+- **DECISION 1 — metadata**: `ExerciseProfile` gained `grip_demand`
+  (`none|low|high_static|high_dynamic`), `elbow_flexion_load` (`none|low|high`)
+  and `wrist_load` (`none|low|high`), applied over the existing `CATALOG` via a
+  single `_DEMAND_METADATA` table (`dataclasses.replace`; no duplicated
+  representations; exported by `public_metadata()`).
+- **Load levels**: `region_load_level(profile, region) → none|reduce|replace`.
+  Weight-bearing joints (knee/shoulder/back/hip) keep the accepted binary
+  semantics (direct joint load ⇒ replace). Elbow/wrist are refined: a dynamic
+  pronated grip ⇒ replace; a static/neutral grip, high flexion, or a direct
+  joint entry ⇒ reduce — this is what keeps an upper session trainable under
+  tennis elbow instead of gutting it.
+- **DECISION 2 — reduction**: exactly ONE axis per exercise. Weighted:
+  weight × 0.6 snapped to the exercise increment, floored at one increment.
+  Unweighted: sets − 1, floored at 2 sets.
+- **DECISION 3 — severity**: `decide_pain_adaptation` — severity ≥ 7 never
+  keeps a loading exercise: REPLACE with a fully-clean candidate
+  (`require_clean`) or OMIT. Below high severity: replace-level ⇒ replace
+  (same-movement variant preferred ⇒ "modify"), reduce-level ⇒ keep with
+  load reduction.
+- **Replacement search**: the exercise's own `alts` first, then the
+  `REPLACEMENTS` same-pattern table; candidates loading the trigger region at
+  replace-level are rejected; candidates loading ANY other active region are
+  vetted the same way; clean candidates rank before reduce-level ones;
+  equipment/skill checks reuse `exercise_allowed`.
+- **Backfill hardening**: `_pain_safe_backfill_candidates` now requires
+  `region_load_level == "none"` for every active region — a reduce-level
+  exercise may survive adaptation in place, but is never *added* to a session
+  on the injured joint's account (previously the binary joint-load check let
+  static-grip RDL into a severity-8 elbow session).
+- **DECISION 4 — explanations**: `ADAPTATION_EXPLANATIONS_HE` (replace /
+  modify / reduce / omit), ≤ 120 chars, no diagnostic language; carried per
+  exercise (`adaptation_note`) and per change in the audit; the limitation
+  note in plan assumptions now fires on any pain-driven change (replacement,
+  reduction or backfill), not only backfill.
+- **Severity plumbing**: `build_workout_candidates` reads
+  `medical_constraints (kind='pain')` → `active_pain_regions` (14-day TTL,
+  worst severity per region) → `pain_detail` → `_workout_candidate` →
+  `adapt_exercises`. Text-derived regions without a constraint row get
+  severity `None` (treated as non-high). Deterministic throughout; no AI call.
+
+## Tests added (15 in tests/test_task61_pain_adaptation.py)
+- DECISION 1: metadata validity across the whole catalog; pull-variant
+  distinction (lat_pull dynamic vs neutral_pull static).
+- Load-level matrix: elbow/wrist/knee/shoulder cases incl. bench=reduce,
+  squat-elbow=none, squat-knee=replace, bar_curl-wrist=replace.
+- DECISION 2: 60 kg → 35.0 (one axis, snapped), floor ≥ increment,
+  bodyweight sets 4→3 with floor 2.
+- DECISION 3: severity 7 never keeps; keep below threshold; OMIT when the only
+  alt is reduce-level and severity is high.
+- Backfill: candidates must be fully clean for the active region (regression
+  for the RDL leak).
+- The source incident: severity-4 tennis elbow adapts the upper session in
+  place (press reduced, pull → neutral variant, curl → cable variant, no leg
+  substitution).
+- Knee semantics unchanged; upper work untouched by knee pain.
+- DECISION 4: explanations short/non-diagnostic; adapted exercises carry notes.
+- End-to-end: seeded DB with a severity-8 elbow constraint →
+  `build_workout_candidates` leaves no elbow-loading exercise in any session
+  of any strategy.
+
+## Contract updates (2, both TASK_61-semantic)
+- `tests/test_training_intelligence.py::test_elbow_pain_backfills_gutted_session_cross_pattern`
+  asserted the old binary contract ("nothing with elbow in joint_load
+  survives"). Updated to the approved contract: nothing replace-level
+  survives; reduce-level survivors must carry an `adaptation_note`.
+- `tests/regression/test_task3_strategy_selection.py` (unchanged) drove a
+  wording/trigger fix in `planning.py`: the "המגבלה שדיווחת" assumption now
+  appears for in-place adaptations too, phrased "התאמתי חלק מהתרגילים
+  (החלפה או הפחתת עומס)…".
+
+## Verification
+- `python -m compileall -q .` — clean; `ruff check .` — clean.
+- Focused: 15/15 (`tests/test_task61_pain_adaptation.py`).
+- Neighbor suites (pain/planning/strategy/recording): all passing.
+- Full `pytest --cov` with zero deselections: **1709 passed** (1694 → 1709).
+- Evaluations: **33/33**; `build_release`: clean (416 files).
+- Protected baseline: **19/19 blob hashes byte-identical**; staging area clean
+  of protected files at commit time.
+
+## Known limitations
+- The demand metadata is mechanically inferred (per the approved DECISION 1
+  authoring approach); a domain review pass can refine individual entries
+  without any engine change — the matrix is data, not code.
+- At high severity (≥ 7) with a fully-equipped gym, every press still loads
+  the elbow at reduce level, so DECISION 3 correctly omits them and the
+  session backfills with clean patterns — sessions are safe but intentionally
+  conservative; only explicit future rules may soften this.
+- Severity arrives only from `medical_constraints` rows; free-text limitations
+  without a row adapt at the (gentler) non-high pathway by design.
