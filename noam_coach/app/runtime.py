@@ -157,7 +157,12 @@ def schedule_jobs(application: Application) -> None:
         return
     morning = dttime(hour=8, minute=0, tzinfo=TZ)
     evening = dttime(hour=22, minute=0, tzinfo=TZ)
-    jq.run_daily(job_morning, time=morning, name="morning")
+    # TASK-62: the scheduled morning delivery is the SHORT briefing (same
+    # semantics as menu:morning) + check-in; the full daily menu flows
+    # through the same job but is opt-in-gated at the delivery boundary.
+    from noam_coach.services.morning_policy import job_morning_briefing
+
+    jq.run_daily(job_morning_briefing, time=morning, name="morning")
     jq.run_daily(job_evening, time=evening, name="evening")
     jq.run_repeating(job_calorie_watch, interval=1800, first=300, name="calorie_watch")
     jq.run_repeating(job_motivation, interval=1800, first=900, name="motivation")
@@ -300,6 +305,10 @@ def build_telegram_app() -> Application:
     from noam_coach.services.multi_fact import install_multi_fact_updates
 
     install_multi_fact_updates()
+    # TASK-62: the morning-menu opt-in/out toggle callbacks.
+    from noam_coach.services.morning_policy import install_morning_policy
+
+    install_morning_policy()
     for command_name, command_handler in (
         ("start", command_start),
         ("import", command_import),

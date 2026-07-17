@@ -69,6 +69,23 @@ class FakeMessage:
         self.replies.append(text)
 
 
+def _freeze_reschedule_clock(monkeypatch: Any, hour: int = 15) -> "datetime":
+    """Pin workout_reschedule's internal clock to a fixed afternoon instant
+    so same-day future times never wrap past midnight during late-night
+    suite runs (this exact wrap bit a 00:xx full-suite run)."""
+    from noam_coach.services import workout_reschedule as wr
+
+    fixed = datetime.now(TZ).replace(hour=hour, minute=0, second=0, microsecond=0)
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):  # noqa: D401
+            return fixed.astimezone(tz) if tz else fixed.replace(tzinfo=None)
+
+    monkeypatch.setattr(wr, "datetime", _FrozenDatetime)
+    return fixed
+
+
 def _update(text: str) -> Any:
     return SimpleNamespace(
         effective_message=FakeMessage(text),
@@ -175,7 +192,8 @@ async def test_slot_tap_persists_a_concrete_decision(db: Database, monkeypatch: 
     monkeypatch.setattr(callback_menu_bot, "_render_next_meal_screen", fake_render)
     install_workout_reschedule()
 
-    future = (datetime.now(TZ) + timedelta(hours=3)).replace(second=0, microsecond=0)
+    fixed_now = _freeze_reschedule_clock(monkeypatch)
+    future = (fixed_now + timedelta(hours=3)).replace(second=0, microsecond=0)
     hhmm = f"{future:%H%M}"
     handled = await coach_bot.handle_menu_callback(FakeQuery(), USER_ID, f"wktat:{hhmm}")
 
@@ -190,15 +208,15 @@ async def test_slot_tap_persists_a_concrete_decision(db: Database, monkeypatch: 
 
 
 @pytest.mark.asyncio
-async def test_free_text_time_is_normalized_and_persisted(db: Database) -> None:
+async def test_free_text_time_is_normalized_and_persisted(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
     install_workout_reschedule()
+    _freeze_reschedule_clock(monkeypatch)  # 15:00 → "19:30" is always future
     # "אכתוב שעה" arms the pending question...
     await coach_bot.handle_menu_callback(FakeQuery(), USER_ID, "wktat:text")
     # ...and the next text turn is parsed as the time.
     update = _update("19:30")
-    now = datetime.now(TZ)
-    if now.hour >= 19 and (now.hour, now.minute) >= (19, 30):
-        update = _update("23:59")
     await coach_bot.route_free_text(update, USER_ID)
 
     flags = await _flags(db)
