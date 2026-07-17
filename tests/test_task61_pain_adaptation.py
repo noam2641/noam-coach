@@ -197,6 +197,99 @@ def test_backfill_never_reintroduces_reduce_level_load_on_the_painful_region() -
         assert region_load_level(profile, "elbow") == "none", item["id"]
 
 
+# ---------------------------------------------------------------------------
+# Semantic-goal preservation — a slot is refilled toward its own goal or not
+# at all (variation → same movement → same muscle goal → OMIT)
+# ---------------------------------------------------------------------------
+
+
+def test_replacement_preserves_the_slot_muscle_goal() -> None:
+    """A press with no usable variation must be replaced by another CHEST
+    exercise (same primary muscle goal), never by a merely-clean unrelated
+    movement."""
+    regions = {"elbow": _region("elbow", severity=8)}
+    bench = _exercise("bench", name="לחיצת חזה", weight=50.0, alts=[])
+    adapted, changes = adapt_exercises(
+        [bench],
+        equipment_value=GYM_EQUIPMENT, location=None,
+        pain_value="כאב מרפק", medical_avoidance="",
+        experience="intermediate", pain_detail=regions,
+    )
+    assert len(adapted) == 1
+    profile = CATALOG[str(adapted[0]["id"])]
+    assert profile.primary_muscles[0] == "chest"
+    assert region_load_level(profile, "elbow") == "none"
+
+
+def test_omit_when_no_goal_preserving_candidate_exists() -> None:
+    """Severity-8 tennis elbow with a biceps slot: every biceps exercise in
+    the catalog loads the elbow, so there is no clean same-goal substitute —
+    the slot is OMITTED and nothing unrelated is inserted in its place."""
+    regions = {"elbow": _region("elbow", severity=8)}
+    curl = _exercise("bar_curl", name="כפיפת מרפקים במוט", weight=25.0, alts=[])
+    adapted, changes = adapt_exercises(
+        [curl],
+        equipment_value=GYM_EQUIPMENT, location=None,
+        pain_value="כאב מרפק", medical_avoidance="",
+        experience="intermediate", pain_detail=regions,
+    )
+    assert adapted == []
+    assert changes and changes[0]["replacement"] is None
+
+
+def test_severity8_upper_session_gains_no_lower_body_or_unrelated_work() -> None:
+    """Severity-8 tennis elbow across a press/pull/arm session: every exercise
+    that survives or enters the session is clean for the elbow AND serves a
+    muscle goal the session already had — no squat/leg work enters an upper
+    slot merely to preserve the exercise count."""
+    regions = {"elbow": _region("elbow", severity=8)}
+    originals = _upper_session()
+    original_goals = {
+        CATALOG[str(item["id"])].primary_muscles[0] for item in originals
+    }
+    adapted, changes = adapt_exercises(
+        originals,
+        equipment_value=GYM_EQUIPMENT, location=None,
+        pain_value="כאב מרפק (טניס אלבו)", medical_avoidance="",
+        experience="intermediate", pain_detail=regions,
+    )
+    leg_ids = {"squat", "leg_press", "hack", "goblet", "smith_squat", "chair_squat", "rdl", "hip_thrust"}
+    for item in adapted:
+        profile = CATALOG[str(item["id"])]
+        assert region_load_level(profile, "elbow") == "none", item["id"]
+        assert profile.primary_muscles[0] in original_goals, item["id"]
+        assert item["id"] not in leg_ids
+    # The pull and curl slots have no clean same-goal substitute → OMIT.
+    omitted = [change for change in changes if change.get("replacement", "") is None]
+    assert omitted, "expected at least one OMIT with no goal-preserving candidate"
+
+
+def test_backfill_is_restricted_to_the_omitted_slots_muscle_goals() -> None:
+    restricted = ti._pain_safe_backfill_candidates(
+        equipment=ti.normalize_equipment(GYM_EQUIPMENT, None),
+        pain={"elbow"},
+        experience="intermediate",
+        present_ids=set(),
+        regions=["elbow"],
+        allowed_muscles={"chest"},
+    )
+    assert restricted
+    for item in restricted:
+        assert CATALOG[item["id"]].primary_muscles[0] == "chest", item["id"]
+    # An empty goal set means nothing may be inserted at all.
+    assert (
+        ti._pain_safe_backfill_candidates(
+            equipment=ti.normalize_equipment(GYM_EQUIPMENT, None),
+            pain={"elbow"},
+            experience="intermediate",
+            present_ids=set(),
+            regions=["elbow"],
+            allowed_muscles=set(),
+        )
+        == []
+    )
+
+
 def test_knee_pain_keeps_accepted_replace_semantics_for_legs() -> None:
     regions = {"knee": _region("knee", severity=4)}
     squat = _exercise("squat", name="סקוואט", weight=60.0, alts=[])
@@ -229,10 +322,32 @@ def test_upper_work_untouched_by_knee_pain() -> None:
 
 
 def test_explanations_are_short_and_non_diagnostic() -> None:
-    banned = ("אבחנה", "דלקת", "פציעה", "רופא קבע", "טיפול רפואי")
+    # "בטוח" is banned as well: the copy contract forbids promising safety.
+    banned = ("אבחנה", "דלקת", "פציעה", "רופא קבע", "טיפול רפואי", "בטוח")
     for key, text in ADAPTATION_EXPLANATIONS_HE.items():
         assert len(text) <= 120, key
         assert not any(term in text for term in banned), key
+
+
+def test_adaptation_copy_never_guarantees_safety_or_completeness() -> None:
+    """The copy contract: no safety promise ("בטוח"/"בטוחים"), no claim that
+    every workout stays complete (OMIT may legitimately empty a slot). This
+    covers every user-facing string a severity-8 adaptation can emit —
+    exercise notes and audit reasons."""
+    banned = ("בטוח", "מלאים", "מובטח")
+    regions = {"elbow": _region("elbow", severity=8)}
+    adapted, changes = adapt_exercises(
+        _upper_session(),
+        equipment_value=GYM_EQUIPMENT, location=None,
+        pain_value="כאב מרפק", medical_avoidance="",
+        experience="intermediate", pain_detail=regions,
+    )
+    texts = [item.get("adaptation_note", "") for item in adapted]
+    for change in changes:
+        texts.extend(change.get("reasons", []))
+    assert any(texts)
+    for text in texts:
+        assert not any(term in text for term in banned), text
 
 
 def test_adapted_exercises_carry_their_explanation() -> None:
@@ -305,6 +420,14 @@ async def test_plan_generation_threads_severity_into_adaptation(
     candidates = await planning.build_workout_candidates(db, 1)
     assert candidates
     for candidate in candidates:
+        # The limitation is named, but never as a safety/completeness promise.
+        assert any("המגבלה שדיווחת" in line for line in candidate.assumptions)
+        for line in candidate.assumptions:
+            assert "בטוח" not in line and "מלאים" not in line, line
+        for entry in candidate.payload.get("adaptation_audit", []):
+            for change in entry.get("changes", []):
+                for reason in change.get("reasons", []):
+                    assert "בטוח" not in reason, reason
         for session in candidate.payload["sessions"]:
             ids = {str(item.get("id")) for item in session["exercises"]}
             # DECISION 3 at severity 8: nothing elbow-loading may remain.

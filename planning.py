@@ -1012,8 +1012,8 @@ def _workout_candidate(
         ]
         if pain_labels:
             assumptions.append(
-                "התאמתי חלק מהתרגילים (החלפה או הפחתת עומס) בגלל המגבלה שדיווחת "
-                f"({', '.join(pain_labels)}). כך כל האימונים נשארים מלאים ובטוחים."
+                "התאמתי חלק מהתרגילים בגלל המגבלה שדיווחת עליה "
+                f"({', '.join(pain_labels)}), תוך שמירה ככל האפשר על מטרת האימון."
             )
     payload = {
         "frequency": frequency,

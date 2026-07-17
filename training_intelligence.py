@@ -623,6 +623,7 @@ def _pain_safe_backfill_candidates(
     experience: str,
     present_ids: set[str],
     regions: Iterable[str] = (),
+    allowed_muscles: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Deterministic pain-safe, equipment-available exercises from the catalog.
 
@@ -633,10 +634,14 @@ def _pain_safe_backfill_candidates(
     the injured joint. Catalog order is stable, so the selection is
     deterministic. IDs already present in the session are skipped.
 
-    A backfill exists to make a gutted session safe, so candidates must be
-    fully clean (``region_load_level == "none"``) for every active pain
+    A backfill exists to make a gutted session trainable, so candidates must
+    be fully clean (``region_load_level == "none"``) for every active pain
     region — a reduce-level exercise may survive adaptation in place, but it
-    must never be *added* to a session on the injured joint's account.
+    must never be *added* to a session on the injured joint's account. When
+    ``allowed_muscles`` is given, only exercises whose primary muscle goal is
+    in that set qualify: a slot removed for pain may only be refilled with
+    work toward the same goal, never with an unrelated movement inserted just
+    to preserve the session's exercise count.
     """
     region_tokens = [token for token in regions if token] or sorted(pain)
     allowed_by_muscle: dict[str, list[dict[str, Any]]] = {}
@@ -652,6 +657,8 @@ def _pain_safe_backfill_candidates(
         if any(region_load_level(profile, token) != "none" for token in region_tokens):
             continue
         muscle = profile.primary_muscles[0] if profile.primary_muscles else ""
+        if allowed_muscles is not None and muscle not in allowed_muscles:
+            continue
         allowed_by_muscle.setdefault(muscle, []).append(
             {
                 "id": exercise_id,
@@ -714,7 +721,7 @@ ADAPTATION_EXPLANATIONS_HE = {
         "השארתי את התרגיל אבל הפחתתי את העומס כדי להקטין לחץ על האזור הרגיש."
     ),
     "omit": (
-        "הורדתי את התרגיל מהאימון של היום כי אין לו חלופה בטוחה לאזור "
+        "הורדתי את התרגיל מהאימון של היום כי לא מצאתי לו חלופה מתאימה לאזור "
         "שדיווחת עליו."
     ),
 }
@@ -808,22 +815,50 @@ def _adaptive_replacement(
     pain: set[str],
     experience: str,
     require_clean: bool,
+    exclude_ids: set[str] | None = None,
 ) -> dict[str, Any] | None:
-    """A same-pattern replacement vetted by the demand-aware engine.
+    """A semantic-goal-preserving replacement vetted by the demand-aware engine.
 
-    Candidates are ranked so lower-demand variants of the SAME movement come
-    first (the packet's MODIFY: e.g. pronated pull → neutral-grip pull).
-    ``require_clean`` (high severity, DECISION 3) accepts only candidates
-    that do not load the region at all; otherwise a "reduce"-level candidate
-    is acceptable and is returned already load-reduced.
+    Candidate tiers follow the approved hierarchy strictly: (1) the exercise's
+    own alternatives (regression/variation of the same exercise — the packet's
+    MODIFY source, e.g. pronated pull → neutral-grip pull), (2) same-movement
+    fallbacks from REPLACEMENTS, (3) a fully-clean catalog exercise with the
+    SAME primary muscle goal, then the caller omits. A candidate is never
+    accepted merely because it is clean for the region — an unrelated movement
+    must not enter the slot. ``require_clean`` (high severity, DECISION 3)
+    accepts only candidates that do not load the region at all; otherwise a
+    "reduce"-level tier-1/2 candidate is acceptable and is returned already
+    load-reduced.
     """
     profile = CATALOG.get(str(original.get("id")))
     if not profile:
         return None
-    ranked: list[tuple[int, dict[str, Any]]] = []
-    # Same-movement gym variants come from the exercise's own alternatives
-    # (the packet's MODIFY source: lat_pull → neutral_pull); the movement's
-    # home/bodyweight fallbacks extend the pool after them.
+    exclude = exclude_ids or set()
+    ranked: list[tuple[tuple[int, int], dict[str, Any]]] = []
+
+    def _blocked_by_other_regions(candidate_profile: ExerciseProfile) -> bool:
+        # Other active pain regions must not be loaded at replace-level
+        # either (and never at all when they are high-severity).
+        for other_region, other_detail in regions.items():
+            if other_region == triggering_region:
+                continue
+            other_level = region_load_level(candidate_profile, other_region)
+            severity = getattr(other_detail, "severity", None)
+            other_high = severity is not None and severity >= HIGH_SEVERITY_MIN
+            if other_level == "replace" or (other_high and other_level != "none"):
+                return True
+        return False
+
+    def _allowed_for_user(candidate_profile: ExerciseProfile) -> bool:
+        if candidate_profile.equipment and not set(candidate_profile.equipment).intersection(equipment):
+            return False
+        if candidate_profile.skill == "intermediate" and experience in {
+            "none", "unknown", "beginner", "מתחיל",
+        }:
+            return False
+        return True
+
+    # Tiers 1+2: the exercise's own alternatives, then same-movement fallbacks.
     candidates: list[dict[str, Any]] = [
         dict(alt) for alt in (original.get("alts") or []) if isinstance(alt, dict)
     ]
@@ -837,27 +872,10 @@ def _adaptive_replacement(
             continue
         if require_clean and level != "none":
             continue
-        # Other active pain regions must not be loaded at replace-level
-        # either (and never at all when they are high-severity).
-        blocked = False
-        for other_region, other_detail in regions.items():
-            if other_region == triggering_region:
-                continue
-            other_level = region_load_level(candidate_profile, other_region)
-            severity = getattr(other_detail, "severity", None)
-            other_high = severity is not None and severity >= HIGH_SEVERITY_MIN
-            if other_level == "replace" or (other_high and other_level != "none"):
-                blocked = True
-                break
-        if blocked:
+        if _blocked_by_other_regions(candidate_profile):
             continue
-        if candidate_profile.equipment and not set(candidate_profile.equipment).intersection(equipment):
+        if not _allowed_for_user(candidate_profile):
             continue
-        if candidate_profile.skill == "intermediate" and experience in {
-            "none", "unknown", "beginner", "מתחיל",
-        }:
-            continue
-        rank = 0 if level == "none" else 1
         replacement = {
             "id": candidate.get("id"),
             "name": candidate.get("name"),
@@ -873,7 +891,43 @@ def _adaptive_replacement(
         }
         if level == "reduce":
             replacement = apply_load_reduction(replacement)
-        ranked.append((rank, replacement))
+        ranked.append(((0, 0 if level == "none" else 1), replacement))
+
+    # Tier 3: same-primary-muscle-goal catalog exercise, fully clean for every
+    # active region (never a load compromise at this distance from the
+    # original), deduplicated against the session.
+    goal_muscle = profile.primary_muscles[0] if profile.primary_muscles else ""
+    if goal_muscle:
+        for candidate_id, candidate_profile in CATALOG.items():
+            if candidate_id == profile.exercise_id or candidate_id in exclude:
+                continue
+            if not candidate_profile.primary_muscles:
+                continue
+            if candidate_profile.primary_muscles[0] != goal_muscle:
+                continue
+            if any(
+                region_load_level(candidate_profile, region) != "none"
+                for region in regions
+            ):
+                continue
+            if not _allowed_for_user(candidate_profile):
+                continue
+            ranked.append(
+                (
+                    (1, 0),
+                    {
+                        "id": candidate_id,
+                        "name": _CATALOG_NAMES_HE.get(candidate_id, candidate_id),
+                        "muscle": goal_muscle,
+                        "sets": original.get("sets", 3),
+                        "rmin": original.get("rmin", 8),
+                        "rmax": original.get("rmax", 12),
+                        "rest": original.get("rest", 120),
+                        "cues": ["טווח ללא כאב", "שליטה מלאה", "עצור אם הכאב מחמיר"],
+                        "alts": [],
+                    },
+                )
+            )
     if not ranked:
         return None
     ranked.sort(key=lambda item: item[0])
@@ -906,6 +960,10 @@ def adapt_exercises(
     adapted: list[dict[str, Any]] = []
     changes: list[dict[str, Any]] = []
     removed_for_pain = False
+    # Goal muscles of pain-omitted slots: the only muscles a backfill may
+    # serve (an unrelated movement never enters a removed slot).
+    omitted_goal_muscles: set[str] = set()
+    session_ids = {str(item.get("id") or "") for item in exercises}
     for original in exercises:
         # Equipment/skill problems keep the pre-TASK-61 replace path.
         allowed, reasons = exercise_allowed(
@@ -964,6 +1022,7 @@ def adapt_exercises(
             pain=pain,
             experience=experience,
             require_clean=require_clean,
+            exclude_ids=session_ids | {str(item.get("id") or "") for item in adapted},
         )
         removed_for_pain = True
         if replacement is not None:
@@ -986,6 +1045,8 @@ def adapt_exercises(
                 }
             )
         else:
+            if profile is not None and profile.primary_muscles:
+                omitted_goal_muscles.add(profile.primary_muscles[0])
             changes.append(
                 {
                     "removed": original.get("name"),
@@ -995,12 +1056,14 @@ def adapt_exercises(
                 }
             )
 
-    # Cross-pattern backfill: if pain gutted the session and same-pattern
-    # substitution could not refill it, pull pain-safe exercises from other
-    # movement patterns so the session stays trainable (and the split-heavy
-    # candidates stay buildable) rather than collapsing to an empty session.
+    # Goal-preserving backfill: if pain gutted the session and neither a
+    # same-movement nor a same-muscle-goal replacement could refill it, look
+    # once more for clean exercises serving the OMITTED slots' muscle goals.
+    # An omitted slot's goal is the only thing a backfill may serve — it never
+    # inserts an unrelated movement just to preserve the exercise count, so a
+    # session may legitimately stay short.
     if pain and removed_for_pain and len(adapted) < _MIN_SESSION_EXERCISES:
-        present_ids = {str(item.get("id") or "") for item in adapted}
+        present_ids = {str(item.get("id") or "") for item in adapted} | session_ids
         needed = _MIN_SESSION_EXERCISES - len(adapted)
         backfill = _pain_safe_backfill_candidates(
             equipment=equipment,
@@ -1008,6 +1071,7 @@ def adapt_exercises(
             experience=experience,
             present_ids=present_ids,
             regions=regions,
+            allowed_muscles=omitted_goal_muscles,
         )[:needed]
         for item in backfill:
             item["warmup_sets"] = warmup_sets(item)
@@ -1016,7 +1080,9 @@ def adapt_exercises(
             changes.append(
                 {
                     "backfilled": [item["name"] for item in backfill],
-                    "reasons": ["הושלמו תרגילים בטוחים לאזור הכאב שדיווחת"],
+                    "reasons": [
+                        "הוספתי תרגילים מאותה מטרת אימון במקום תרגילים שהוסרו בגלל המגבלה שדיווחת"
+                    ],
                 }
             )
     return adapted, changes

@@ -392,3 +392,41 @@ behaviour was reopened.
   conservative; only explicit future rules may soften this.
 - Severity arrives only from `medical_constraints` rows; free-text limitations
   without a row adapt at the (gentler) non-high pathway by design.
+
+## TASK 61 — post-commit review follow-up (copy contract + semantic-goal backfill)
+
+Narrow review of `a4eec07` against two contract issues; both required changes.
+
+**1. User-facing safety claim (violation, fixed).** The plan assumption ended
+"כך כל האימונים נשארים מלאים ובטוחים" (safety + completeness guarantee), the
+backfill audit reason said "תרגילים בטוחים", and the omit explanation said
+"חלופה בטוחה". All three reworded without safety guarantees or completeness
+claims: the assumption is now "התאמתי חלק מהתרגילים בגלל המגבלה שדיווחת עליה
+(<אזורים>), תוך שמירה ככל האפשר על מטרת האימון." Guard tests: "בטוח" added to
+the banned-terms test; a new test scans every note/audit reason a severity-8
+adaptation emits; the e2e scans candidate assumptions and audit for
+"בטוח"/"מלאים". (The pre-TASK_61 chat string "אין לי חלופה מספיק בטוחה" in the
+runtime pain flow predates this task and was left untouched.)
+
+**2. Semantic-goal backfill (violation, fixed).** `_adaptive_replacement`
+implemented tiers 1–2 only (own alts → same-movement REPLACEMENTS → OMIT), and
+`_pain_safe_backfill_candidates` round-robined across ALL muscle groups — an
+unrelated clean exercise (e.g. squat) could enter an upper-body session merely
+to preserve exercise count. Fixes:
+- Tier 3 added to `_adaptive_replacement`: a fully-clean catalog exercise with
+  the SAME primary muscle goal (ranked strictly after tiers 1–2, deduplicated
+  against the session via `exclude_ids`); hierarchy is now variation →
+  same-movement → same-muscle-goal → OMIT.
+- The backfill takes `allowed_muscles` = primary muscle goals of pain-OMITTED
+  slots only; an empty goal set inserts nothing. Sessions may legitimately
+  stay short — exercise count is never preserved with unrelated work.
+
+New regressions (5): replacement preserves the slot muscle goal (severity-8
+bench → a clean chest exercise); OMIT when no goal-preserving candidate exists
+(severity-8 biceps slot — every biceps exercise loads the elbow); severity-8
+press/pull/arm session gains no lower-body/unrelated work; backfill restricted
+to omitted-slot goals (and empty set ⇒ nothing); copy guard test above.
+
+Verification: focused 20/20; training/planning/pain suites green; full suite
+**1714 passed / 0 deselected**; evals 33/33; build clean; protected baseline
+19/19 byte-identical.
