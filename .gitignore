@@ -2,7 +2,10 @@
 .env.*
 !.env.example
 .venv/
-.claude/
+# Local Claude settings stay private; the review-workflow skills (R6) are
+# versioned so /review-session and /implement-review travel with the repo.
+.claude/*
+!.claude/skills/
 __pycache__/
 *.py[cod]
 .pytest_cache/

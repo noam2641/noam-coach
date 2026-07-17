@@ -122,8 +122,10 @@ async def _cmd_build(args: argparse.Namespace) -> int:
     if args.rebuild:
         source_manifest = load_manifest(reviews_dir, args.rebuild)
         requested = RequestedSelection.from_dict(source_manifest["requested_selection"])
-        if requested.mode in ("since_last_review", "last_hours"):
-            # Relative selections drift; rebuild the exact recorded range.
+        if requested.mode not in ("traces", "interactions", "event_id_range"):
+            # Cursor/time selections drift as new events arrive; a rebuild
+            # must reproduce EXACTLY the recorded evidence — the resolved
+            # canonical id range is the immutable form of the selection.
             requested = RequestedSelection(
                 mode="event_id_range",
                 after_event_id=(source_manifest.get("first_event_id") or 1) - 1,
