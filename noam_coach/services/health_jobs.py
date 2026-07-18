@@ -2650,7 +2650,10 @@ async def build_morning_briefing_text(user_id: int, ctx: "DailyContext | None" =
     # now the same single source of truth the daily menu uses.
     from noam_coach.services.nutrition_context import day_type as _classify_day_type
 
-    weekday_label = weekday_labels_he([local_weekday(ctx.now)])
+    # Audit F-A6: weekday_labels_he returns a LIST — interpolating it raw
+    # rendered the Python literal "['שבת']" in the headline. Join to a
+    # localized string; the headline is always exactly one day.
+    weekday_label = "".join(weekday_labels_he([local_weekday(ctx.now)])) or "היום"
     today_type = _classify_day_type(ctx.now)
     workout_time = await _todays_workout_time(user_id, ctx.now)
     is_workout_day = ctx.is_usual_workout_day or bool(workout_time)

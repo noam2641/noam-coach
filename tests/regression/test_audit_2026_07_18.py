@@ -495,6 +495,57 @@ def test_fa4_incomplete_workout_status_is_partial_even_on_full_choice() -> None:
     ) == "completed"
 
 
+# ---------------------------------------------------------------------------
+# F-A6 — the morning briefing never renders a Python list literal
+# ---------------------------------------------------------------------------
+
+
+async def test_fa6_morning_briefing_headline_has_no_list_literal(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import datetime, timezone
+
+    from noam_coach.jobs.proactive import DailyContext
+    from noam_coach.services import health_jobs
+
+    health_jobs.DB = db
+
+    async def _fake_time(_user_id: int, _now: Any) -> str | None:
+        return None
+
+    monkeypatch.setattr(health_jobs, "_todays_workout_time", _fake_time)
+
+    ctx = DailyContext(
+        user_id=USER_ID,
+        now=datetime(2026, 7, 18, 9, 0, tzinfo=timezone.utc),  # a Saturday
+        local_date="2026-07-18",
+        calories_consumed=210.0, protein_consumed=3.0,
+        calorie_target=2090, protein_target=170,
+        calories_remaining=1880.0, protein_remaining=167.0,
+        hours_left=14.0, sleep_quality=None, fasting=False,
+        medications_today=[], flags={}, active_constraints=[],
+        workout_active=False, workout_completed=False,
+        usual_workout_time=None, is_usual_workout_day=False,
+        latest_health_date=None, goal_computed=True, profile={},
+        goal={"calories": 2090, "protein": 170},
+    )
+    text = await health_jobs.build_morning_briefing_text(USER_ID, ctx)
+    assert "['" not in text and "']" not in text  # no Python list literal
+    assert "עדכון בוקר —" in text
+    headline = text.splitlines()[0]
+    assert "[" not in headline and "]" not in headline
+    assert "שבת" in headline  # the actual weekday name is rendered
+
+
+def test_fa6_weekday_label_is_joined_to_string() -> None:
+    from noam_coach.services.weekdays import weekday_labels_he
+
+    labels = weekday_labels_he([5])  # Saturday index
+    assert isinstance(labels, list)  # the source is a list...
+    joined = "".join(labels)
+    assert joined and "[" not in joined  # ...and must be joined before display
+
+
 async def test_fa4_finish_dialog_hides_full_when_incomplete(db: Database) -> None:
     from noam_coach.bot import callback_session as session_bot
 
