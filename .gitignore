@@ -2,10 +2,12 @@
 .env.*
 !.env.example
 .venv/
-# Local Claude settings stay private; the review-workflow skills (R6) are
-# versioned so /review-session and /implement-review travel with the repo.
-.claude/*
-!.claude/skills/
+# The entire .claude/ directory is local operator configuration — never
+# tracked (CI's forbidden-files check rejects ANY tracked .claude path).
+# The /review-session and /implement-review skills therefore live only on
+# the operator's machine; docs/REVIEW_PROTOCOL.md and
+# docs/CONTINUOUS_IMPROVEMENT_WORKFLOW.md are the versioned counterparts.
+.claude/
 __pycache__/
 *.py[cod]
 .pytest_cache/

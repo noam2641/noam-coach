@@ -104,6 +104,12 @@ def _skill_text(name: str) -> str:
     return (REPO_ROOT / ".claude" / "skills" / name / "SKILL.md").read_text(encoding="utf-8")
 
 
+@pytest.mark.skipif(
+    not (REPO_ROOT / ".claude" / "skills").exists(),
+    reason=".claude/ is local operator configuration and is never tracked "
+           "(CI forbidden-files rule); this consistency check runs only on "
+           "machines that have the skills installed.",
+)
 def test_skills_reference_only_existing_scripts_and_subcommands() -> None:
     from scripts.review_findings import build_parser as findings_parser
     from scripts.review_session import build_parser as session_parser
