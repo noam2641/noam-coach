@@ -267,7 +267,12 @@ async def test_full_life_scenario_from_onboarding_to_meal_correction(
         data=coach_bot.session_action_data("finish", session),
     )
     assert "לסיים את האימון?" in query.messages[-1]
-    assert any("סיים חלקי" in label for label in _labels(query.reply_markups[-1]))
+    # Audit F-A4: an incomplete workout (1 set logged) no longer offers a
+    # false "full"; the truthful partial-finish option is 'סיים כחלקי'
+    # and its callback is still wdone:...:partial.
+    labels = _labels(query.reply_markups[-1])
+    assert any("כחלקי" in label or "חלקי" in label for label in labels)
+    assert not any("סיים מלא" in label for label in labels)
 
     await callback_session_bot.handle_session_action_callback(
         query,
