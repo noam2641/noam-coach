@@ -170,9 +170,22 @@ async def handle_callback(
         return
 
     query = update.callback_query
-    await safe_answer_callback(query)
     user_id = await ensure_user(update)
     data = query.data or ""
+    # Review 2026-07-18_1 / F-02+F-03: a rapid duplicate tap is refused
+    # BEFORE the empty pre-answer (Telegram displays only the first answer
+    # to a query), with a visible toast and a canonical refusal event —
+    # never silently. Checked first so the duplicate branch owns the ACK.
+    if _is_duplicate_tap(user_id, data):
+        from noam_coach.services.control_refusal import refuse_control
+
+        await refuse_control(
+            query, user_id,
+            reason="duplicate_tap",
+            toast="קיבלתי כבר — הפעולה בביצוע, אין צורך ללחוץ שוב.",
+        )
+        return
+    await safe_answer_callback(query)
     route_decision = await conversation.ConversationRouter.route(
         DB,
         user_id,
@@ -196,6 +209,15 @@ async def handle_callback(
                 "current_version": active_flow.version,
                 "active_flow": active_flow.name.value if hasattr(active_flow.name, "value") else str(active_flow.name),
             },
+        )
+        # F-03: refusals are decisions — emit the canonical refusal event so
+        # every refused press is queryable uniformly (the legacy
+        # stale_callback_recovered event above is kept for its consumers).
+        from noam_coach.services.control_refusal import refuse_control
+
+        await refuse_control(
+            query, user_id, reason="stale_version", toast=None,
+            extra={"old_version": callback_version, "current_version": active_flow.version},
         )
         # Try to remove old keyboard
         with suppress(Exception):
@@ -227,11 +249,6 @@ async def handle_callback(
         )
         return
     await track_event(user_id, "user_callback", data=data)
-
-    # Ignore a rapid repeat of the exact same button (prevents double actions
-    # like subtracting grams twice). Navigation taps are naturally distinct.
-    if _is_duplicate_tap(user_id, data):
-        return
 
     if data.startswith("onb:") or data.startswith("qa:") or data.startswith("routine:"):
         await handle_onboarding_callback(query, user_id, data)

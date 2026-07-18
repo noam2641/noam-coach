@@ -674,12 +674,47 @@ async def safe_answer_callback(
     Telegram rejects callback-query answers after a short TTL. Those errors are
     expected when a user taps an old inline keyboard, so they should be logged
     by the router at most, not shown as a Python failure to the user.
+
+    Review 2026-07-18_1 / F-03: a TEXTUAL ack (a visible toast) is user
+    feedback and is recorded as a canonical delivery event
+    (operation=callback_ack) — empty spinner-stopping acks are deliberately
+    not evented (volume, zero decision value).
     """
     try:
         await query.answer(text=text, show_alert=show_alert)
-        return True
+        delivered = True
     except BadRequest as exc:
-        if is_stale_callback_error(exc):
-            LOGGER.info("Ignoring stale callback ACK: %s", exc)
-            return False
-        raise
+        if not is_stale_callback_error(exc):
+            raise
+        LOGGER.info("Ignoring stale callback ACK: %s", exc)
+        delivered = False
+    if text:
+        await _emit_callback_ack(text, show_alert=show_alert, delivered=delivered)
+    return delivered
+
+
+async def _emit_callback_ack(text: str, *, show_alert: bool, delivered: bool) -> None:
+    """Best-effort canonical evidence for a visible callback toast (F-03)."""
+    try:
+        import coach_bot
+        from noam_coach.observability import taxonomy
+        from noam_coach.observability.emit import emit_event
+        from noam_coach.observability.obs_context import current_user_id
+
+        user_id = current_user_id()
+        if user_id is None:
+            return
+        await emit_event(
+            coach_bot.DB,
+            user_id,
+            taxonomy.DELIVERY_SUCCEEDED if delivered else taxonomy.DELIVERY_FAILED,
+            entity="callback_ack",
+            source="telegram",
+            surface="telegram",
+            status="delivered" if delivered else "failed",
+            outcome="toast" if delivered else "stale_query",
+            properties={"operation": "callback_ack", "show_alert": show_alert},
+            content={"text": text},
+        )
+    except Exception:  # noqa: BLE001 — observability must not break the ACK.
+        pass

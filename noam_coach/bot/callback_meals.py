@@ -310,6 +310,18 @@ async def _handle_meal_decision_actions(
         )
         meal_id = await persist_meal(user_id, approval_id)
         if meal_id is None:
+            from noam_coach.services.control_refusal import refuse_control
+
+            await refuse_control(
+                query, user_id,
+                reason="approval_already_handled",
+                source="meal_approval",
+            )
+            await safe_edit(
+                query,
+                "הארוחה הזו כבר טופלה ✅",
+                InlineKeyboardMarkup([[button("📊 מצב היום", "menu:status")]]),
+            )
             return True
         await clear_meal_fix(user_id)
         totals = force_analysis.totals() if force_analysis else {"calories": 0.0, "protein": 0.0}
@@ -346,6 +358,24 @@ async def _handle_meal_decision_actions(
                 return True
         meal_id = await persist_meal(user_id, approval_id)
         if meal_id is None:
+            # Review 2026-07-18_1 / F-02: a press on an already-consumed
+            # approval card (e.g. a second ✅ שמור) was refused in total
+            # silence — correct idempotency, invisible to the user and the
+            # trace. Record the refusal and EDIT the card to a terminal
+            # state (a toast cannot display here — the query was already
+            # empty-answered at router entry).
+            from noam_coach.services.control_refusal import refuse_control
+
+            await refuse_control(
+                query, user_id,
+                reason="approval_already_handled",
+                source="meal_approval",
+            )
+            await safe_edit(
+                query,
+                "הארוחה הזו כבר טופלה ✅",
+                InlineKeyboardMarkup([[button("📊 מצב היום", "menu:status")]]),
+            )
             return True
         # Refinement loop ends on approval.
         await clear_meal_fix(user_id)

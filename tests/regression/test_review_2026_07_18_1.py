@@ -195,3 +195,176 @@ async def test_f01_generic_every_item_skipped_twice_ends_wizard(
             break
     state = await onboarding_bot.get_flow_state(USER_ID, health_jobs.HEALTH_CONFIRM_FLOW)
     assert not state, "wizard flow state must be cleared after finite skips"
+
+
+# ---------------------------------------------------------------------------
+# F-02 / F-03 — control refusals are visible and trace-evident, never silent
+# (production evidence: events 590/601 duplicate ✅ שמור; 267/275 stale press)
+# ---------------------------------------------------------------------------
+
+from types import SimpleNamespace  # noqa: E402
+
+import conversation  # noqa: E402
+import event_log  # noqa: E402
+from noam_coach.observability import ObservabilityMode, interaction_scope, set_mode  # noqa: E402
+from noam_coach.observability.modes import reset_mode  # noqa: E402
+from noam_coach.observability.taxonomy import (  # noqa: E402
+    DECISION_FINALIZED,
+    DELIVERY_SUCCEEDED,
+)
+
+
+class RouterQuery:
+    """Query double for the REAL handle_callback (records answers + edits)."""
+
+    def __init__(self, data: str, message_id: int = 900) -> None:
+        self.data = data
+        self.from_user = SimpleNamespace(id=USER_ID)
+        self.message = SimpleNamespace(
+            message_id=message_id, chat=SimpleNamespace(id=USER_ID), chat_id=USER_ID,
+        )
+        self.answers: list[str | None] = []
+        self.edits: list[str] = []
+
+    async def edit_message_text(self, text: str, reply_markup=None, parse_mode=None) -> None:  # noqa: ANN001
+        self.edits.append(text)
+
+    async def edit_message_reply_markup(self, reply_markup=None) -> None:  # noqa: ANN001
+        return None
+
+    async def answer(self, text: str | None = None, show_alert: bool = False) -> None:
+        self.answers.append(text)
+
+
+def _router_update(query: RouterQuery) -> SimpleNamespace:
+    return SimpleNamespace(
+        effective_user=SimpleNamespace(id=USER_ID, first_name="T", username=None),
+        effective_chat=SimpleNamespace(id=USER_ID),
+        effective_message=query.message,
+        callback_query=query,
+    )
+
+
+@pytest.fixture
+def _obs_content_mode(monkeypatch: pytest.MonkeyPatch):
+    set_mode(ObservabilityMode.CONTENT)
+    from config import SETTINGS
+
+    monkeypatch.setattr(SETTINGS, "telegram_allowed_user_id", USER_ID, raising=False)
+    # Debounce state is process-global — isolate per test.
+    from noam_coach.bot import callback_router
+
+    callback_router._LAST_CALLBACK.clear()
+    yield
+    callback_router._LAST_CALLBACK.clear()
+    reset_mode()
+
+
+async def _refusals(db: Database) -> list:
+    events = await event_log.list_events(db, USER_ID, event=DECISION_FINALIZED)
+    return [e for e in events if e.outcome == "refused" and e.entity == "ui_control"]
+
+
+async def test_f02_consumed_approval_press_gets_terminal_edit_and_refusal_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _obs_content_mode
+) -> None:
+    """The exact event-601 shape: approve_meal pressed after the approval was
+    consumed — must edit the card to a terminal state and record a refusal."""
+    db = await _make_db(tmp_path)
+    _patch_db(monkeypatch, db)
+
+    query = RouterQuery("approve_meal:consumed123")
+    with interaction_scope(user_id=USER_ID):
+        await coach_bot.handle_callback(_router_update(query), SimpleNamespace(job_queue=None, bot=None))
+
+    assert any("כבר טופלה" in text for text in query.edits), query.edits
+    refusals = await _refusals(db)
+    assert len(refusals) == 1
+    assert refusals[0].properties["reason"] == "approval_already_handled"
+    assert "consumed123" not in str(refusals[0].properties)  # digest, not raw
+    meals = await db.fetch_all("SELECT COUNT(*) AS c FROM meals WHERE user_id=?", (USER_ID,))
+    assert meals[0]["c"] == 0  # idempotency preserved — refusal changed nothing
+
+
+async def test_f02_duplicate_tap_gets_visible_toast_and_refusal_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _obs_content_mode
+) -> None:
+    """A rapid second press of the same debounced control answers with a
+    visible toast (first answer of that query) instead of pure silence."""
+    db = await _make_db(tmp_path)
+    _patch_db(monkeypatch, db)
+
+    first = RouterQuery("approve_meal:dup999")
+    with interaction_scope(user_id=USER_ID):
+        await coach_bot.handle_callback(_router_update(first), SimpleNamespace(job_queue=None, bot=None))
+
+    second = RouterQuery("approve_meal:dup999")
+    with interaction_scope(user_id=USER_ID):
+        await coach_bot.handle_callback(_router_update(second), SimpleNamespace(job_queue=None, bot=None))
+
+    # The duplicate's FIRST answer carries the toast (Telegram shows only the
+    # first answer to a query, so ordering is the guarantee that it displays).
+    assert second.answers and second.answers[0], second.answers
+    assert "ללחוץ שוב" in second.answers[0]
+    reasons = [r.properties["reason"] for r in await _refusals(db)]
+    assert reasons == ["approval_already_handled", "duplicate_tap"]
+
+
+async def test_f02_normal_callbacks_are_not_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _obs_content_mode
+) -> None:
+    """False-positive proof: distinct presses in sequence pass through the
+    dup gate untouched (the relocated check must not swallow real taps)."""
+    db = await _make_db(tmp_path)
+    _patch_db(monkeypatch, db)
+
+    for data in ("menu:home", "menu:status", "menu:home"):
+        query = RouterQuery(data)
+        with interaction_scope(user_id=USER_ID):
+            await coach_bot.handle_callback(_router_update(query), SimpleNamespace(job_queue=None, bot=None))
+        assert query.edits or query.answers  # something happened, not a refusal
+    assert await _refusals(db) == []
+
+
+async def test_f03_stale_versioned_control_emits_canonical_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _obs_content_mode
+) -> None:
+    db = await _make_db(tmp_path)
+    _patch_db(monkeypatch, db)
+    monkeypatch.setattr(conversation, "DB", db, raising=False)
+
+    await conversation.set_active_flow(db, USER_ID, conversation.FlowName.goal_review, step="review")
+    flow = await conversation.get_active_flow(db, USER_ID)
+    stale = conversation.encode_callback(
+        "onb", "edit", flow_id=flow.flow_id, version=flow.version + 5
+    )
+    query = RouterQuery(stale)
+    with interaction_scope(user_id=USER_ID):
+        await coach_bot.handle_callback(_router_update(query), SimpleNamespace(job_queue=None, bot=None))
+
+    refusals = await _refusals(db)
+    assert len(refusals) == 1
+    assert refusals[0].properties["reason"] == "stale_version"
+    # The pre-existing visible recovery is unchanged.
+    legacy = await event_log.list_events(db, USER_ID, event="stale_callback_recovered")
+    assert len(legacy) == 1
+
+
+async def test_f03_visible_toast_is_recorded_as_callback_ack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _obs_content_mode
+) -> None:
+    db = await _make_db(tmp_path)
+    _patch_db(monkeypatch, db)
+    from noam_coach.bot.ui import safe_answer_callback
+
+    query = RouterQuery("whatever")
+    with interaction_scope(user_id=USER_ID):
+        await safe_answer_callback(query, "הפעולה כבר בביצוע")
+        await safe_answer_callback(query)  # empty spinner-stop: NOT evented
+
+    acks = await event_log.list_events(db, USER_ID, event=DELIVERY_SUCCEEDED)
+    ack_events = [e for e in acks if e.entity == "callback_ack"]
+    assert len(ack_events) == 1
+    assert ack_events[0].properties["operation"] == "callback_ack"
+    assert ack_events[0].properties["content"]["text"] == "הפעולה כבר בביצוע"
+    assert ack_events[0].interaction_id is not None  # correlated, not orphaned
