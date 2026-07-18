@@ -914,23 +914,33 @@ async def _handle_session_lifecycle_actions(
         )
         logged_sets = int(done["c"]) if done else 0
         progress = f"בוצעו <b>{logged_sets}</b> מתוך <b>{planned_sets}</b> סטים מתוכננים."
-        warn = (
-            "\n\n⚠️ <i>בוצע סט אחד או פחות — בטוח לסיים עכשיו?</i>"
-            if logged_sets <= 1
-            else ""
-        )
+        # Audit F-A4: the workout_status truth rule demotes an incomplete
+        # workout to "partial" regardless of the button pressed. Offering
+        # "✅ סיים מלא" when the sets are incomplete therefore lied — the
+        # user pressed "full" and got "partial". When the workout cannot be
+        # marked full, the dialog says so and does not offer a false "full".
+        all_sets_done = logged_sets >= max(1, planned_sets)
+        rows = [[button("⏸️ אמשיך מאוחר יותר", session_action_data("wpause", session))]]
+        if all_sets_done:
+            warn = ""
+            # Every planned set logged → "full" is honest and offered.
+            rows.append([button("✅ סיים מלא", session_action_data("wdone", session, "full"))])
+            rows.append([button("🟡 סיים חלקי", session_action_data("wdone", session, "partial"))])
+        else:
+            warn = (
+                f"\n\n⚠️ <i>לא בוצעו כל הסטים ({logged_sets}/{planned_sets}) — "
+                "האימון ייסמן כ<b>חלקי</b>.</i>"
+            )
+            # No false "full": the only completion option is the truthful
+            # "partial"; the user can also return to finish the remaining sets.
+            rows.append([button("🟡 סיים כחלקי", session_action_data("wdone", session, "partial"))])
+            rows.append([button("↩️ המשך לסטים שנותרו", session_action_data("ready", session))])
+        rows.append([button("❌ בטל אימון", session_action_data("wcancel", session))])
+        rows.append([button("↩️ חזרה לאימון", session_action_data("ready", session))])
         await safe_edit(
             query,
             f"<b>לסיים את האימון?</b>\n{progress}{warn}\nאיך לסמן אותו?",
-            InlineKeyboardMarkup(
-                [
-                    [button("⏸️ אמשיך מאוחר יותר", session_action_data("wpause", session))],
-                    [button("✅ סיים מלא", session_action_data("wdone", session, "full"))],
-                    [button("🟡 סיים חלקי", session_action_data("wdone", session, "partial"))],
-                    [button("❌ בטל אימון", session_action_data("wcancel", session))],
-                    [button("↩️ חזרה לאימון", session_action_data("ready", session))],
-                ]
-            ),
+            InlineKeyboardMarkup(rows),
         )
         return True
 

@@ -406,14 +406,28 @@ async def _handle_workout_menu_actions(
         if session:
             await show_session(query, user_id, session["id"])
             return True
-        code = await select_todays_workout_code(user_id)
-        if code:
-            # Auto-pick today's workout (or next in cycle) and show its brief.
-            await render_workout_overview(query, user_id, code)
-        else:
+        # Audit F-A3: 'כבר הושלם ✅' used to be shown whenever no code was
+        # offered — including when the user simply has no plan and has done
+        # zero workouts. Distinguish the states with provenance from real
+        # session rows (the single completion truth), never a false claim.
+        from noam_coach.bot.ui import resolve_todays_workout
+
+        todays = await resolve_todays_workout(user_id)
+        if todays.code:
+            await render_workout_overview(query, user_id, todays.code)
+        elif todays.reason == "all_done_today":
+            done = ", ".join(todays.done_today)
             await safe_edit(
                 query,
-                "האימון של היום כבר הושלם ✅\nרוצה לבחור אימון נוסף בכל זאת?",
+                f"כל האימונים של היום כבר בוצעו ({esc(done)}) ✅\n"
+                "רוצה לבחור אימון נוסף בכל זאת?",
+                plans_keyboard(),
+            )
+        else:  # no_plan
+            await safe_edit(
+                query,
+                "עוד אין לך תוכנית אימונים פעילה.\n"
+                "אפשר ליצור אחת דרך \"התוכנית שלי\", או לבחור אימון ידני:",
                 plans_keyboard(),
             )
         return True

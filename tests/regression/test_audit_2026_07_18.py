@@ -75,10 +75,20 @@ async def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Database:
         "INSERT INTO users(id, first_name, username, updated_at) VALUES(?, 'Test', NULL, ?)",
         (USER_ID, utc_now()),
     )
+    from noam_coach.bot import callback_plans as callback_plans_bot
+    from noam_coach.bot import callback_session as callback_session_bot
+    from noam_coach.bot import ui as ui_bot
+
     monkeypatch.setattr(coach_bot, "DB", database)
     monkeypatch.setattr(core_services, "DB", database)
     monkeypatch.setattr(callback_meals_bot, "DB", database)
     monkeypatch.setattr(meals_bot, "DB", database)
+    monkeypatch.setattr(ui_bot, "DB", database)
+    monkeypatch.setattr(callback_plans_bot, "DB", database, raising=False)
+    monkeypatch.setattr(callback_session_bot, "DB", database, raising=False)
+    import user_model as user_model_mod
+
+    monkeypatch.setattr(user_model_mod, "DB", database, raising=False)
     monkeypatch.setattr(conversation, "DB", database, raising=False)
     from config import SETTINGS
 
@@ -403,3 +413,117 @@ async def test_fa1_rendered_card_carries_revision_tokens(db: Database) -> None:
     callbacks = _markup_callbacks(query.edit_markups[-1])
     assert f"approve_meal:{approval_id}:r2" in callbacks
     assert f"reject_meal:{approval_id}:r2" in callbacks
+
+
+# ---------------------------------------------------------------------------
+# F-A3 — workout completion has ONE truth (real sessions), stated with provenance
+# ---------------------------------------------------------------------------
+
+
+async def _seed_plan(db: Database) -> None:
+    import user_model
+
+    await user_model.set_fact(
+        db, USER_ID, "active_workout_plan",
+        {"sessions": [{"code": "A", "weekday": 0}, {"code": "B", "weekday": 2},
+                      {"code": "C", "weekday": 4}]},
+        kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
+    )
+
+
+async def test_fa3_no_plan_and_all_done_are_distinct_states(db: Database) -> None:
+    from noam_coach.bot.ui import resolve_todays_workout
+
+    # No plan, zero workouts → NOT "already completed".
+    result = await resolve_todays_workout(USER_ID)
+    assert result.code is None and result.reason == "no_plan"
+    assert result.done_today == ()
+
+    # With a plan and no sessions today → a code is offered.
+    await _seed_plan(db)
+    offered = await resolve_todays_workout(USER_ID)
+    assert offered.code in {"A", "B", "C"}
+    assert offered.reason in {"offer_today", "offer_next"}
+
+
+async def test_fa3_all_done_reflects_real_sessions(db: Database) -> None:
+    from noam_coach.bot.ui import resolve_todays_workout
+
+    await _seed_plan(db)
+    now = utc_now()
+    for code in ("A", "B", "C"):
+        await db.execute(
+            "INSERT INTO sessions(user_id, code, name, plan, status, exercise_index, "
+            "set_number, started_at, ended_at) "
+            "VALUES(?, ?, ?, '{}', 'completed', 0, 1, ?, ?)",
+            (USER_ID, code, f"אימון {code}", now, now),
+        )
+    result = await resolve_todays_workout(USER_ID)
+    assert result.code is None
+    assert result.reason == "all_done_today"
+    assert set(result.done_today) == {"A", "B", "C"}
+
+
+async def test_fa3_menu_message_matches_state(db: Database) -> None:
+    from noam_coach.bot import callback_plans as plans_bot
+
+    query = FakeQuery("menu:workout")
+    handled = await plans_bot._handle_workout_menu_actions(
+        query, SimpleNamespace(bot=None), USER_ID, "menu:workout",
+    )
+    assert handled is True
+    text = " ".join(query.edits)
+    assert "כבר הושלם" not in text  # the false claim is gone for a planless user
+    assert "אין לך תוכנית אימונים פעילה" in text
+
+
+# ---------------------------------------------------------------------------
+# F-A4 — the finish dialog never offers a "full" it will silently demote
+# ---------------------------------------------------------------------------
+
+
+def test_fa4_incomplete_workout_status_is_partial_even_on_full_choice() -> None:
+    import training_intelligence
+
+    # The truth rule the dialog must respect: 1/12 sets + "full" → partial.
+    assert training_intelligence.workout_status(
+        1, 12, user_choice="full", duration_seconds=60,
+    ) == "partial"
+    # And a genuinely complete workout honors "full".
+    assert training_intelligence.workout_status(
+        12, 12, user_choice="full", duration_seconds=600,
+    ) == "completed"
+
+
+async def test_fa4_finish_dialog_hides_full_when_incomplete(db: Database) -> None:
+    from noam_coach.bot import callback_session as session_bot
+
+    session_bot.DB = db
+    plan = {"exercises": [{"name": "x", "sets": 4}, {"name": "y", "sets": 4},
+                          {"name": "z", "sets": 4}]}  # 12 planned
+    import json as _json
+
+    session_id = await db.execute(
+        "INSERT INTO sessions(user_id, code, name, plan, status, exercise_index, "
+        "set_number, started_at) VALUES(?, 'B', 'אימון B', ?, 'active', 0, 1, ?)",
+        (USER_ID, _json.dumps(plan), utc_now()),
+    )
+    await db.execute(
+        "INSERT INTO sets(session_id, exercise_id, exercise_name, set_number, weight, "
+        "reps, rir, source, created_at) VALUES(?, 0, 'x', 1, 54, 10, -1, 'telegram', ?)",
+        (session_id, utc_now()),
+    )
+    session = await db.fetch_one("SELECT * FROM sessions WHERE id=?", (session_id,))
+
+    query = FakeQuery()
+    handled = await session_bot._handle_session_lifecycle_actions(
+        query, SimpleNamespace(bot=None), USER_ID, "finish",
+        ["finish", str(session_id), "0", "1"], session_id, session,
+        _json.loads(session["plan"]), {}, 0.0, 0,
+    )
+    assert handled is True
+    callbacks = _markup_callbacks(query.edit_markups[-1])
+    # No "full" option is offered for an incomplete workout...
+    assert not any(cb.endswith(":full") for cb in callbacks)
+    # ...and the dialog says it will be marked partial.
+    assert any("ייסמן כ" in text and "חלקי" in text for text in query.edits)

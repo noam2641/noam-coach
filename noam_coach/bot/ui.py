@@ -499,10 +499,30 @@ async def select_todays_workout_code(user_id: int, *, now: datetime | None = Non
     (it never claims "the workout is upcoming/in-progress/done" — only "here
     is which code to show").
     """
+    return (await resolve_todays_workout(user_id, now=now)).code
+
+
+@dataclass(frozen=True)
+class TodaysWorkout:
+    """Why the workout menu shows what it shows (audit F-A3).
+
+    ``code`` is the workout to offer (None when there is nothing to offer);
+    ``reason`` explains WHY, so the menu can render an honest message
+    instead of collapsing 'no plan' and 'already done' into one
+    'כבר הושלם' claim. ``done_today`` lists the codes already performed
+    today, from real session rows — the single source of completion truth.
+    """
+
+    code: str | None
+    reason: str  # offer_today | offer_next | no_plan | all_done_today
+    done_today: tuple[str, ...] = ()
+
+
+async def resolve_todays_workout(user_id: int, *, now: datetime | None = None) -> "TodaysWorkout":
     current = (now or datetime.now(TZ)).astimezone(TZ)
     plan = await user_model.get_value(DB, user_id, "active_workout_plan")
     if not plan or not plan.get("sessions"):
-        return None
+        return TodaysWorkout(code=None, reason="no_plan")
     sessions = plan["sessions"]
     cycle = [s["code"] for s in sessions]
 
@@ -514,12 +534,13 @@ async def select_todays_workout_code(user_id: int, *, now: datetime | None = Non
         (user_id, start, end),
     )
     done_today = {r["code"] for r in done_today_rows}
+    done_tuple = tuple(sorted(done_today))
 
     # 1) A session scheduled for today's weekday that wasn't done yet.
     today_wd = current.weekday()
     for session in sessions:
         if session.get("weekday") == today_wd and session["code"] not in done_today:
-            return session["code"]
+            return TodaysWorkout(code=session["code"], reason="offer_today", done_today=done_tuple)
 
     # 2) Otherwise the next code in the cycle after the last performed workout.
     last = await DB.fetch_one(
@@ -534,15 +555,16 @@ async def select_todays_workout_code(user_id: int, *, now: datetime | None = Non
         # Skip forward over anything already done today.
         for _ in range(len(cycle)):
             if candidate not in done_today:
-                return candidate
+                return TodaysWorkout(code=candidate, reason="offer_next", done_today=done_tuple)
             nxt = (nxt + 1) % len(cycle)
             candidate = cycle[nxt]
-        return candidate
+        # Every code in the cycle was already performed today.
+        return TodaysWorkout(code=None, reason="all_done_today", done_today=done_tuple)
     # Fall back to the first code not yet done today.
     for code in cycle:
         if code not in done_today:
-            return code
-    return None
+            return TodaysWorkout(code=code, reason="offer_next", done_today=done_tuple)
+    return TodaysWorkout(code=None, reason="all_done_today", done_today=done_tuple)
 
 
 @runtime_bound(RUNTIME_NAMES)
