@@ -246,7 +246,14 @@ async def handle_photo(
         path = folder / (
             f"{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}.jpg"
         )
-        await asyncio.to_thread(path.write_bytes, image_bytes)
+        # Audit F-A9: photo persistence is one evidenced operation — the
+        # storage path, content hash and provider id are recorded, so a
+        # later 'missing image' is always explainable (classify_missing_image).
+        from noam_coach.services.media_persistence import persist_meal_photo
+
+        await persist_meal_photo(
+            user_id, image_bytes, path, provider_file_unique_id=file_unique_id,
+        )
 
         # Detect both exact Telegram duplicates and visually similar saved meals.
         pending_dup = await DB.fetch_one(

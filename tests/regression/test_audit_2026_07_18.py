@@ -547,6 +547,78 @@ def test_fa6_weekday_label_is_joined_to_string() -> None:
 
 
 # ---------------------------------------------------------------------------
+# F-A9 — unified photo persistence + differentiated missing-image observability
+# ---------------------------------------------------------------------------
+
+
+async def test_fa9_persist_emits_storage_evidence(db: Database, tmp_path: Path) -> None:
+    from noam_coach.services.media_persistence import persist_meal_photo
+
+    path = tmp_path / "food.jpg"
+    sha = await persist_meal_photo(
+        USER_ID, b"jpeg-bytes-here", path, provider_file_unique_id="AQADabc",
+    )
+    assert path.exists()
+    persisted = [
+        e for e in await event_log.list_events(db, USER_ID, event=STATE_MUTATED)
+        if e.properties.get("action") == "persisted"
+    ]
+    assert len(persisted) == 1
+    props = persisted[0].properties
+    assert props["storage_ref"] == str(path)
+    assert props["provider_file_unique_id"] == "AQADabc"  # the metadata the audit found missing
+    assert props["sha256_prefix"] == sha[:16]
+    assert props["byte_size"] == len(b"jpeg-bytes-here")
+
+
+async def test_fa9_missing_image_is_classified_not_silent(db: Database, tmp_path: Path) -> None:
+    from noam_coach.services.media_persistence import (
+        classify_missing_image,
+        persist_meal_photo,
+    )
+
+    present = tmp_path / "present.jpg"
+    await persist_meal_photo(USER_ID, b"bytes", present)
+    assert await classify_missing_image(USER_ID, image_path=str(present)) == "present"
+
+    # A path recorded but the file gone, with no deletion event → storage gap.
+    gone = tmp_path / "gone.jpg"
+    assert await classify_missing_image(
+        USER_ID, image_path=str(gone), media_sha_prefix="deadbeefdeadbeef",
+    ) == "storage_object_gone"
+
+    # Only a Telegram id, never persisted.
+    assert await classify_missing_image(
+        USER_ID, image_path=None, provider_file_unique_id="AQADxyz",
+    ) == "provider_only"
+
+    # Nothing recorded at all.
+    assert await classify_missing_image(USER_ID, image_path=None) == "no_reference"
+
+
+async def test_fa9_reject_deletion_is_classified_as_deleted_on_reject(
+    db: Database, tmp_path: Path
+) -> None:
+    """The MEDIA_003 shape: persisted, then deleted by reject — the trace
+    now explains the absence instead of leaving it a silent mystery."""
+    from noam_coach.services.media_persistence import (
+        classify_missing_image,
+        persist_meal_photo,
+    )
+
+    image = tmp_path / "rejected.jpg"
+    sha = await persist_meal_photo(USER_ID, b"reject-me", image)
+    approval_id = await _create_meal_approval(db, image=str(image))
+    await _press(f"reject_meal:{approval_id}:r0")
+    assert not image.exists()
+
+    verdict = await classify_missing_image(
+        USER_ID, image_path=str(image), media_sha_prefix=sha[:16],
+    )
+    assert verdict == "deleted_on_reject"  # not "storage_object_gone" — explained
+
+
+# ---------------------------------------------------------------------------
 # F-A8 — health status: two dates measure different things, stated honestly
 # ---------------------------------------------------------------------------
 
