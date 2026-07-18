@@ -114,6 +114,23 @@ PENDING_PLAN_GENERATE_STEP = "generate_candidates"
 PENDING_CALLBACK_STEP = "callback"
 
 
+def goal_status_line(provisional: bool, missing: list) -> str:
+    """The daily-goal precision line (extracted for review F-05).
+
+    Review 2026-07-18_1 / F-05: a provisional goal with NOTHING left on the
+    soft precision list must not render a dangling 'נדרש עוד: ' with an
+    empty list after the colon (production event 370).
+    """
+    if not provisional:
+        return "✅ מחושב מהפרופיל שלך"
+    if missing:
+        return (
+            "⚠️ <b>יעד לפי הערכה חלקית</b> — לדיוק מלא נדרש עוד: "
+            + ", ".join(esc(user_model.display_label(item)) for item in missing)
+        )
+    return "⚠️ <b>יעד לפי הערכה חלקית</b> — טרם אושר סופית"
+
+
 async def _set_pending_plan_action(user_id: int, plan_type: str) -> None:
     from noam_coach.bot.onboarding import set_flow_state
 
@@ -314,12 +331,7 @@ async def render_goal_proposal(query: Any, user_id: int) -> None:
     # RE10-9 / D2: "missing" here is the SOFT list (sex/age/height/avg_steps)
     # that only affects precision, not the hard GOAL_REQUIRED_FACTS gate —
     # label it as "for more precision" so it isn't confused with a blocker.
-    status_line = (
-        "⚠️ <b>יעד לפי הערכה חלקית</b> — לדיוק מלא נדרש עוד: "
-        + ", ".join(esc(user_model.display_label(item)) for item in missing)
-        if payload["provisional"]
-        else "✅ מחושב מהפרופיל שלך"
-    )
+    status_line = goal_status_line(bool(payload["provisional"]), missing)
     # TASK-4: the daily target is decision-oriented. When the requested goal +
     # timeline is infeasible, lead with a single direct recommendation and
     # replace the vague "❌ דחה" with explicit decisions (approve the recommended

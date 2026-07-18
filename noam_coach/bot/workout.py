@@ -301,8 +301,9 @@ async def render_post_meal_confirmation_day_status(user_id: int, totals: dict[st
     )
     if context.remaining_calories is not None and context.remaining_protein is not None:
         lines.append(
-            f"נשאר להיום: {context.remaining_calories:.0f} קלוריות | "
-            f"{context.remaining_protein:.0f} גרם חלבון"
+            format_remaining_budget_line(
+                context.remaining_calories, context.remaining_protein
+            )
         )
 
     try:
@@ -344,6 +345,24 @@ async def render_post_meal_confirmation_day_status(user_id: int, totals: dict[st
                 lines.append(status_line)
 
     return "\n".join(lines)
+
+
+def format_remaining_budget_line(remaining_calories: float, remaining_protein: float) -> str:
+    """The post-meal 'נשאר להיום' line (review 2026-07-18_1 / F-09).
+
+    An overshoot is phrased as חריגה — the same convention the status
+    screen uses — never as a raw negative remainder ("-5 גרם חלבון"
+    reads as a bug to the user; production event 598).
+    """
+    def part(value: float, unit: str) -> str:
+        if value >= 0:
+            return f"{value:.0f} {unit}"
+        return f"חריגה של {-value:.0f} {unit}"
+
+    return (
+        f"נשאר להיום: {part(remaining_calories, 'קלוריות')} | "
+        f"{part(remaining_protein, 'גרם חלבון')}"
+    )
 
 
 def _bedtime_clock(current_local_time: str, hours_until_bedtime: float) -> str | None:

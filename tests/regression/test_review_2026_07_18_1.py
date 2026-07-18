@@ -382,6 +382,79 @@ async def test_f06_stale_wizard_version_press_is_visibly_recovered(
     assert "כבר לא פעילים" in visible  # never silent
 
 
+# ---------------------------------------------------------------------------
+# F-04 / F-05 / F-08 / F-09 — presentation & classification rules
+# ---------------------------------------------------------------------------
+
+
+def test_f04_goal_weight_guard_example_derives_from_current_weight() -> None:
+    """Event 348: a 58 kg user aiming at 48 was offered 'למשל 83' — the
+    example must be plausible for THIS user and follow their direction."""
+    from noam_coach.services.goal_validation import validate_goal_weight
+
+    result = validate_goal_weight(48, 58)
+    assert result.needs_confirmation
+    assert "83" not in result.message
+    assert "למשל 52" in result.message  # 58 * 0.9, moderate loss example
+
+    gain = validate_goal_weight(120, 58)
+    assert gain.needs_confirmation
+    assert "למשל 64" in gain.message  # 58 * 1.1, moderate gain example
+
+
+def test_f05_partial_goal_card_never_renders_dangling_missing_header() -> None:
+    from noam_coach.bot.callback_plans import goal_status_line
+
+    empty = goal_status_line(True, [])
+    assert not empty.rstrip().endswith(":")
+    assert "נדרש עוד" not in empty
+    assert "הערכה חלקית" in empty  # provisional state still communicated
+
+    with_items = goal_status_line(True, ["sex", "age"])
+    assert "נדרש עוד" in with_items and not with_items.rstrip().endswith(":")
+    assert goal_status_line(False, []).startswith("✅")
+
+
+async def test_f08_preference_is_not_labeled_a_prohibition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _obs_content_mode
+) -> None:
+    """Events 224/227/436: 'מעדיף להימנע' was displayed under 'איסורים
+    תזונתיים'. The label is now level-neutral and the chosen level is
+    PERSISTED per item instead of surviving only in the ack text."""
+    db = await _make_db(tmp_path)
+    _patch_db(monkeypatch, db)
+    monkeypatch.setattr(conversation, "DB", db, raising=False)
+
+    assert user_model.display_label("diet_restrictions") == "העדפות והגבלות תזונה"
+
+    await user_model.set_fact(
+        db, USER_ID, "diet_restrictions", "פירות",
+        kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
+    )
+    query = RouterQuery("qa:diet_type:preference:פירות")
+    with interaction_scope(user_id=USER_ID):
+        await coach_bot.handle_callback(_router_update(query), SimpleNamespace(job_queue=None, bot=None))
+
+    levels = await user_model.get_fact(db, USER_ID, "diet_restriction_levels")
+    assert levels is not None
+    assert levels["value"] == {"פירות": "preference"}
+    assert any("מעדיף להימנע" in text for text in query.edits)
+
+
+def test_f09_protein_overshoot_phrased_as_overshoot_not_negative() -> None:
+    """Event 598: 'נשאר להיום: 296 קלוריות | -5 גרם חלבון' — overshoot uses
+    the same חריגה phrasing as the status screen."""
+    from noam_coach.bot.workout import format_remaining_budget_line
+
+    incident = format_remaining_budget_line(296, -5)
+    assert incident == "נשאר להיום: 296 קלוריות | חריגה של 5 גרם חלבון"
+    assert "-" not in incident
+    both_over = format_remaining_budget_line(-120, -5)
+    assert both_over == "נשאר להיום: חריגה של 120 קלוריות | חריגה של 5 גרם חלבון"
+    normal = format_remaining_budget_line(796, 61)
+    assert normal == "נשאר להיום: 796 קלוריות | 61 גרם חלבון"
+
+
 async def test_f03_visible_toast_is_recorded_as_callback_ack(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _obs_content_mode
 ) -> None:

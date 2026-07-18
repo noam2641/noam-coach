@@ -1031,6 +1031,20 @@ async def handle_onboarding_callback(query: Any, user_id: int, data: str) -> Non
             }
             type_label = type_labels.get(restriction_type, restriction_type)
             await _mark_no_allergies_if_missing(user_id)
+            # Review 2026-07-18_1 / F-08: the chosen level used to survive
+            # only in the ack text — persist it per item so the profile and
+            # future menu logic can distinguish a soft preference from a
+            # real restriction.
+            if food_item:
+                levels_fact = await user_model.get_fact(DB, user_id, "diet_restriction_levels")
+                levels = dict(levels_fact.get("value") or {}) if levels_fact else {}
+                levels[food_item] = restriction_type
+                await user_model.set_fact(
+                    DB, user_id, "diet_restriction_levels", levels,
+                    kind=user_model.KIND_FACT,
+                    source=user_model.SOURCE_USER,
+                    confirmed=True,
+                )
             await safe_edit(
                 query,
                 f"רשמתי: {esc(food_item)} — {esc(type_label)} ✅",
@@ -1728,7 +1742,7 @@ _EDITABLE_PROFILE_FIELDS: tuple[tuple[str, str], ...] = (
     ("goal_weight_kg", "🎯 משקל יעד"),
     ("goal_timeframe_weeks", "⏳ משך זמן ליעד"),
     ("allergies", "🚫 אלרגיות"),
-    ("diet_restrictions", "🥗 איסורים תזונתיים"),
+    ("diet_restrictions", "🥗 העדפות והגבלות תזונה"),
     ("training_location", "📍 מקום אימון"),
     ("equipment", "🏋️ ציוד זמין"),
     ("session_minutes", "⏱️ זמן לאימון"),

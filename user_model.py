@@ -237,7 +237,12 @@ FACT_REGISTRY: dict[str, FactSpec] = {
     ),
     "diet_restrictions": FactSpec(
         "diet_restrictions",
-        "איסורים תזונתיים",
+        # Review 2026-07-18_1 / F-08: this fact holds preferences,
+        # intolerances and sensitivities alike — the old hard-prohibition
+        # label ("איסורים תזונתיים") misrepresented a user who explicitly
+        # chose the softest option ("מעדיף להימנע"). Diagnosed allergies
+        # stay a separate fact with their own label.
+        "העדפות והגבלות תזונה",
         "reported",
         ("menu_planning",),
     ),
@@ -471,7 +476,7 @@ FACT_DISPLAY_LABELS: dict[str, str] = {
     "strength_experience": "ניסיון באימוני כוח",
     "training_location": "מקום אימון",
     "equipment": "ציוד זמין",
-    "diet_restrictions": "איסורים תזונתיים",
+    "diet_restrictions": "העדפות והגבלות תזונה",
     "allergies": "אלרגיות",
     "weight_kg": "משקל",
     "height_cm": "גובה",
