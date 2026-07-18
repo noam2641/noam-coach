@@ -311,6 +311,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows consoles may run a narrow codepage (e.g. cp1255): never let
+    # operator feedback crash on an arrow or Hebrew evidence text.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     args = build_parser().parse_args(argv)
     if args.command == "build":
         return asyncio.run(_cmd_build(args))

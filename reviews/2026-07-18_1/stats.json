@@ -1,0 +1,74 @@
+{
+  "events_total": 632,
+  "events_by_family": {
+    "ai": 10,
+    "decision": 2,
+    "delivery": 160,
+    "flow": 58,
+    "interaction": 68,
+    "legacy_domain": 88,
+    "media": 2,
+    "routing": 67,
+    "state": 40,
+    "ui": 132,
+    "validation": 5
+  },
+  "first_event_at": "2026-07-15T16:06:08.358100+00:00",
+  "last_event_at": "2026-07-15T17:23:01.255677+00:00",
+  "interactions_total": 68,
+  "interactions_by_kind": {
+    "command": 1,
+    "text": 13,
+    "callback": 52,
+    "photo": 2
+  },
+  "interactions_by_surface": {
+    "telegram": 68
+  },
+  "ai": {
+    "calls": 5,
+    "failed": 0,
+    "unresolved": 0,
+    "by_purpose": {
+      "goal_explanation": {
+        "count": 1,
+        "failed": 0,
+        "p50_ms": 5296,
+        "p95_ms": 5296
+      },
+      "morning_menu_generation": {
+        "count": 1,
+        "failed": 0,
+        "p50_ms": 8766,
+        "p95_ms": 8766
+      },
+      "meal_image_analysis": {
+        "count": 2,
+        "failed": 0,
+        "p50_ms": 7125,
+        "p95_ms": 8282
+      },
+      "meal_reanalysis": {
+        "count": 1,
+        "failed": 0,
+        "p50_ms": 6328,
+        "p95_ms": 6328
+      }
+    }
+  },
+  "renders": {
+    "prepared": 80,
+    "delivered": 78,
+    "not_modified": 2,
+    "failed_terminal": 0,
+    "unknown": 0
+  },
+  "flows": {
+    "started": 25,
+    "completed": 20,
+    "expired": 0,
+    "suspended": 4,
+    "resumed": 3
+  },
+  "legacy_uncorrelated_events": 1
+}

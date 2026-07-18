@@ -8,7 +8,7 @@
       "finding_id": "F-01",
       "title": "Health-import wizard: 'skip for now' on the last remaining item loops back to the same item",
       "kind": "defect",
-      "status": "approved",
+      "status": "implemented",
       "evidence_level": "CONFIRMED",
       "severity": "HIGH",
       "confidence": "high",
@@ -42,7 +42,7 @@
       "detector_references": [
         "repeated_user_input"
       ],
-      "reproduction_status": "evidence_inspected",
+      "reproduction_status": "synthetically_reproduced",
       "suspected_root_cause": "skip_item marks the item 'ask later' and recomputes the next unconfirmed item, which is the same item when nothing else remains; there is no terminal branch for 'all remaining items skipped'.",
       "affected_components": [
         "health_import.py",
@@ -56,13 +56,13 @@
         "approved_scope": "Root-cause fix of the GENERIC wizard skip/progression behavior (not only the sleep item), with generic + incident-specific regression coverage"
       },
       "implementation_eligibility": "eligible",
-      "final_resolution": null
+      "final_resolution": "Root cause: wizard deferral had no terminal state — 'דלג כרגע' re-queued the item and _next_wizard_step returned it immediately when nothing else remained; a skip on a finished wizard even restarted it. Fixed generically in health_jobs.py (first skip defers with an announced return pass, second skip is terminal via a new 'skipped' list, one _wizard_payload shape for all state writers) + callback_menu.py (stale skip refuses visibly). Commit 54d34e4; regressions incident-specific + generic in tests/regression/test_review_2026_07_18_1.py."
     },
     {
       "finding_id": "F-02",
       "title": "Stale/duplicate control presses are dropped with no visible acknowledgement",
       "kind": "ux_problem",
-      "status": "approved",
+      "status": "implemented",
       "evidence_level": "PROBABLE",
       "severity": "MEDIUM",
       "confidence": "medium",
@@ -102,7 +102,7 @@
         "interaction_no_output",
         "repeated_user_input"
       ],
-      "reproduction_status": "evidence_inspected",
+      "reproduction_status": "synthetically_reproduced",
       "suspected_root_cause": "The identity/duplicate gates (B2/B5 family) return early on refusal without sending any user-visible acknowledgement.",
       "affected_components": [
         "noam_coach/services/recommendation_identity.py",
@@ -118,13 +118,13 @@
         "notes": "Operator requires reproduction before treating as fact"
       },
       "implementation_eligibility": "eligible",
-      "final_resolution": null
+      "final_resolution": "Reproduced pre-fix (conditional approval honored): the consumed-approval press produced no visible output through the real handle_callback. Root causes: persist_meal→None hit a bare 'return True', and the duplicate-tap gate ran after the query was already empty-answered so no toast could display. Fixed: duplicate check moved before the pre-answer with a visible toast; consumed-approval presses edit the card to an explicit terminal state; idempotency unchanged. Commit 30fbf9f."
     },
     {
       "finding_id": "F-03",
       "title": "Refusal decisions and callback ACKs are invisible to the trace",
       "kind": "observability_gap",
-      "status": "approved",
+      "status": "implemented",
       "evidence_level": "CONFIRMED",
       "severity": "MEDIUM",
       "confidence": "high",
@@ -158,7 +158,7 @@
       "detector_references": [
         "interaction_no_output"
       ],
-      "reproduction_status": "evidence_inspected",
+      "reproduction_status": "synthetically_reproduced",
       "suspected_root_cause": "The gates predate a 'refusal is a decision' convention: nothing emits decision.finalized(outcome=refused, reason=stale_control|duplicate), and ACK toasts bypass the egress instrumentation.",
       "affected_components": [
         "noam_coach/observability/telegram_egress.py",
@@ -173,13 +173,13 @@
         "approved_scope": "Instrument intentional callback refusals (stale/duplicate) and callback toast acknowledgements so they are distinguishable from hangs and delivery failures"
       },
       "implementation_eligibility": "eligible",
-      "final_resolution": null
+      "final_resolution": "Refusals are decisions now: services/control_refusal.py emits canonical decision.finalized(entity=ui_control, outcome=refused, reason) at every intentional refusal site (duplicate_tap, stale_version, approval_already_handled, wizard_already_finished), and ui.safe_answer_callback records every TEXTUAL toast as a delivery event (entity=callback_ack). Empty spinner-stop acks deliberately not evented. Commit 30fbf9f."
     },
     {
       "finding_id": "F-04",
       "title": "Goal-weight typo guard suggests a nonsensical example value",
       "kind": "conversation_quality",
-      "status": "approved",
+      "status": "implemented",
       "evidence_level": "CONFIRMED",
       "severity": "LOW",
       "confidence": "high",
@@ -216,13 +216,13 @@
         "approved_scope": "Fix underlying formatting/derivation rule + focused regression"
       },
       "implementation_eligibility": "eligible",
-      "final_resolution": null
+      "final_resolution": "The 'למשל 83' example was hardcoded in goal_validation.py; the alternative example now derives from the user's current weight in their direction (0.9×/1.1×). Commit 6991aa3."
     },
     {
       "finding_id": "F-05",
       "title": "Partial-estimate goal card renders a dangling empty 'missing items' header",
       "kind": "conversation_quality",
-      "status": "approved",
+      "status": "implemented",
       "evidence_level": "CONFIRMED",
       "severity": "LOW",
       "confidence": "high",
@@ -259,7 +259,7 @@
         "approved_scope": "Fix underlying formatting rule + focused regression"
       },
       "implementation_eligibility": "eligible",
-      "final_resolution": null
+      "final_resolution": "Status line extracted to callback_plans.goal_status_line(): the missing-items header renders only when items exist; an empty soft list renders 'טרם אושר סופית'. Commit 6991aa3."
     },
     {
       "finding_id": "F-06",
@@ -297,7 +297,7 @@
       "detector_references": [
         "repeated_user_input"
       ],
-      "reproduction_status": "evidence_inspected",
+      "reproduction_status": "not_reproducible",
       "suspected_root_cause": "Plan-center renders are per-message but wizard/selection state is singleton; regeneration bumps the version token without editing superseded cards to a non-interactive state.",
       "affected_components": [
         "noam_coach/bot/callback_plans.py",
@@ -360,7 +360,7 @@
       "finding_id": "F-08",
       "title": "A soft food preference is presented as a hard prohibition in the profile",
       "kind": "conversation_quality",
-      "status": "approved",
+      "status": "implemented",
       "evidence_level": "CONFIRMED",
       "severity": "LOW",
       "confidence": "high",
@@ -403,13 +403,13 @@
         "approved_scope": "Fix underlying classification/labeling rule + focused regression"
       },
       "implementation_eligibility": "eligible",
-      "final_resolution": null
+      "final_resolution": "diet_restrictions label changed to the level-neutral 'העדפות והגבלות תזונה' (FACT_REGISTRY + display map + profile edit menu), and the chosen classification level is now persisted per item in the diet_restriction_levels fact instead of surviving only in the ack text. Commit 6991aa3."
     },
     {
       "finding_id": "F-09",
       "title": "Protein overshoot is shown as a negative remainder in the save summary",
       "kind": "conversation_quality",
-      "status": "approved",
+      "status": "implemented",
       "evidence_level": "CONFIRMED",
       "severity": "LOW",
       "confidence": "high",
@@ -447,7 +447,7 @@
         "approved_scope": "Fix underlying formatting rule + focused regression"
       },
       "implementation_eligibility": "eligible",
-      "final_resolution": null
+      "final_resolution": "Extracted workout.format_remaining_budget_line(): overshoot renders as 'חריגה של X' (the status screen's convention) instead of a raw negative. Commit 6991aa3."
     }
   ]
 }

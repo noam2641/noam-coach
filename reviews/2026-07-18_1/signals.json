@@ -1,0 +1,268 @@
+{
+  "detector_set_version": "1.0",
+  "detectors": [
+    {
+      "detector_id": "error_captured",
+      "version": 1,
+      "severity_hint": "critical",
+      "description": "Unhandled exception recorded at an execution boundary.",
+      "supported_contract": "error.captured (R1 boundaries + daily-flags CAS)",
+      "limitations": "Only exceptions that reached an instrumented boundary appear."
+    },
+    {
+      "detector_id": "ai_call_failed",
+      "version": 1,
+      "severity_hint": "high",
+      "description": "AI call terminated with a failure.",
+      "supported_contract": "ai.call.failed grouped per interaction",
+      "limitations": "Product-level fallbacks may have masked the user impact (see decision_fallback)."
+    },
+    {
+      "detector_id": "ai_call_unresolved",
+      "version": 1,
+      "severity_hint": "medium",
+      "description": "AI call started but no completion/failure was recorded.",
+      "supported_contract": "ai.call.started without terminal event in the same interaction",
+      "limitations": "A window boundary can split start/terminal events; verify against the full stream."
+    },
+    {
+      "detector_id": "delivery_failed_terminal",
+      "version": 1,
+      "severity_hint": "high",
+      "description": "Prepared message whose delivery terminally failed (no later success).",
+      "supported_contract": "ui.render.prepared + delivery.* chain per render",
+      "limitations": "Retries outside the recorded chain are not visible."
+    },
+    {
+      "detector_id": "render_without_delivery",
+      "version": 1,
+      "severity_hint": "medium",
+      "description": "Prepared render with no recorded delivery result at all.",
+      "supported_contract": "RenderTrace.delivery_result == unknown",
+      "limitations": "Can be caused by process death between prepare and send."
+    },
+    {
+      "detector_id": "callback_unresolved",
+      "version": 1,
+      "severity_hint": "low",
+      "description": "Pressed control whose source render could not be proven.",
+      "supported_contract": "ui.control.activated correlation=unresolved",
+      "limitations": "Expected for controls older than the render-registry scan window."
+    },
+    {
+      "detector_id": "validation_failed",
+      "version": 1,
+      "severity_hint": "medium",
+      "description": "Deterministic validation rejected produced output.",
+      "supported_contract": "validation.failed",
+      "limitations": "Repair chains may have recovered; correlate with decision_* signals."
+    },
+    {
+      "detector_id": "decision_repaired",
+      "version": 1,
+      "severity_hint": "low",
+      "description": "AI output required deterministic repair.",
+      "supported_contract": "decision.repaired",
+      "limitations": "Repair is working as designed; frequency is the signal."
+    },
+    {
+      "detector_id": "decision_fallback",
+      "version": 1,
+      "severity_hint": "medium",
+      "description": "Deterministic fallback replaced the intended path.",
+      "supported_contract": "decision.fallback_selected",
+      "limitations": "The user saw degraded output silently; reason field says why."
+    },
+    {
+      "detector_id": "flow_expired",
+      "version": 1,
+      "severity_hint": "medium",
+      "description": "An active flow expired before completion.",
+      "supported_contract": "flow.expired",
+      "limitations": "Expiry may be legitimate abandonment; repetition on one flow is the signal."
+    },
+    {
+      "detector_id": "user_correction",
+      "version": 1,
+      "severity_hint": "medium",
+      "description": "Explicit user correction of produced output (undo / analysis override).",
+      "supported_contract": "MEAL_UNDONE + decision.finalized with non-empty overrides",
+      "limitations": "Only correction paths with structured evidence are counted."
+    },
+    {
+      "detector_id": "repeated_user_input",
+      "version": 1,
+      "severity_hint": "medium",
+      "description": "Consecutive identical user inputs (retry/frustration evidence).",
+      "supported_contract": "interaction.received text digest / callback_data+source message",
+      "limitations": "Identical input does not prove one shared cause; digests only, no text."
+    },
+    {
+      "detector_id": "interaction_no_output",
+      "version": 1,
+      "severity_hint": "high",
+      "description": "User input with no delivered output, state change, or view render.",
+      "supported_contract": "InteractionTrace renders/state_mutations/view_renders",
+      "limitations": "Excludes crashed interactions (error_captured covers those); an intentionally silent handler would also match."
+    },
+    {
+      "detector_id": "observability_write_failed",
+      "version": 1,
+      "severity_hint": "high",
+      "description": "The trace itself degraded during the window.",
+      "supported_contract": "observability.write_failed",
+      "limitations": "The failed event's own payload is by definition incomplete."
+    },
+    {
+      "detector_id": "ai_purpose_unclassified",
+      "version": 1,
+      "severity_hint": "low",
+      "description": "An AI call site without a purpose wrap appeared (coverage regression).",
+      "supported_contract": "ai.call.* purpose=unclassified",
+      "limitations": "Identifies the call, not the missing wrap location."
+    }
+  ],
+  "signals": [
+    {
+      "detector_id": "user_correction",
+      "detector_version": 1,
+      "severity_hint": "medium",
+      "summary": "Explicit user correction of produced output (undo / analysis override).",
+      "count": 1,
+      "occurrences": [
+        {
+          "event_ids": [
+            584
+          ],
+          "trace_id": "tr_2594d50ec62046c2",
+          "interaction_id": "in_8fc643f35fae4e9e",
+          "detail": {
+            "correction": "analysis_override",
+            "entity": "meal_analysis",
+            "override_count": 2
+          }
+        }
+      ],
+      "affected_traces": [
+        "tr_2594d50ec62046c2"
+      ]
+    },
+    {
+      "detector_id": "repeated_user_input",
+      "detector_version": 1,
+      "severity_hint": "medium",
+      "summary": "Consecutive identical user inputs (retry/frustration evidence).",
+      "count": 4,
+      "occurrences": [
+        {
+          "event_ids": [
+            66,
+            75,
+            84
+          ],
+          "trace_id": "tr_c664c44881494156",
+          "interaction_id": "in_3cf6446463474be7",
+          "detail": {
+            "kind": "callback",
+            "input_digest": "health:skip_item@1606",
+            "repetitions": 3,
+            "interaction_ids": [
+              "in_3cf6446463474be7",
+              "in_e4fd15aeadd84ddf",
+              "in_76cdb180bb5b4877"
+            ]
+          }
+        },
+        {
+          "event_ids": [
+            244,
+            256
+          ],
+          "trace_id": "tr_13e4e0add3e44035",
+          "interaction_id": "in_26e21a5aadf14424",
+          "detail": {
+            "kind": "callback",
+            "input_digest": "planv2:generate:workout@1621",
+            "repetitions": 2,
+            "interaction_ids": [
+              "in_26e21a5aadf14424",
+              "in_a779031cb4e64422"
+            ]
+          }
+        },
+        {
+          "event_ids": [
+            267,
+            275
+          ],
+          "trace_id": "tr_13e4e0add3e44035",
+          "interaction_id": "in_a3d9ebee13a74564",
+          "detail": {
+            "kind": "callback",
+            "input_digest": "planv2:wiz_type:consistency:ff-322493274-a13bfe366328:v39@1621",
+            "repetitions": 2,
+            "interaction_ids": [
+              "in_a3d9ebee13a74564",
+              "in_1bc6bde7ca064f3a"
+            ]
+          }
+        },
+        {
+          "event_ids": [
+            590,
+            601
+          ],
+          "trace_id": "tr_2594d50ec62046c2",
+          "interaction_id": "in_862d943ee4be485d",
+          "detail": {
+            "kind": "callback",
+            "input_digest": "approve_meal:FsfP5UUdPsk@1637",
+            "repetitions": 2,
+            "interaction_ids": [
+              "in_862d943ee4be485d",
+              "in_558c5fea44be4afc"
+            ]
+          }
+        }
+      ],
+      "affected_traces": [
+        "tr_13e4e0add3e44035",
+        "tr_2594d50ec62046c2",
+        "tr_c664c44881494156"
+      ]
+    },
+    {
+      "detector_id": "interaction_no_output",
+      "detector_version": 1,
+      "severity_hint": "high",
+      "summary": "User input with no delivered output, state change, or view render.",
+      "count": 2,
+      "occurrences": [
+        {
+          "event_ids": [
+            275
+          ],
+          "trace_id": "tr_13e4e0add3e44035",
+          "interaction_id": "in_1bc6bde7ca064f3a",
+          "detail": {
+            "kind": "callback"
+          }
+        },
+        {
+          "event_ids": [
+            601
+          ],
+          "trace_id": "tr_2594d50ec62046c2",
+          "interaction_id": "in_558c5fea44be4afc",
+          "detail": {
+            "kind": "callback"
+          }
+        }
+      ],
+      "affected_traces": [
+        "tr_13e4e0add3e44035",
+        "tr_2594d50ec62046c2"
+      ]
+    }
+  ]
+}
