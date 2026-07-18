@@ -277,6 +277,125 @@ async def test_fa5_decision_addressed_to_other_meal_leaves_active_flow(db: Datab
     assert flow.step == approval_a  # A's flow untouched by B's decision
 
 
+# ---------------------------------------------------------------------------
+# F-A2 — canonical quantity interpretation: no impossible meal may persist
+# ---------------------------------------------------------------------------
+
+
+def _incident_schnitzel_item() -> FoodItem:
+    """The exact production values: count 3 written into the grams field."""
+    return FoodItem(
+        name="שניצל", grams=3.0, calories=8.4, protein=0.7, carbs=0.3, fat=0.5,
+        confidence=1.0, quantity_count=3.0, quantity_unit="כדור",
+        quantity_source="visual_count",
+    )
+
+
+def test_fa2_incident_count_as_grams_is_blocked() -> None:
+    from noam_coach.services.meal_plausibility import check_item
+
+    issues = check_item(_incident_schnitzel_item())
+    assert [i.code for i in issues] == ["count_written_as_grams"]
+    assert issues[0].severity == "block"
+
+
+def test_fa2_impossible_densities_are_blocked() -> None:
+    from noam_coach.services.meal_plausibility import check_item
+
+    protein_heavier_than_food = FoodItem(
+        name="חזה עוף", grams=50.0, calories=200.0, protein=80.0,
+        carbs=0.0, fat=2.0, confidence=0.9,
+    )
+    assert any(i.code == "impossible_protein_density" and i.severity == "block"
+               for i in check_item(protein_heavier_than_food))
+
+    denser_than_fat = FoodItem(
+        name="גבינה", grams=20.0, calories=400.0, protein=5.0,
+        carbs=1.0, fat=10.0, confidence=0.9,
+    )
+    assert any(i.code == "impossible_calorie_density" and i.severity == "block"
+               for i in check_item(denser_than_fat))
+
+    zero_energy_solid = FoodItem(
+        name="אורז מבושל", grams=200.0, calories=3.0, protein=0.1,
+        carbs=0.5, fat=0.0, confidence=0.9,
+    )
+    assert any(i.code == "implausible_zero_energy_solid" and i.severity == "block"
+               for i in check_item(zero_energy_solid))
+
+
+def test_fa2_legitimate_foods_are_not_flagged() -> None:
+    """False-positive proof: small counted units, drinks, tiny genuine
+    ingredients and ordinary meals all pass."""
+    from noam_coach.services.meal_plausibility import check_analysis, check_item
+
+    olives = FoodItem(name="זיתים", grams=40.0, calories=60.0, protein=0.4,
+                      carbs=1.5, fat=6.0, confidence=0.9,
+                      quantity_count=10.0, quantity_unit="יחידות")
+    assert check_item(olives) == []
+
+    zero_cola = FoodItem(name="משקה קולה ללא סוכר", grams=330.0, calories=0.0,
+                         protein=0.0, carbs=0.0, fat=0.0, confidence=0.9)
+    assert check_item(zero_cola) == []  # beverages may be zero-energy
+
+    yeast = FoodItem(name="שמרים", grams=3.0, calories=10.0, protein=1.2,
+                     carbs=1.0, fat=0.1, confidence=0.9)  # no count → no signature
+    assert check_item(yeast) == []
+
+    normal_meal = _analysis("שניצל אמיתי")
+    assert check_analysis(normal_meal.items) == []
+
+
+def test_fa2_incident_meal_cannot_be_persisted(db: Database) -> None:
+    from noam_coach.services.meal_validation import validate_meal_analysis
+
+    incident = MealAnalysis(
+        meal_name="שניצל + חציל + רוטב",
+        items=[
+            _incident_schnitzel_item(),
+            FoodItem(name="חציל בשרוף מטוגן", grams=100.0, calories=120.0,
+                     protein=1.0, carbs=8.0, fat=9.0, confidence=0.8),
+        ],
+        confidence=0.9,
+    )
+    result = validate_meal_analysis(incident)
+    assert result.blocked  # the render shows "אי אפשר לשמור" and persist raises
+
+
+async def test_fa2_blocked_card_offers_quantity_fix_not_only_reject(db: Database) -> None:
+    payload = {
+        "analysis": MealAnalysis(
+            meal_name="שניצל", items=[_incident_schnitzel_item()], confidence=0.9,
+        ).model_dump(),
+        "eaten_at": utc_now(),
+        "revision": 0,
+    }
+    approval_id = await create_approval(USER_ID, "meal", payload)
+    query = FakeQuery()
+    await meals_bot.render_meal(query, USER_ID, approval_id)
+    assert any("אי אפשר לשמור" in text for text in query.edits)
+    callbacks = _markup_callbacks(query.edit_markups[-1])
+    assert f"editqtymenu:{approval_id}" in callbacks  # the fix path
+    assert not any(cb.startswith("approve_meal:") for cb in callbacks)  # no save
+
+
+async def test_fa2_persist_refuses_impossible_meal(db: Database) -> None:
+    payload = {
+        "analysis": MealAnalysis(
+            meal_name="שניצל", items=[_incident_schnitzel_item()], confidence=0.9,
+        ).model_dump(),
+        "eaten_at": utc_now(),
+        "revision": 0,
+    }
+    approval_id = await create_approval(USER_ID, "meal", payload)
+    with pytest.raises(Exception):
+        await meals_bot.persist_meal(USER_ID, approval_id)
+    meals = await db.fetch_all("SELECT COUNT(*) AS c FROM meals", ())
+    assert meals[0]["c"] == 0
+    row = await fetch_approval_any(USER_ID, approval_id)
+    assert row["status"] == "pending"  # nothing consumed; the user can fix it
+
+
 async def test_fa1_rendered_card_carries_revision_tokens(db: Database) -> None:
     approval_id = await _create_meal_approval(db, revision=2)
     query = FakeQuery()

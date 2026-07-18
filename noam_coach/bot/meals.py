@@ -785,6 +785,10 @@ async def render_meal(target: Any, user_id: int, approval_id: str, refine_count:
         # write a correction directly while this meal is awaiting approval.
         if validation.blocked:
             text += "\n\n<b>אי אפשר לשמור עד שמתקנים את זה.</b>"
+            # F-A2: a blocked card must offer the fix path, not only דחה —
+            # implausible quantities are repaired in the quantity editor
+            # (or by typing a correction).
+            option_rows.append([button("⚖️ ערוך כמויות", f"editqtymenu:{approval_id}")])
             option_rows.append([button("❌ דחה", reject_cb)])
         else:
             option_rows.append(
@@ -819,6 +823,7 @@ async def render_meal(target: Any, user_id: int, approval_id: str, refine_count:
             text += "\n\n<b>אי אפשר לשמור עד שמתקנים את זה.</b>"
             keyboard = InlineKeyboardMarkup(
                 [
+                    [button("⚖️ ערוך כמויות", f"editqtymenu:{approval_id}")],
                     [button("❌ דחה", reject_cb)],
                 ]
             )

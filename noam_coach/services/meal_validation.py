@@ -100,6 +100,24 @@ def validate_meal_analysis(
                 message="סך החלבון גבוה מסך הקלוריות האפשרי בארוחה",
             )
         )
+
+    # Audit F-A2: canonical quantity/plausibility rules — a serving count
+    # written into the grams field ("3 שניצלים" → 3 גרם), impossible
+    # protein/energy densities and zero-energy solids can never persist.
+    # The rules live in meal_plausibility (versioned, reusable); flowing
+    # them through this result means BOTH the card render and the persist
+    # transaction enforce them with no extra wiring.
+    from noam_coach.services.meal_plausibility import check_analysis
+
+    for finding in check_analysis(analysis.items):
+        issues.append(
+            MealValidationIssue(
+                code=finding.code,
+                severity=finding.severity,
+                item_name=finding.item_name,
+                message=finding.message,
+            )
+        )
     return MealValidationResult(issues=issues)
 
 
