@@ -1,0 +1,453 @@
+{
+  "findings_schema_version": "1.0",
+  "review_id": "2026-07-18_1",
+  "review_protocol_version": "1.0",
+  "focus": "full",
+  "findings": [
+    {
+      "finding_id": "F-01",
+      "title": "Health-import wizard: 'skip for now' on the last remaining item loops back to the same item",
+      "kind": "defect",
+      "status": "approved",
+      "evidence_level": "CONFIRMED",
+      "severity": "HIGH",
+      "confidence": "high",
+      "frequency": 3,
+      "scope": "isolated",
+      "user_impact": "The user pressed 'דלג כרגע' on the sleep-schedule confirmation three times and received the identical screen back each time; the only escape was 'דלג על שאר האישורים'.",
+      "deterministic_facts": [
+        "Events 66/75/84: three consecutive health:skip_item presses on the sleep_schedule item.",
+        "After each press the flow completed and immediately restarted at step __health_edit_sleep_schedule__ (flow.started events 71, 80, 89 — all with flow_after.step __health_edit_sleep_schedule__).",
+        "The re-rendered question text was byte-identical each time (renders 63/72/81).",
+        "Earlier in the same wizard (event 37), skip_item on sleep DID advance — to avg_steps — while other unconfirmed items remained."
+      ],
+      "explicit_assumptions": [
+        "The loop occurs specifically when the skipped item is the only unconfirmed item left: 'skip for now' re-queues it as the next pending item instead of ending the wizard."
+      ],
+      "missing_information": [],
+      "evidence_references": [
+        {
+          "event_ids": [
+            66,
+            71,
+            75,
+            80,
+            84,
+            89
+          ],
+          "interaction_id": "in_3cf6446463474be7",
+          "note": "first of the three identical skip loops"
+        }
+      ],
+      "detector_references": [
+        "repeated_user_input"
+      ],
+      "reproduction_status": "evidence_inspected",
+      "suspected_root_cause": "skip_item marks the item 'ask later' and recomputes the next unconfirmed item, which is the same item when nothing else remains; there is no terminal branch for 'all remaining items skipped'.",
+      "affected_components": [
+        "health_import.py",
+        "noam_coach/services (health wizard sub-steps)"
+      ],
+      "proposed_regression": "Harness journey: drive the wizard to a single remaining item, press health:skip_item, assert the flow terminates (wizard summary rendered) instead of restarting at the same step.",
+      "proposed_implementation_scope": "small",
+      "approval_record": {
+        "approver": "noam",
+        "timestamp": "2026-07-18T05:47:18.494011+00:00",
+        "approved_scope": "Root-cause fix of the GENERIC wizard skip/progression behavior (not only the sleep item), with generic + incident-specific regression coverage"
+      },
+      "implementation_eligibility": "eligible",
+      "final_resolution": null
+    },
+    {
+      "finding_id": "F-02",
+      "title": "Stale/duplicate control presses are dropped with no visible acknowledgement",
+      "kind": "ux_problem",
+      "status": "approved",
+      "evidence_level": "PROBABLE",
+      "severity": "MEDIUM",
+      "confidence": "medium",
+      "frequency": 2,
+      "scope": "systemic_candidate",
+      "user_impact": "Twice the user tapped a button and — as far as the recorded conversation shows — nothing happened at all, which reads as the bot hanging.",
+      "deterministic_facts": [
+        "Event 275 (in_1bc6bde7ca064f3a): pressing the step-1 wizard button after the wizard had advanced produced routing.decided and then zero further events — no render, no state change.",
+        "Event 601 (in_558c5fea44be4afc): a second approve_meal press after the meal was saved produced zero further events.",
+        "Both interactions are the two interaction_no_output signals; the refusals themselves were CORRECT (no double-save, no wizard regression)."
+      ],
+      "explicit_assumptions": [
+        "The user perceived silence. A Telegram callback toast (query.answer) may have been shown but is not instrumented, so the recorded experience is silence."
+      ],
+      "missing_information": [
+        "Whether query.answer produced any visible toast on these two refusal paths."
+      ],
+      "evidence_references": [
+        {
+          "event_ids": [
+            267,
+            275
+          ],
+          "interaction_id": "in_1bc6bde7ca064f3a",
+          "note": "stale wizard-type press"
+        },
+        {
+          "event_ids": [
+            590,
+            601
+          ],
+          "interaction_id": "in_558c5fea44be4afc",
+          "note": "duplicate approve_meal press"
+        }
+      ],
+      "detector_references": [
+        "interaction_no_output",
+        "repeated_user_input"
+      ],
+      "reproduction_status": "evidence_inspected",
+      "suspected_root_cause": "The identity/duplicate gates (B2/B5 family) return early on refusal without sending any user-visible acknowledgement.",
+      "affected_components": [
+        "noam_coach/services/recommendation_identity.py",
+        "noam_coach/services/callback_grammar.py",
+        "noam_coach/bot/meals.py"
+      ],
+      "proposed_regression": "Harness journey: press a stale wizard control and a duplicate approve control; assert a delivered acknowledgement render (or recorded callback answer) exists in the trace.",
+      "proposed_implementation_scope": "small",
+      "approval_record": {
+        "approver": "noam",
+        "timestamp": "2026-07-18T05:54:43.566857+00:00",
+        "approved_scope": "CONDITIONAL: reproduce first; preserve stale/duplicate rejection and idempotency; add a short user-visible acknowledgement instead of silence; coordinate with F-03",
+        "notes": "Operator requires reproduction before treating as fact"
+      },
+      "implementation_eligibility": "eligible",
+      "final_resolution": null
+    },
+    {
+      "finding_id": "F-03",
+      "title": "Refusal decisions and callback ACKs are invisible to the trace",
+      "kind": "observability_gap",
+      "status": "approved",
+      "evidence_level": "CONFIRMED",
+      "severity": "MEDIUM",
+      "confidence": "high",
+      "frequency": 2,
+      "scope": "repeated",
+      "user_impact": "A correct silent refusal is indistinguishable from a hang in the canonical trace, which will repeatedly waste review time.",
+      "deterministic_facts": [
+        "In both no-output interactions (events 267-275, 590-601) the trace ends after routing.decided: the gate refusal emitted no decision.* event.",
+        "query.answer / answer_callback_query is not an instrumented delivery boundary anywhere in the O1-O10 event stream (no ACK events exist in this window)."
+      ],
+      "explicit_assumptions": [
+        "Any control-refusal path (not only these two gates) likely shares the gap."
+      ],
+      "missing_information": [],
+      "evidence_references": [
+        {
+          "event_ids": [
+            267,
+            275
+          ],
+          "interaction_id": "in_1bc6bde7ca064f3a"
+        },
+        {
+          "event_ids": [
+            590,
+            601
+          ],
+          "interaction_id": "in_558c5fea44be4afc"
+        }
+      ],
+      "detector_references": [
+        "interaction_no_output"
+      ],
+      "reproduction_status": "evidence_inspected",
+      "suspected_root_cause": "The gates predate a 'refusal is a decision' convention: nothing emits decision.finalized(outcome=refused, reason=stale_control|duplicate), and ACK toasts bypass the egress instrumentation.",
+      "affected_components": [
+        "noam_coach/observability/telegram_egress.py",
+        "noam_coach/services/recommendation_identity.py",
+        "noam_coach/services/callback_grammar.py"
+      ],
+      "proposed_regression": "Trace assertion: a refused control press yields decision.finalized outcome=refused with a machine-readable reason in the same interaction.",
+      "proposed_implementation_scope": "small",
+      "approval_record": {
+        "approver": "noam",
+        "timestamp": "2026-07-18T05:54:42.145284+00:00",
+        "approved_scope": "Instrument intentional callback refusals (stale/duplicate) and callback toast acknowledgements so they are distinguishable from hangs and delivery failures"
+      },
+      "implementation_eligibility": "eligible",
+      "final_resolution": null
+    },
+    {
+      "finding_id": "F-04",
+      "title": "Goal-weight typo guard suggests a nonsensical example value",
+      "kind": "conversation_quality",
+      "status": "approved",
+      "evidence_level": "CONFIRMED",
+      "severity": "LOW",
+      "confidence": "high",
+      "frequency": 1,
+      "scope": "isolated",
+      "user_impact": "A 58 kg user aiming at 48 kg was told to either confirm or write another goal, e.g. 83 — a 25 kg GAIN example that undermines trust in the guard.",
+      "deterministic_facts": [
+        "Event 348: the guard render for input 48 (current weight 58) ends with the example value 83."
+      ],
+      "explicit_assumptions": [
+        "The example value is hardcoded (likely from a different authoring context) instead of derived from the user's current weight."
+      ],
+      "missing_information": [],
+      "evidence_references": [
+        {
+          "event_ids": [
+            348
+          ],
+          "interaction_id": "in_080429d68e7a44e4"
+        }
+      ],
+      "detector_references": [],
+      "reproduction_status": "evidence_inspected",
+      "suspected_root_cause": "Static example text in the goal-weight sanity-check template.",
+      "affected_components": [
+        "questions.py",
+        "targets.py"
+      ],
+      "proposed_regression": "Unit test: the guard message example value is within a plausible band of the user's current weight.",
+      "proposed_implementation_scope": "small",
+      "approval_record": {
+        "approver": "noam",
+        "timestamp": "2026-07-18T05:54:46.406354+00:00",
+        "approved_scope": "Fix underlying formatting/derivation rule + focused regression"
+      },
+      "implementation_eligibility": "eligible",
+      "final_resolution": null
+    },
+    {
+      "finding_id": "F-05",
+      "title": "Partial-estimate goal card renders a dangling empty 'missing items' header",
+      "kind": "conversation_quality",
+      "status": "approved",
+      "evidence_level": "CONFIRMED",
+      "severity": "LOW",
+      "confidence": "high",
+      "frequency": 1,
+      "scope": "isolated",
+      "user_impact": "The goal card promises a list of missing items after a colon and shows nothing, looking broken.",
+      "deterministic_facts": [
+        "Event 370: the daily-goal render contains the missing-items header followed directly by the next warning block — zero items."
+      ],
+      "explicit_assumptions": [
+        "The missing-items collection was empty but the header renders unconditionally."
+      ],
+      "missing_information": [],
+      "evidence_references": [
+        {
+          "event_ids": [
+            370
+          ],
+          "interaction_id": "in_95a473d05f714d6b"
+        }
+      ],
+      "detector_references": [],
+      "reproduction_status": "evidence_inspected",
+      "suspected_root_cause": "Header rendered before checking the emptiness of the missing-details list.",
+      "affected_components": [
+        "targets.py",
+        "noam_coach/bot/callback_plans.py"
+      ],
+      "proposed_regression": "Unit test: partial-estimate goal card with no missing items renders no dangling header.",
+      "proposed_implementation_scope": "small",
+      "approval_record": {
+        "approver": "noam",
+        "timestamp": "2026-07-18T05:54:47.829550+00:00",
+        "approved_scope": "Fix underlying formatting rule + focused regression"
+      },
+      "implementation_eligibility": "eligible",
+      "final_resolution": null
+    },
+    {
+      "finding_id": "F-06",
+      "title": "Multiple live plan-center cards run parallel wizard instances with version churn",
+      "kind": "state_consistency",
+      "status": "needs_investigation",
+      "evidence_level": "PROBABLE",
+      "severity": "MEDIUM",
+      "confidence": "medium",
+      "frequency": 3,
+      "scope": "repeated",
+      "user_impact": "Three separate messages (1617/1619/1621) all became the plan center with live generate buttons; pressing generate on one silently invalidated the wizard buttons on another (v39 to v40), producing the dead press of F-02 and a confusing multi-card state.",
+      "deterministic_facts": [
+        "Messages 1617, 1619 and 1621 each rendered the plan center with planv2:generate buttons during the session.",
+        "Events 244 and 256: planv2:generate:workout pressed on two different messages within a minute; the second regenerated the wizard with token v40 while message 1621 still displayed v39 buttons.",
+        "Event 275: the subsequent v39 press was refused with no output (see F-02)."
+      ],
+      "explicit_assumptions": [
+        "The user did not realize older cards stay interactive but stale; the wizard state is global while cards are per-message."
+      ],
+      "missing_information": [
+        "Whether superseding is intended UX for plan-center cards (vs. decommissioning old cards visually)."
+      ],
+      "evidence_references": [
+        {
+          "event_ids": [
+            244,
+            256,
+            267,
+            275
+          ],
+          "interaction_id": "in_26e21a5aadf14424"
+        }
+      ],
+      "detector_references": [
+        "repeated_user_input"
+      ],
+      "reproduction_status": "evidence_inspected",
+      "suspected_root_cause": "Plan-center renders are per-message but wizard/selection state is singleton; regeneration bumps the version token without editing superseded cards to a non-interactive state.",
+      "affected_components": [
+        "noam_coach/bot/callback_plans.py",
+        "noam_coach/services/flow_convergence.py"
+      ],
+      "proposed_regression": "Harness journey: render plan center twice, generate on the newer card, assert the older card is edited to a superseded state or its press yields an explicit refusal message.",
+      "proposed_implementation_scope": "medium",
+      "approval_record": {
+        "approver": "noam",
+        "timestamp": "2026-07-18T05:54:44.926351+00:00",
+        "approved_scope": "Reproduction + root-cause investigation; implement ONLY if the parallel authoritative-card/stale-version interaction is confirmed; no broad navigation redesign",
+        "notes": "Stop and report if scope proves broader"
+      },
+      "implementation_eligibility": "ineligible",
+      "final_resolution": null
+    },
+    {
+      "finding_id": "F-07",
+      "title": "Workout menu claims today's workout is already completed on the user's first day",
+      "kind": "ux_problem",
+      "status": "needs_investigation",
+      "evidence_level": "PROBABLE",
+      "severity": "LOW",
+      "confidence": "low",
+      "frequency": 1,
+      "scope": "isolated",
+      "user_impact": "A brand-new user (onboarded 80 minutes earlier, zero in-bot workout activity) opened the workout menu and was told today's workout is already completed.",
+      "deterministic_facts": [
+        "Event 1 of the database is this user's /start earlier the same session; no workout set/session events exist anywhere in the window.",
+        "Event 623: the workout menu render states the day's workout is already completed."
+      ],
+      "explicit_assumptions": [
+        "The completion flag may derive legitimately from the Apple Health import (1,378 records through 2026-07-15, possibly including a workout today) — but the message gives no attribution, so it reads as false state."
+      ],
+      "missing_information": [
+        "Whether an imported Health workout for 2026-07-15 exists and is the source of the completion flag."
+      ],
+      "evidence_references": [
+        {
+          "event_ids": [
+            623
+          ],
+          "interaction_id": "in_ff35e2cb148941e8"
+        }
+      ],
+      "detector_references": [],
+      "reproduction_status": "evidence_inspected",
+      "suspected_root_cause": "Workout-completion state presented without provenance; if import-sourced, the message should attribute it to the imported health data.",
+      "affected_components": [
+        "noam_coach/bot/callback_menu.py",
+        "health_import.py"
+      ],
+      "proposed_regression": "Unit test: workout menu on a day whose only completion evidence is imported attributes the completion to the import in the message.",
+      "proposed_implementation_scope": "small",
+      "approval_record": null,
+      "implementation_eligibility": "ineligible",
+      "final_resolution": null
+    },
+    {
+      "finding_id": "F-08",
+      "title": "A soft food preference is presented as a hard prohibition in the profile",
+      "kind": "conversation_quality",
+      "status": "approved",
+      "evidence_level": "CONFIRMED",
+      "severity": "LOW",
+      "confidence": "high",
+      "frequency": 1,
+      "scope": "isolated",
+      "user_impact": "The user explicitly chose the softest option (prefer to avoid) for fruit; the profile screen lists it under hard dietary prohibitions, misrepresenting what they said.",
+      "deterministic_facts": [
+        "Event 224: the preference-level button was chosen (label: prefer to avoid).",
+        "Event 227: storage correctly recorded allergies=none (the classification IS distinguished internally).",
+        "Event 436: the profile render lists fruit under the dietary-prohibitions label."
+      ],
+      "explicit_assumptions": [
+        "Menu-generation severity may also treat preference as prohibition (not proven here — the day's menus simply contained no fruit)."
+      ],
+      "missing_information": [
+        "Which fact the profile renderer reads and whether downstream menu constraints honor the preference/allergy distinction."
+      ],
+      "evidence_references": [
+        {
+          "event_ids": [
+            224,
+            227,
+            436
+          ],
+          "interaction_id": "in_5b95b84b4fb044fc"
+        }
+      ],
+      "detector_references": [],
+      "reproduction_status": "evidence_inspected",
+      "suspected_root_cause": "The profile renderer labels the diet_restrictions fact as prohibitions regardless of the stored classification level.",
+      "affected_components": [
+        "noam_coach/bot/callback_plans.py",
+        "noam_coach/services/profile.py"
+      ],
+      "proposed_regression": "Unit test: a preference-classified restriction renders under a preference label, not under prohibitions.",
+      "proposed_implementation_scope": "small",
+      "approval_record": {
+        "approver": "noam",
+        "timestamp": "2026-07-18T05:54:49.243781+00:00",
+        "approved_scope": "Fix underlying classification/labeling rule + focused regression"
+      },
+      "implementation_eligibility": "eligible",
+      "final_resolution": null
+    },
+    {
+      "finding_id": "F-09",
+      "title": "Protein overshoot is shown as a negative remainder in the save summary",
+      "kind": "conversation_quality",
+      "status": "approved",
+      "evidence_level": "CONFIRMED",
+      "severity": "LOW",
+      "confidence": "high",
+      "frequency": 1,
+      "scope": "isolated",
+      "user_impact": "After the second meal the save summary showed a remaining protein of minus five grams, while the status screen correctly phrases the same state as an overshoot — inconsistent, and the raw negative looks like a bug.",
+      "deterministic_facts": [
+        "Event 598: save-summary render contains the raw negative remaining-protein value.",
+        "The subsequent status render phrases the same state as an overshoot of five grams."
+      ],
+      "explicit_assumptions": [
+        "The save-summary path lacks the overshoot phrasing the status path already has."
+      ],
+      "missing_information": [],
+      "evidence_references": [
+        {
+          "event_ids": [
+            598
+          ],
+          "interaction_id": "in_862d943ee4be485d"
+        }
+      ],
+      "detector_references": [],
+      "reproduction_status": "evidence_inspected",
+      "suspected_root_cause": "Two renderers format remaining protein independently; only one clamps and rephrases negatives.",
+      "affected_components": [
+        "noam_coach/bot/meals.py",
+        "noam_coach/bot/ui.py"
+      ],
+      "proposed_regression": "Unit test: overshoot renders the same phrasing in the save summary as in the status screen.",
+      "proposed_implementation_scope": "small",
+      "approval_record": {
+        "approver": "noam",
+        "timestamp": "2026-07-18T05:54:50.633829+00:00",
+        "approved_scope": "Fix underlying formatting rule + focused regression"
+      },
+      "implementation_eligibility": "eligible",
+      "final_resolution": null
+    }
+  ]
+}

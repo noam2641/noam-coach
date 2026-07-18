@@ -350,6 +350,38 @@ async def test_f03_stale_versioned_control_emits_canonical_refusal(
     assert len(legacy) == 1
 
 
+async def test_f06_stale_wizard_version_press_is_visibly_recovered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _obs_content_mode
+) -> None:
+    """F-06 investigation record: the suspected 'parallel card / stale
+    version' dead press is NOT reproducible — a wizard control carrying an
+    outdated version gets the explicit stale-recovery path (visible text +
+    legacy event + canonical refusal), not silence. The production silence
+    at event 275 is therefore attributed to an unhandled exception, which
+    was invisible before R1 error capture and is recorded since."""
+    db = await _make_db(tmp_path)
+    _patch_db(monkeypatch, db)
+    monkeypatch.setattr(conversation, "DB", db, raising=False)
+
+    await conversation.set_active_flow(
+        db, USER_ID, conversation.FlowName.workout_plan_selection, step="choose_structure",
+    )
+    flow = await conversation.get_active_flow(db, USER_ID)
+    stale = conversation.encode_callback(
+        "planv2", "wiz_type", "consistency", flow_id=flow.flow_id, version=flow.version + 1,
+    )
+    query = RouterQuery(stale)
+    with interaction_scope(user_id=USER_ID):
+        await coach_bot.handle_callback(_router_update(query), SimpleNamespace(job_queue=None, bot=None))
+
+    legacy = await event_log.list_events(db, USER_ID, event="stale_callback_recovered")
+    assert len(legacy) == 1
+    refusals = await _refusals(db)
+    assert [r.properties["reason"] for r in refusals] == ["stale_version"]
+    visible = " ".join(query.edits) + " ".join(t for t in query.answers if t)
+    assert "כבר לא פעילים" in visible  # never silent
+
+
 async def test_f03_visible_toast_is_recorded_as_callback_ack(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _obs_content_mode
 ) -> None:
