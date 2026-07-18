@@ -317,11 +317,7 @@ async def _handle_meal_decision_actions(
                 reason="approval_already_handled",
                 source="meal_approval",
             )
-            await safe_edit(
-                query,
-                "הארוחה הזו כבר טופלה ✅",
-                InlineKeyboardMarkup([[button("📊 מצב היום", "menu:status")]]),
-            )
+            await safe_edit(query, "הארוחה הזו כבר טופלה ✅", home_keyboard())
             return True
         await clear_meal_fix(user_id)
         totals = force_analysis.totals() if force_analysis else {"calories": 0.0, "protein": 0.0}
@@ -371,11 +367,7 @@ async def _handle_meal_decision_actions(
                 reason="approval_already_handled",
                 source="meal_approval",
             )
-            await safe_edit(
-                query,
-                "הארוחה הזו כבר טופלה ✅",
-                InlineKeyboardMarkup([[button("📊 מצב היום", "menu:status")]]),
-            )
+            await safe_edit(query, "הארוחה הזו כבר טופלה ✅", home_keyboard())
             return True
         # Refinement loop ends on approval.
         await clear_meal_fix(user_id)

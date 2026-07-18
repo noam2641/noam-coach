@@ -143,6 +143,18 @@ _DEBOUNCE_PREFIXES = (
     "reconcile_ok:",
     "plan:set:",
     "qa:",
+    # DEBUG_APPEND_ONLY_MESSAGES audit: with the flag on, an already-tapped
+    # button stays visible instead of disappearing behind an edited message,
+    # so a stale re-tap becomes reachable in practice, not just in theory.
+    # These two fire real side effects on every invocation with no other
+    # idempotency guard (planv2:select: re-sends the standalone pinnable
+    # daily-menu message every time; menu:refresh_daily_menu/menu:daily_menu
+    # re-run the full AI menu generation every time) -- see the accompanying
+    # activate_plan/build_morning_menu_text guards for the non-debounce half
+    # of this fix.
+    "planv2:select:",
+    "menu:refresh_daily_menu",
+    "menu:daily_menu",
 )
 
 @runtime_bound(RUNTIME_NAMES)
@@ -161,6 +173,23 @@ def _is_duplicate_tap(user_id: int, data: str) -> bool:
                 _LAST_CALLBACK.pop(k, None)
     return last is not None and (now - last) < CALLBACK_DEBOUNCE_SECONDS
 
+async def _refused_as_duplicate_tap(query: Any, user_id: int, data: str) -> bool:
+    """Review 2026-07-18_1 / F-02+F-03: a rapid duplicate tap is refused
+    BEFORE the empty pre-answer (Telegram displays only the first answer to
+    a query, so this branch owns the ACK), with a visible toast and a
+    canonical refusal event — never silently."""
+    if not _is_duplicate_tap(user_id, data):
+        return False
+    from noam_coach.services.control_refusal import refuse_control
+
+    await refuse_control(
+        query, user_id,
+        reason="duplicate_tap",
+        toast="קיבלתי כבר — הפעולה בביצוע, אין צורך ללחוץ שוב.",
+    )
+    return True
+
+
 @runtime_bound(RUNTIME_NAMES)
 async def handle_callback(
     update: Update,
@@ -172,18 +201,7 @@ async def handle_callback(
     query = update.callback_query
     user_id = await ensure_user(update)
     data = query.data or ""
-    # Review 2026-07-18_1 / F-02+F-03: a rapid duplicate tap is refused
-    # BEFORE the empty pre-answer (Telegram displays only the first answer
-    # to a query), with a visible toast and a canonical refusal event —
-    # never silently. Checked first so the duplicate branch owns the ACK.
-    if _is_duplicate_tap(user_id, data):
-        from noam_coach.services.control_refusal import refuse_control
-
-        await refuse_control(
-            query, user_id,
-            reason="duplicate_tap",
-            toast="קיבלתי כבר — הפעולה בביצוע, אין צורך ללחוץ שוב.",
-        )
+    if await _refused_as_duplicate_tap(query, user_id, data):
         return
     await safe_answer_callback(query)
     route_decision = await conversation.ConversationRouter.route(
