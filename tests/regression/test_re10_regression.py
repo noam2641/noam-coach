@@ -366,7 +366,7 @@ _ROUTER_OWNED_PREFIXES = {
     "goal",  # handle_workout_setup_callback -> _handle_workout_menu_actions (RE10-9 "goal:manual")
     "clarify", "fixmeal", "editqtymenu", "editqty", "qtydelta", "dup",
     "reject_dup", "editmeal", "backmeal", "cancelfix", "force_approve_meal",
-    "approve_meal", "undo_meal", "reject_meal",  # handle_meal_callback
+    "approve_meal", "undo_meal", "reject_meal", "restore_meal",  # handle_meal_callback
     "approve_goal", "reject_goal",  # handle_goal_callback (menu family also matches first)
 }
 
