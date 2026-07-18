@@ -674,6 +674,12 @@ async def render_meal(target: Any, user_id: int, approval_id: str, refine_count:
 
     analysis = MealAnalysis.model_validate(row["data"]["analysis"])
     totals = analysis.totals()
+    # Audit F-A1: decision controls carry the payload revision, so a press
+    # on a card that predates a correction is detected as stale instead of
+    # deciding content the user is no longer looking at.
+    decision_rev = int(row["data"].get("revision", 0) or 0)
+    approve_cb = f"approve_meal:{approval_id}:r{decision_rev}"
+    reject_cb = f"reject_meal:{approval_id}:r{decision_rev}"
 
     validation: MealValidationResult = await validate_meal_analysis_for_user(DB, user_id, analysis)
     restriction_warnings = []
@@ -779,12 +785,12 @@ async def render_meal(target: Any, user_id: int, approval_id: str, refine_count:
         # write a correction directly while this meal is awaiting approval.
         if validation.blocked:
             text += "\n\n<b>אי אפשר לשמור עד שמתקנים את זה.</b>"
-            option_rows.append([button("❌ דחה", f"reject_meal:{approval_id}")])
+            option_rows.append([button("❌ דחה", reject_cb)])
         else:
             option_rows.append(
                 [
-                    button("✅ אישור", f"approve_meal:{approval_id}"),
-                    button("❌ דחה", f"reject_meal:{approval_id}"),
+                    button("✅ אישור", approve_cb),
+                    button("❌ דחה", reject_cb),
                 ]
             )
         keyboard = InlineKeyboardMarkup(option_rows)
@@ -813,7 +819,7 @@ async def render_meal(target: Any, user_id: int, approval_id: str, refine_count:
             text += "\n\n<b>אי אפשר לשמור עד שמתקנים את זה.</b>"
             keyboard = InlineKeyboardMarkup(
                 [
-                    [button("❌ דחה", f"reject_meal:{approval_id}")],
+                    [button("❌ דחה", reject_cb)],
                 ]
             )
         else:
@@ -823,10 +829,10 @@ async def render_meal(target: Any, user_id: int, approval_id: str, refine_count:
             keyboard = InlineKeyboardMarkup(
                 [
                     [
-                        button("✅ שמור", f"approve_meal:{approval_id}"),
+                        button("✅ שמור", approve_cb),
                         button("⚖️ ערוך כמויות", f"editqtymenu:{approval_id}"),
                     ],
-                    [button("❌ דחה", f"reject_meal:{approval_id}")],
+                    [button("❌ דחה", reject_cb)],
                 ]
             )
 

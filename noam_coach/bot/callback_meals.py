@@ -154,9 +154,13 @@ async def _handle_meal_clarification_actions(
         analysis.options = []
         row["data"]["analysis"] = analysis.model_dump()
 
+        # Audit F-A1: every content change bumps the revision so decision
+        # controls rendered before it become detectably stale.
+        from noam_coach.services.meal_approval_lifecycle import payload_revision_json
+
         await DB.execute(
             "UPDATE approvals SET payload=? WHERE id=?",
-            (json.dumps(row["data"], ensure_ascii=False), approval_id),
+            (payload_revision_json(row["data"]), approval_id),
         )
         _, rc = await get_meal_fix(user_id)
         await render_meal(query, user_id, approval_id, refine_count=rc)
@@ -222,9 +226,11 @@ async def _handle_meal_clarification_actions(
         item.carbs = round(item.carbs * ratio, 1)
         item.fat = round(item.fat * ratio, 1)
         row["data"]["analysis"] = analysis.model_dump()
+        from noam_coach.services.meal_approval_lifecycle import payload_revision_json
+
         await DB.execute(
             "UPDATE approvals SET payload=? WHERE id=?",
-            (json.dumps(row["data"], ensure_ascii=False), approval_id),
+            (payload_revision_json(row["data"]), approval_id),
         )
         await render_quantity_editor(query, user_id, approval_id, item_index)
         return True
@@ -300,7 +306,14 @@ async def _handle_meal_decision_actions(
     data: str,
 ) -> bool:
     if data.startswith("force_approve_meal:"):
-        approval_id = data.split(":", 1)[1]
+        from noam_coach.services.core import clear_meal_fix_for
+        from noam_coach.services.meal_approval_lifecycle import (
+            parse_decision_token,
+            render_decided_terminal,
+            represent_resumed_meal_card,
+        )
+
+        approval_id, _rev = parse_decision_token(data)
         # Fetch approval details before persisting so we can show a rich confirmation.
         force_row = await fetch_approval(user_id, approval_id)
         force_analysis = (
@@ -310,16 +323,9 @@ async def _handle_meal_decision_actions(
         )
         meal_id = await persist_meal(user_id, approval_id)
         if meal_id is None:
-            from noam_coach.services.control_refusal import refuse_control
-
-            await refuse_control(
-                query, user_id,
-                reason="approval_already_handled",
-                source="meal_approval",
-            )
-            await safe_edit(query, "הארוחה הזו כבר טופלה ✅", home_keyboard())
+            await render_decided_terminal(query, user_id, approval_id)
             return True
-        await clear_meal_fix(user_id)
+        await clear_meal_fix_for(user_id, approval_id)
         totals = force_analysis.totals() if force_analysis else {"calories": 0.0, "protein": 0.0}
         confirmation = await render_post_meal_confirmation_day_status(user_id, totals)
         await safe_edit(
@@ -330,15 +336,38 @@ async def _handle_meal_decision_actions(
                 [button("✏️ ערוך ארוחה", f"editmeal:{meal_id}"), button("📊 מצב היום", "menu:status")],
             ]),
         )
+        await represent_resumed_meal_card(query, user_id)
         return True
 
     if data.startswith("approve_meal:"):
-        approval_id = data.split(":", 1)[1]
+        # Audit F-A1: decision controls carry the payload revision; a press
+        # from a card that predates a correction is refused with the CURRENT
+        # card re-rendered (recoverable), and a press on a decided approval
+        # gets a truthful terminal (saved / rejected+restore / unavailable).
+        from noam_coach.services.control_refusal import refuse_control
+        from noam_coach.services.core import clear_meal_fix_for
+        from noam_coach.services.meal_approval_lifecycle import (
+            is_stale_revision,
+            parse_decision_token,
+            render_decided_terminal,
+            represent_resumed_meal_card,
+        )
+
+        approval_id, pressed_revision = parse_decision_token(data)
         # Fetch approval details for duplicate check and confirmation message.
         row = await fetch_approval(user_id, approval_id)
-        analysis = (
-            MealAnalysis.model_validate(row["data"]["analysis"]) if row else None
-        )
+        if row is None:
+            await render_decided_terminal(query, user_id, approval_id)
+            return True
+        if is_stale_revision(row, pressed_revision):
+            await refuse_control(
+                query, user_id,
+                reason="stale_approval_revision",
+                source="meal_approval",
+            )
+            await render_meal(query, user_id, approval_id)
+            return True
+        analysis = MealAnalysis.model_validate(row["data"]["analysis"])
         if analysis:
             dup = await check_duplicate_meal(user_id, analysis)
             if dup:
@@ -354,23 +383,13 @@ async def _handle_meal_decision_actions(
                 return True
         meal_id = await persist_meal(user_id, approval_id)
         if meal_id is None:
-            # Review 2026-07-18_1 / F-02: a press on an already-consumed
-            # approval card (e.g. a second ✅ שמור) was refused in total
-            # silence — correct idempotency, invisible to the user and the
-            # trace. Record the refusal and EDIT the card to a terminal
-            # state (a toast cannot display here — the query was already
-            # empty-answered at router entry).
-            from noam_coach.services.control_refusal import refuse_control
-
-            await refuse_control(
-                query, user_id,
-                reason="approval_already_handled",
-                source="meal_approval",
-            )
-            await safe_edit(query, "הארוחה הזו כבר טופלה ✅", home_keyboard())
+            # Decided between the fetch above and the persist transaction —
+            # same truthful terminal as the no-row path.
+            await render_decided_terminal(query, user_id, approval_id)
             return True
-        # Refinement loop ends on approval.
-        await clear_meal_fix(user_id)
+        # Refinement loop ends on approval — but ONLY this meal's flow
+        # (audit F-A5: a decision on meal B must never close meal A).
+        await clear_meal_fix_for(user_id, approval_id)
         totals = analysis.totals() if analysis else {"calories": 0.0, "protein": 0.0}
         confirmation = await render_post_meal_confirmation_day_status(user_id, totals)
         await safe_edit(
@@ -381,6 +400,9 @@ async def _handle_meal_decision_actions(
                 [button("✏️ ערוך ארוחה", f"editmeal:{meal_id}"), button("📊 מצב היום", "menu:status")],
             ]),
         )
+        # Audit F-A5: if this decision resumed a suspended meal flow, its
+        # card is re-presented so the pending meal can never be lost.
+        await represent_resumed_meal_card(query, user_id)
         return True
 
     if data.startswith("undo_meal:"):
@@ -445,13 +467,75 @@ async def _handle_meal_decision_actions(
         return True
 
     if data.startswith("reject_meal:"):
-        approval_id = data.split(":", 1)[1]
+        from noam_coach.services.control_refusal import refuse_control
+        from noam_coach.services.core import clear_meal_fix_for
+        from noam_coach.services.meal_approval_lifecycle import (
+            emit_approval_rejected,
+            emit_media_deleted,
+            is_stale_revision,
+            parse_decision_token,
+            render_decided_terminal,
+            represent_resumed_meal_card,
+        )
+
+        approval_id, pressed_revision = parse_decision_token(data)
         row = await fetch_approval(user_id, approval_id)
-        if row and row["data"].get("image"):
-            Path(row["data"]["image"]).unlink(missing_ok=True)
+        if row is None:
+            # Audit F-A1: never claim "נדחתה" for a press that decided
+            # nothing — state the actual status (saved / already rejected).
+            await render_decided_terminal(query, user_id, approval_id)
+            return True
+        if is_stale_revision(row, pressed_revision):
+            # A reject from a pre-correction card must not consume the
+            # approval the corrected card depends on (the production
+            # incident). Refuse and show the current content instead.
+            await refuse_control(
+                query, user_id,
+                reason="stale_approval_revision",
+                source="meal_approval",
+            )
+            await render_meal(query, user_id, approval_id)
+            return True
+        image_path = row["data"].get("image")
+        if image_path:
+            # F-A9: the deletion becomes trace evidence BEFORE the unlink,
+            # so a missing storage file is always explainable.
+            await emit_media_deleted(user_id, str(image_path), reason="meal_rejected")
+            Path(image_path).unlink(missing_ok=True)
         await decide_approval(approval_id, "rejected")
-        await clear_meal_fix(user_id)
-        await safe_edit(query, "הארוחה נדחתה ולא נשמרה.", home_keyboard())
+        await emit_approval_rejected(user_id, approval_id, had_image=bool(image_path))
+        await clear_meal_fix_for(user_id, approval_id)
+        await safe_edit(
+            query,
+            "הארוחה נדחתה ולא נשמרה.\nאם זו הייתה טעות — אפשר לשחזר:",
+            InlineKeyboardMarkup([
+                [button("♻️ שחזר את הארוחה", f"restore_meal:{approval_id}")],
+                [button("⬅️ תפריט", "menu:home")],
+            ]),
+        )
+        await represent_resumed_meal_card(query, user_id)
+        return True
+
+    if data.startswith("restore_meal:"):
+        from noam_coach.services.core import set_meal_fix
+        from noam_coach.services.meal_approval_lifecycle import restore_rejected_approval
+
+        source_id = data.split(":", 1)[1]
+        new_id = await restore_rejected_approval(user_id, source_id)
+        if new_id is None:
+            await safe_edit(query, "אי אפשר לשחזר את הארוחה הזו.", home_keyboard())
+            return True
+        await set_meal_fix(user_id, new_id)
+        note = ""
+        restored = await fetch_approval(user_id, new_id)
+        if restored and restored["data"].get("image_deleted_on_reject"):
+            note = "\n<i>התמונה המקורית נמחקה בדחייה — הניתוח שוחזר במלואו.</i>"
+        if note:
+            message = getattr(query, "message", None)
+            if message is not None and hasattr(message, "reply_text"):
+                with suppress(Exception):
+                    await message.reply_text("שחזרתי את הארוחה ↩️" + note, parse_mode=ParseMode.HTML)
+        await render_meal(query, user_id, new_id)
         return True
     return False
 

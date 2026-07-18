@@ -122,6 +122,7 @@ _DEBOUNCE_PREFIXES = (
     "confirm:",
     "approve_meal:",
     "approve_goal:",
+    "restore_meal:",
     "undo_meal:",
     "chk:med",
     "param:",

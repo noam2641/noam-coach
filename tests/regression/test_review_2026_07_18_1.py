@@ -277,7 +277,12 @@ async def test_f02_consumed_approval_press_gets_terminal_edit_and_refusal_event(
     with interaction_scope(user_id=USER_ID):
         await coach_bot.handle_callback(_router_update(query), SimpleNamespace(job_queue=None, bot=None))
 
-    assert any("כבר טופלה" in text for text in query.edits), query.edits
+    # Audit 2026-07-18 F-A1 refined the terminal into truthful variants:
+    # an unknown approval renders "כבר לא זמין" (approved → "כבר נשמרה",
+    # rejected → restore offer). The refusal event contract is unchanged.
+    assert any(
+        "כבר לא זמין" in text or "כבר טופלה" in text for text in query.edits
+    ), query.edits
     refusals = await _refusals(db)
     assert len(refusals) == 1
     assert refusals[0].properties["reason"] == "approval_already_handled"

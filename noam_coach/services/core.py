@@ -223,6 +223,27 @@ async def clear_meal_fix(user_id: int) -> None:
 
 
 @runtime_bound(RUNTIME_NAMES)
+async def clear_meal_fix_for(user_id: int, approval_id: str) -> bool:
+    """Entity-addressed meal-flow completion (audit F-A5).
+
+    A decision on meal B must never close meal A's flow: the active
+    meal_correction flow is cleared (resuming any suspended flow) ONLY when
+    its step is exactly the decided approval id. Returns True when the flow
+    was cleared/resumed, False when the active flow belongs to a different
+    meal and was deliberately left untouched.
+    """
+    current = await conversation.get_active_flow(DB, user_id)
+    if current.name != conversation.FlowName.meal_correction:
+        return False
+    if (current.step or "") != str(approval_id):
+        return False
+    restored = await conversation.resume_suspended(DB, user_id)
+    if restored is None:
+        await conversation.clear_active_flow(DB, user_id)
+    return True
+
+
+@runtime_bound(RUNTIME_NAMES)
 async def notify_admin(bot: Any, text: str) -> None:
     with suppress(Exception):
         await bot.send_message(chat_id=admin_chat_id(), text=text)
@@ -341,6 +362,27 @@ async def fetch_approval(
         FROM approvals
         WHERE id=? AND user_id=? AND status='pending'
         """,
+        (approval_id, user_id),
+    )
+    if row:
+        row["data"] = json.loads(row.pop("payload"))
+    return row
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def fetch_approval_any(
+    user_id: int,
+    approval_id: str,
+) -> dict[str, Any] | None:
+    """Fetch an approval REGARDLESS of status (audit F-A1).
+
+    ``fetch_approval`` deliberately returns only pending rows; the approval
+    lifecycle also needs to see decided rows so a press on a stale card can
+    be answered truthfully ("already saved" / "already rejected — restore?")
+    instead of being treated as nonexistent.
+    """
+    row = await DB.fetch_one(
+        "SELECT * FROM approvals WHERE id=? AND user_id=?",
         (approval_id, user_id),
     )
     if row:
