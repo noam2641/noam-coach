@@ -546,6 +546,53 @@ def test_fa6_weekday_label_is_joined_to_string() -> None:
     assert joined and "[" not in joined  # ...and must be joined before display
 
 
+# ---------------------------------------------------------------------------
+# F-A8 — health status: two dates measure different things, stated honestly
+# ---------------------------------------------------------------------------
+
+
+async def test_fa8_stale_export_is_labeled_not_contradictory(db: Database) -> None:
+    from noam_coach.bot import checkins as checkins_bot
+
+    checkins_bot.DB = db
+    # The production shape: imported today, but the newest sample is a month old.
+    await db.execute(
+        "INSERT INTO audit(user_id, action, entity, entity_id, details, created_at) "
+        "VALUES(?, 'health_import', 'health', '0', '{}', ?)",
+        (USER_ID, "2026-07-18T06:00:00+00:00"),
+    )
+    await db.execute(
+        "INSERT INTO health(user_id, external_id, sample_type, value, unit, "
+        "start_time, end_time, created_at) VALUES(?, 'x1', 'steps', 5000, 'count', ?, ?, ?)",
+        (USER_ID, "2026-06-15T00:00:00+00:00", "2026-06-15T23:59:00+00:00", "2026-07-18T06:00:00+00:00"),
+    )
+    text = await checkins_bot.build_health_status_text(USER_ID)
+    # Each date is labeled by what it MEANS, not two bare dates that look contradictory.
+    assert "מתי נטען הקובץ" in text
+    assert "תאריך המדידה" in text
+    assert "2026-07-18" in text and "2026-06-15" in text
+    # And the lag is flagged as a stale export, the single honest interpretation.
+    assert "אינו עדכני" in text
+
+
+async def test_fa8_fresh_export_has_no_stale_warning(db: Database) -> None:
+    from noam_coach.bot import checkins as checkins_bot
+
+    checkins_bot.DB = db
+    await db.execute(
+        "INSERT INTO audit(user_id, action, entity, entity_id, details, created_at) "
+        "VALUES(?, 'health_import', 'health', '0', '{}', ?)",
+        (USER_ID, "2026-07-18T06:00:00+00:00"),
+    )
+    await db.execute(
+        "INSERT INTO health(user_id, external_id, sample_type, value, unit, "
+        "start_time, end_time, created_at) VALUES(?, 'x2', 'steps', 5000, 'count', ?, ?, ?)",
+        (USER_ID, "2026-07-18T00:00:00+00:00", "2026-07-18T08:00:00+00:00", "2026-07-18T06:00:00+00:00"),
+    )
+    text = await checkins_bot.build_health_status_text(USER_ID)
+    assert "אינו עדכני" not in text  # same-day data → no false stale warning
+
+
 async def test_fa4_finish_dialog_hides_full_when_incomplete(db: Database) -> None:
     from noam_coach.bot import callback_session as session_bot
 

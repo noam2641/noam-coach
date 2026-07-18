@@ -193,13 +193,25 @@ async def build_health_status_text(user_id: int) -> str:
         (user_id,),
     )
     lines = ["<b>⌚ נתוני Apple Health</b>", ""]
-    if last:
-        when = (last["created_at"] or "")[:10]
-        lines.append(f"ייבוא אחרון: {when}")
+    # Audit F-A8: these two dates measure DIFFERENT things — when the file
+    # was imported vs. how recent the newest sample INSIDE it is. They can
+    # legitimately differ (a stale export imported today), but the old
+    # labels didn't say so, reading as a contradiction. Label each by its
+    # meaning and, when the newest sample lags the import, say the export
+    # itself was stale — one honest source of truth.
+    import_day = (last["created_at"] or "")[:10] if last else None
+    data_day = latest_day["d"][:10] if latest_day and latest_day["d"] else None
+    if import_day:
+        lines.append(f"תאריך הייבוא האחרון (מתי נטען הקובץ): {import_day}")
     else:
         lines.append("עוד לא יובאו נתונים. שלח קובץ ZIP כדי להתחיל.")
-    if latest_day and latest_day["d"]:
-        lines.append(f"היום האחרון שנקלט: {latest_day['d'][:10]}")
+    if data_day:
+        lines.append(f"הנתון העדכני ביותר בקובץ (תאריך המדידה): {data_day}")
+        if import_day and data_day < import_day:
+            lines.append(
+                "⚠️ <i>הקובץ שיובא אינו עדכני — המדידה החדשה ביותר בו מוקדמת "
+                "מיום הייבוא. ייצא קובץ עדכני כדי לשפר את הדיוק.</i>"
+            )
     lines += [
         "",
         "<b>משמש ל:</b>",
