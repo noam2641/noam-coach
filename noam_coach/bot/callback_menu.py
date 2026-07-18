@@ -763,8 +763,14 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
         from noam_coach.bot.onboarding import get_flow_state, clear_pending
 
         state = await get_flow_state(user_id, HEALTH_CONFIRM_FLOW)
-        if state and state.get("step"):
-            await skip_health_wizard_item(user_id, str(state["step"]))
+        if not (state and state.get("step")):
+            # Review 2026-07-18_1 / F-01: a skip pressed on a stale card
+            # after the wizard finished must not RESTART the wizard from
+            # scratch (done/deferred bookkeeping is gone by then). Refuse
+            # with a visible acknowledgement instead.
+            await safe_answer_callback(query, "האשף כבר הסתיים — אין ממה לדלג.")
+            return True
+        await skip_health_wizard_item(user_id, str(state["step"]))
         await clear_pending(user_id)
         if not await ask_next_health_confirm_step(query, user_id):
             await finish_health_confirm_wizard(query, user_id)

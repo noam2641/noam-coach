@@ -588,6 +588,37 @@ async def _wizard_deferred_steps(user_id: int) -> list[str]:
     return [str(step) for step in deferred if isinstance(step, str)]
 
 
+async def _wizard_skipped_steps(user_id: int) -> list[str]:
+    """Steps the user declined TWICE — terminal for this wizard run.
+
+    Review 2026-07-18_1 / F-01: deferral used to have no terminal state, so
+    "דלג כרגע" on the last remaining item re-asked the identical question
+    forever. A first skip defers (the item returns once, after everything
+    else); a second skip on the same item ends its run — the wizard can then
+    finish without it. The fact itself stays pending/unconfirmed for future
+    imports; nothing is applied or invalidated.
+    """
+    from noam_coach.bot.onboarding import get_flow_state
+
+    state = await get_flow_state(user_id, HEALTH_CONFIRM_FLOW)
+    payload = (state or {}).get("payload") or {}
+    skipped = payload.get("skipped") or []
+    return [str(step) for step in skipped if isinstance(step, str)]
+
+
+def _wizard_payload(
+    done: list[str], deferred: list[str], skipped: list[str]
+) -> dict[str, Any]:
+    """The ONE shape every wizard-state writer persists — a writer that
+    forgets a list (the F-01 bug class) can no longer exist."""
+    payload: dict[str, Any] = {"done": done}
+    if deferred:
+        payload["deferred"] = deferred
+    if skipped:
+        payload["skipped"] = skipped
+    return payload
+
+
 def _confirmed_fact_value(fact: dict[str, Any] | None) -> Any | None:
     """Return a usable value only for confirmed USER-authored facts.
 
@@ -662,10 +693,18 @@ async def _has_manual_training_hour(user_id: int) -> bool:
 
 
 async def _next_wizard_step(
-    user_id: int, done: list[str], deferred: list[str] | None = None
+    user_id: int,
+    done: list[str],
+    deferred: list[str] | None = None,
+    skipped: list[str] | None = None,
 ) -> tuple[str, dict[str, Any]] | None:
-    """Return (step_id, fact) for the next confirmation, honoring sub-steps."""
+    """Return (step_id, fact) for the next confirmation, honoring sub-steps.
+
+    ``skipped`` steps (declined twice — F-01) are terminal for this run and
+    are never offered again, in EITHER selection loop.
+    """
     deferred_set = set(deferred or [])
+    skipped_set = set(skipped or [])
     first_deferred: tuple[str, dict[str, Any]] | None = None
     pending = await pending_import_facts(user_id)
     # Never surface computed plan outputs (e.g. calorie_target) as a HealthKit
@@ -714,6 +753,8 @@ async def _next_wizard_step(
             and await _has_manual_training_hour(user_id)
         ):
             continue
+        if step_id in skipped_set:
+            continue
         if step_id in deferred_set:
             first_deferred = first_deferred or (step_id, fact)
             continue
@@ -739,6 +780,8 @@ async def _next_wizard_step(
         # Never confirm a fact with no real user-facing value — that would show
         # a placeholder (the label repeated as its own value). Skip it instead.
         if not _has_confirmable_value(key, fact.get("value")):
+            continue
+        if key in skipped_set:
             continue
         if key in deferred_set:
             first_deferred = first_deferred or (key, fact)
@@ -822,21 +865,26 @@ async def ask_next_health_confirm_step(
 
     done = await _wizard_done_steps(user_id)
     deferred = await _wizard_deferred_steps(user_id)
-    next_step = await _next_wizard_step(user_id, done, deferred)
+    skipped = await _wizard_skipped_steps(user_id)
+    next_step = await _next_wizard_step(user_id, done, deferred, skipped)
     if next_step is None:
         await clear_flow_state(user_id, HEALTH_CONFIRM_FLOW)
         return False
 
     step_id, fact = next_step
-    payload: dict[str, Any] = {"done": done}
-    if deferred:
-        payload["deferred"] = deferred
-    await set_flow_state(user_id, HEALTH_CONFIRM_FLOW, step_id, payload)
+    await set_flow_state(
+        user_id, HEALTH_CONFIRM_FLOW, step_id, _wizard_payload(done, deferred, skipped)
+    )
     await set_pending(user_id, f"__health_edit_{step_id}__")
 
     quality = await _wizard_quality_report(user_id)
 
     prefix = f"{ack_text}\n\n" if ack_text else ""
+    # F-01: a deferred item returning for its second (final) pass must never
+    # be a byte-identical re-render — say it is a return visit and name the
+    # way out, so "דלג כרגע" can never read as the bot ignoring the tap.
+    if step_id in deferred:
+        prefix += "🔁 חוזר לפריט שדחית קודם. דילוג נוסף יסיים את האשף בלעדיו.\n\n"
     # RE13: a stale export changes what every number means — warn once, on
     # the very first wizard screen, before any value is approved.
     if quality and not done and not ack_text:
@@ -1114,10 +1162,10 @@ async def _mark_wizard_substep_done(
     if step_id not in done:
         done.append(step_id)
     deferred = [step for step in await _wizard_deferred_steps(user_id) if step != step_id]
-    payload: dict[str, Any] = {"done": done}
-    if deferred:
-        payload["deferred"] = deferred
-    await set_flow_state(user_id, HEALTH_CONFIRM_FLOW, step_id, payload)
+    skipped = [step for step in await _wizard_skipped_steps(user_id) if step != step_id]
+    await set_flow_state(
+        user_id, HEALTH_CONFIRM_FLOW, step_id, _wizard_payload(done, deferred, skipped)
+    )
     remaining = [
         s
         for s in _WORKOUT_SUBSTEPS
@@ -1398,20 +1446,27 @@ async def apply_health_wizard_text_edit(
 async def skip_health_wizard_item(user_id: int, step_id: str) -> None:
     """Defer one wizard item without applying or invalidating it.
 
-    "דלג כרגע" is intentionally different from "דלג על שאר האישורים": it
-    moves the current question behind the other pending questions, then asks it
-    again before the wizard can finish.
+    "דלג כרגע" is intentionally different from "דלג על שאר האישורים": the
+    FIRST skip moves the current question behind the other pending questions
+    and it returns once more before the wizard can finish. A SECOND skip of
+    the same item (review 2026-07-18_1 / F-01) is terminal for this run —
+    deferral with no terminal state trapped the user in an identical-screen
+    loop on the last remaining item. The fact stays pending/unconfirmed.
     """
     from noam_coach.bot.onboarding import set_flow_state
 
     done = await _wizard_done_steps(user_id)
     deferred = await _wizard_deferred_steps(user_id)
-    if step_id not in done and step_id not in deferred:
+    skipped = await _wizard_skipped_steps(user_id)
+    if step_id in deferred:
+        deferred = [step for step in deferred if step != step_id]
+        if step_id not in skipped:
+            skipped.append(step_id)
+    elif step_id not in done and step_id not in skipped:
         deferred.append(step_id)
-    payload: dict[str, Any] = {"done": done}
-    if deferred:
-        payload["deferred"] = deferred
-    await set_flow_state(user_id, HEALTH_CONFIRM_FLOW, step_id, payload)
+    await set_flow_state(
+        user_id, HEALTH_CONFIRM_FLOW, step_id, _wizard_payload(done, deferred, skipped)
+    )
 
 
 async def start_health_confirm_wizard(
