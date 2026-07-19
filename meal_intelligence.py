@@ -66,6 +66,269 @@ def parse_locked_quantities(text: str) -> list[LockedQuantity]:
 
 
 # ---------------------------------------------------------------------------
+# Batch 4 — count/portion quantity domain
+#
+# The historical incident (private trace event 1225) wrote a serving COUNT
+# ("3 כדור") into the grams field, so "3 balls" became "3 grams". This module
+# gives count and portion quantities a first-class representation that is
+# NEVER a gram lock: a ParsedQuantity records how many units (count), of what
+# unit (unit_label), at what size (size), for which food (food_text) — and
+# deliberately carries NO grams. Converting a count to grams is Batch 5's
+# job; Batch 4 only interprets the language deterministically and records the
+# evidence on the FoodItem's existing quantity_count/quantity_unit fields
+# (grams untouched).
+# ---------------------------------------------------------------------------
+
+# Meal-count number words. Deliberately scoped to this module rather than
+# reusing food_environment.HEBREW_NUMBERS, whose frequency mappings
+# (פעם→1, פעמיים→2) are wrong for "how many units of a food". Values are
+# floats so fractions compose ("שניים וחצי" → 2.5).
+_HEBREW_COUNT_WORDS: dict[str, float] = {
+    "אחד": 1.0, "אחת": 1.0,
+    "שני": 2.0, "שתי": 2.0, "שניים": 2.0, "שתיים": 2.0,
+    "שלוש": 3.0, "שלושה": 3.0,
+    "ארבע": 4.0, "ארבעה": 4.0,
+    "חמש": 5.0, "חמישה": 5.0,
+    "שש": 6.0, "שישה": 6.0,
+    "שבע": 7.0, "שבעה": 7.0,
+    "שמונה": 8.0,
+    "תשע": 9.0, "תשעה": 9.0,
+    "עשר": 10.0, "עשרה": 10.0,
+}
+
+# Standalone fraction words and the value they add.
+_HEBREW_FRACTION_WORDS: dict[str, float] = {
+    "חצי": 0.5,
+    "רבע": 0.25,
+    "שליש": 1.0 / 3.0,
+    "שלישית": 1.0 / 3.0,
+}
+
+# Portion/serving unit nouns (singular + construct/plural forms map to a
+# canonical singular label). These are measure words, not foods — "3 כפות"
+# is three tablespoons OF something, so the food itself is matched separately.
+_PORTION_UNITS: dict[str, str] = {
+    "כף": "כף", "כפות": "כף",
+    "כפית": "כפית", "כפיות": "כפית",
+    "כוס": "כוס", "כוסות": "כוס",
+    "פרוסה": "פרוסה", "פרוסות": "פרוסה", "פרוסת": "פרוסה",
+    "יחידה": "יחידה", "יחידות": "יחידה", "יחידת": "יחידה",
+    "חתיכה": "חתיכה", "חתיכות": "חתיכה", "חתיכת": "חתיכה",
+    "כדור": "כדור", "כדורים": "כדור", "כדורי": "כדור",
+    "קציצה": "קציצה", "קציצות": "קציצה", "קציצת": "קציצה",
+}
+
+# Size modifiers → canonical size. Feminine/plural inflections included so the
+# parser generalizes across noun genders ("גדול/גדולה/גדולים").
+_SIZE_WORDS: dict[str, str] = {
+    "קטן": "small", "קטנה": "small", "קטנים": "small", "קטנות": "small",
+    "בינוני": "medium", "בינונית": "medium", "בינוניים": "medium", "בינוניות": "medium",
+    "גדול": "large", "גדולה": "large", "גדולים": "large", "גדולות": "large",
+}
+
+# Approximate-language markers, stripped before matching so "בערך שני שניצלים"
+# and "כ-3 קציצות" parse identically to the bare forms.
+_APPROX_WORDS = ("בערך", "סביב", "כאילו", "בערבון")
+
+# The definite article and a few connective particles that may sit between a
+# number and its unit/food ("שלוש כפות של סוכר").
+_QUANTITY_FILLER = frozenset({"של", "את", "עוד", "יש", "לי"})
+
+# Scale/multiplier words that must NEVER be read as a food or unit — they mean
+# "half a serving" / "times N", which is the SCALE parser's job, not a count.
+_QUANTITY_SCALE_WORDS = frozenset({"מנה", "מנת", "פי", "כפול", "כפולה", "הכל", "כולה"})
+
+# Command verbs (remove/add/change). A count expression describes a quantity
+# of food, never an imperative — "תוריד חצי" ("reduce by half") is a SCALE,
+# not a count of a food called "תוריד". Encountering one means this is not a
+# count expression; bail so the removal/scale parsers handle it.
+_QUANTITY_COMMAND_VERBS = frozenset({
+    "תוריד", "הורד", "להוריד", "תסיר", "הסר", "להסיר", "תוציא", "הוצא", "להוציא",
+    "תוסיף", "הוסף", "להוסיף", "תשים", "שים", "תחליף", "החלף", "להחליף",
+    "תשנה", "שנה", "תתקן", "תעדכן",
+})
+
+
+@dataclass(frozen=True)
+class ParsedQuantity:
+    """A deterministic count/portion reading of user text (Batch 4).
+
+    NEVER carries grams — a count is not a weight. ``count`` is how many
+    ``unit_label`` units (unit_label="" means the food itself is the unit,
+    e.g. "3 schnitzels"). ``size`` is small/medium/large or "". ``food_text``
+    is the food the quantity applies to, or "" when the text names only a
+    unit ("שלוש כפות"). ``source`` is always "user_count" here (the user
+    stated it); grams derivation and its provenance are Batch 5's concern.
+    """
+
+    count: float
+    unit_label: str
+    size: str
+    food_text: str
+    source: str = "user_count"
+
+
+def _strip_approx(text: str) -> str:
+    cleaned = text
+    for word in _APPROX_WORDS:
+        cleaned = cleaned.replace(word, " ")
+    # "כ-3" / "כ3" approximate prefix on a digit.
+    cleaned = re.sub(r"\bכ[-־]?\s*(?=\d)", " ", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _count_from_token(token: str) -> float | None:
+    if token in _HEBREW_COUNT_WORDS:
+        return _HEBREW_COUNT_WORDS[token]
+    if re.fullmatch(r"\d+(?:[.,]\d+)?", token):
+        return float(token.replace(",", "."))
+    return None
+
+
+def _strip_leading_article(word: str) -> str:
+    """Comparison-only definite-article strip, mirroring _tokens (Batch 3)."""
+    if word.startswith("ה") and len(word) > 2:
+        return word[1:]
+    return word
+
+
+def parse_quantity_expression(text: str) -> ParsedQuantity | None:
+    """Parse a single count/portion expression, or None when the text is not
+    a deterministic count/portion phrase.
+
+    Generalizes over: leading or trailing numbers/number-words, standalone
+    fractions ("חצי שניצל"), a food followed by "וחצי" ("שניצל וחצי"),
+    portion units ("שלוש כפות", "רבע פיתה"), and size modifiers ("שני
+    שניצלים גדולים"). It deliberately does NOT fire on:
+    - gram phrases (handled by parse_locked_quantities);
+    - "חצי מהאורז" / "חצי מנה" / bare "חצי" (whole-meal or of-item SCALE,
+      handled by the scale parser — the "מ/מן/מה" preposition or a bare
+      fraction with no food/unit means scale, not a discrete count);
+    - "x2" / "פי 2" multipliers (scale).
+    """
+    raw = _strip_approx(text.strip())
+    if not raw:
+        return None
+    # Grams are a different domain — never treat a gram phrase as a count.
+    if re.search(r"\d+(?:[.,]\d+)?\s*(?:גרם|גר'|ג\b|g\b)", raw, re.IGNORECASE):
+        return None
+
+    tokens = raw.split()
+    if not tokens:
+        return None
+
+    count: float | None = None
+    fraction = 0.0
+    joined_fraction = False  # True for "וחצי" (adds to a whole count)
+    size = ""
+    unit_label = ""
+    food_words: list[str] = []
+    bail_to_other_parser = False
+
+    index = 0
+    n = len(tokens)
+    while index < n:
+        token = tokens[index]
+        bare = _strip_leading_article(token)
+
+        # "וחצי" / "ורבע" — a trailing fraction joined with the vav
+        # conjunction: ADDS to the count ("שניצל וחצי" = 1 + 0.5).
+        if token.startswith("ו") and token[1:] in _HEBREW_FRACTION_WORDS:
+            fraction += _HEBREW_FRACTION_WORDS[token[1:]]
+            joined_fraction = True
+            index += 1
+            continue
+        if token in _HEBREW_FRACTION_WORDS:
+            # A standalone fraction: "חצי שניצל" = 0.5 of a schnitzel (leading,
+            # no implicit 1). "אחד וחצי" style is handled by the vav branch.
+            fraction += _HEBREW_FRACTION_WORDS[token]
+            index += 1
+            continue
+
+        value = _count_from_token(token)
+        if value is not None:
+            # Two adjacent counts don't compose (except number + fraction,
+            # handled above) — the first is the count, later digits are food.
+            if count is None:
+                count = value
+            else:
+                food_words.append(token)
+            index += 1
+            continue
+
+        if bare in _SIZE_WORDS:
+            size = _SIZE_WORDS[bare]
+            index += 1
+            continue
+
+        if bare in _PORTION_UNITS:
+            unit_label = _PORTION_UNITS[bare]
+            index += 1
+            continue
+
+        # "מ/מן/מה<food>" preposition ⇒ this is a SCALE ("חצי מהאורז"),
+        # never a discrete count. Bail so the scale parser handles it.
+        if token in {"מ", "מן", "מה"} or token.startswith("מה") or token.startswith("מן"):
+            bail_to_other_parser = True
+            break
+
+        if token in _QUANTITY_FILLER:
+            index += 1
+            continue
+
+        # A scale/multiplier word ("מנה", "פי", "כפול") means this is a SCALE
+        # expression, not a discrete count — bail to the scale parser.
+        if bare in _QUANTITY_SCALE_WORDS:
+            bail_to_other_parser = True
+            break
+
+        # A command verb ("תוריד", "תוסיף", "תחליף") means this is an
+        # imperative correction, not a count — bail so the removal/scale/
+        # replacement parsers handle it.
+        if token in _QUANTITY_COMMAND_VERBS or bare in _QUANTITY_COMMAND_VERBS:
+            bail_to_other_parser = True
+            break
+
+        # Anything else is part of the food name.
+        food_words.append(token)
+        index += 1
+
+    if bail_to_other_parser:
+        return None
+
+    food_text = " ".join(food_words).strip()
+
+    # A vav-joined fraction ("שניצל וחצי", "אחד וחצי") with no explicit number
+    # implies a leading 1: 1 + 0.5 = 1.5. A LEADING standalone fraction
+    # ("חצי שניצל" = 0.5) does not — it is a fraction OF one unit.
+    if count is None and joined_fraction and (food_text or unit_label):
+        count = 1.0
+
+    total = (count or 0.0) + fraction
+    if total <= 0:
+        return None
+
+    # A bare fraction with no explicit count word, no food, and no unit
+    # ("חצי" alone) is a whole-meal SCALE, not a count — leave it to the
+    # scale parser. But an explicit count ("אחד וחצי" → 1.5) is a real count
+    # even without a food, because it applies to the meal's existing item.
+    if count is None and not food_text and not unit_label:
+        return None
+
+    # A lone number with no unit and no food ("3") is not a count expression.
+    if count is not None and fraction == 0 and not food_text and not unit_label:
+        return None
+
+    return ParsedQuantity(
+        count=round(total, 4),
+        unit_label=unit_label,
+        size=size,
+        food_text=food_text,
+        source="user_count",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Preparation-method correction parser  (REC-MEAL-01 / REC-MEAL-04)
 # ---------------------------------------------------------------------------
 
@@ -144,10 +407,14 @@ PREPARATION_CALORIE_FACTORS: dict[str, float] = {
 @dataclass(frozen=True)
 class MealCorrection:
     """A structured correction parsed from user text."""
-    kind: str  # "preparation", "quantity", "remove", "add", "rename", "replace"
+    kind: str  # "preparation", "quantity", "count", "remove", "add", "rename", "replace"
     item_hint: str  # food item the correction targets ("" = whole meal)
     value: str  # new value: preparation method key, grams, replacement name, etc.
     original_text: str  # the user's raw text for logging
+    # Batch 4: for kind=="count", the structured count/portion reading. None
+    # for every other kind. Kept off ``value`` (a str) so count/unit/size stay
+    # first-class and can never be misread as grams.
+    quantity: "ParsedQuantity | None" = None
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +822,25 @@ def parse_meal_correction(text: str) -> list[MealCorrection]:
     addition_corrections = _parse_addition_corrections(text)
     if addition_corrections:
         return addition_corrections
+
+    # --- Count/portion corrections (Batch 4) ---
+    # Checked before SCALE so "חצי שניצל" (half a schnitzel — a fractional
+    # count of a discrete item) is a count, not a whole-meal 0.5 scale. The
+    # count parser deliberately declines gram phrases and "מ/מן/מה"/"מנה"/"פי"
+    # scale phrasing, so genuine scale corrections still reach _parse_scale_
+    # corrections. A count NEVER becomes a gram lock (kind is "count", never
+    # "quantity").
+    parsed_quantity = parse_quantity_expression(text)
+    if parsed_quantity is not None:
+        return [
+            MealCorrection(
+                kind="count",
+                item_hint=parsed_quantity.food_text,
+                value=f"{parsed_quantity.count:g}",
+                original_text=text,
+                quantity=parsed_quantity,
+            )
+        ]
 
     scale_corrections = _parse_scale_corrections(text)
     if scale_corrections:
@@ -973,6 +1259,101 @@ def apply_locked_quantities(
         elif constraint.measurement_state == "raw" and "יבש" not in item.name and "נא" not in item.name:
             item.name = f"{item.name} (משקל לפני בישול)"
     return analysis, unmatched
+
+
+def _singular_stem(word: str) -> str:
+    """Strip a common Hebrew plural suffix for MATCHING only (not display).
+
+    Hebrew plurals ("שניצלים", "קציצות") don't token-match their singular
+    item names ("שניצל", "קציצה"). Dropping a trailing ים/ות yields a stem
+    that is a substring of the singular ("קציצ" ⊂ "קציצה"), which is enough
+    for the substring-based count matcher below. Never used to rewrite a
+    stored name.
+    """
+    stripped = _strip_leading_article(word)
+    if len(stripped) > 3 and stripped.endswith(("ים", "ות")):
+        return stripped[:-2]
+    return stripped
+
+
+def _count_matches_item(food_text: str, item_name: str) -> bool:
+    """Plural/definite-article-tolerant match of a count food to an item.
+
+    Mirrors apply_locked_quantities' intent (token similarity) but adds
+    singular-stem substring matching so "3 שניצלים" finds the "שניצל" item.
+    """
+    if _similarity(food_text, item_name) >= 0.2:
+        return True
+    item_tokens = {_singular_stem(t) for t in _tokens(item_name)}
+    for token in _tokens(food_text):
+        stem = _singular_stem(token)
+        if not stem:
+            continue
+        if any(stem in it or it in stem for it in item_tokens if it):
+            return True
+    return False
+
+
+def apply_count_correction(
+    analysis: MealAnalysis,
+    correction: MealCorrection,
+) -> MealAnalysis:
+    """Record a count/portion correction on the matched item (Batch 4).
+
+    Sets the item's VISIBLE quantity evidence — ``quantity_count``,
+    ``quantity_unit`` (a portion unit like "כדור" when present, otherwise the
+    item is its own unit) and ``quantity_source="user_count"`` — WITHOUT
+    touching ``grams``, ``calories`` or any macro. A count is not a weight:
+    turning "3 schnitzels" into grams is Batch 5's deterministic-conversion
+    job. Until then the count is preserved as evidence and never silently
+    becomes "3 grams".
+
+    Item matching mirrors ``apply_locked_quantities``: best token similarity
+    on ``food_text``. When the text named no food ("שלוש כפות", "אחד וחצי")
+    the count applies to the meal's single item if there is exactly one;
+    otherwise a note records that the target was ambiguous (Batch 6 will
+    turn that into a clarification).
+    """
+    if correction.kind != "count" or correction.quantity is None:
+        return analysis
+    quantity = correction.quantity
+
+    target = None
+    if quantity.food_text:
+        matches = [
+            item for item in analysis.items
+            if _count_matches_item(quantity.food_text, item.name)
+        ]
+        if matches:
+            # Prefer the highest raw similarity among the tolerant matches.
+            target = max(
+                matches, key=lambda item: _similarity(quantity.food_text, item.name)
+            )
+    elif len(analysis.items) == 1:
+        target = analysis.items[0]
+
+    if target is None:
+        note = (
+            f"כמות לא שויכה לפריט: {quantity.count:g}"
+            + (f" {quantity.unit_label}" if quantity.unit_label else "")
+        )
+        if note not in analysis.notes:
+            analysis.notes.append(note)
+        return analysis
+
+    target.quantity_count = quantity.count
+    # Prefer an explicit portion unit ("כדור"); otherwise the item itself is
+    # the counted unit and quantity_unit stays empty (rendering uses the name).
+    if quantity.unit_label:
+        target.quantity_unit = quantity.unit_label
+    target.quantity_source = "user_count"
+
+    unit_text = f" {quantity.unit_label}" if quantity.unit_label else ""
+    size_text = f" ({quantity.size})" if quantity.size else ""
+    note = f"כמות עודכנה: {target.name} — {quantity.count:g}{unit_text}{size_text}"
+    if note not in analysis.notes:
+        analysis.notes.append(note)
+    return analysis
 
 
 def requires_cooked_raw_clarification(constraints: Iterable[LockedQuantity]) -> bool:

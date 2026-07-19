@@ -151,6 +151,7 @@ async def _handle_meal_correction_text(
         removal_corrections = [c for c in corrections if c.kind == "remove"]
         prep_corrections = [c for c in corrections if c.kind == "preparation"]
         qty_corrections = [c for c in corrections if c.kind == "quantity"]
+        count_corrections = [c for c in corrections if c.kind == "count"]
         scale_corrections = [c for c in corrections if c.kind == "scale"]
 
         used_deterministic = False
@@ -180,6 +181,16 @@ async def _handle_meal_correction_text(
                     corrected_analysis, locked,
                 )
                 used_deterministic = True
+
+        if count_corrections:
+            # Batch 4: record count/portion evidence ("3 שניצלים", "חצי
+            # שניצל") on the matched item WITHOUT touching grams — a count is
+            # never a weight. Deterministic-to-grams conversion is Batch 5.
+            for cc in count_corrections:
+                corrected_analysis = meal_intelligence.apply_count_correction(
+                    corrected_analysis, cc,
+                )
+            used_deterministic = True
 
         if scale_corrections:
             for sc in scale_corrections:

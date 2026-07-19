@@ -795,3 +795,66 @@ async def test_identity_enforced_reanalyze_always_builds_chronological_constrain
         uninstall_meal_identity_enforcement()
         coach_bot.reanalyze_meal_with_text_and_image = real_reanalyze
         meal_identity_module.enforce_identity_constraints = real_enforce
+
+
+# ---------------------------------------------------------------------------
+# Batch 4 — count/portion quantities through the REAL correction handler.
+# A count is recorded on the item without touching grams, deterministically
+# (no AI), and survives an identity replacement for replay.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_count_correction_through_real_handler_preserves_grams(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """'3 שניצלים' via the production handler records count=3 on the item and
+    leaves grams untouched — resolved deterministically, no AI call."""
+    _fail_ai(monkeypatch)
+    approval_id = await _make_falafel_approval()  # single item "פלאפל", 120 g
+    # Rename to schnitzel first so the count food matches, then state count.
+    await _send_correction(monkeypatch, approval_id, "לא פלאפל, שניצל")
+    await _send_correction(monkeypatch, approval_id, "3 שניצלים")
+
+    saved, payload = await _saved_analysis(approval_id)
+    schnitzel = next(item for item in saved.items if "שניצל" in item.name)
+    assert schnitzel.quantity_count == 3.0
+    assert schnitzel.grams == 120  # NEVER 3 — a count is not a weight
+    assert schnitzel.quantity_source == "user_count"
+    assert payload["locked_corrections"] == ["לא פלאפל, שניצל", "3 שניצלים"]
+
+
+@pytest.mark.asyncio
+async def test_count_never_becomes_grams_through_real_handler(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The historical failure shape, blocked at the language layer: '3 כדורי
+    פלאפל' records count=3 unit=כדור, and grams stay the original 120 —
+    never the '3 grams' the incident produced."""
+    _fail_ai(monkeypatch)
+    approval_id = await _make_falafel_approval()
+    await _send_correction(monkeypatch, approval_id, "3 כדורי פלאפל")
+
+    saved, _ = await _saved_analysis(approval_id)
+    falafel = next(item for item in saved.items if "פלאפל" in item.name)
+    assert falafel.quantity_count == 3.0
+    assert falafel.quantity_unit == "כדור"
+    assert falafel.grams == 120  # not 3
+
+
+@pytest.mark.asyncio
+async def test_count_survives_replacement_through_real_handler(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replay journey: 3 falafels → replace with schnitzel → still 3
+    schnitzels (count survives the identity replacement, grams preserved)."""
+    _fail_ai(monkeypatch)
+    approval_id = await _make_falafel_approval()
+    await _send_correction(monkeypatch, approval_id, "3 פלאפל")
+    await _send_correction(monkeypatch, approval_id, "לא פלאפל, שניצל")
+
+    saved, _ = await _saved_analysis(approval_id)
+    schnitzel = next(item for item in saved.items if "שניצל" in item.name)
+    assert not any("פלאפל" in item.name for item in saved.items)
+    assert schnitzel.quantity_count == 3.0  # still three, not reset to one
+    assert schnitzel.grams == 120

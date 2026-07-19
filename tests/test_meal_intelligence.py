@@ -224,9 +224,9 @@ def test_removal_takes_priority_over_preparation_in_parser() -> None:
 #      These must keep passing through every later batch.
 #   2. KNOWN GAPS — pinned as strict xfail so the implementing batch must
 #      consciously flip them by removing the marker. Batch 2 flipped the
-#      remove/add parsing group (now regular passing tests); the count
-#      quantity group remains xfail until Batch 4. An unexpected pass fails
-#      the suite (strict).
+#      remove/add parsing group and Batch 4 flipped the count-quantity group
+#      (both now regular passing tests). No strict xfails remain in this file.
+#      An unexpected pass fails the suite (strict).
 # ---------------------------------------------------------------------------
 
 
@@ -615,9 +615,8 @@ COUNT_PHRASES = [
 @pytest.mark.parametrize("text", COUNT_PHRASES)
 def test_count_phrases_never_produce_gram_locks(text: str) -> None:
     """FROZEN safety property: a count phrase must never be interpreted as
-    an explicit gram amount ('3 שניצלים' must not lock grams=3). Today these
-    phrases produce no deterministic parse at all; after Batch 4 they must
-    parse as counts — but never as gram locks."""
+    an explicit gram amount ('3 שניצלים' must not lock grams=3). Batch 4
+    makes them parse as counts — but never as gram locks."""
     locked = meal_intelligence.parse_locked_quantities(text)
     assert locked == []
     corrections = meal_intelligence.parse_meal_correction(text)
@@ -625,16 +624,14 @@ def test_count_phrases_never_produce_gram_locks(text: str) -> None:
 
 
 @pytest.mark.parametrize("text", COUNT_PHRASES[:4])
-@pytest.mark.xfail(
-    strict=True,
-    reason="Batch 4 TODO: count/portion phrases need a deterministic non-gram representation",
-)
-def test_count_phrases_should_parse_deterministically(text: str) -> None:
-    """Desired (Batch 4): count phrases produce SOME deterministic
-    correction object (count/portion — exact shape defined in Batch 4),
-    instead of falling through to AI with no lock."""
+def test_count_phrases_parse_deterministically(text: str) -> None:
+    """Batch 4: count/portion phrases produce a deterministic ``count``
+    correction (not a gram lock, not an AI fallthrough). "יש יותר שניצל"
+    (COUNT_PHRASES[4]) is intentionally excluded — it states no quantity."""
     corrections = meal_intelligence.parse_meal_correction(text)
-    assert corrections != []
+    assert [c.kind for c in corrections] == ["count"]
+    assert corrections[0].quantity is not None
+    assert corrections[0].quantity.count > 0
     assert not any(c.kind == "quantity" for c in corrections)
 
 
@@ -663,3 +660,208 @@ def test_explicit_gram_lock_still_works_for_schnitzel() -> None:
     assert corrected.items[0].grams == 180
     assert corrected.items[0].calories == 450  # scaled by 1.8, not re-invented
     assert corrected.items[0].confidence >= 0.95
+
+
+# ---------------------------------------------------------------------------
+# Batch 4 — count/portion quantity domain (parse_quantity_expression,
+# apply_count_correction). Counts are NEVER grams.
+# ---------------------------------------------------------------------------
+
+
+def _one_item(name: str = "שניצל", grams: float = 120) -> MealAnalysis:
+    return MealAnalysis(
+        meal_name=name,
+        confidence=0.85,
+        items=[
+            FoodItem(name=name, grams=grams, calories=grams * 2, protein=grams * 0.1,
+                     carbs=grams * 0.2, fat=grams * 0.05, confidence=0.85)
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "count", "unit", "size", "food"),
+    [
+        # Counts
+        ("שניצל אחד", 1.0, "", "", "שניצל"),
+        ("שני שניצלים", 2.0, "", "", "שניצלים"),
+        ("שלושה שניצלים", 3.0, "", "", "שניצלים"),
+        ("ארבעה שניצלים", 4.0, "", "", "שניצלים"),
+        ("3 שניצלים", 3.0, "", "", "שניצלים"),
+        ("חצי שניצל", 0.5, "", "", "שניצל"),
+        ("רבע פיתה", 0.25, "", "", "פיתה"),
+        ("אחד וחצי", 1.5, "", "", ""),
+        ("שתיים וחצי קציצות", 2.5, "קציצה", "", ""),
+        ("שניצל וחצי", 1.5, "", "", "שניצל"),
+        # Portion units
+        ("חצי כוס", 0.5, "כוס", "", ""),
+        ("שלוש כפות", 3.0, "כף", "", ""),
+        ("שתי פרוסות", 2.0, "פרוסה", "", ""),
+        ("3 כדורי פלאפל", 3.0, "כדור", "", "פלאפל"),
+        ("שלוש חתיכות", 3.0, "חתיכה", "", ""),
+        ("שתי קציצות", 2.0, "קציצה", "", ""),
+        # Size modifiers / mixed expressions
+        ("שניצל אחד גדול", 1.0, "", "large", "שניצל"),
+        ("שני שניצלים גדולים", 2.0, "", "large", "שניצלים"),
+        ("שלוש קציצות קטנות", 3.0, "קציצה", "small", ""),
+        ("חצי פיתה", 0.5, "", "", "פיתה"),
+        # Approximate language normalizes away
+        ("בערך שני שניצלים", 2.0, "", "", "שניצלים"),
+        ("כ-3 קציצות", 3.0, "קציצה", "", ""),
+    ],
+)
+def test_parse_quantity_expression_matrix(
+    text: str, count: float, unit: str, size: str, food: str
+) -> None:
+    q = meal_intelligence.parse_quantity_expression(text)
+    assert q is not None, text
+    assert q.count == pytest.approx(count)
+    assert q.unit_label == unit
+    assert q.size == size
+    assert q.food_text == food
+    assert q.source == "user_count"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "חצי מהאורז",  # of-item SCALE
+        "חצי מנה",  # whole-meal SCALE
+        "חצי",  # bare fraction = SCALE
+        "x2",  # multiplier = SCALE
+        "פי 2",  # multiplier = SCALE
+        "השניצל בערך 180 גרם",  # gram lock
+        "אורז 150 גרם",  # gram lock
+        "3 גרם",  # grams
+        "יש יותר שניצל",  # vague, no quantity
+        "3",  # lone number, no food/unit
+        "אחת",  # lone number word, no food/unit
+        "בלי שמן",  # removal
+        "לא פלאפל, שניצל",  # replacement
+    ],
+)
+def test_parse_quantity_expression_declines_non_counts(text: str) -> None:
+    assert meal_intelligence.parse_quantity_expression(text) is None
+
+
+def test_count_correction_sets_count_without_touching_grams() -> None:
+    """The core invariant: '3 שניצלים' records count=3 on the item and leaves
+    grams exactly as they were — 3 schnitzels is NEVER 3 grams."""
+    analysis = _one_item("שניצל", grams=120)
+    correction = meal_intelligence.parse_meal_correction("3 שניצלים")[0]
+    assert correction.kind == "count"
+    result = meal_intelligence.apply_count_correction(analysis, correction)
+    item = result.items[0]
+    assert item.grams == 120  # UNTOUCHED
+    assert item.calories == 240  # UNTOUCHED
+    assert item.quantity_count == 3.0
+    assert item.quantity_source == "user_count"
+
+
+def test_count_correction_records_portion_unit() -> None:
+    analysis = _one_item("פלאפל", grams=100)
+    correction = meal_intelligence.parse_meal_correction("3 כדורי פלאפל")[0]
+    result = meal_intelligence.apply_count_correction(analysis, correction)
+    item = result.items[0]
+    assert item.grams == 100
+    assert item.quantity_count == 3.0
+    assert item.quantity_unit == "כדור"
+
+
+def test_count_correction_matches_plural_to_singular_item() -> None:
+    """'3 שניצלים' (plural) must find the singular 'שניצל' item."""
+    analysis = _one_item("שניצל", grams=120)
+    result = meal_intelligence.apply_count_correction(
+        analysis, meal_intelligence.parse_meal_correction("3 שניצלים")[0]
+    )
+    assert result.items[0].quantity_count == 3.0
+
+
+def test_count_correction_targets_only_the_named_item() -> None:
+    analysis = MealAnalysis(
+        meal_name="ארוחה",
+        confidence=0.85,
+        items=[
+            FoodItem(name="שניצל", grams=120, calories=240, protein=12, carbs=24,
+                     fat=6, confidence=0.85),
+            FoodItem(name="אורז לבן", grams=150, calories=300, protein=15, carbs=30,
+                     fat=7.5, confidence=0.85),
+        ],
+    )
+    result = meal_intelligence.apply_count_correction(
+        analysis, meal_intelligence.parse_meal_correction("3 שניצלים")[0]
+    )
+    schnitzel = next(i for i in result.items if "שניצל" in i.name)
+    rice = next(i for i in result.items if "אורז" in i.name)
+    assert schnitzel.quantity_count == 3.0
+    assert rice.quantity_count is None  # untouched
+    assert rice.grams == 150
+
+
+def test_count_correction_ambiguous_target_records_note_and_no_mutation() -> None:
+    """'שלוש כפות' with no food, on a multi-item meal, cannot pick a target —
+    it records a note and mutates nothing (Batch 6 will clarify)."""
+    analysis = MealAnalysis(
+        meal_name="ארוחה",
+        confidence=0.85,
+        items=[
+            FoodItem(name="טחינה", grams=60, calories=350, protein=10, carbs=12,
+                     fat=30, confidence=0.85),
+            FoodItem(name="אורז", grams=150, calories=200, protein=4, carbs=44,
+                     fat=0.5, confidence=0.85),
+        ],
+    )
+    result = meal_intelligence.apply_count_correction(
+        analysis, meal_intelligence.parse_meal_correction("שלוש כפות")[0]
+    )
+    assert all(i.quantity_count is None for i in result.items)
+    assert any("לא שויכה" in note for note in result.notes)
+
+
+def test_count_correction_single_item_meal_accepts_unitless_count() -> None:
+    """'אחד וחצי' with no food resolves against a single-item meal."""
+    analysis = _one_item("בורקס", grams=90)
+    result = meal_intelligence.apply_count_correction(
+        analysis, meal_intelligence.parse_meal_correction("אחד וחצי")[0]
+    )
+    assert result.items[0].quantity_count == pytest.approx(1.5)
+    assert result.items[0].grams == 90  # untouched
+
+
+def test_count_never_shows_as_grams_end_to_end() -> None:
+    """Acceptance criterion: no count of N can surface as 'N גרם' — the
+    parser yields kind='count' (never 'quantity') and apply leaves grams."""
+    for text in ["3 שניצלים", "שני שניצלים", "חצי שניצל", "שלוש חתיכות"]:
+        corrections = meal_intelligence.parse_meal_correction(text)
+        assert corrections and corrections[0].kind == "count"
+        assert corrections[0].value != "3.0"  # value is the count, not a gram string like "3.0"
+    analysis = _one_item("שניצל", grams=120)
+    meal_intelligence.apply_count_correction(
+        analysis, meal_intelligence.parse_meal_correction("3 שניצלים")[0]
+    )
+    assert analysis.items[0].grams == 120
+
+
+# --- Replay preservation: count survives an identity replacement -----------
+
+
+def test_count_survives_identity_replacement_for_replay() -> None:
+    """3 falafels → replace with schnitzel → still 3 schnitzels (not 1).
+
+    quantity_count lives on the FoodItem; apply_item_replacement_correction
+    only renames and re-prices, so the count is preserved through replay."""
+    analysis = _one_item("פלאפל", grams=120)
+    # First: user states the count.
+    analysis = meal_intelligence.apply_count_correction(
+        analysis, meal_intelligence.parse_meal_correction("3 פלאפל")[0]
+    )
+    assert analysis.items[0].quantity_count == 3.0
+    # Then: identity replacement (Batch 2/3 path).
+    analysis = meal_intelligence.apply_item_replacement_correction(
+        analysis, meal_intelligence.parse_meal_correction("לא פלאפל, שניצל")[0]
+    )
+    item = analysis.items[0]
+    assert "שניצל" in item.name
+    assert "פלאפל" not in item.name
+    assert item.quantity_count == 3.0  # STILL three, not reset to one
+    assert item.grams == 120
