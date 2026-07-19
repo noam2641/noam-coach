@@ -1103,6 +1103,20 @@ def enforce_identity_constraints(
     or drop it when the confirmed food already exists as another item.
     Returns the analysis plus a machine-readable list of enforcement actions
     for tracing. Unrelated items are never touched.
+
+    CONTRACT (Batch 3): *constraints* MUST be in chronological order
+    (oldest correction first) — the exact order ``identity_constraints_
+    from_texts`` returns when given texts oldest-to-newest. Enforcement
+    applies constraints via a single forward pass and does not re-scan
+    earlier constraints after a later one fires, so a REVERSED chain
+    (e.g. ["שניצל→חזה עוף", "פלאפל→שניצל"] instead of the chronological
+    ["פלאפל→שניצל", "שניצל→חזה עוף"]) converges to the wrong food: an item
+    still named "פלאפל" is renamed once (→"שניצל") and never re-scanned
+    against the constraint that already ran. The current production caller
+    (``meal_identity.identity_enforced_reanalyze``) always builds its
+    constraint list from ``[*locked_corrections, correction_text]``, which
+    is chronological by construction — do not reorder, dedupe-by-recency,
+    or otherwise permute a constraint list before passing it here.
     """
     enforced: list[dict[str, str]] = []
     for constraint in constraints:

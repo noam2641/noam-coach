@@ -713,3 +713,85 @@ async def test_explicit_readd_reverses_removal(db: Database) -> None:
     finally:
         uninstall_meal_identity_enforcement()
         coach_bot.reanalyze_meal_with_text_and_image = real
+
+
+# ---------------------------------------------------------------------------
+# Architecture contract: enforce_identity_constraints requires its input in
+# chronological order (see the CONTRACT note on the function's docstring).
+# ---------------------------------------------------------------------------
+
+
+def test_enforce_identity_constraints_documents_reversed_order_failure() -> None:
+    """Pins the exact failure the docstring CONTRACT warns about: enforcement
+    makes one forward pass and never re-scans an earlier constraint after a
+    later one has already fired, so a REVERSED constraint list converges to
+    the wrong food. This test is not "desired behavior to fix" — it exists so
+    that if a future change makes enforcement order-independent, someone
+    notices and updates the contract instead of the guarantee silently
+    drifting out of sync with its documentation."""
+    chronological = meal_intelligence.identity_constraints_from_texts(
+        ["לא פלאפל, שניצל", "לא שניצל, חזה עוף"]
+    )
+    assert [(c.rejected, c.confirmed) for c in chronological] == [
+        ("פלאפל", "שניצל"),
+        ("שניצל", "חזה עוף"),
+    ]
+
+    forward, _ = meal_intelligence.enforce_identity_constraints(
+        _falafel_analysis(), chronological
+    )
+    assert _names(forward) == ["חזה עוף"]  # correct: converges to the latest identity
+
+    reversed_order = list(reversed(chronological))
+    backward, _ = meal_intelligence.enforce_identity_constraints(
+        _falafel_analysis(), reversed_order
+    )
+    # Documented failure mode, not a desired outcome: "שניצל→חזה עוף" scans
+    # first and finds no שניצל item yet (still פלאפל), so it no-ops; "פלאפל→
+    # שניצל" then renames the item, and the loop ends without re-checking the
+    # first constraint. If this assertion ever starts failing because
+    # enforcement became order-independent, update the CONTRACT note on
+    # enforce_identity_constraints instead of loosening this test.
+    assert _names(backward) == ["שניצל"]
+    assert _names(backward) != _names(forward)
+
+
+@pytest.mark.asyncio
+async def test_identity_enforced_reanalyze_always_builds_chronological_constraints() -> None:
+    """The one production caller of enforce_identity_constraints must keep
+    building its constraint list chronologically (locked history oldest→
+    newest, current correction last) — verified against the real installed
+    wrapper, not just the docstring claim."""
+    captured: dict[str, Any] = {}
+
+    def spy_enforce(analysis: MealAnalysis, constraints: Any) -> Any:
+        captured["constraints"] = list(constraints)
+        return meal_intelligence.enforce_identity_constraints(analysis, constraints)
+
+    async def noncompliant(image_path: str, correction_text: str,
+                           locked_corrections: Any = None,
+                           nutrition_context: Any = None) -> MealAnalysis:
+        return _incident_analysis("טחינה")
+
+    from noam_coach.services import meal_identity as meal_identity_module
+
+    real_reanalyze = coach_bot.reanalyze_meal_with_text_and_image
+    real_enforce = meal_identity_module.enforce_identity_constraints
+    coach_bot.reanalyze_meal_with_text_and_image = noncompliant
+    meal_identity_module.enforce_identity_constraints = spy_enforce
+    try:
+        install_meal_identity_enforcement()
+        await coach_bot.reanalyze_meal_with_text_and_image(
+            "unused.jpg", "לא הודו אלא עוף",
+            locked_corrections=["לא טחינה, חציל במיונז", "לא עוף, הודו"],
+            nutrition_context={"user_id": USER_ID},
+        )
+        rejected_order = [c.rejected for c in captured["constraints"]]
+        # Chronological: locked history first (oldest), current correction
+        # constraint derivation last (newest) — never the reverse.
+        assert rejected_order[0] == "טחינה"
+        assert rejected_order[-1] == "הודו"
+    finally:
+        uninstall_meal_identity_enforcement()
+        coach_bot.reanalyze_meal_with_text_and_image = real_reanalyze
+        meal_identity_module.enforce_identity_constraints = real_enforce
