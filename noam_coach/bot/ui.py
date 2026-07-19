@@ -519,12 +519,23 @@ class TodaysWorkout:
 
 
 async def resolve_todays_workout(user_id: int, *, now: datetime | None = None) -> "TodaysWorkout":
+    """Thin I/O wrapper: reads the active_workout_plan fact mirror and the
+    sessions table, then delegates the cycle/weekday decision to
+    ``workout_catalog.pick_session`` -- the pure core extracted from this
+    function's own former body (workout-selection architecture, Batch 3).
+    Behavior is byte-equivalent to before the extraction (proven by
+    tests/test_workout_catalog.py's parity test); this function's SOURCE
+    (the fact mirror, not planning.get_active_plan) and its exact return
+    shape are both preserved so existing direct callers/tests
+    (e.g. tests/regression/test_audit_2026_07_18.py) keep working unchanged.
+    """
+    from noam_coach.services.workout_catalog import pick_session
+
     current = (now or datetime.now(TZ)).astimezone(TZ)
     plan = await user_model.get_value(DB, user_id, "active_workout_plan")
     if not plan or not plan.get("sessions"):
         return TodaysWorkout(code=None, reason="no_plan")
     sessions = plan["sessions"]
-    cycle = [s["code"] for s in sessions]
 
     # Which codes were already completed today? Don't offer those again.
     start, end = daily_state.local_day_bounds_utc(current)
@@ -536,35 +547,16 @@ async def resolve_todays_workout(user_id: int, *, now: datetime | None = None) -
     done_today = {r["code"] for r in done_today_rows}
     done_tuple = tuple(sorted(done_today))
 
-    # 1) A session scheduled for today's weekday that wasn't done yet.
-    today_wd = current.weekday()
-    for session in sessions:
-        if session.get("weekday") == today_wd and session["code"] not in done_today:
-            return TodaysWorkout(code=session["code"], reason="offer_today", done_today=done_tuple)
-
-    # 2) Otherwise the next code in the cycle after the last performed workout.
     last = await DB.fetch_one(
         "SELECT code FROM sessions WHERE user_id=? "
         "AND status IN ('completed','partial') "
         "ORDER BY ended_at DESC LIMIT 1",
         (user_id,),
     )
-    if last and last["code"] in cycle:
-        nxt = (cycle.index(last["code"]) + 1) % len(cycle)
-        candidate = cycle[nxt]
-        # Skip forward over anything already done today.
-        for _ in range(len(cycle)):
-            if candidate not in done_today:
-                return TodaysWorkout(code=candidate, reason="offer_next", done_today=done_tuple)
-            nxt = (nxt + 1) % len(cycle)
-            candidate = cycle[nxt]
-        # Every code in the cycle was already performed today.
-        return TodaysWorkout(code=None, reason="all_done_today", done_today=done_tuple)
-    # Fall back to the first code not yet done today.
-    for code in cycle:
-        if code not in done_today:
-            return TodaysWorkout(code=code, reason="offer_next", done_today=done_tuple)
-    return TodaysWorkout(code=None, reason="all_done_today", done_today=done_tuple)
+    last_code = last["code"] if last else None
+
+    code, reason = pick_session(sessions, done_today, current.weekday(), last_code)
+    return TodaysWorkout(code=code, reason=reason, done_today=done_tuple)
 
 
 @runtime_bound(RUNTIME_NAMES)
