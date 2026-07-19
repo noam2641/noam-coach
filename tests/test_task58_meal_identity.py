@@ -488,3 +488,228 @@ async def test_remove_add_phrasing_blocks_reintroduced_identity(db: Database) ->
     finally:
         uninstall_meal_identity_enforcement()
         coach_bot.reanalyze_meal_with_text_and_image = real
+
+
+# ---------------------------------------------------------------------------
+# Batch 3 — production-path lifecycle: idempotency, chains, remove-only
+# persistence, add-reversal, replay. All through the REAL correction handler
+# (_handle_meal_correction_text) or the installed enforcement wrapper.
+# ---------------------------------------------------------------------------
+
+
+async def _make_falafel_approval(extra_items: list[FoodItem] | None = None) -> str:
+    from noam_coach.services import core as core_services
+
+    analysis = _falafel_analysis()
+    if extra_items:
+        analysis.items.extend(extra_items)
+    return await core_services.create_approval(
+        USER_ID, "meal",
+        {"analysis": analysis.model_dump(), "image": None, "revision": 0},
+    )
+
+
+async def _send_correction(
+    monkeypatch: pytest.MonkeyPatch, approval_id: str, text: str
+) -> None:
+    """Drive the REAL _handle_meal_correction_text with a fake Telegram update."""
+    from noam_coach.bot import meal_text as meal_text_bot
+
+    rendered: list[str] = []
+
+    async def fake_render(target: Any, user_id: int, approval_id_: str, **k: Any) -> None:
+        rendered.append(approval_id_)
+
+    monkeypatch.setattr(coach_bot, "render_meal", fake_render, raising=False)
+    message = _FakeMessage(text)
+    update = SimpleNamespace(
+        effective_message=message,
+        effective_user=SimpleNamespace(id=USER_ID),
+        effective_chat=SimpleNamespace(id=USER_ID),
+    )
+    await meal_text_bot._handle_meal_correction_text(update, USER_ID, approval_id, 0)
+    assert rendered == [approval_id]  # every correction re-renders the card
+
+
+async def _saved_analysis(approval_id: str) -> tuple[MealAnalysis, dict[str, Any]]:
+    from noam_coach.services import core as core_services
+
+    row = await core_services.fetch_approval(USER_ID, approval_id)
+    assert row is not None
+    return MealAnalysis.model_validate(row["data"]["analysis"]), row["data"]
+
+
+def _fail_ai(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fail(*a: Any, **k: Any) -> None:
+        raise AssertionError("this correction must resolve deterministically")
+
+    monkeypatch.setattr(coach_bot, "reanalyze_meal_with_text_and_image", fail, raising=False)
+    monkeypatch.setattr(coach_bot, "analyze_meal_text", fail, raising=False)
+
+
+RICE = FoodItem(name="אורז לבן", grams=150, calories=195, protein=4,
+                carbs=42, fat=0.5, confidence=0.9)
+
+
+@pytest.mark.asyncio
+async def test_same_replacement_twice_is_idempotent(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Duplicate delivery of the same correction text (Telegram retry /
+    impatient user): item state converges — one schnitzel, same grams —
+    while the audit trail honestly records both submissions."""
+    _fail_ai(monkeypatch)
+    approval_id = await _make_falafel_approval()
+    await _send_correction(monkeypatch, approval_id, "לא פלאפל, שניצל")
+    await _send_correction(monkeypatch, approval_id, "לא פלאפל, שניצל")
+
+    saved, payload = await _saved_analysis(approval_id)
+    schnitzels = [item for item in saved.items if "שניצל" in item.name]
+    assert len(schnitzels) == 1  # never duplicated
+    assert schnitzels[0].grams == 120
+    assert not any("פלאפל" in item.name for item in saved.items)
+    assert payload["revision"] == 2  # both submissions audited
+    assert payload["locked_corrections"] == ["לא פלאפל, שניצל", "לא פלאפל, שניצל"]
+    # Constraint derivation stays single (dedup by supersede).
+    constraints = meal_intelligence.identity_constraints_from_texts(
+        payload["locked_corrections"]
+    )
+    assert len(constraints) == 1
+
+
+@pytest.mark.asyncio
+async def test_same_removal_twice_is_idempotent(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fail_ai(monkeypatch)
+    approval_id = await _make_falafel_approval([RICE.model_copy(deep=True)])
+    await _send_correction(monkeypatch, approval_id, "תוריד פלאפל")
+    await _send_correction(monkeypatch, approval_id, "תוריד פלאפל")
+
+    saved, payload = await _saved_analysis(approval_id)
+    assert [item.name for item in saved.items] == ["אורז לבן"]
+    assert saved.items[0].grams == 150  # untouched by the duplicate
+    assert payload["revision"] == 2
+    assert payload["locked_corrections"] == ["תוריד פלאפל", "תוריד פלאפל"]
+
+
+@pytest.mark.asyncio
+async def test_replacement_chain_through_real_handler(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """falafel → schnitzel → chicken through the production handler: the
+    final card carries only the latest confirmed identity, grams preserved,
+    and locked corrections accumulate in chronological order."""
+    _fail_ai(monkeypatch)
+    approval_id = await _make_falafel_approval()
+    await _send_correction(monkeypatch, approval_id, "לא פלאפל, שניצל")
+    await _send_correction(monkeypatch, approval_id, "לא שניצל, חזה עוף")
+
+    saved, payload = await _saved_analysis(approval_id)
+    names = _names(saved)
+    assert not any("פלאפל" in name for name in names)
+    assert not any("שניצל" in name for name in names)
+    chicken = next(item for item in saved.items if "חזה עוף" in item.name)
+    assert chicken.grams == 120
+    assert payload["locked_corrections"] == ["לא פלאפל, שניצל", "לא שניצל, חזה עוף"]
+    assert payload["revision"] == 2
+
+
+@pytest.mark.asyncio
+async def test_chain_survives_noncompliant_reanalysis(db: Database) -> None:
+    """After the chain, a noncompliant AI that resurrects BOTH earlier
+    identities is enforced down to the latest confirmed one — earlier
+    rejected identities stay rejected transitively."""
+
+    async def noncompliant(image_path: str, correction_text: str,
+                           locked_corrections: Any = None,
+                           nutrition_context: Any = None) -> MealAnalysis:
+        analysis = _falafel_analysis()
+        analysis.items.append(
+            FoodItem(name="שניצל", grams=50, calories=110, protein=8,
+                     carbs=4, fat=6, confidence=0.9)
+        )
+        analysis.items.append(RICE.model_copy(deep=True))
+        return analysis
+
+    real = coach_bot.reanalyze_meal_with_text_and_image
+    coach_bot.reanalyze_meal_with_text_and_image = noncompliant
+    try:
+        install_meal_identity_enforcement()
+        result = await coach_bot.reanalyze_meal_with_text_and_image(
+            "unused.jpg", "זה היה בצהריים",  # unrelated follow-up → AI path
+            locked_corrections=["לא פלאפל, שניצל", "לא שניצל, חזה עוף"],
+            nutrition_context={"user_id": USER_ID},
+        )
+        names = _names(result)
+        assert not any("פלאפל" in name for name in names)
+        assert not any(name == "שניצל" for name in names)
+        assert any("חזה עוף" in name for name in names)
+        assert any("אורז" in name for name in names)  # unrelated item untouched
+    finally:
+        uninstall_meal_identity_enforcement()
+        coach_bot.reanalyze_meal_with_text_and_image = real
+
+
+@pytest.mark.asyncio
+async def test_remove_only_survives_noncompliant_reanalysis(db: Database) -> None:
+    """Batch 3 gap closed: 'תוריד פלאפל' previously produced NO constraint,
+    so a later AI reanalysis could resurrect the removed food. Now the
+    rejected-only constraint deletes it, with trace evidence."""
+
+    async def noncompliant(image_path: str, correction_text: str,
+                           locked_corrections: Any = None,
+                           nutrition_context: Any = None) -> MealAnalysis:
+        analysis = _falafel_analysis()  # falafel is back
+        analysis.items.append(RICE.model_copy(deep=True))
+        return analysis
+
+    real = coach_bot.reanalyze_meal_with_text_and_image
+    coach_bot.reanalyze_meal_with_text_and_image = noncompliant
+    try:
+        install_meal_identity_enforcement()
+        result = await coach_bot.reanalyze_meal_with_text_and_image(
+            "unused.jpg", "זה היה בצהריים",
+            locked_corrections=["תוריד פלאפל"],
+            nutrition_context={"user_id": USER_ID},
+        )
+        names = _names(result)
+        assert not any("פלאפל" in name for name in names)
+        assert any("אורז" in name for name in names)
+        events = await event_log.list_events(db, USER_ID)
+        enforcement = [e for e in events if e.entity == "identity_enforcement"]
+        assert enforcement and enforcement[-1].outcome == "enforced"
+        actions = enforcement[-1].properties["actions"]
+        assert any(a["action"] == "removed_rejected" for a in actions)
+    finally:
+        uninstall_meal_identity_enforcement()
+        coach_bot.reanalyze_meal_with_text_and_image = real
+
+
+@pytest.mark.asyncio
+async def test_explicit_readd_reverses_removal(db: Database) -> None:
+    """TASK-58's escape hatch through the wrapper: the user removed falafel
+    but then explicitly asked to add it back — enforcement must NOT strip
+    it (the current correction is the newest decision)."""
+
+    async def compliant_add(image_path: str, correction_text: str,
+                            locked_corrections: Any = None,
+                            nutrition_context: Any = None) -> MealAnalysis:
+        analysis = _falafel_analysis()  # AI re-added the falafel as asked
+        analysis.items.append(RICE.model_copy(deep=True))
+        return analysis
+
+    real = coach_bot.reanalyze_meal_with_text_and_image
+    coach_bot.reanalyze_meal_with_text_and_image = compliant_add
+    try:
+        install_meal_identity_enforcement()
+        result = await coach_bot.reanalyze_meal_with_text_and_image(
+            "unused.jpg", "תוסיף פלאפל",  # newest decision, after the removal
+            locked_corrections=["תוריד פלאפל"],
+            nutrition_context={"user_id": USER_ID},
+        )
+        names = _names(result)
+        assert any("פלאפל" in name for name in names)  # NOT stripped
+    finally:
+        uninstall_meal_identity_enforcement()
+        coach_bot.reanalyze_meal_with_text_and_image = real

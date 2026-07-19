@@ -381,11 +381,14 @@ REMOVE_ONLY_FORMS = [
 @pytest.mark.parametrize("text", REMOVE_ONLY_FORMS)
 def test_remove_only_forms_parse_clean(text: str) -> None:
     """Remove-only language (audit Finding B) parses as a clean removal whose
-    hint contains only the removed item — never a replacement."""
+    hint contains only the removed item — never a replacement. Batch 3: it
+    also yields a rejected-only identity constraint (confirmed=""), so a
+    removed food can no longer return through a later AI reanalysis."""
     corrections = meal_intelligence.parse_meal_correction(text)
     assert [c.kind for c in corrections] == ["remove"]
     assert corrections[0].item_hint == "פלאפל"
-    assert meal_intelligence.identity_constraints_from_texts([text]) == []
+    constraints = meal_intelligence.identity_constraints_from_texts([text])
+    assert [(c.rejected, c.confirmed) for c in constraints] == [("פלאפל", "")]
 
 
 def test_removal_guards_protect_scale_and_quantity_language() -> None:
@@ -396,6 +399,170 @@ def test_removal_guards_protect_scale_and_quantity_language() -> None:
     assert [c.kind for c in scale] == ["scale"]
     fallthrough = meal_intelligence.parse_meal_correction("תוריד קצת מהאורז")
     assert not any(c.kind == "remove" for c in fallthrough)
+
+
+# ---------------------------------------------------------------------------
+# Batch 3 — identity-constraint semantics: ולא direction, definite article,
+# add-only reversal, removal constraints, supersede, replay equivalence.
+# ---------------------------------------------------------------------------
+
+
+def test_velo_direction_supported_forms() -> None:
+    """Correct ולא direction: 'שניצל ולא פלאפל' means the meal IS schnitzel
+    and NOT falafel — replace(פלאפל→שניצל). Classic forms keep working."""
+    corrections = meal_intelligence.parse_meal_correction("שניצל ולא פלאפל")
+    assert [(c.kind, c.item_hint, c.value) for c in corrections] == [
+        ("replace", "פלאפל", "שניצל")
+    ]
+    classic = meal_intelligence.parse_meal_correction("זו קולה זירו ולא קולה רגילה")
+    assert [(c.kind, c.item_hint, c.value) for c in classic] == [
+        ("replace", "קולה רגילה", "קולה זירו")
+    ]
+
+
+def test_velo_after_remove_verb_is_remove_only() -> None:
+    """'תוריד פלאפל ולא שניצל' = "remove the falafel, not the schnitzel" —
+    a remove-only correction for פלאפל. Before Batch 3 this matched the
+    general 'X ולא Y' pattern REVERSED (rejecting שניצל and confirming the
+    verb-polluted phrase 'תוריד פלאפל')."""
+    corrections = meal_intelligence.parse_meal_correction("תוריד פלאפל ולא שניצל")
+    assert [(c.kind, c.item_hint) for c in corrections] == [("remove", "פלאפל")]
+    constraints = meal_intelligence.identity_constraints_from_texts(
+        ["תוריד פלאפל ולא שניצל"]
+    )
+    assert [(c.rejected, c.confirmed) for c in constraints] == [("פלאפל", "")]
+
+
+def test_hedged_velo_phrasing_creates_no_replacement() -> None:
+    """A hedged sentence must not become a hard identity lock — it falls
+    through to the AI/clarification path."""
+    corrections = meal_intelligence.parse_meal_correction("אני חושב שזה שניצל ולא פלאפל")
+    assert not any(c.kind == "replace" for c in corrections)
+    assert (
+        meal_intelligence.identity_constraints_from_texts(["אולי שניצל ולא פלאפל"]) == []
+    )
+
+
+def test_definite_article_target_matches_bare_item() -> None:
+    """'תוריד הפלאפל' / 'תוריד את הפלאפל ותוסיף שניצל' must act on the item
+    named 'פלאפל' — comparison-only normalization, names never rewritten."""
+    removal = meal_intelligence.parse_meal_correction("תוריד הפלאפל")
+    assert [(c.kind, c.item_hint) for c in removal] == [("remove", "הפלאפל")]
+    removed = meal_intelligence.apply_item_removal_correction(
+        _falafel_analysis(), removal[0]
+    )
+    assert removed.items == []
+
+    replace = meal_intelligence.parse_meal_correction("תוריד את הפלאפל ותוסיף שניצל")
+    assert [c.kind for c in replace] == ["replace"]
+    corrected = meal_intelligence.apply_item_replacement_correction(
+        _falafel_analysis(), replace[0]
+    )
+    names = [item.name for item in corrected.items]
+    assert names and not any("פלאפל" in name for name in names)
+    assert any("שניצל" in name for name in names)
+    assert corrected.items[0].grams == 120
+
+
+def test_definite_article_normalization_does_not_corrupt_names() -> None:
+    """Genuine ה-initial food names keep matching themselves ('הודו' is a
+    food, not a definite article on 'ודו') and no unrelated match appears."""
+    turkey = MealAnalysis(
+        meal_name="הודו",
+        confidence=0.9,
+        items=[
+            FoodItem(name="הודו מעושן", grams=100, calories=110, protein=20,
+                     carbs=1, fat=3, confidence=0.9)
+        ],
+    )
+    correction = meal_intelligence.parse_meal_correction("לא הודו אלא עוף")[0]
+    corrected = meal_intelligence.apply_item_replacement_correction(turkey, correction)
+    names = [item.name for item in corrected.items]
+    assert any("עוף" in name for name in names)
+    assert not any("הודו" in name for name in names)
+    # Rejected 'הפלאפל' matches falafel variants, nothing else.
+    assert meal_intelligence._matches_rejected_identity("פלאפל כשר (3 כדורים)", "הפלאפל")
+    assert not meal_intelligence._matches_rejected_identity("סלט ירקות", "הפלאפל")
+
+
+def test_add_only_parses_as_add_kind() -> None:
+    corrections = meal_intelligence.parse_meal_correction("תוסיף שניצל")
+    assert [(c.kind, c.item_hint, c.value) for c in corrections] == [
+        ("add", "", "שניצל")
+    ]
+
+
+def test_explicit_add_reverses_earlier_rejection() -> None:
+    """TASK-58's escape hatch: an explicit later add of a rejected food
+    reverses the rejection — for both replacement- and removal-born
+    constraints. Order matters: a removal AFTER the add stands."""
+    assert (
+        meal_intelligence.identity_constraints_from_texts(
+            ["לא פלאפל, שניצל", "תוסיף פלאפל"]
+        )
+        == []
+    )
+    assert (
+        meal_intelligence.identity_constraints_from_texts(
+            ["תוריד פלאפל", "תוסיף פלאפל"]
+        )
+        == []
+    )
+    later_removal = meal_intelligence.identity_constraints_from_texts(
+        ["תוסיף פלאפל", "תוריד פלאפל"]
+    )
+    assert [(c.rejected, c.confirmed) for c in later_removal] == [("פלאפל", "")]
+
+
+def test_removal_constraint_enforcement_deletes_reintroduced_item() -> None:
+    """Remove-only history must strip a reintroduced item during enforcement
+    (previously removal texts produced no constraint at all), and repeated
+    enforcement is idempotent."""
+    rice = FoodItem(name="אורז לבן", grams=150, calories=195, protein=4,
+                    carbs=42, fat=0.5, confidence=0.9)
+    analysis = _falafel_analysis()
+    analysis.items.append(rice)
+    constraints = meal_intelligence.identity_constraints_from_texts(["תוריד פלאפל"])
+    enforced, actions = meal_intelligence.enforce_identity_constraints(
+        analysis, constraints
+    )
+    assert [item.name for item in enforced.items] == ["אורז לבן"]
+    assert [a["action"] for a in actions] == ["removed_rejected"]
+    again, actions2 = meal_intelligence.enforce_identity_constraints(
+        enforced, constraints
+    )
+    assert [item.name for item in again.items] == ["אורז לבן"]
+    assert actions2 == []  # idempotent — nothing left to enforce
+
+
+def test_same_rejected_food_latest_constraint_wins() -> None:
+    """Two corrections about the SAME rejected food: the newest supersedes
+    ('לא פלאפל, שניצל' then 'לא פלאפל, חזה עוף' → פלאפל→חזה עוף only)."""
+    constraints = meal_intelligence.identity_constraints_from_texts(
+        ["לא פלאפל, שניצל", "לא פלאפל, חזה עוף"]
+    )
+    assert [(c.rejected, c.confirmed) for c in constraints] == [("פלאפל", "חזה עוף")]
+
+
+def test_correction_replay_matches_sequential_application() -> None:
+    """Replaying the locked-correction history against the ORIGINAL analysis
+    produces exactly the state sequential application produced — names,
+    grams and calories identical (deterministic replay guarantee)."""
+    first, second = "לא פלאפל, שניצל", "לא שניצל, חזה עוף"
+    sequential = _falafel_analysis()
+    for text in (first, second):
+        sequential = meal_intelligence.apply_item_replacement_correction(
+            sequential, meal_intelligence.parse_meal_correction(text)[0]
+        )
+    replayed, _ = meal_intelligence.enforce_identity_constraints(
+        _falafel_analysis(),
+        meal_intelligence.identity_constraints_from_texts([first, second]),
+    )
+    assert [
+        (item.name, item.grams, item.calories) for item in sequential.items
+    ] == [(item.name, item.grams, item.calories) for item in replayed.items]
+    assert [item.name for item in replayed.items] == ["חזה עוף"]
+    assert replayed.items[0].grams == 120
 
 
 @pytest.mark.parametrize("text", ["תוסיף שניצל", "הוסף שניצל", "שים שניצל"])

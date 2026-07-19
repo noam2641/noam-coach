@@ -176,7 +176,10 @@ _REMOVAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 # captured hint is truncated at the first add/replace connector token.
 _REMOVAL_HINT_STOP_TOKENS = frozenset({
     "ותוסיף", "והוסף", "ולהוסיף", "ותשים", "ושים", "ובמקום", "במקום",
-    "ותחליף", "והחלף", "אלא", "וגם", "תוסיף", "הוסף", "להוסיף", "תשים", "שים",
+    "ותחליף", "והחלף", "אלא", "וגם", "תוסיף", "הוסף", "להוסיף", "תשים",
+    # Batch 3: "תוריד פלאפל ולא שניצל" is remove-only — the hint must
+    # stop before the clarifying "not Y" clause (and any chained בלי).
+    "שים", "ולא", "ובלי", "וללא",
 })
 
 # Leading filler tokens that may precede the actual food ("תוריד לי את הפלאפל").
@@ -274,6 +277,16 @@ _HEB = r"[\u0590-\u05FF][\u0590-\u05FF\s'\u05F3]{0,40}"  # Hebrew words (incl. g
 # rename that would inherit the removed item's grams.
 _RA_REMOVE_VERBS = r"(?:תוריד|הורד|להוריד|הסר|תסיר|להסיר|תוציא|הוצא|להוציא)"
 _RA_ADD_VERBS = r"(?:תוסיף|הוסף|להוסיף|תשים|שים)"
+
+# Batch 3: a replacement side that BEGINS with command/hedge language is
+# not a food identity — "תוריד פלאפל ולא שניצל" must never become
+# replace(שניצל→"תוריד פלאפל"). Matches with such a side are skipped so
+# the text falls through to the removal/AI paths instead.
+_UNSAFE_REPLACEMENT_SIDE_TOKENS = frozenset({
+    "תוריד", "הורד", "להוריד", "הסר", "תסיר", "להסיר", "תוציא", "הוצא",
+    "להוציא", "תוסיף", "הוסף", "להוסיף", "תשים", "שים", "תחליף", "החלף",
+    "להחליף", "בלי", "ללא", "אולי", "כנראה", "לדעתי", "אני",
+})
 
 _REPLACEMENT_PATTERNS: list[re.Pattern[str]] = [
     # TASK-58: negation-FIRST identity corrections — the production incident
@@ -375,6 +388,13 @@ def _parse_replacement_corrections(text: str) -> list[MealCorrection]:
         # Sanity: both sides must be non-empty and differ.
         if not target or not replacement or target == replacement:
             continue
+        # Batch 3: sides starting with command/hedge words are not
+        # identities (see _UNSAFE_REPLACEMENT_SIDE_TOKENS).
+        if (
+            target.split()[0] in _UNSAFE_REPLACEMENT_SIDE_TOKENS
+            or replacement.split()[0] in _UNSAFE_REPLACEMENT_SIDE_TOKENS
+        ):
+            continue
         # Skip if either side matches a pure preparation alias (those are not
         # item names and should be handled by the preparation-correction path).
         if target in PREPARATION_ALIASES or replacement in PREPARATION_ALIASES:
@@ -386,6 +406,37 @@ def _parse_replacement_corrections(text: str) -> list[MealCorrection]:
                 value=replacement,
                 original_text=text,
             )
+        ]
+    return []
+
+
+# Batch 3: add-only commands. They never apply deterministically (macros
+# for a new item come from the AI path), but the parsed intent joins the
+# identity-constraint history — an explicit later add REVERSES an earlier
+# rejection of the same food (see identity_constraints_from_texts).
+_ADDITION_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"^ו?(?:תוסיף|הוסף|להוסיף|תשים|שים)\s+(?:את\s+)?"
+        r"(?P<item>" + _HEB + r")$",
+        re.IGNORECASE,
+    ),
+]
+
+
+def _parse_addition_corrections(text: str) -> list[MealCorrection]:
+    """Parse an anchored add-only command into kind="add" (value=item)."""
+    normalized = re.sub(r"\s+", " ", text.strip()).strip(" .,;:!?")
+    for pattern in _ADDITION_PATTERNS:
+        m = pattern.match(normalized)
+        if m is None:
+            continue
+        item = m.group("item").strip()
+        if not item or item in PREPARATION_ALIASES:
+            continue
+        if item.split()[0] in _REMOVAL_HINT_NON_ITEM_TOKENS:
+            continue
+        return [
+            MealCorrection(kind="add", item_hint="", value=item, original_text=text)
         ]
     return []
 
@@ -496,6 +547,14 @@ def parse_meal_correction(text: str) -> list[MealCorrection]:
     if removal_corrections:
         corrections.extend(removal_corrections)
         return corrections  # removal is unambiguous; skip further parsing
+
+    # --- Add-only commands (Batch 3) ---
+    # Returned for intent/history (constraint reversal); the handler still
+    # routes them to the AI path because nothing deterministic can price a
+    # newly added item.
+    addition_corrections = _parse_addition_corrections(text)
+    if addition_corrections:
+        return addition_corrections
 
     scale_corrections = _parse_scale_corrections(text)
     if scale_corrections:
@@ -858,11 +917,24 @@ def apply_scale_correction(
 
 
 def _tokens(text: str) -> set[str]:
-    return {
-        token
-        for token in re.findall(r"[\w\u0590-\u05FF]+", text.casefold())
-        if len(token) > 1 and token not in {"מבושל", "נא", "גרם"}
-    }
+    """Comparison token set for identity/quantity matching.
+
+    Batch 3: tokens are normalized for the Hebrew definite article — a
+    leading ה on a token of 3+ letters is stripped FOR COMPARISON ONLY
+    ("הפלאפל" and "פלאפל" yield the same token, so a correction naming an
+    item with the definite article matches the bare analysis item).
+    Stored item names are never rewritten, and both sides of every
+    comparison normalize identically, so genuine ה-initial food names
+    ("הודו", "המבורגר") keep matching themselves exactly as before.
+    """
+    tokens: set[str] = set()
+    for token in re.findall(r"[\w\u0590-\u05FF]+", text.casefold()):
+        if len(token) <= 1 or token in {"מבושל", "נא", "גרם"}:
+            continue
+        if token.startswith("ה") and len(token) > 2:
+            token = token[1:]
+        tokens.add(token)
+    return tokens
 
 
 def _similarity(a: str, b: str) -> float:
@@ -927,29 +999,66 @@ class IdentityConstraint:
 
 
 def identity_constraints_from_texts(texts: Iterable[str]) -> list[IdentityConstraint]:
-    """Parse identity corrections out of the current + locked correction texts.
+    """Parse identity constraints out of the current + locked correction texts.
 
-    This is the deterministic mirror of the prompt rule "the user's text is
-    authoritative": every replacement-form correction ("לא טחינה חציל במיונז",
-    "זה עוף לא הודו", "X במקום Y") becomes a hard constraint that outlives
-    the current AI call — TASK-58's invariant is that a rejected identity
-    cannot reappear in ANY later reanalysis of the same meal lifecycle.
+    The deterministic mirror of the prompt rule "the user's text is
+    authoritative". Texts are processed IN ORDER (the order meal_text
+    appends them to locked_corrections):
+
+    - A replacement form ("לא פלאפל, שניצל", "תוריד פלאפל ותוסיף שניצל")
+      yields rejected→confirmed. A later constraint about the SAME rejected
+      food supersedes the earlier one (the newest decision wins); chains
+      over different foods (פלאפל→שניצל then שניצל→חזה עוף) remain two
+      auditable constraints and resolve transitively during enforcement.
+    - A remove-only form ("תוריד פלאפל") yields a rejected-only constraint
+      (confirmed="") so enforcement DELETES a reintroduced item instead of
+      renaming it (Batch 3: a removed food could previously return via a
+      later AI reanalysis because removal texts produced no constraint).
+    - An add-only form ("תוסיף פלאפל") REVERSES earlier rejections of that
+      food — the user explicitly brought it back (TASK-58's escape hatch:
+      "unless the user later reverses the correction").
     """
     constraints: list[IdentityConstraint] = []
-    seen: set[tuple[str, str]] = set()
+
+    def _same_food(a: str, b: str) -> bool:
+        return _matches_rejected_identity(a, b) or _matches_rejected_identity(b, a)
+
+    def _supersede(rejected: str) -> None:
+        constraints[:] = [
+            existing for existing in constraints
+            if not _same_food(existing.rejected, rejected)
+        ]
+
     for text in texts:
-        for correction in _parse_replacement_corrections(str(text or "")):
-            key = (correction.item_hint.casefold(), correction.value.casefold())
-            if key in seen:
-                continue
-            seen.add(key)
-            constraints.append(
-                IdentityConstraint(
-                    rejected=correction.item_hint,
-                    confirmed=correction.value,
-                    source_text=correction.original_text,
+        raw = str(text or "")
+        replacements = _parse_replacement_corrections(raw)
+        if replacements:
+            for correction in replacements:
+                _supersede(correction.item_hint)
+                constraints.append(
+                    IdentityConstraint(
+                        rejected=correction.item_hint,
+                        confirmed=correction.value,
+                        source_text=correction.original_text,
+                    )
                 )
-            )
+            continue
+        removals = _parse_removal_corrections(raw)
+        if removals:
+            for correction in removals:
+                if not correction.item_hint:
+                    continue
+                _supersede(correction.item_hint)
+                constraints.append(
+                    IdentityConstraint(
+                        rejected=correction.item_hint,
+                        confirmed="",
+                        source_text=correction.original_text,
+                    )
+                )
+            continue
+        for correction in _parse_addition_corrections(raw):
+            _supersede(correction.value)
     return constraints
 
 
@@ -1002,6 +1111,24 @@ def enforce_identity_constraints(
             if _matches_rejected_identity(item.name, constraint.rejected)
         ]
         if not matching:
+            continue
+        if not constraint.confirmed:
+            # Rejected-only constraint (remove-only correction): delete the
+            # reintroduced item — there is no confirmed identity to rename
+            # it to (Batch 3).
+            for item in matching:
+                analysis.items.remove(item)
+                enforced.append(
+                    {
+                        "action": "removed_rejected",
+                        "rejected": constraint.rejected,
+                        "confirmed": "",
+                        "item_was": item.name,
+                    }
+                )
+            note = f"אכיפת זהות: {constraint.rejected} הוסר"
+            if note not in analysis.notes:
+                analysis.notes.append(note)
             continue
         confirmed_exists = any(
             _similarity(constraint.confirmed, item.name) >= 0.6
