@@ -386,3 +386,110 @@ async def test_full_incident_journey_through_the_real_correction_handler(
     events = await event_log.list_events(db, USER_ID)
     applied = [e for e in events if e.event == "meal_correction_applied"]
     assert applied and applied[-1].properties["deterministic"] is True
+
+
+# ---------------------------------------------------------------------------
+# Batch 1 characterization (FINAL_MEAL_INTERACTION_IMPLEMENTATION_PLAN.md,
+# 2026-07-19 falafel/schnitzel root-cause audit) — identity lifecycle.
+# FROZEN tests pin behavior that already works; the strict xfail pins the
+# remove/add phrasing gap that Batch 2/3 must close.
+# ---------------------------------------------------------------------------
+
+
+def _falafel_analysis(falafel_name: str = "פלאפל") -> MealAnalysis:
+    return MealAnalysis(
+        meal_name="פלאפל",
+        confidence=0.85,
+        items=[
+            FoodItem(
+                name=falafel_name, grams=120, calories=396, protein=13,
+                carbs=31, fat=24, confidence=0.85,
+            )
+        ],
+    )
+
+
+def test_sequential_replacement_of_replacement_lands_on_latest_identity() -> None:
+    """FROZEN: 'לא פלאפל, שניצל' then 'לא שניצל, חזה עוף' — the final item is
+    חזה עוף, grams preserved through both renames, no rejected identity left."""
+    constraints = meal_intelligence.identity_constraints_from_texts(
+        ["לא פלאפל, שניצל", "לא שניצל, חזה עוף"]
+    )
+    assert [(c.rejected, c.confirmed) for c in constraints] == [
+        ("פלאפל", "שניצל"),
+        ("שניצל", "חזה עוף"),
+    ]
+    enforced, actions = meal_intelligence.enforce_identity_constraints(
+        _falafel_analysis(), constraints
+    )
+    assert [item.name for item in enforced.items] == ["חזה עוף"]
+    assert enforced.items[0].grams == 120
+    assert [a["action"] for a in actions] == [
+        "renamed_to_confirmed",
+        "renamed_to_confirmed",
+    ]
+
+
+def test_duplicate_identity_correction_is_idempotent() -> None:
+    """FROZEN: repeating the same correction produces one constraint and one
+    enforcement action — never duplicate items or duplicate actions."""
+    constraints = meal_intelligence.identity_constraints_from_texts(
+        ["לא פלאפל, שניצל", "לא פלאפל, שניצל"]
+    )
+    assert len(constraints) == 1
+    enforced, actions = meal_intelligence.enforce_identity_constraints(
+        _falafel_analysis(), constraints
+    )
+    assert [item.name for item in enforced.items] == ["שניצל"]
+    assert len(actions) == 1
+
+
+def test_rejected_identity_matches_parenthetical_descriptor() -> None:
+    """FROZEN: rejected 'פלאפל' must catch the descriptor-laden AI name
+    'פלאפל כשר (3 כדורים)' (the exact initial-analysis name from the trace)."""
+    analysis = _falafel_analysis("פלאפל כשר (3 כדורים)")
+    constraints = meal_intelligence.identity_constraints_from_texts(["לא פלאפל, שניצל"])
+    enforced, actions = meal_intelligence.enforce_identity_constraints(
+        analysis, constraints
+    )
+    names = _names(enforced)
+    assert not any("פלאפל" in name for name in names)
+    assert any("שניצל" in name for name in names)
+    assert actions
+
+
+@pytest.mark.asyncio
+@pytest.mark.xfail(
+    strict=True,
+    reason="Batch 2/3 TODO: remove/add phrasing does not yet create identity constraints, "
+    "so post-AI enforcement cannot block the reintroduced rejected food",
+)
+async def test_remove_add_phrasing_blocks_reintroduced_identity(db: Database) -> None:
+    """Desired (Batch 2/3): after 'תוריד פלאפל ותוסיף שניצל', a noncompliant
+    reanalysis that returns falafel again must have it enforced away — the
+    same guarantee 'לא פלאפל, שניצל' already provides today."""
+
+    async def noncompliant_reanalyze(image_path: str, correction_text: str,
+                                     locked_corrections: Any = None,
+                                     nutrition_context: Any = None) -> MealAnalysis:
+        analysis = _falafel_analysis()
+        analysis.items.append(
+            FoodItem(name="שניצל", grams=180, calories=430, protein=32,
+                     carbs=14, fat=26, confidence=0.9)
+        )
+        return analysis
+
+    real = coach_bot.reanalyze_meal_with_text_and_image
+    coach_bot.reanalyze_meal_with_text_and_image = noncompliant_reanalyze
+    try:
+        install_meal_identity_enforcement()
+        result = await coach_bot.reanalyze_meal_with_text_and_image(
+            "unused.jpg", "תוריד פלאפל ותוסיף שניצל",
+            locked_corrections=[], nutrition_context={"user_id": USER_ID},
+        )
+        names = _names(result)
+        assert not any("פלאפל" in name for name in names)
+        assert any("שניצל" in name for name in names)
+    finally:
+        uninstall_meal_identity_enforcement()
+        coach_bot.reanalyze_meal_with_text_and_image = real

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 import meal_intelligence
 from models import FoodItem, MealAnalysis
 
@@ -210,3 +212,209 @@ def test_removal_takes_priority_over_preparation_in_parser() -> None:
     kinds = {c.kind for c in corrections}
     assert kinds == {"remove"}
     assert "preparation" not in kinds
+
+
+# ---------------------------------------------------------------------------
+# Batch 1 characterization (FINAL_MEAL_INTERACTION_IMPLEMENTATION_PLAN.md,
+# 2026-07-19 falafel/schnitzel root-cause audit).
+#
+# Two groups:
+#   1. FROZEN behavior — replacement forms, explicit gram locking, and the
+#      "count phrases never corrupt grams deterministically" safety property.
+#      These must keep passing through every later batch.
+#   2. KNOWN GAPS — pinned as strict xfail so Batch 2 (remove/add parsing)
+#      and Batch 4 (count quantity model) must consciously flip them by
+#      removing the marker. An unexpected pass fails the suite (strict).
+# ---------------------------------------------------------------------------
+
+
+def _falafel_analysis() -> MealAnalysis:
+    """The incident draft: one falafel item, 120 g / 396 kcal (trace event 1200)."""
+    return MealAnalysis(
+        meal_name="פלאפל",
+        confidence=0.85,
+        items=[
+            FoodItem(
+                name="פלאפל",
+                grams=120,
+                calories=396,
+                protein=13,
+                carbs=31,
+                fat=24,
+                confidence=0.85,
+            )
+        ],
+    )
+
+
+SUPPORTED_REPLACEMENT_FORMS = [
+    "לא פלאפל, שניצל",       # the incident correction (trace event 1204)
+    "לא פלאפל אלא שניצל",
+    "זה שניצל, לא פלאפל",
+    "שניצל במקום פלאפל",
+]
+
+
+@pytest.mark.parametrize("text", SUPPORTED_REPLACEMENT_FORMS)
+def test_supported_replacement_forms_parse_as_replace(text: str) -> None:
+    """FROZEN: every currently-working replacement form stays a canonical
+    replace(rejected=פלאפל, confirmed=שניצל)."""
+    corrections = meal_intelligence.parse_meal_correction(text)
+    assert [c.kind for c in corrections] == ["replace"]
+    assert corrections[0].item_hint == "פלאפל"
+    assert corrections[0].value == "שניצל"
+    constraints = meal_intelligence.identity_constraints_from_texts([text])
+    assert [(c.rejected, c.confirmed) for c in constraints] == [("פלאפל", "שניצל")]
+
+
+def test_supported_replacement_preserves_grams_and_recalculates_macros() -> None:
+    """FROZEN: applying the incident correction renames the item, preserves
+    the observed 120 g, and recalculates calories deterministically (the
+    historical trace showed exactly 120 g / 336 kcal after event 1210)."""
+    correction = meal_intelligence.parse_meal_correction("לא פלאפל, שניצל")[0]
+    corrected = meal_intelligence.apply_item_replacement_correction(
+        _falafel_analysis(), correction
+    )
+    names = [item.name for item in corrected.items]
+    assert not any("פלאפל" in name for name in names)
+    schnitzel = next(item for item in corrected.items if "שניצל" in item.name)
+    assert schnitzel.grams == 120  # grams are NEVER invented by a rename
+    assert schnitzel.calories != 396  # macros re-derived for the new identity
+    assert 150 <= schnitzel.calories <= 500  # plausible schnitzel at 120 g
+
+
+UNSUPPORTED_REMOVE_ADD_FORMS = [
+    # The audit's reproducible gap: none of these currently produce a
+    # replace/constraint, so post-AI enforcement has nothing to enforce.
+    # Worst of them: "הסר פלאפל והוסף שניצל" mis-parses today as a REMOVAL
+    # with the polluted hint "פלאפל והוסף שניצל", which deletes the falafel
+    # item and adds nothing — the meal ends up empty.
+    "תוריד פלאפל ותוסיף שניצל",
+    "הסר פלאפל והוסף שניצל",
+    "תוציא פלאפל ותשים שניצל",
+    "תחליף פלאפל בשניצל",
+    "במקום פלאפל יש שניצל",
+    "במקום פלאפל זה שניצל",
+]
+
+
+@pytest.mark.parametrize("text", UNSUPPORTED_REMOVE_ADD_FORMS)
+@pytest.mark.xfail(
+    strict=True,
+    reason="Batch 2 TODO: normalize Hebrew remove-and-add phrasing to a canonical replace",
+)
+def test_remove_add_forms_should_parse_as_canonical_replace(text: str) -> None:
+    corrections = meal_intelligence.parse_meal_correction(text)
+    assert [c.kind for c in corrections] == ["replace"]
+    assert corrections[0].item_hint == "פלאפל"
+    assert corrections[0].value == "שניצל"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Batch 2 TODO: remove/add phrasing must yield an identity constraint",
+)
+def test_remove_add_form_should_yield_identity_constraint() -> None:
+    constraints = meal_intelligence.identity_constraints_from_texts(
+        ["תוריד פלאפל ותוסיף שניצל"]
+    )
+    assert [(c.rejected, c.confirmed) for c in constraints] == [("פלאפל", "שניצל")]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Batch 2 TODO: 'תוריד X' alone should parse as a remove-only correction",
+)
+def test_toride_alone_should_parse_as_remove_only() -> None:
+    corrections = meal_intelligence.parse_meal_correction("תוריד פלאפל")
+    assert [c.kind for c in corrections] == ["remove"]
+    assert corrections[0].item_hint == "פלאפל"
+
+
+def test_add_only_command_creates_no_replacement_or_rejection() -> None:
+    """FROZEN ambiguity rule: 'תוסיף שניצל' is add-only — it must never
+    produce a replace correction or reject any identity."""
+    corrections = meal_intelligence.parse_meal_correction("תוסיף שניצל")
+    assert not any(c.kind == "replace" for c in corrections)
+    assert meal_intelligence.identity_constraints_from_texts(["תוסיף שניצל"]) == []
+
+
+def test_two_foods_without_connector_do_not_parse_as_replace() -> None:
+    """FROZEN ambiguity rule: 'פלאפל שניצל' has no replacement connector —
+    it must stay unparsed (AI/clarification fallback), never a guessed swap."""
+    corrections = meal_intelligence.parse_meal_correction("פלאפל שניצל")
+    assert not any(c.kind == "replace" for c in corrections)
+
+
+def test_multi_item_remove_add_never_invents_extra_rejections() -> None:
+    """FROZEN safety rule (holds today and must survive Batch 2): a
+    multi-item correction may only ever reject the explicitly removed food —
+    it must not manufacture rejections for the added foods."""
+    constraints = meal_intelligence.identity_constraints_from_texts(
+        ["תוריד פלאפל ותוסיף שניצל וחציל"]
+    )
+    assert all(c.rejected == "פלאפל" for c in constraints)
+
+
+# --- Count/portion quantity characterization (Batch 4 target) --------------
+
+COUNT_PHRASES = [
+    "3 שניצלים",
+    "3 כדורי פלאפל",
+    "שניצל אחד גדול",
+    "שלוש חתיכות",
+    "יש יותר שניצל",
+]
+
+
+@pytest.mark.parametrize("text", COUNT_PHRASES)
+def test_count_phrases_never_produce_gram_locks(text: str) -> None:
+    """FROZEN safety property: a count phrase must never be interpreted as
+    an explicit gram amount ('3 שניצלים' must not lock grams=3). Today these
+    phrases produce no deterministic parse at all; after Batch 4 they must
+    parse as counts — but never as gram locks."""
+    locked = meal_intelligence.parse_locked_quantities(text)
+    assert locked == []
+    corrections = meal_intelligence.parse_meal_correction(text)
+    assert not any(c.kind == "quantity" for c in corrections)
+
+
+@pytest.mark.parametrize("text", COUNT_PHRASES[:4])
+@pytest.mark.xfail(
+    strict=True,
+    reason="Batch 4 TODO: count/portion phrases need a deterministic non-gram representation",
+)
+def test_count_phrases_should_parse_deterministically(text: str) -> None:
+    """Desired (Batch 4): count phrases produce SOME deterministic
+    correction object (count/portion — exact shape defined in Batch 4),
+    instead of falling through to AI with no lock."""
+    corrections = meal_intelligence.parse_meal_correction(text)
+    assert corrections != []
+    assert not any(c.kind == "quantity" for c in corrections)
+
+
+def test_explicit_gram_lock_still_works_for_schnitzel() -> None:
+    """FROZEN: 'השניצל בערך 180 גרם' locks 180 g and scales macros —
+    the working path the plan forbids regressing."""
+    analysis = MealAnalysis(
+        meal_name="שניצל",
+        confidence=0.8,
+        items=[
+            FoodItem(
+                name="שניצל",
+                grams=100,
+                calories=250,
+                protein=20,
+                carbs=12,
+                fat=14,
+                confidence=0.8,
+            )
+        ],
+    )
+    locked = meal_intelligence.parse_locked_quantities("השניצל בערך 180 גרם")
+    assert [q.grams for q in locked] == [180.0]
+    corrected, unmatched = meal_intelligence.apply_locked_quantities(analysis, locked)
+    assert not unmatched
+    assert corrected.items[0].grams == 180
+    assert corrected.items[0].calories == 450  # scaled by 1.8, not re-invented
+    assert corrected.items[0].confidence >= 0.95
