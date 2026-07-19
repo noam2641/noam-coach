@@ -762,3 +762,57 @@ def test_rc_plausible_schnitzel_count_with_real_weight_passes() -> None:
         quantity_source="visual_count",
     )
     assert check_item(plausible) == []
+
+
+# ---------------------------------------------------------------------------
+# Batch 4 verification-gate regression — a user-stated count MUST be visible
+# on the rendered card. Before the fix, "user_count" was absent from
+# render_meal's count allowlist, so a count correction bumped the revision
+# and showed "עדכנתי" while the card re-rendered byte-identical grams — a
+# correction presented as accepted with no visible effect (gate §8).
+# ---------------------------------------------------------------------------
+
+
+async def test_batch4_user_count_is_rendered_on_the_card(db: Database) -> None:
+    payload = {
+        "analysis": MealAnalysis(
+            meal_name="שניצל",
+            items=[
+                FoodItem(name="שניצל", grams=120.0, calories=240.0, protein=12.0,
+                         carbs=24.0, fat=6.0, confidence=0.9,
+                         quantity_count=3.0, quantity_source="user_count"),
+            ],
+            confidence=0.9,
+        ).model_dump(),
+        "eaten_at": utc_now(),
+        "revision": 1,
+    }
+    approval_id = await create_approval(USER_ID, "meal", payload)
+    query = FakeQuery()
+    await meals_bot.render_meal(query, USER_ID, approval_id)
+    rendered = " ".join(query.edits)
+    # The user said "3" — the card shows 3 units, not the silent "120 גרם".
+    assert "3 יחידות" in rendered
+    assert "120 גרם" not in rendered
+
+
+async def test_batch4_user_count_with_unit_is_rendered(db: Database) -> None:
+    payload = {
+        "analysis": MealAnalysis(
+            meal_name="פלאפל",
+            items=[
+                FoodItem(name="פלאפל", grams=100.0, calories=300.0, protein=10.0,
+                         carbs=25.0, fat=18.0, confidence=0.9,
+                         quantity_count=3.0, quantity_unit="כדור",
+                         quantity_source="user_count"),
+            ],
+            confidence=0.9,
+        ).model_dump(),
+        "eaten_at": utc_now(),
+        "revision": 1,
+    }
+    approval_id = await create_approval(USER_ID, "meal", payload)
+    query = FakeQuery()
+    await meals_bot.render_meal(query, USER_ID, approval_id)
+    rendered = " ".join(query.edits)
+    assert "3 כדור" in rendered

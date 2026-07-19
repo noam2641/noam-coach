@@ -708,7 +708,12 @@ async def render_meal(target: Any, user_id: int, approval_id: str, refine_count:
         # value. quantity_source is internal and never shown.
         count = getattr(item, "quantity_count", None)
         source = str(getattr(item, "quantity_source", "") or "")
-        if count and source in {"", "visual_count", "estimate"}:
+        # Batch 4: "user_count" is a user-stated count ("3 שניצלים", "חצי
+        # שניצל") — render it as the count the user gave, exactly like the
+        # AI's visual_count evidence. Without this the correction is recorded
+        # (revision bumped, "עדכנתי" shown) but the card re-renders identical
+        # grams, so the user gets no confirmation their count was understood.
+        if count and source in {"", "visual_count", "estimate", "user_count"}:
             unit = str(getattr(item, "quantity_unit", "") or "יחידות")
             count_str = f"{count:g}"
             return f"{count_str} {esc(unit)}"
