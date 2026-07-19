@@ -222,9 +222,11 @@ def test_removal_takes_priority_over_preparation_in_parser() -> None:
 #   1. FROZEN behavior — replacement forms, explicit gram locking, and the
 #      "count phrases never corrupt grams deterministically" safety property.
 #      These must keep passing through every later batch.
-#   2. KNOWN GAPS — pinned as strict xfail so Batch 2 (remove/add parsing)
-#      and Batch 4 (count quantity model) must consciously flip them by
-#      removing the marker. An unexpected pass fails the suite (strict).
+#   2. KNOWN GAPS — pinned as strict xfail so the implementing batch must
+#      consciously flip them by removing the marker. Batch 2 flipped the
+#      remove/add parsing group (now regular passing tests); the count
+#      quantity group remains xfail until Batch 4. An unexpected pass fails
+#      the suite (strict).
 # ---------------------------------------------------------------------------
 
 
@@ -283,12 +285,12 @@ def test_supported_replacement_preserves_grams_and_recalculates_macros() -> None
     assert 150 <= schnitzel.calories <= 500  # plausible schnitzel at 120 g
 
 
-UNSUPPORTED_REMOVE_ADD_FORMS = [
-    # The audit's reproducible gap: none of these currently produce a
-    # replace/constraint, so post-AI enforcement has nothing to enforce.
-    # Worst of them: "הסר פלאפל והוסף שניצל" mis-parses today as a REMOVAL
-    # with the polluted hint "פלאפל והוסף שניצל", which deletes the falafel
-    # item and adds nothing — the meal ends up empty.
+REMOVE_ADD_REPLACEMENT_FORMS = [
+    # Batch 2 (audit Finding A): natural remove-and-add / swap phrasing now
+    # normalizes to the SAME canonical replace as the classic forms. Before
+    # Batch 2 the worst of these ("הסר פלאפל והוסף שניצל") mis-parsed as a
+    # removal with the polluted hint "פלאפל והוסף שניצל", which deleted the
+    # falafel item and added nothing — the meal ended up empty.
     "תוריד פלאפל ותוסיף שניצל",
     "הסר פלאפל והוסף שניצל",
     "תוציא פלאפל ותשים שניצל",
@@ -297,53 +299,129 @@ UNSUPPORTED_REMOVE_ADD_FORMS = [
     "במקום פלאפל זה שניצל",
 ]
 
+PUNCTUATION_AND_SPACING_VARIANTS = [
+    "תוריד פלאפל, ותוסיף שניצל",  # comma between clauses
+    "תוריד פלאפל ותוסיף שניצל.",  # trailing period
+    "הסר פלאפל: והוסף שניצל",  # colon
+    "הסר פלאפל - והוסף שניצל",  # dash
+    "הסר פלאפל; והוסף שניצל",  # semicolon
+    "תוריד  פלאפל   ותוסיף  שניצל",  # extra whitespace
+    "לא פלאפל, שניצל.",  # trailing period on a classic form
+]
 
-@pytest.mark.parametrize("text", UNSUPPORTED_REMOVE_ADD_FORMS)
-@pytest.mark.xfail(
-    strict=True,
-    reason="Batch 2 TODO: normalize Hebrew remove-and-add phrasing to a canonical replace",
+
+@pytest.mark.parametrize(
+    "text", REMOVE_ADD_REPLACEMENT_FORMS + PUNCTUATION_AND_SPACING_VARIANTS
 )
-def test_remove_add_forms_should_parse_as_canonical_replace(text: str) -> None:
+def test_remove_add_forms_parse_as_canonical_replace(text: str) -> None:
     corrections = meal_intelligence.parse_meal_correction(text)
     assert [c.kind for c in corrections] == ["replace"]
     assert corrections[0].item_hint == "פלאפל"
     assert corrections[0].value == "שניצל"
+    # original_text is preserved verbatim for locked-correction replay.
+    assert corrections[0].original_text == text
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Batch 2 TODO: remove/add phrasing must yield an identity constraint",
-)
-def test_remove_add_form_should_yield_identity_constraint() -> None:
+def test_all_equivalent_replacement_forms_are_structurally_identical() -> None:
+    """Every replacement-equivalent surface form — classic or verb-based —
+    produces one structurally identical canonical MealCorrection."""
+    canonical = ("replace", "פלאפל", "שניצל")
+    for text in SUPPORTED_REPLACEMENT_FORMS + REMOVE_ADD_REPLACEMENT_FORMS:
+        corrections = meal_intelligence.parse_meal_correction(text)
+        assert [(c.kind, c.item_hint, c.value) for c in corrections] == [canonical], text
+        constraints = meal_intelligence.identity_constraints_from_texts([text])
+        assert [(c.rejected, c.confirmed) for c in constraints] == [
+            ("פלאפל", "שניצל")
+        ], text
+
+
+def test_remove_add_form_yields_identity_constraint() -> None:
     constraints = meal_intelligence.identity_constraints_from_texts(
         ["תוריד פלאפל ותוסיף שניצל"]
     )
     assert [(c.rejected, c.confirmed) for c in constraints] == [("פלאפל", "שניצל")]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Batch 2 TODO: 'תוריד X' alone should parse as a remove-only correction",
-)
-def test_toride_alone_should_parse_as_remove_only() -> None:
-    corrections = meal_intelligence.parse_meal_correction("תוריד פלאפל")
+def test_hasar_form_never_produces_polluted_removal_hint() -> None:
+    """Audit Finding A, direct-call safety: even the removal parser alone can
+    never emit remove(item_hint='פלאפל והוסף שניצל') — the hint is truncated
+    at the add connector."""
+    removals = meal_intelligence._parse_removal_corrections("הסר פלאפל והוסף שניצל")
+    assert all(c.item_hint == "פלאפל" for c in removals)
+    # ...and the full parser routes the text to replacement, never removal.
+    kinds = [c.kind for c in meal_intelligence.parse_meal_correction("הסר פלאפל והוסף שניצל")]
+    assert kinds == ["replace"]
+
+
+def test_hasar_form_cannot_empty_the_meal() -> None:
+    """The destructive-path regression: applying the parsed correction to a
+    falafel meal must produce a schnitzel meal — never an empty one."""
+    analysis = _falafel_analysis()
+    corrections = meal_intelligence.parse_meal_correction("הסר פלאפל והוסף שניצל")
+    assert [c.kind for c in corrections] == ["replace"]
+    corrected = meal_intelligence.apply_item_replacement_correction(
+        analysis, corrections[0]
+    )
+    assert corrected.items  # the meal can never end up empty
+    names = [item.name for item in corrected.items]
+    assert not any("פלאפל" in name for name in names)
+    schnitzel = next(item for item in corrected.items if "שניצל" in item.name)
+    assert schnitzel.grams == 120  # grams preserved, exactly like classic forms
+
+
+REMOVE_ONLY_FORMS = [
+    "תוריד פלאפל",
+    "הסר פלאפל",
+    "תוציא פלאפל",
+    "בלי פלאפל",
+    "ללא פלאפל",
+]
+
+
+@pytest.mark.parametrize("text", REMOVE_ONLY_FORMS)
+def test_remove_only_forms_parse_clean(text: str) -> None:
+    """Remove-only language (audit Finding B) parses as a clean removal whose
+    hint contains only the removed item — never a replacement."""
+    corrections = meal_intelligence.parse_meal_correction(text)
     assert [c.kind for c in corrections] == ["remove"]
     assert corrections[0].item_hint == "פלאפל"
+    assert meal_intelligence.identity_constraints_from_texts([text]) == []
 
 
-def test_add_only_command_creates_no_replacement_or_rejection() -> None:
-    """FROZEN ambiguity rule: 'תוסיף שניצל' is add-only — it must never
-    produce a replace correction or reject any identity."""
-    corrections = meal_intelligence.parse_meal_correction("תוסיף שניצל")
-    assert not any(c.kind == "replace" for c in corrections)
-    assert meal_intelligence.identity_constraints_from_texts(["תוסיף שניצל"]) == []
+def test_removal_guards_protect_scale_and_quantity_language() -> None:
+    """'תוריד' as a quantity/scale verb must not become an item removal:
+    'תוריד חצי' stays a whole-meal scale and 'תוריד קצת מהאורז' falls
+    through (no deterministic removal of a 'קצת' item)."""
+    scale = meal_intelligence.parse_meal_correction("תוריד חצי")
+    assert [c.kind for c in scale] == ["scale"]
+    fallthrough = meal_intelligence.parse_meal_correction("תוריד קצת מהאורז")
+    assert not any(c.kind == "remove" for c in fallthrough)
 
 
-def test_two_foods_without_connector_do_not_parse_as_replace() -> None:
-    """FROZEN ambiguity rule: 'פלאפל שניצל' has no replacement connector —
-    it must stay unparsed (AI/clarification fallback), never a guessed swap."""
-    corrections = meal_intelligence.parse_meal_correction("פלאפל שניצל")
-    assert not any(c.kind == "replace" for c in corrections)
+@pytest.mark.parametrize("text", ["תוסיף שניצל", "הוסף שניצל", "שים שניצל"])
+def test_add_only_commands_create_no_replacement_or_rejection(text: str) -> None:
+    """FROZEN ambiguity rule: add-only commands must never produce a replace
+    or remove correction, and must never reject any identity."""
+    corrections = meal_intelligence.parse_meal_correction(text)
+    assert not any(c.kind in {"replace", "remove"} for c in corrections)
+    assert meal_intelligence.identity_constraints_from_texts([text]) == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "פלאפל שניצל",  # no connector
+        "יש פלאפל וגם שניצל",  # coexistence, not replacement
+        "אולי פלאפל או שניצל",  # uncertainty, not replacement
+    ],
+)
+def test_ambiguous_two_food_mentions_do_not_parse_as_replace(text: str) -> None:
+    """FROZEN ambiguity rule: unrelated/uncertain two-food mentions must stay
+    unparsed (AI/clarification fallback) — never a guessed swap or a false
+    rejected/confirmed pair."""
+    corrections = meal_intelligence.parse_meal_correction(text)
+    assert not any(c.kind in {"replace", "remove"} for c in corrections)
+    assert meal_intelligence.identity_constraints_from_texts([text]) == []
 
 
 def test_multi_item_remove_add_never_invents_extra_rejections() -> None:

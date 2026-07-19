@@ -459,15 +459,10 @@ def test_rejected_identity_matches_parenthetical_descriptor() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason="Batch 2/3 TODO: remove/add phrasing does not yet create identity constraints, "
-    "so post-AI enforcement cannot block the reintroduced rejected food",
-)
 async def test_remove_add_phrasing_blocks_reintroduced_identity(db: Database) -> None:
-    """Desired (Batch 2/3): after 'תוריד פלאפל ותוסיף שניצל', a noncompliant
-    reanalysis that returns falafel again must have it enforced away — the
-    same guarantee 'לא פלאפל, שניצל' already provides today."""
+    """Batch 2: after 'תוריד פלאפל ותוסיף שניצל', a noncompliant reanalysis
+    that returns falafel again has it enforced away — the same guarantee
+    'לא פלאפל, שניצל' already provided, now via the normalized parser."""
 
     async def noncompliant_reanalyze(image_path: str, correction_text: str,
                                      locked_corrections: Any = None,

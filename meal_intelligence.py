@@ -154,21 +154,72 @@ class MealCorrection:
 # Item-removal patterns  (REC-PLAN-MEAL-03-12)
 # ---------------------------------------------------------------------------
 
+# Natural Hebrew removal language (Batch 2, audit Finding B): the negation
+# words the parser always knew (בלי/ללא/הוצא/הסר) plus imperative/infinitive
+# remove verbs (תוריד/תסיר/תוציא and their inflections).
+_REMOVAL_VERBS = r"(?:בלי|ללא|הוצא|תוציא|להוציא|הסר|תסיר|להסיר|תוריד|הורד|להוריד)"
+
 # Each tuple is (compiled_pattern, canonical_item_name).
 # The canonical name is a Hebrew term used for similarity matching against
 # the analysis items.  Use the most common Hebrew name for the ingredient.
 _REMOVAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    # "בלי שמן" / "ללא שמן" / "הוצא שמן" / "בלי שמן זית"
-    (re.compile(r"(?:בלי|ללא|הוצא|הסר)\s+שמן(?:\s+זית)?", re.IGNORECASE), "שמן"),
-    # Generic "בלי <item>" / "ללא <item>" for other common additions
-    # Captures the item after the negation keyword so it can be used as item_hint.
-    (re.compile(r"(?:בלי|ללא|הוצא|הסר)\s+([\u0590-\u05FF][\u0590-\u05FF\s]{1,30})", re.IGNORECASE), ""),
+    # "בלי שמן" / "ללא שמן" / "הוצא שמן" / "תוריד שמן" / "בלי שמן זית"
+    (re.compile(_REMOVAL_VERBS + r"\s+שמן(?:\s+זית)?", re.IGNORECASE), "שמן"),
+    # Generic "בלי <item>" / "תוריד <item>" for other items.
+    # Captures the item after the keyword so it can be used as item_hint.
+    (re.compile(_REMOVAL_VERBS + r"\s+([֐-׿][֐-׿\s]{1,30})", re.IGNORECASE), ""),
 ]
+
+# Batch 2, audit Finding A: the generic capture above is greedy and used to
+# swallow a trailing add clause, producing the destructive polluted hint
+# "פלאפל והוסף שניצל" (which removed the falafel and added nothing). The
+# captured hint is truncated at the first add/replace connector token.
+_REMOVAL_HINT_STOP_TOKENS = frozenset({
+    "ותוסיף", "והוסף", "ולהוסיף", "ותשים", "ושים", "ובמקום", "במקום",
+    "ותחליף", "והחלף", "אלא", "וגם", "תוסיף", "הוסף", "להוסיף", "תשים", "שים",
+})
+
+# Leading filler tokens that may precede the actual food ("תוריד לי את הפלאפל").
+_REMOVAL_HINT_FILLER_TOKENS = frozenset({"לי", "את", "בבקשה", "רק", "גם"})
+
+# If the hint STARTS with one of these, the text is a quantity/scale/general
+# instruction ("תוריד חצי", "תוריד קצת מהכמות"), not an item removal — the
+# parser must fall through to the scale/quantity/AI paths untouched.
+_REMOVAL_HINT_NON_ITEM_TOKENS = frozenset({
+    "חצי", "רבע", "שליש", "קצת", "מעט", "עוד", "כמות", "הכמות", "מהכמות",
+    "מנה", "קלוריות", "גרם", "זה", "זו", "זאת", "אותו", "אותה", "הכל", "הכול",
+})
+
+
+def _clean_removal_hint(raw_hint: str) -> str | None:
+    """Reduce a captured removal hint to the removed item only.
+
+    Truncates at the first add/replace connector, skips leading filler
+    tokens, and refuses hints that describe amounts rather than items.
+    Returns None when no safe item hint remains.
+    """
+    kept: list[str] = []
+    for token in raw_hint.split():
+        if token in _REMOVAL_HINT_STOP_TOKENS:
+            break
+        kept.append(token)
+    while kept and kept[0] in _REMOVAL_HINT_FILLER_TOKENS:
+        kept.pop(0)
+    if not kept or kept[0] in _REMOVAL_HINT_NON_ITEM_TOKENS:
+        return None
+    return " ".join(kept)
 
 
 def _parse_removal_corrections(text: str) -> list[MealCorrection]:
-    """Extract explicit item-removal instructions from *text*."""
-    normalized = text.strip()
+    """Extract explicit item-removal instructions from *text*.
+
+    NOTE: remove-and-add phrasing ("תוריד פלאפל ותוסיף שניצל") is a
+    REPLACEMENT, parsed by ``_parse_replacement_corrections`` which
+    ``parse_meal_correction`` consults first. Even when this function is
+    called directly on such text, the hint is cleaned so it can never
+    carry a trailing add clause.
+    """
+    normalized = re.sub(r"\s+", " ", text.strip())
     found: list[MealCorrection] = []
 
     # First try the oil-specific pattern (highest priority).
@@ -182,14 +233,14 @@ def _parse_removal_corrections(text: str) -> list[MealCorrection]:
         ))
         return found  # oil removal found; don't also emit a generic removal
 
-    # Generic negation pattern.
+    # Generic pattern.
     gen_pat, _ = _REMOVAL_PATTERNS[1]
     m = gen_pat.search(normalized)
     if m:
-        item_hint = m.group(1).strip()
-        # Skip if the captured text looks like a preparation method
-        # (those are handled by _PREP_ITEM_PATTERNS).
-        if item_hint not in PREPARATION_ALIASES:
+        item_hint = _clean_removal_hint(m.group(1).strip())
+        # Skip if nothing safe remains or the captured text looks like a
+        # preparation method (those are handled by _PREP_ITEM_PATTERNS).
+        if item_hint and item_hint not in PREPARATION_ALIASES:
             found.append(MealCorrection(
                 kind="remove",
                 item_hint=item_hint,
@@ -217,6 +268,12 @@ def _parse_removal_corrections(text: str) -> list[MealCorrection]:
 # covered by _REMOVAL_PATTERNS above.
 
 _HEB = r"[\u0590-\u05FF][\u0590-\u05FF\s'\u05F3]{0,40}"  # Hebrew words (incl. geresh: \u05E7\u05D5\u05D8\u05D2')
+
+# Batch 2: verbs for explicit remove-and-add replacement phrasing. בלי/ללא
+# are deliberately EXCLUDED — "בלי שמן ותוסיף מלח" stays a removal, not a
+# rename that would inherit the removed item's grams.
+_RA_REMOVE_VERBS = r"(?:תוריד|הורד|להוריד|הסר|תסיר|להסיר|תוציא|הוצא|להוציא)"
+_RA_ADD_VERBS = r"(?:תוסיף|הוסף|להוסיף|תשים|שים)"
 
 _REPLACEMENT_PATTERNS: list[re.Pattern[str]] = [
     # TASK-58: negation-FIRST identity corrections — the production incident
@@ -265,6 +322,37 @@ _REPLACEMENT_PATTERNS: list[re.Pattern[str]] = [
         r"^(?P<replacement>" + _HEB + r")\s+לא\s+(?P<target>" + _HEB + r")$",
         re.IGNORECASE,
     ),
+    # ------------------------------------------------------------------
+    # Batch 2 (audit Finding A) — explicit-verb replacement forms. These
+    # normalize natural remove-and-add / swap phrasing into the SAME
+    # canonical replace correction as the forms above (one representation,
+    # one enforcement path — never a second remove+add mechanism). All are
+    # fully anchored, so they can never match mid-sentence commentary, and
+    # none of them can collide with the לא-based forms above.
+    # ------------------------------------------------------------------
+    # "תוריד X ותוסיף Y" / "הסר X, והוסף Y" / "תוציא X - ותשים Y"
+    re.compile(
+        r"^" + _RA_REMOVE_VERBS + r"\s+(?:את\s+)?"
+        r"(?P<target>[֐-׿][֐-׿\s]{0,40}?)"
+        r"[\s,;.:–—-]*ו?" + _RA_ADD_VERBS + r"\s+(?:את\s+)?"
+        r"(?P<replacement>" + _HEB + r")$",
+        re.IGNORECASE,
+    ),
+    # "תחליף X בY" / "החלף את X ב-Y"
+    re.compile(
+        r"^(?:תחליף|החלף|להחליף)\s+(?:את\s+)?"
+        r"(?P<target>[֐-׿][֐-׿\s]{0,40}?)"
+        r"\s+ב-?\s*(?P<replacement>" + _HEB + r")$",
+        re.IGNORECASE,
+    ),
+    # "במקום X יש Y" / "במקום X זה Y"
+    re.compile(
+        r"^במקום\s+(?:את\s+)?"
+        r"(?P<target>[֐-׿][֐-׿\s]{0,40}?)"
+        r"\s+(?:יש|זה|זו|זאת|היה|הייתה|תשים|שים)\s+(?:את\s+)?"
+        r"(?P<replacement>" + _HEB + r")$",
+        re.IGNORECASE,
+    ),
 ]
 
 
@@ -275,7 +363,9 @@ def _parse_replacement_corrections(text: str) -> list[MealCorrection]:
     The ``item_hint`` field holds the *target* (old item to swap out) and
     ``value`` holds the *replacement* (new item name).
     """
-    normalized = text.strip()
+    # Batch 2: tolerate punctuation/whitespace variants — collapse runs of
+    # whitespace and strip trailing sentence punctuation before matching.
+    normalized = re.sub(r"\s+", " ", text.strip()).strip(" .,;:!?")
     for pattern in _REPLACEMENT_PATTERNS:
         m = pattern.match(normalized)
         if m is None:
@@ -374,29 +464,38 @@ _PREP_ITEM_PATTERNS = [
 def parse_meal_correction(text: str) -> list[MealCorrection]:
     """Parse user correction text into structured :class:`MealCorrection` objects.
 
-    Priority order:
-    1. Item-removal corrections ("בלי שמן", "ללא שמן", generic "בלי X").
-    2. Item-replacement corrections ("X לא Y", "X ולא Y", "X במקום Y", "זה X לא Y").
-    3. Preparation-method corrections.
-    4. Quantity corrections (delegate to parse_locked_quantities).
+    Priority order (Batch 2 — replacement language wins first so
+    remove-and-add phrasing is one canonical replace, never a bare removal;
+    audit Finding A):
+    1. Item-replacement corrections ("לא X, Y", "X במקום Y",
+       "תוריד X ותוסיף Y", "תחליף X בY", "במקום X יש Y").
+    2. Item-removal corrections ("בלי שמן", "תוריד X", generic "בלי X").
+    3. Relative scale corrections ("חצי מהאורז", "x2").
+    4. Preparation-method corrections.
+    5. Quantity corrections (delegate to parse_locked_quantities).
     """
     normalized = text.strip().lower()
     corrections: list[MealCorrection] = []
 
-    # --- Item-removal corrections (REC-PLAN-MEAL-03-12) ---
-    # Checked first so "בלי שמן" is an explicit removal, not a prep change.
-    removal_corrections = _parse_removal_corrections(text)
-    if removal_corrections:
-        corrections.extend(removal_corrections)
-        return corrections  # removal is unambiguous; skip further parsing
-
-    # --- Item-replacement corrections (REC-PROGRAM-04-12) ---
-    # Checked before preparation so "שניצל רגיל לא טופו" is a replace, not a
-    # prep-method change.
+    # --- Item-replacement corrections (REC-PROGRAM-04-12 / Batch 2) ---
+    # Checked FIRST: explicit replacement language (including remove-and-add
+    # phrasing like "תוריד פלאפל ותוסיף שניצל") must win before the generic
+    # removal parser can misread its removal half (audit Finding A), and
+    # before preparation so "שניצל רגיל לא טופו" is a replace, not a
+    # prep-method change. Replacement patterns are fully anchored, so plain
+    # removal texts ("בלי שמן") can never match them.
     replacement_corrections = _parse_replacement_corrections(text)
     if replacement_corrections:
         corrections.extend(replacement_corrections)
         return corrections  # replacement is unambiguous; skip further parsing
+
+    # --- Item-removal corrections (REC-PLAN-MEAL-03-12) ---
+    # Checked before preparation so "בלי שמן" is an explicit removal, not
+    # a prep change.
+    removal_corrections = _parse_removal_corrections(text)
+    if removal_corrections:
+        corrections.extend(removal_corrections)
+        return corrections  # removal is unambiguous; skip further parsing
 
     scale_corrections = _parse_scale_corrections(text)
     if scale_corrections:
