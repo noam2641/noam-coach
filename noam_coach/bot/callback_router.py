@@ -141,6 +141,10 @@ _DEBOUNCE_PREFIXES = (
     # NOT debounced -- re-tapping a selector row is a legitimate repeat and
     # must stay usable. The unique partial index + IntegrityError recovery
     # remains the real correctness guarantee; debounce only trims the noise.
+    # Batch 5's repeat variants (`wk:start:<id>:<sidx>:again`) are covered by
+    # these same prefixes -- _is_duplicate_tap matches on startswith, and the
+    # marker is a SUFFIX -- so they need no separate entry. Verified by
+    # test_workout_start_provenance.py's debounce-coverage test.
     "wk:start:",
     "wk:fstart:",
     # Codex audit round: sensitive single-shot writes that advance a flow —

@@ -149,6 +149,9 @@ _PRODUCTION_CALLBACKS = [
     # `^v\d{1,9}$` version token or the `^ff-\d+-[0-9a-f]{6,}$` flow token.
     "wk:list", "wk:sel:12:0", "wk:start:12:0",
     "wk:fsel:1a2b3c4d:0", "wk:fstart:1a2b3c4d:2",
+    # Batch 5 repeat-confirmation variants: `again` sits in the terminal
+    # position the grammar inspects, and is neither `v<digits>` nor a flow id.
+    "wk:start:12:0:again", "wk:fstart:1a2b3c4d:2:again",
     "setok:5:0:1", "different:5:0:1", "qtydelta:55:0:+10",
     "wparamtext:F:2", "param:F:2:weight",
     "onb:edit_menu", "onb:edit:field", "routine:confirm", "routine:fix",

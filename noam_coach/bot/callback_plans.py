@@ -601,12 +601,23 @@ async def _render_workout_selector(query: Any, user_id: int) -> None:
 
 
 def _parse_wk_ref(data: str) -> Any:
-    """Parse `wk:{sel,fsel,start,fstart}:<identity>:<sidx>` into a
+    """Parse `wk:{sel,fsel,start,fstart}:<identity>:<sidx>[:again]` into a
     WorkoutSelectionRef. Returns None for any malformed payload (a corrupted
-    or hand-crafted callback must refuse, never raise)."""
+    or hand-crafted callback must refuse, never raise).
+
+    The optional trailing `:again` (Batch 5) is a repeat-confirmation marker
+    on the START forms only; it is stripped here and read separately by
+    _wk_is_again, so identity parsing stays one function with one shape.
+    """
     from noam_coach.services.workout_catalog import WorkoutSelectionRef
 
     parts = data.split(":")
+    if len(parts) == 5:
+        # Only the start forms accept the repeat marker; `wk:sel:...:again`
+        # is not a callback this codebase mints and must not be honored.
+        if parts[4] != "again" or parts[1] not in ("start", "fstart"):
+            return None
+        parts = parts[:4]
     if len(parts) != 4:
         return None
     _, action, identity, index_text = parts
@@ -627,6 +638,13 @@ def _parse_wk_ref(data: str) -> Any:
             return None
         return WorkoutSelectionRef(tier="fact", plan_id=None, fact_rev=identity, session_index=session_index)
     return None
+
+
+def _wk_is_again(data: str) -> bool:
+    """True when a start callback carries the Batch-5 repeat-confirmation
+    marker. `:again` skips ONLY the done-today interstitial -- identity
+    re-validation and the active-session/unique-index guards all still run."""
+    return data.endswith(":again")
 
 
 @runtime_bound(RUNTIME_NAMES)
@@ -694,6 +712,30 @@ async def _handle_workout_v2_actions(
             await _refuse_stale_workout_ref(query, user_id, ref=ref, detail=str(exc))
             return True
 
+        # Batch 5: repeat-today confirmation. Starting a session already
+        # completed today is legitimate (a second leg day, a redo) but must be
+        # DELIBERATE -- otherwise a stale overview left open from this morning
+        # silently starts a duplicate. The interstitial is shown once; the
+        # `:again` variant of this exact callback skips ONLY this check.
+        # Identity re-validation above and the active-session/unique-index
+        # guards below still run for `:again`, so confirming a repeat can
+        # never bypass staleness or concurrency protection.
+        if resolved.choice.done_today and not _wk_is_again(data):
+            await safe_edit(
+                query,
+                f"כבר ביצעת היום את <b>{esc(resolved.choice.name)}</b> ✅\n\n"
+                "לחזור עליו שוב?",
+                InlineKeyboardMarkup([
+                    [button("🔁 כן, להתחיל שוב", f"{data}:again")],
+                    [button("⬅️ חזרה", "wk:list")],
+                ]),
+            )
+            await track_event(
+                user_id, "workout_repeat_confirm_shown",
+                tier=ref.tier, session_index=ref.session_index,
+            )
+            return True
+
         overrides = await workout_catalog.collect_overrides(DB, user_id, resolved.session)
         snapshot = workout_catalog.materialize_snapshot(user_id, resolved, overrides)
         code = resolved.choice.code
@@ -728,6 +770,8 @@ async def _handle_workout_v2_actions(
             session_id=session_id, tier=ref.tier, session_index=ref.session_index,
             source=snapshot["provenance"]["source"],
             overrides_applied_count=len(snapshot["provenance"]["overrides_applied"]),
+            defaults_filled_count=len(snapshot["provenance"]["defaults_filled"]),
+            repeat=_wk_is_again(data),
         )
         await show_session(query, user_id, session_id)
         return True
