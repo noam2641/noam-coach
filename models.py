@@ -38,7 +38,10 @@ class FoodItem(BaseModel):
     # how the gram weight was derived and is internal (not shown to the user).
     quantity_count: float | None = Field(default=None, ge=0, le=1000)
     quantity_unit: str | None = None  # e.g. "עוגייה" / "יחידה" / "פרוסה"
-    quantity_source: str | None = None  # visual_count | package_label | canonical | user | estimate
+    # visual_count | package_label | canonical | user | estimate | user_count
+    # (a user-stated count, Batch 4) | count_derived (grams derived from a
+    # count via the portion model, Batch 5).
+    quantity_source: str | None = None
 
     @field_validator("grams", "calories", "protein", "carbs", "fat", "confidence")
     @classmethod

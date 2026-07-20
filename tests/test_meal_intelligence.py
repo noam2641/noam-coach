@@ -744,18 +744,33 @@ def test_parse_quantity_expression_declines_non_counts(text: str) -> None:
     assert meal_intelligence.parse_quantity_expression(text) is None
 
 
-def test_count_correction_sets_count_without_touching_grams() -> None:
-    """The core invariant: '3 שניצלים' records count=3 on the item and leaves
-    grams exactly as they were — 3 schnitzels is NEVER 3 grams."""
+def test_count_correction_records_count_and_never_copies_it_as_grams() -> None:
+    """The core invariant: '3 שניצלים' records count=3 and NEVER writes 3 into
+    grams. Batch 5 may derive a plausible weight (schnitzel is a supported
+    discrete food), but grams must never equal the raw count."""
     analysis = _one_item("שניצל", grams=120)
     correction = meal_intelligence.parse_meal_correction("3 שניצלים")[0]
     assert correction.kind == "count"
     result = meal_intelligence.apply_count_correction(analysis, correction)
     item = result.items[0]
-    assert item.grams == 120  # UNTOUCHED
-    assert item.calories == 240  # UNTOUCHED
     assert item.quantity_count == 3.0
-    assert item.quantity_source == "user_count"
+    assert item.grams != 3  # never the raw count as grams (the incident shape)
+    # Supported discrete food → Batch 5 materializes a plausible weight.
+    assert item.grams == 450  # 3 × 150 g/schnitzel
+    assert item.quantity_source == "count_derived"
+
+
+def test_count_correction_on_unsupported_food_leaves_grams_untouched() -> None:
+    """A count on a food with NO supported portion model records the count but
+    never touches grams — the count is preserved as evidence for later."""
+    analysis = _one_item("תבשיל מיוחד", grams=200)
+    correction = meal_intelligence.parse_meal_correction("3 תבשיל מיוחד")[0]
+    result = meal_intelligence.apply_count_correction(analysis, correction)
+    item = result.items[0]
+    assert item.grams == 200  # UNTOUCHED — no portion model
+    assert item.calories == 400  # UNTOUCHED
+    assert item.quantity_count == 3.0
+    assert item.quantity_source == "user_count"  # not derived
 
 
 def test_count_correction_records_portion_unit() -> None:
@@ -763,9 +778,11 @@ def test_count_correction_records_portion_unit() -> None:
     correction = meal_intelligence.parse_meal_correction("3 כדורי פלאפל")[0]
     result = meal_intelligence.apply_count_correction(analysis, correction)
     item = result.items[0]
-    assert item.grams == 100
     assert item.quantity_count == 3.0
     assert item.quantity_unit == "כדור"
+    # Falafel is supported → 3 balls × 18 g materializes (never 100 g/ball).
+    assert item.grams == 54
+    assert item.quantity_source == "count_derived"
 
 
 def test_count_correction_matches_plural_to_singular_item() -> None:
@@ -819,27 +836,31 @@ def test_count_correction_ambiguous_target_records_note_and_no_mutation() -> Non
 
 
 def test_count_correction_single_item_meal_accepts_unitless_count() -> None:
-    """'אחד וחצי' with no food resolves against a single-item meal."""
+    """'אחד וחצי' with no food resolves against a single-item meal; a
+    supported food (בורקס) materializes 1.5 × 100 g."""
     analysis = _one_item("בורקס", grams=90)
     result = meal_intelligence.apply_count_correction(
         analysis, meal_intelligence.parse_meal_correction("אחד וחצי")[0]
     )
     assert result.items[0].quantity_count == pytest.approx(1.5)
-    assert result.items[0].grams == 90  # untouched
+    assert result.items[0].grams == 150  # 1.5 × 100 g/בורקס
+    assert result.items[0].grams != 1  # never the raw count
 
 
-def test_count_never_shows_as_grams_end_to_end() -> None:
-    """Acceptance criterion: no count of N can surface as 'N גרם' — the
-    parser yields kind='count' (never 'quantity') and apply leaves grams."""
+def test_count_never_copied_literally_as_grams_end_to_end() -> None:
+    """Acceptance criterion: no count of N can surface as 'N גרם'. The parser
+    yields kind='count' (never 'quantity'); Batch 5 may derive a plausible
+    weight but grams must never equal the raw count."""
     for text in ["3 שניצלים", "שני שניצלים", "חצי שניצל", "שלוש חתיכות"]:
         corrections = meal_intelligence.parse_meal_correction(text)
         assert corrections and corrections[0].kind == "count"
-        assert corrections[0].value != "3.0"  # value is the count, not a gram string like "3.0"
     analysis = _one_item("שניצל", grams=120)
     meal_intelligence.apply_count_correction(
         analysis, meal_intelligence.parse_meal_correction("3 שניצלים")[0]
     )
-    assert analysis.items[0].grams == 120
+    # Derived (schnitzel supported), and never the literal count as grams.
+    assert analysis.items[0].grams == 450
+    assert analysis.items[0].grams != 3
 
 
 # --- Replay preservation: count survives an identity replacement -----------
@@ -848,14 +869,18 @@ def test_count_never_shows_as_grams_end_to_end() -> None:
 def test_count_survives_identity_replacement_for_replay() -> None:
     """3 falafels → replace with schnitzel → still 3 schnitzels (not 1).
 
-    quantity_count lives on the FoodItem; apply_item_replacement_correction
-    only renames and re-prices, so the count is preserved through replay."""
+    quantity_count lives on the FoodItem, so the count survives the rename.
+    Batch 5: the falafel-derived grams are invalidated on replacement (one
+    schnitzel ≠ one falafel ball); re-materialization then re-derives from the
+    schnitzel model."""
     analysis = _one_item("פלאפל", grams=120)
-    # First: user states the count.
+    # First: user states the count → materializes 3 × 18 g = 54 g (falafel).
     analysis = meal_intelligence.apply_count_correction(
         analysis, meal_intelligence.parse_meal_correction("3 פלאפל")[0]
     )
     assert analysis.items[0].quantity_count == 3.0
+    assert analysis.items[0].grams == 54
+    assert analysis.items[0].quantity_source == "count_derived"
     # Then: identity replacement (Batch 2/3 path).
     analysis = meal_intelligence.apply_item_replacement_correction(
         analysis, meal_intelligence.parse_meal_correction("לא פלאפל, שניצל")[0]
@@ -864,4 +889,152 @@ def test_count_survives_identity_replacement_for_replay() -> None:
     assert "שניצל" in item.name
     assert "פלאפל" not in item.name
     assert item.quantity_count == 3.0  # STILL three, not reset to one
+    # Derived provenance invalidated so the falafel per-unit weight is dropped.
+    assert item.quantity_source == "user_count"
+    # Re-materialization now re-derives from the schnitzel model.
+    meal_intelligence.materialize_count_quantity(item)
+    assert item.grams == 450  # 3 × 150 g/schnitzel, not 3 × 18 g/falafel ball
+    assert item.quantity_source == "count_derived"
+
+
+# ---------------------------------------------------------------------------
+# Batch 5 — count → grams materialization (materialize_count_quantity).
+# Count is evidence; grams are a derived estimate, produced ONLY with a
+# supported portion model, a plausible result, and evidence strong enough to
+# override the current grams. Reuses israeli_foods.scaled_macros for macros
+# and meal_plausibility as the final gate.
+# ---------------------------------------------------------------------------
+
+
+def _count_item(name: str, grams: float, count: float, unit: str | None = None,
+                source: str = "user_count", calories: float | None = None) -> FoodItem:
+    calories = calories if calories is not None else grams * 2
+    return FoodItem(
+        name=name, grams=grams, calories=calories, protein=grams * 0.1,
+        carbs=grams * 0.2, fat=grams * 0.05, confidence=0.85,
+        quantity_count=count, quantity_unit=unit, quantity_source=source,
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "grams", "count", "unit", "expected_grams"),
+    [
+        ("שניצל", 120, 3, None, 450),        # 3 × 150
+        ("פלאפל", 100, 4, None, 72),         # 4 × 18
+        ("קציצה", 90, 2, None, 90),          # 2 × 45
+        ("פיתה", 60, 0.5, None, 30),         # half × 60
+        ("שניצל", 150, 1.5, None, 225),      # 1.5 × 150
+        ("אורז לבן", 150, 0.5, "כוס", 79),   # half × 158 (cooked rice cup)
+        ("לחם", 50, 2, "פרוסה", 50),         # 2 × 25 (bread slice)
+    ],
+)
+def test_materialize_supported_conversions(name, grams, count, unit, expected_grams) -> None:
+    item = _count_item(name, grams, count, unit)
+    assert meal_intelligence.materialize_count_quantity(item) is True
+    assert item.grams == expected_grams
+    assert item.quantity_source == "count_derived"
+    assert item.grams != count  # never the raw count as grams
+
+
+@pytest.mark.parametrize(
+    ("name", "grams", "count", "unit"),
+    [
+        ("תבשיל מיוחד", 200, 3, None),   # unknown discrete food
+        ("אורז לבן", 150, 0.5, None),    # mass food, no unit → unsupported
+        ("אורז לבן", 2, 2, "יחידה"),     # rice has no discrete-unit weight
+        ("שניצל", 150, 1, "כוס"),        # a "cup of schnitzel" is nonsense
+        ("שניצל", 120, 100, None),       # absurd count
+    ],
+)
+def test_materialize_declines_unsupported_or_unsafe(name, grams, count, unit) -> None:
+    item = _count_item(name, grams, count, unit)
+    before = (item.grams, item.calories)
+    assert meal_intelligence.materialize_count_quantity(item) is False
+    assert (item.grams, item.calories) == before  # grams UNTOUCHED
+    assert item.quantity_count == count  # count evidence preserved
+
+
+def test_materialize_never_overwrites_explicit_user_grams() -> None:
+    item = _count_item("שניצל", 180, 3, source="user")  # user-pinned grams
+    assert meal_intelligence.materialize_count_quantity(item) is False
+    assert item.grams == 180  # explicit user grams win over a count estimate
+
+
+def test_materialize_macros_stay_coherent_and_scale() -> None:
+    """Curated food: macros recomputed from per-100g at the derived grams."""
+    item = _count_item("שניצל", 120, 3, calories=240)
+    meal_intelligence.materialize_count_quantity(item)
+    # israeli_foods שניצל = 280 kcal/100g → 450 g = 1260 kcal.
+    assert item.grams == 450
+    assert item.calories == pytest.approx(1260, abs=1)
+    # No stale macros: recompute macro-kcal roughly matches calories field.
+    macro_kcal = item.protein * 4 + item.carbs * 4 + item.fat * 9
+    assert abs(macro_kcal - item.calories) <= max(150, item.calories * 0.35)
+
+
+def test_materialize_is_idempotent() -> None:
+    item = _count_item("שניצל", 120, 3)
+    assert meal_intelligence.materialize_count_quantity(item) is True
+    snapshot = (item.grams, item.calories, item.protein, item.quantity_source)
+    for _ in range(3):
+        # Already derived to this count → no-op, no compounding.
+        assert meal_intelligence.materialize_count_quantity(item) is False
+        assert (item.grams, item.calories, item.protein, item.quantity_source) == snapshot
+
+
+def test_materialize_recorrection_rederives_from_per_unit_not_result() -> None:
+    """Re-stating a new count re-derives from the per-unit weight, never from
+    the already-derived grams (no compounding)."""
+    item = _count_item("שניצל", 120, 3)
+    meal_intelligence.materialize_count_quantity(item)
+    assert item.grams == 450
+    # User re-corrects to 4 (via apply_count_correction on a fresh analysis).
+    analysis = MealAnalysis(meal_name="x", confidence=0.85, items=[item])
+    meal_intelligence.apply_count_correction(
+        analysis, meal_intelligence.parse_meal_correction("4 שניצלים")[0]
+    )
+    assert item.grams == 600  # 4 × 150, not 450 × 4/3 or 450 × 4
+
+
+def test_materialize_declines_on_missing_count() -> None:
+    item = _count_item("שניצל", 120, 3)
+    item.quantity_count = None  # no count evidence to materialize from
+    assert meal_intelligence.materialize_count_quantity(item) is False
     assert item.grams == 120
+
+
+def test_count_derived_survives_serialization_round_trip() -> None:
+    import json
+
+    item = _count_item("שניצל", 120, 3)
+    meal_intelligence.materialize_count_quantity(item)
+    analysis = MealAnalysis(meal_name="שניצל", confidence=0.85, items=[item])
+    reloaded = MealAnalysis.model_validate(json.loads(json.dumps(analysis.model_dump())))
+    it = reloaded.items[0]
+    assert it.grams == 450
+    assert it.quantity_count == 3.0
+    assert it.quantity_source == "count_derived"
+    # Re-materializing the reloaded item is a no-op (deterministic replay).
+    assert meal_intelligence.materialize_count_quantity(it) is False
+    assert it.grams == 450
+
+
+def test_replacement_invalidates_derived_grams_then_rederives() -> None:
+    analysis = MealAnalysis(meal_name="פלאפל", confidence=0.85,
+                            items=[_count_item("פלאפל", 100, 3)])
+    meal_intelligence.materialize_count_quantity(analysis.items[0])
+    assert analysis.items[0].grams == 54  # 3 × 18 (falafel ball)
+    analysis = meal_intelligence.apply_item_replacement_correction(
+        analysis, meal_intelligence.parse_meal_correction("לא פלאפל, שניצל")[0]
+    )
+    it = analysis.items[0]
+    assert it.quantity_source == "user_count"  # derived provenance invalidated
+    meal_intelligence.materialize_count_quantity(it)
+    assert it.grams == 450  # re-derived from schnitzel, not carried 54 g
+
+
+def test_legacy_item_without_quantity_fields_is_unaffected() -> None:
+    item = FoodItem(name="אורז", grams=150, calories=200, protein=4, carbs=44,
+                    fat=1, confidence=0.8)
+    assert meal_intelligence.materialize_count_quantity(item) is False
+    assert item.grams == 150 and item.quantity_source is None

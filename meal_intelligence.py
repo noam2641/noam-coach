@@ -1145,6 +1145,16 @@ def apply_item_replacement_correction(
     # ------------------------------------------------------------------
     best.name = replacement_name
 
+    # Batch 5: a count-derived gram estimate belongs to the OLD identity's
+    # per-unit weight (one schnitzel != one falafel ball). On replacement the
+    # count evidence survives (quantity_count is untouched) but its DERIVED
+    # provenance is invalidated back to "user_count", so a later
+    # materialization re-derives grams from the NEW identity's portion model
+    # rather than carrying the wrong per-unit weight forward. Explicit user
+    # grams / package labels are left alone.
+    if str(getattr(best, "quantity_source", "") or "") == QSOURCE_COUNT_DERIVED:
+        best.quantity_source = QSOURCE_USER_COUNT
+
     note = f"הוחלף: {old_name} → {replacement_name}"
     if note not in analysis.notes:
         analysis.notes.append(note)
@@ -1254,6 +1264,9 @@ def apply_locked_quantities(
         item.carbs = round(item.carbs * ratio, 1)
         item.fat = round(item.fat * ratio, 1)
         item.confidence = max(float(item.confidence), 0.95)
+        # Batch 5: an explicit user gram lock is the STRONGEST gram evidence —
+        # label it so a later count correction can never overwrite it.
+        item.quantity_source = "user"
         if constraint.measurement_state == "cooked" and "מבושל" not in item.name:
             item.name = f"{item.name} (מבושל)"
         elif constraint.measurement_state == "raw" and "יבש" not in item.name and "נא" not in item.name:
@@ -1341,19 +1354,270 @@ def apply_count_correction(
             analysis.notes.append(note)
         return analysis
 
+    prior_source = str(getattr(target, "quantity_source", "") or "")
     target.quantity_count = quantity.count
     # Prefer an explicit portion unit ("כדור"); otherwise the item itself is
     # the counted unit and quantity_unit stays empty (rendering uses the name).
     if quantity.unit_label:
         target.quantity_unit = quantity.unit_label
-    target.quantity_source = "user_count"
+    # Record the count, but NEVER downgrade a stronger gram provenance
+    # (explicit user grams / package label): a bare count must not relabel or
+    # overwrite grams the user already pinned (Batch 5 evidence hierarchy).
+    if prior_source not in _STRONGER_THAN_COUNT:
+        target.quantity_source = QSOURCE_USER_COUNT
 
     unit_text = f" {quantity.unit_label}" if quantity.unit_label else ""
     size_text = f" ({quantity.size})" if quantity.size else ""
     note = f"כמות עודכנה: {target.name} — {quantity.count:g}{unit_text}{size_text}"
     if note not in analysis.notes:
         analysis.notes.append(note)
+
+    # Batch 5: try to derive grams from the count — only when the food/unit has
+    # a supported portion model and the result is plausible and stronger than
+    # the item's current gram evidence. materialize_count_quantity itself
+    # declines when the current source is stronger, so explicit user grams are
+    # safe even though the count was recorded above.
+    materialize_count_quantity(target)
     return analysis
+
+
+# ---------------------------------------------------------------------------
+# Batch 5 — count → grams materialization
+#
+# A count is EVIDENCE; grams are a DERIVED estimate. Grams are materialized
+# from a count ONLY when every eligibility rule holds (identified food, a
+# SUPPORTED per-unit/per-portion-unit weight, a plausible result, and count
+# evidence that is stronger than the item's current gram source). Otherwise
+# the count is preserved and grams are left unchanged. Conversion is a pure,
+# idempotent function of (count, unit, size, food, model), so replay and
+# re-materialization always converge to the same grams — never compounding.
+# ---------------------------------------------------------------------------
+
+# Provenance markers.
+QSOURCE_USER_COUNT = "user_count"       # a stated count, grams not derived
+QSOURCE_COUNT_DERIVED = "count_derived"  # grams derived here from a count
+# Gram sources STRONGER than a count-derived estimate — never overwrite these.
+_STRONGER_THAN_COUNT = frozenset({"user", "user_grams", "package_label"})
+
+# Discrete-item weights: grams for ONE whole item, (min, default, max).
+# Deliberately small and high-confidence. NOTE: this is NOT
+# israeli_foods.typical_serving_g, which is a "serving" (a plate of falafel is
+# ~100 g of MANY balls) — a per-unit weight must be per single item.
+_DISCRETE_UNIT_GRAMS: dict[str, tuple[float, float, float]] = {
+    "שניצל": (120.0, 150.0, 200.0),
+    "פלאפל": (15.0, 18.0, 25.0),      # ONE ball
+    "קציצה": (30.0, 45.0, 60.0),
+    "פיתה": (50.0, 60.0, 70.0),
+    "בורקס": (80.0, 100.0, 120.0),
+}
+
+# Portion-unit weights. A unit does NOT have one universal weight, so this is
+# keyed by (canonical_unit, food_key) with a small "" generic fallback ONLY
+# where a generic value is defensible. (min, default, max) grams per 1 unit.
+_PORTION_UNIT_GRAMS: dict[tuple[str, str], tuple[float, float, float]] = {
+    ("כף", "שמן"): (12.0, 14.0, 16.0),
+    ("כפית", "שמן"): (4.0, 5.0, 6.0),
+    ("כף", ""): (12.0, 15.0, 20.0),      # a heaped tablespoon of a solid
+    ("כפית", ""): (4.0, 5.0, 7.0),
+    ("פרוסה", "לחם"): (20.0, 25.0, 35.0),
+    ("פרוסה", "גבינה"): (15.0, 20.0, 25.0),
+    ("כוס", "אורז"): (140.0, 158.0, 180.0),  # cooked white rice, ~1 cup
+}
+
+# Measure units (volume/portion) whose weight depends entirely on the food.
+# For these, an unmapped (unit, food) combination DECLINES — "כוס שניצל" (a
+# cup of schnitzel) is nonsense and must NOT fall back to a per-schnitzel
+# weight. Non-measure units (כדור, יחידה, and the food's own name as a unit)
+# describe a discrete piece and may use the discrete-item table.
+_MEASURE_UNITS = frozenset({"כף", "כפית", "כוס"})
+
+_SIZE_MULTIPLIER = {"small": 0.7, "medium": 1.0, "large": 1.3, "": 1.0}
+
+# Guards against absurd counts / totals (also keeps derived grams inside the
+# FoodItem schema's 0..5000 g bound so materialization can never raise).
+_MAX_REASONABLE_COUNT = 30.0
+_MAX_DERIVED_GRAMS = 3000.0
+
+
+def _food_stems(name: str) -> set[str]:
+    """All singular stems of a food name, for portion-model matching (handles
+    multi-word names like "אורז לבן" deterministically — never picks one
+    arbitrary token)."""
+    return {_singular_stem(t) for t in _tokens(name) if _singular_stem(t)}
+
+
+def _discrete_weight_for(name: str) -> tuple[float, float, float] | None:
+    """(min, default, max) grams for ONE whole item, or None. Matches the
+    discrete table against the food's own name (any token/stem)."""
+    stems = _food_stems(name)
+    for food, weights in _DISCRETE_UNIT_GRAMS.items():
+        if food in name or _singular_stem(food) in stems:
+            return weights
+    return None
+
+
+def _per_unit_weight(item: Any) -> tuple[float, float, float] | None:
+    """Return (min, default, max) grams for ONE unit of this item, or None
+    when the food/unit combination has no supported portion model.
+
+    Precedence:
+    - an explicit portion unit (כף/פרוסה/כוס...) → keyed by (unit, food-stem)
+      then (unit, generic "");
+    - a unit that is itself a discrete FOOD (e.g. "קציצה", "פיתה") → the
+      discrete-item table for that food;
+    - no unit → the item's own name in the discrete-item table.
+    No generic per-item weight exists: an unknown discrete food declines
+    rather than receiving an unsafe default.
+    """
+    name = str(getattr(item, "name", "") or "")
+    unit = str(getattr(item, "quantity_unit", "") or "")
+
+    if unit:
+        # Explicit portion unit: weight depends on the food.
+        stems = _food_stems(name)
+        for (u, food_key), weights in _PORTION_UNIT_GRAMS.items():
+            if u != unit or food_key == "":
+                continue  # try specific (unit, food) before the generic ("")
+            if food_key in name or _singular_stem(food_key) in stems:
+                return weights
+        # A measure unit (כף/כפית/כוס) with no specific mapping: a small,
+        # defensible generic exists ONLY for כף/כפית. An unmapped measure
+        # unit (e.g. "כוס שניצל") DECLINES — it must never borrow the food's
+        # per-item weight.
+        if unit in _MEASURE_UNITS:
+            return _PORTION_UNIT_GRAMS.get((unit, ""))
+        # A discrete-piece unit ("כדור", "יחידה", or the food's own name):
+        # the piece IS the item, so use the discrete-item table.
+        return _DISCRETE_UNIT_GRAMS.get(unit) or _discrete_weight_for(name)
+    # No explicit unit — the food itself is the counted unit.
+    return _discrete_weight_for(name)
+
+
+def materialize_count_quantity(item: Any) -> bool:
+    """Derive grams for one item from its count evidence, or leave it as-is.
+
+    Returns True when grams were materialized. Idempotent: an item already
+    carrying ``count_derived`` grams for the same count is a no-op, and a
+    changed count re-derives from the per-unit weight (never from the
+    already-derived grams, so counts never compound). Declines — preserving
+    the count and leaving grams untouched — when the food/unit is unsupported,
+    the current gram source is stronger, the result is implausible, or macros
+    cannot be kept coherent.
+    """
+    count = getattr(item, "quantity_count", None)
+    if not count or float(count) <= 0:
+        return False
+    count = float(count)
+    source = str(getattr(item, "quantity_source", "") or "")
+
+    # (5) Never overwrite stronger gram evidence.
+    if source in _STRONGER_THAN_COUNT:
+        return False
+
+    # Unreasonable-count guard: an absurd count ("100 שניצלים") is not a
+    # portion the deterministic model should price — decline and keep the
+    # count evidence for review rather than fabricate kilos of food.
+    if count > _MAX_REASONABLE_COUNT:
+        return False
+
+    weights = _per_unit_weight(item)
+    if weights is None:
+        return False  # (3) no supported portion model → decline, keep count
+
+    _lo, default, _hi = weights
+    size = ""  # size is captured on ParsedQuantity, not persisted on the item;
+    # size adjustment is applied at parse→apply time via a note. Kept neutral
+    # here so re-materialization on reload is deterministic.
+    per_unit = default * _SIZE_MULTIPLIER.get(size, 1.0)
+    derived = round(per_unit * count, 1)
+
+    # Total-weight ceiling: never produce grams the model (or the FoodItem
+    # schema) cannot hold. A result over the ceiling means the count is
+    # implausible for this food → decline.
+    if derived > _MAX_DERIVED_GRAMS:
+        return False
+
+    old_grams = float(getattr(item, "grams", 0) or 0)
+
+    # (7) Idempotency: already derived to exactly this from the same count.
+    if source == QSOURCE_COUNT_DERIVED and abs(old_grams - derived) < 0.05:
+        return False
+
+    # (4) Recompute macros coherently BEFORE mutating, so a food we cannot
+    # price never leaves changed grams with stale macros.
+    new_macros = _recompute_macros_for_grams(item, derived, old_grams)
+    if new_macros is None:
+        return False
+
+    # (4b) Plausibility trial on the candidate result — the final safety net.
+    trial = _trial_item(item, derived, new_macros, count)
+    from noam_coach.services.meal_plausibility import check_item
+
+    if any(issue.severity == "block" for issue in check_item(trial)):
+        note = f"המרה לגרמים נדחתה (לא סבירה): {item.name}"
+        _append_item_note(item, note)
+        return False
+
+    # Assign atomically; any schema rejection declines rather than crashes
+    # (the ceilings above already keep values in-range — this is belt-and-
+    # suspenders so materialization can never raise into the handler).
+    try:
+        item.grams = derived
+        item.calories = new_macros["calories"]
+        item.protein = new_macros["protein"]
+        item.carbs = new_macros["carbs"]
+        item.fat = new_macros["fat"]
+        item.quantity_source = QSOURCE_COUNT_DERIVED
+    except Exception:  # noqa: BLE001 — decline on any validation failure
+        return False
+    return True
+
+
+def _recompute_macros_for_grams(
+    item: Any, new_grams: float, old_grams: float
+) -> dict[str, float] | None:
+    """Coherent macros for ``new_grams``. Prefers the curated per-100g source;
+    falls back to ratio-scaling the item's current macros; returns None when
+    neither is safe (so the caller declines the gram change)."""
+    try:
+        import israeli_foods
+
+        food = israeli_foods.lookup(str(getattr(item, "name", "") or ""))
+        if food is not None:
+            return israeli_foods.scaled_macros(food, new_grams)
+    except Exception:  # noqa: BLE001 — fall through to ratio scaling
+        pass
+    if old_grams and old_grams > 0:
+        ratio = new_grams / old_grams
+        return {
+            "calories": round(float(getattr(item, "calories", 0) or 0) * ratio, 1),
+            "protein": round(float(getattr(item, "protein", 0) or 0) * ratio, 1),
+            "carbs": round(float(getattr(item, "carbs", 0) or 0) * ratio, 1),
+            "fat": round(float(getattr(item, "fat", 0) or 0) * ratio, 1),
+        }
+    return None
+
+
+def _trial_item(item: Any, grams: float, macros: dict[str, float], count: float) -> Any:
+    """A lightweight stand-in carrying the candidate values for plausibility."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        name=str(getattr(item, "name", "") or ""),
+        grams=grams,
+        calories=macros["calories"],
+        protein=macros["protein"],
+        carbs=macros["carbs"],
+        fat=macros["fat"],
+        quantity_count=count,
+        quantity_unit=getattr(item, "quantity_unit", None),
+    )
+
+
+def _append_item_note(item: Any, note: str) -> None:
+    """Best-effort note attach (items don't carry notes; the analysis does —
+    this is a no-op hook kept for symmetry / future use)."""
+    return None
 
 
 def requires_cooked_raw_clarification(constraints: Iterable[LockedQuantity]) -> bool:

@@ -708,13 +708,19 @@ async def render_meal(target: Any, user_id: int, approval_id: str, refine_count:
         # value. quantity_source is internal and never shown.
         count = getattr(item, "quantity_count", None)
         source = str(getattr(item, "quantity_source", "") or "")
+        unit = str(getattr(item, "quantity_unit", "") or "יחידות")
+        # Batch 5: a count that was MATERIALIZED to a gram estimate shows both,
+        # so the user sees the count they gave AND the derived weight, clearly
+        # marked approximate ("3 יחידות (~450 גרם)"). This is distinct from a
+        # bare unconverted count and from an exact gram value.
+        if count and source == "count_derived":
+            return f"{count:g} {esc(unit)} (~{item.grams:g} גרם)"
         # Batch 4: "user_count" is a user-stated count ("3 שניצלים", "חצי
-        # שניצל") — render it as the count the user gave, exactly like the
-        # AI's visual_count evidence. Without this the correction is recorded
-        # (revision bumped, "עדכנתי" shown) but the card re-renders identical
-        # grams, so the user gets no confirmation their count was understood.
+        # שניצל") not yet converted — render the count the user gave, exactly
+        # like the AI's visual_count evidence. Without this the correction is
+        # recorded (revision bumped, "עדכנתי" shown) but the card re-renders
+        # identical grams, so the user gets no confirmation it was understood.
         if count and source in {"", "visual_count", "estimate", "user_count"}:
-            unit = str(getattr(item, "quantity_unit", "") or "יחידות")
             count_str = f"{count:g}"
             return f"{count_str} {esc(unit)}"
         return f"{item.grams:g} {_quantity_unit(item)}"

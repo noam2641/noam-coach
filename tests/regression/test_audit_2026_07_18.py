@@ -816,3 +816,33 @@ async def test_batch4_user_count_with_unit_is_rendered(db: Database) -> None:
     await meals_bot.render_meal(query, USER_ID, approval_id)
     rendered = " ".join(query.edits)
     assert "3 כדור" in rendered
+
+
+# ---------------------------------------------------------------------------
+# Batch 5 — a count_derived item shows the count AND the derived grams
+# distinctly ("3 יחידות (~450 גרם)"), never an unmarked exact gram value and
+# never the raw count as grams.
+# ---------------------------------------------------------------------------
+
+
+async def test_batch5_count_derived_renders_count_and_grams(db: Database) -> None:
+    payload = {
+        "analysis": MealAnalysis(
+            meal_name="שניצל",
+            items=[
+                FoodItem(name="שניצל", grams=450.0, calories=1260.0, protein=76.5,
+                         carbs=67.5, fat=76.5, confidence=0.9,
+                         quantity_count=3.0, quantity_source="count_derived"),
+            ],
+            confidence=0.9,
+        ).model_dump(),
+        "eaten_at": utc_now(),
+        "revision": 1,
+    }
+    approval_id = await create_approval(USER_ID, "meal", payload)
+    query = FakeQuery()
+    await meals_bot.render_meal(query, USER_ID, approval_id)
+    rendered = " ".join(query.edits)
+    assert "3 יחידות" in rendered           # the count the user gave
+    assert "450 גרם" in rendered            # the derived weight, shown too
+    assert "~" in rendered                  # marked approximate

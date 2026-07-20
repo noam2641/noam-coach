@@ -798,18 +798,19 @@ async def test_identity_enforced_reanalyze_always_builds_chronological_constrain
 
 
 # ---------------------------------------------------------------------------
-# Batch 4 — count/portion quantities through the REAL correction handler.
-# A count is recorded on the item without touching grams, deterministically
-# (no AI), and survives an identity replacement for replay.
+# Batch 4/5 — count/portion quantities through the REAL correction handler.
+# A count is recorded deterministically (no AI); Batch 5 materializes a
+# plausible weight for supported foods, and a count never becomes its raw
+# number as grams.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_count_correction_through_real_handler_preserves_grams(
+async def test_count_correction_through_real_handler_materializes_grams(
     db: Database, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """'3 שניצלים' via the production handler records count=3 on the item and
-    leaves grams untouched — resolved deterministically, no AI call."""
+    """'3 שניצלים' via the production handler records count=3 and (Batch 5)
+    materializes 3 × 150 g for the supported schnitzel — never 3 g."""
     _fail_ai(monkeypatch)
     approval_id = await _make_falafel_approval()  # single item "פלאפל", 120 g
     # Rename to schnitzel first so the count food matches, then state count.
@@ -819,18 +820,19 @@ async def test_count_correction_through_real_handler_preserves_grams(
     saved, payload = await _saved_analysis(approval_id)
     schnitzel = next(item for item in saved.items if "שניצל" in item.name)
     assert schnitzel.quantity_count == 3.0
-    assert schnitzel.grams == 120  # NEVER 3 — a count is not a weight
-    assert schnitzel.quantity_source == "user_count"
+    assert schnitzel.grams == 450  # 3 × 150 g/schnitzel — never 3
+    assert schnitzel.grams != 3
+    assert schnitzel.quantity_source == "count_derived"
     assert payload["locked_corrections"] == ["לא פלאפל, שניצל", "3 שניצלים"]
 
 
 @pytest.mark.asyncio
-async def test_count_never_becomes_grams_through_real_handler(
+async def test_count_never_becomes_raw_grams_through_real_handler(
     db: Database, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The historical failure shape, blocked at the language layer: '3 כדורי
-    פלאפל' records count=3 unit=כדור, and grams stay the original 120 —
-    never the '3 grams' the incident produced."""
+    פלאפל' records count=3 unit=כדור and materializes 3 × 18 g = 54 g — never
+    the '3 grams' the incident produced, and never 100 g/ball."""
     _fail_ai(monkeypatch)
     approval_id = await _make_falafel_approval()
     await _send_correction(monkeypatch, approval_id, "3 כדורי פלאפל")
@@ -839,15 +841,19 @@ async def test_count_never_becomes_grams_through_real_handler(
     falafel = next(item for item in saved.items if "פלאפל" in item.name)
     assert falafel.quantity_count == 3.0
     assert falafel.quantity_unit == "כדור"
-    assert falafel.grams == 120  # not 3
+    assert falafel.grams == 54  # 3 × 18 g/ball, not 3 and not 300
+    assert falafel.grams != 3
+    assert falafel.quantity_source == "count_derived"
 
 
 @pytest.mark.asyncio
 async def test_count_survives_replacement_through_real_handler(
     db: Database, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Replay journey: 3 falafels → replace with schnitzel → still 3
-    schnitzels (count survives the identity replacement, grams preserved)."""
+    """Replay journey: 3 falafels → replace with schnitzel. The count survives
+    the identity replacement; the falafel-derived grams are invalidated (source
+    back to user_count) so the wrong per-unit weight is not carried onto the
+    schnitzel (Batch 5 replacement semantics)."""
     _fail_ai(monkeypatch)
     approval_id = await _make_falafel_approval()
     await _send_correction(monkeypatch, approval_id, "3 פלאפל")
@@ -857,4 +863,5 @@ async def test_count_survives_replacement_through_real_handler(
     schnitzel = next(item for item in saved.items if "שניצל" in item.name)
     assert not any("פלאפל" in item.name for item in saved.items)
     assert schnitzel.quantity_count == 3.0  # still three, not reset to one
-    assert schnitzel.grams == 120
+    assert schnitzel.grams == 54  # falafel-derived weight, provenance dropped
+    assert schnitzel.quantity_source == "user_count"
