@@ -34,6 +34,13 @@ REFUSAL_REASONS = (
     "stale_version",
     "approval_already_handled",
     "wizard_already_finished",
+    # workout-selection architecture, Batch 4: a `wk:` callback whose carried
+    # identity no longer matches the user's live plan/fact -- the plan was
+    # regenerated (Tier-1 plan_id mismatch) or the weekly fact was replaced
+    # (Tier-2 fact_rev mismatch). Content-addressed, deliberately NOT the
+    # router's `:v` version-token mechanism (that one is for conversation
+    # flows). See the architecture plan, section F.
+    "stale_plan_reference",
 )
 
 

@@ -143,6 +143,12 @@ _PRODUCTION_CALLBACKS = [
     "planv2:complete_missing",
     "workout:A", "workout:F", "startworkout:F",
     "editparams:F:2", "editparams_menu:F",
+    # workout-selection architecture, Batch 4. Tier-1 carries the immutable
+    # plan_versions id; Tier-2 carries the 8-hex fact fingerprint. Both sit in
+    # NON-terminal positions, so neither can be mistaken for the terminal
+    # `^v\d{1,9}$` version token or the `^ff-\d+-[0-9a-f]{6,}$` flow token.
+    "wk:list", "wk:sel:12:0", "wk:start:12:0",
+    "wk:fsel:1a2b3c4d:0", "wk:fstart:1a2b3c4d:2",
     "setok:5:0:1", "different:5:0:1", "qtydelta:55:0:+10",
     "wparamtext:F:2", "param:F:2:weight",
     "onb:edit_menu", "onb:edit:field", "routine:confirm", "routine:fix",

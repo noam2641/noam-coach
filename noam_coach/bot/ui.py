@@ -445,6 +445,117 @@ def workout_overview_keyboard(code: str) -> InlineKeyboardMarkup:
     )
 
 
+# ---------------------------------------------------------------------------
+# Workout selector / overview v2 (workout-selection architecture, Batch 4).
+#
+# These builders mint ONLY `wk:` callbacks, every one of which has a handler
+# in callback_plans.py in this same batch (`wk:list`, `wk:sel`, `wk:fsel`,
+# `wk:start`, `wk:fstart`) -- the batch never exposes a dangling button.
+# The legacy builders above are deliberately left byte-identical: old
+# Telegram messages keep working until the Batch 7 adapter retires them.
+# ---------------------------------------------------------------------------
+
+
+def _wk_ref_suffix(ref: Any) -> str:
+    """The `<identity>:<session_index>` tail shared by every `wk:` callback.
+
+    Tier-1 carries the immutable plan_versions id; Tier-2 carries the 8-hex
+    content fingerprint (compute_fact_rev). Both are placed as NON-TERMINAL
+    segments, so neither can occupy the last-two positions the ARCH-04
+    grammar inspects for `^v\\d{1,9}$` / `^ff-\\d+-[0-9a-f]{6,}$`
+    (callback_grammar.py:66-72) -- verified by test_callback_grammar_b2.
+    """
+    identity = ref.plan_id if ref.tier == "plan" else ref.fact_rev
+    return f"{identity}:{ref.session_index}"
+
+
+@runtime_bound(RUNTIME_NAMES)
+def wk_select_callback(ref: Any) -> str:
+    """`wk:sel:<plan_id>:<sidx>` (Tier-1) / `wk:fsel:<fact_rev>:<sidx>` (Tier-2)."""
+    prefix = "wk:sel" if ref.tier == "plan" else "wk:fsel"
+    return f"{prefix}:{_wk_ref_suffix(ref)}"
+
+
+@runtime_bound(RUNTIME_NAMES)
+def wk_start_callback(ref: Any) -> str:
+    """`wk:start:<plan_id>:<sidx>` (Tier-1) / `wk:fstart:<fact_rev>:<sidx>` (Tier-2)."""
+    prefix = "wk:start" if ref.tier == "plan" else "wk:fstart"
+    return f"{prefix}:{_wk_ref_suffix(ref)}"
+
+
+@runtime_bound(RUNTIME_NAMES)
+def workout_selector_keyboard(choices: list[Any]) -> InlineKeyboardMarkup:
+    """One row per selectable session, labelled with its REAL name (not the
+    global template's), ⭐ on the recommended one and ✅ on anything already
+    completed today. Recommendation is a hint, never a forced selection --
+    every session in the plan is tappable (plan section J).
+    """
+    rows = []
+    for choice in choices:
+        label = choice.name
+        if choice.recommended:
+            label = f"⭐ {label}"
+        if choice.done_today:
+            label = f"{label} ✅"
+        rows.append([button(label, wk_select_callback(choice.ref))])
+    rows.append([button("⬅️ תפריט", "menu:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+@runtime_bound(RUNTIME_NAMES)
+def workout_overview_keyboard_v2(ref: Any, *, single_choice: bool = False) -> InlineKeyboardMarkup:
+    """Overview keyboard whose Start button carries the SAME identity the
+    overview was rendered from -- display identity == start identity, the
+    W2 defect this batch closes.
+
+    Parameter editing stays on the legacy `editparams_menu:<code>` route
+    until Batch 6 rebuilds it as `wk:exm`; it is omitted here rather than
+    minted against an identity the legacy handler cannot read.
+    """
+    rows = [[button("✅ התחל אימון", wk_start_callback(ref))]]
+    # With only one selectable session there is no selector to go back TO;
+    # Back goes home instead of to a one-row list (plan section J).
+    rows.append([button("⬅️ חזרה", "menu:home" if single_choice else "wk:list")])
+    return InlineKeyboardMarkup(rows)
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def render_workout_overview_v2(query: Any, user_id: int, resolved: Any, *, single_choice: bool = False) -> None:
+    """Overview for a catalog-resolved session (Tier-1 personalized payload
+    or Tier-2 template-seeded content), replacing the template-only
+    render_workout_overview on every `wk:` route."""
+    text = await build_workout_overview_text_v2(user_id, resolved)
+    await safe_edit(query, text, workout_overview_keyboard_v2(resolved.choice.ref, single_choice=single_choice))
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def build_workout_overview_text_v2(user_id: int, resolved: Any) -> str:
+    """Shared overview body for both surfaces (callback overview and the
+    assistant's reply-message overview), so the two can never drift apart.
+    Mirrors render_workout_overview's existing format exactly; the only
+    difference is WHERE the exercises come from (the resolved session, not
+    PLANS[code]).
+    """
+    lines: list[str] = []
+    for index, exercise_data in enumerate(resolved.session.get("exercises", []), start=1):
+        weight, reps, _ = await recommend_load(user_id, exercise_data)
+        muscle = exercise_data.get("muscle")
+        muscle_tag = f" <i>({muscle})</i>" if muscle else ""
+        lines.append(
+            f"{index}. <b>{esc(exercise_data['name'])}</b>{muscle_tag} — "
+            f"{exercise_data['sets']}×{reps} במשקל {weight:g} ק״ג"
+        )
+    banner = await constraint_banner(user_id)
+    banner += await fatigue_banner(user_id)
+    if resolved.choice.done_today:
+        # E2 (plan section F): an honest "already trained" note. Batch 5 adds
+        # the `:again` repeat-confirmation gate; this batch only informs.
+        banner += "כבר ביצעת את האימון הזה היום ✅\n\n"
+    return (
+        f"<b>{esc(resolved.choice.name)}</b>\n\n" + banner + "\n".join(lines) + "\n\nמוכן? לחץ <b>התחל</b>."
+    )
+
+
 @runtime_bound(RUNTIME_NAMES)
 def exercise_picker_keyboard(code: str) -> InlineKeyboardMarkup:
     plan = PLANS[code]

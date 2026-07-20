@@ -193,21 +193,27 @@ async def _seed_tier1_plan(
 
 
 # ---------------------------------------------------------------------------
-# Pin 1: menu:workout renders global PLANS content for the recommended code,
-# NOT the personalized active-plan payload.
+# Pin 1 (FLIPPED in Batch 4, per plan section M.1): menu:workout renders the
+# PERSONALIZED active-plan session content, not the global PLANS template.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_pin1_menu_workout_renders_plans_template_not_personalized_payload(
+async def test_pin1_menu_workout_renders_personalized_payload_not_plans_template(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """KNOWN DEFECT (root cause 3, plan section C): render_workout_overview
-    resolves content via get_user_plan(code) = deep copy of the GLOBAL
-    PLANS[code] template + positional overrides. It never consults the
-    user's personalized active-plan session exercises. Session A here has
-    "leg_press" as its only exercise; the rendered overview shows "bench"
-    (PLANS["A"]'s real first exercise name) instead.
+    """BATCH 4 FLIP (was: KNOWN DEFECT, root cause 3, plan section C).
+
+    Before Batch 4, menu:workout -> render_workout_overview resolved content
+    via get_user_plan(code) = a deep copy of the GLOBAL PLANS[code] template,
+    never consulting the user's personalized active-plan session exercises.
+    Batch 4 routes menu:workout through workout_catalog instead, so the
+    single-session plan seeded here renders its OWN "leg_press" exercise and
+    the template's "bench" no longer leaks in.
+
+    With exactly one selectable session the selector is skipped and the
+    overview is rendered directly (plan section J), so this asserts on the
+    overview content just as the pre-flip pin did.
     """
     db = await _make_db(tmp_path, "pin1")
     _bind(monkeypatch, db)
@@ -233,10 +239,16 @@ async def test_pin1_menu_workout_renders_plans_template_not_personalized_payload
 
     assert handled is True
     rendered_text = query.messages[-1]
-    # PIN: the template's exercise ("bench" -> "לחיצת חזה עם מוט") leaks
-    # into the overview instead of the personalized "לחיצת רגליים".
-    assert PLANS["A"]["exercises"][0]["name"] in rendered_text
-    assert "לחיצת רגליים" not in rendered_text
+    # FLIPPED: the personalized exercise is what the user now sees, and the
+    # global template's "bench" no longer leaks in.
+    assert "לחיצת רגליים" in rendered_text
+    assert PLANS["A"]["exercises"][0]["name"] not in rendered_text
+    # Display identity == start identity: the Start button carries the same
+    # Tier-1 (plan_id, session_index) the overview was resolved from.
+    keyboard = query.reply_markups[-1]
+    callback_datas = {btn.callback_data for row in keyboard.inline_keyboard for btn in row}
+    assert any(d.startswith("wk:start:") for d in callback_datas), callback_datas
+    assert not any(d.startswith("startworkout:") for d in callback_datas), callback_datas
 
 
 # ---------------------------------------------------------------------------
@@ -545,8 +557,9 @@ async def test_pin8_resolve_todays_workout_matrix(
 
 # ---------------------------------------------------------------------------
 # Pin 9 (Tier-2 baseline): a fact-only weekly plan (build_weekly_plan output
-# shape, freq 2 -> codes ["F","F"]) -> recommendation works, overview
-# renders template content.
+# shape, freq 2 -> codes ["F","F"]) -> recommendation works, template content
+# renders. SHAPE flipped in Batch 4 (selector, then overview) -- see the
+# inline note at the assertion; the pin's substance is unchanged.
 # ---------------------------------------------------------------------------
 
 
@@ -600,26 +613,59 @@ async def test_pin9_fact_only_plan_recommends_and_renders_template_content(
     query = FakeQuery()
     handled = await callback_plans_bot.handle_workout_setup_callback(query, _ctx(), 1, "menu:workout")
     assert handled is True
-    # Overview renders via get_user_plan -> PLANS["F"] template content.
-    assert PLANS["F"]["exercises"][0]["name"] in query.messages[-1]
+
+    # BATCH 4 SHAPE FLIP (documented deviation from plan section M.1, which
+    # listed pin #9 as "never" -- that entry contradicts section J and the
+    # section M.3 Batch-4 test list, both of which require Tier-2 users to
+    # get "the same selector over their fact sessions". A 2-session fact
+    # therefore MUST render a selector here, not an overview. Approved as a
+    # 4th Batch-4 pin change; the pin's SUBSTANCE below is unchanged.)
+    #
+    # The recommendation assertions above still hold exactly as pinned, and
+    # the template content is still what a selected Tier-2 session resolves
+    # to -- it is now one tap deeper, behind an explicit choice, instead of
+    # being force-selected by the recommendation.
+    from noam_coach.services import workout_catalog
+
+    keyboard = query.reply_markups[-1]
+    callback_datas = [btn.callback_data for row in keyboard.inline_keyboard for btn in row]
+    fsel = [d for d in callback_datas if d.startswith("wk:fsel:")]
+    # The duplicate-code split is preserved as two DISTINCT index-keyed
+    # choices sharing one fact_rev -- never collapsed into a single "F" row.
+    assert len(fsel) == 2, callback_datas
+    fact_rev = workout_catalog.compute_fact_rev(fact_only_plan)
+    assert fsel == [f"wk:fsel:{fact_rev}:0", f"wk:fsel:{fact_rev}:1"]
+
+    # PIN SUBSTANCE PRESERVED: selecting a Tier-2 session still renders the
+    # PLANS["F"] template content (Tier-2 content comes from the guarded
+    # template path -- W1 residual, by design).
+    overview_query = FakeQuery()
+    handled = await callback_plans_bot.handle_workout_setup_callback(
+        overview_query, _ctx(), 1, f"wk:fsel:{fact_rev}:0"
+    )
+    assert handled is True
+    assert PLANS["F"]["exercises"][0]["name"] in overview_query.messages[-1]
 
 
 # ---------------------------------------------------------------------------
-# Pin 10 (W2 baseline): assistant start_workout action renders template
-# content with a startworkout: button.
+# Pin 10 (FLIPPED in Batch 4, per plan section M.1): the assistant surface
+# renders catalog content with a `wk:` Start button -- display identity is
+# the start identity (W2 closed).
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_pin10_assistant_start_workout_renders_template_with_startworkout_button(
+async def test_pin10_assistant_start_workout_renders_catalog_with_wk_button(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """W2 BASELINE: assistant.py's "start_workout" intent action
-    (assistant.py:465-468) calls render_workout_overview_reply, a SEPARATE
-    renderer from the menu:workout path that performs the exact same
-    template-only resolution (get_user_plan) and emits the same
-    startworkout:{code} button. Confirms the assistant surface duplicates
-    the menu surface's defects rather than sharing one resolver.
+    """BATCH 4 FLIP (was: W2 BASELINE).
+
+    Before Batch 4, render_workout_overview_reply was a SEPARATE renderer
+    duplicating the menu path's template-only get_user_plan resolution and
+    emitting a bare startworkout:{code} button -- so a personalized plan
+    displayed one workout and started another. Batch 4 routes it through the
+    catalog and shares build_workout_overview_text_v2 with the callback
+    overview, and its Start button now carries the resolved ref itself.
     """
     db = await _make_db(tmp_path, "pin10")
     _bind(monkeypatch, db)
@@ -638,16 +684,24 @@ async def test_pin10_assistant_start_workout_renders_template_with_startworkout_
     code = await ui_bot.select_todays_workout_code(1, now=now)
     assert code == "A"
 
+    from noam_coach.services import workout_catalog
+
+    recommended = await workout_catalog.resolve_recommended(db, 1)
+    assert recommended is not None
     message = FakeMessage()
-    await assistant_bot.render_workout_overview_reply(message, 1, code)
+    await assistant_bot.render_workout_overview_reply(message, 1, recommended.ref)
 
     rendered_text = message.texts[-1]
-    assert PLANS["A"]["exercises"][0]["name"] in rendered_text
-    assert "לחיצת רגליים" not in rendered_text  # personalized content, still absent
+    # FLIPPED: personalized content is rendered; the template no longer leaks.
+    assert "לחיצת רגליים" in rendered_text
+    assert PLANS["A"]["exercises"][0]["name"] not in rendered_text
 
     keyboard = message.markups[-1]
     callback_datas = {btn.callback_data for row in keyboard.inline_keyboard for btn in row}
-    assert "startworkout:A" in callback_datas
+    # FLIPPED: no bare-code startworkout button; the Start callback carries
+    # the exact identity that was displayed.
+    assert "startworkout:A" not in callback_datas
+    assert f"wk:start:{recommended.ref.plan_id}:{recommended.ref.session_index}" in callback_datas
 
 
 # ---------------------------------------------------------------------------
@@ -741,16 +795,20 @@ async def test_pin11_start_regenerate_complete_history_chain(
 
 
 @pytest.mark.asyncio
-async def test_pin12_non_template_code_crashes_build_workout_prompt_text(
+async def test_pin12_non_template_code_renders_safe_fallback_without_keyerror(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """W5 PIN (KNOWN DEFECT): assistant.build_workout_prompt_text (:1004)
-    hard-indexes PLANS[code]['name'] on the "near usual workout hour, no
-    weekday match" branch. planning.repair_workout_payload legitimately
-    defaults a session's code to "custom" (planning.py:851) when the
-    generator omits one -- a code that is NOT a key of PLANS. Reached via
-    select_todays_workout_code returning that code, this branch raises
-    KeyError. build_workout_prompt_text reads the real clock directly
+    """BATCH 4 FLIP (was: W5 PIN, KNOWN DEFECT).
+
+    assistant.build_workout_prompt_text used to hard-index PLANS[code]['name']
+    on the "near usual workout hour, no weekday match" branch. Since
+    planning.repair_workout_payload legitimately defaults a session's code to
+    "custom" (planning.py:851) -- not a PLANS key -- that branch raised
+    KeyError on a plain nudge. Batch 4 replaces it with a
+    PLANS.get(...) -> session name -> code fallback chain: no KeyError, and
+    no invented template name.
+
+    build_workout_prompt_text reads the real clock directly
     (datetime.now(TZ)), so this test aligns the fact's session/typical_hour
     fields to the CURRENT real time rather than a frozen `now=` -- there is
     no injectable clock on this path today (a residual risk the redesign's
@@ -781,5 +839,7 @@ async def test_pin12_non_template_code_crashes_build_workout_prompt_text(
 
     assert "custom" not in PLANS
 
-    with pytest.raises(KeyError):
-        await assistant_bot.build_workout_prompt_text(1)
+    # FLIPPED: no KeyError. The nudge renders using the session's own name.
+    text = await assistant_bot.build_workout_prompt_text(1)
+    assert text is not None
+    assert "Custom Session" in text

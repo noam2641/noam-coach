@@ -135,6 +135,14 @@ _DEBOUNCE_PREFIXES = (
     "nextmeal:plan:",
     "nextmeal:choose:",
     "dailymenu:save:",
+    # workout-selection architecture, Batch 4: Start is the mutation in the
+    # `wk:` graph (it INSERTs a session), so a double delivery must be
+    # debounced. Navigation (`wk:list`, `wk:sel`, `wk:fsel`) is deliberately
+    # NOT debounced -- re-tapping a selector row is a legitimate repeat and
+    # must stay usable. The unique partial index + IntegrityError recovery
+    # remains the real correctness guarantee; debounce only trims the noise.
+    "wk:start:",
+    "wk:fstart:",
     # Codex audit round: sensitive single-shot writes that advance a flow —
     # a double-tap must not apply/skip TWO steps (e.g. health:skip_item
     # tapped twice would silently discard the next wizard item too).

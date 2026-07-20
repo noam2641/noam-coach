@@ -463,9 +463,17 @@ async def _handle_plan_text_action(ctx: FreeTextContext) -> bool:
         return True
 
     if ctx.action == "start_workout":
-        code = await select_todays_workout_code(ctx.user_id)
-        if code:
-            await render_workout_overview_reply(ctx.message, ctx.user_id, code)
+        # Batch 4 (workout-selection architecture): resolve through the
+        # catalog so the assistant's card shows the SAME session the Start
+        # button starts (pin #10 flip, closes W2 -- previously the card
+        # rendered PLANS[code] content under a bare `startworkout:<code>`
+        # button, so a personalized plan displayed one workout and started
+        # another).
+        from noam_coach.services import workout_catalog
+
+        recommended = await workout_catalog.resolve_recommended(DB, ctx.user_id)
+        if recommended is not None:
+            await render_workout_overview_reply(ctx.message, ctx.user_id, recommended.ref)
         else:
             await ctx.send(
                 "עוד אין תוכנית פעילה. כתוב לי כמה אימונים בשבוע ואבנה אחת, "
@@ -800,24 +808,34 @@ async def route_free_text(update: Update, user_id: int) -> None:
 
 
 @runtime_bound(RUNTIME_NAMES)
-async def render_workout_overview_reply(message: Any, user_id: int, code: str) -> None:
-    """Same brief as render_workout_overview but as a fresh reply message."""
-    plan = await get_user_plan(user_id, code)
-    lines = []
-    for index, exercise_data in enumerate(plan["exercises"], start=1):
-        weight, reps, _ = await recommend_load(user_id, exercise_data)
-        muscle = exercise_data.get("muscle")
-        muscle_tag = f" <i>({muscle})</i>" if muscle else ""
-        lines.append(
-            f"{index}. <b>{exercise_data['name']}</b>{muscle_tag} — "
-            f'{exercise_data["sets"]}×{reps} במשקל {weight:g} ק"ג'
+async def render_workout_overview_reply(message: Any, user_id: int, ref: Any) -> None:
+    """Same brief as render_workout_overview_v2 but as a fresh reply message.
+
+    Batch 4 (workout-selection architecture): takes a WorkoutSelectionRef,
+    not a bare code, and renders through the catalog with a `wk:` keyboard --
+    so the assistant surface's DISPLAY identity is literally the same object
+    as its START identity (W2). Both surfaces share
+    build_workout_overview_text_v2, so the callback overview and this reply
+    can never drift apart.
+    """
+    from noam_coach.bot.ui import build_workout_overview_text_v2, workout_overview_keyboard_v2
+    from noam_coach.services import workout_catalog
+
+    try:
+        resolved = await workout_catalog.resolve_selection(DB, user_id, ref)
+    except workout_catalog.StalePlanReference:
+        # The plan changed between recommendation and render. Say so plainly
+        # rather than showing an unverified card; the entry point re-resolves.
+        await message.reply_text(
+            "התוכנית התעדכנה. פתח שוב את מסך האימון כדי לראות את התוכנית המעודכנת.",
+            reply_markup=InlineKeyboardMarkup([[button("🏋️ אימון", "wk:list")]]),
         )
-    banner = await constraint_banner(user_id)
-    banner += await fatigue_banner(user_id)
-    text = f"<b>{plan['name']}</b>\n\n" + banner + "\n".join(lines) + "\n\nמוכן? לחץ <b>התחל</b>."
+        return
+
+    text = await build_workout_overview_text_v2(user_id, resolved)
     await message.reply_text(
         text,
-        reply_markup=workout_overview_keyboard(code),
+        reply_markup=workout_overview_keyboard_v2(resolved.choice.ref),
         parse_mode=ParseMode.HTML,
     )
 
@@ -1000,7 +1018,18 @@ async def build_workout_prompt_text(user_id: int) -> str | None:
         if abs(nowh - target) <= 1.0:
             code = await select_todays_workout_code(user_id)
             if code:
-                return f"🏋️ זה סביב שעת האימון הרגילה שלך (~{workout_hour}). רוצה להתחיל את {PLANS[code]['name']}?"
+                # W5 fix (Batch 4, pin #12 flip): planning.repair_workout_payload
+                # legitimately defaults a session's code to "custom"
+                # (planning.py:851), which is NOT a PLANS key -- hard-indexing
+                # PLANS[code]['name'] here raised KeyError on a plain nudge.
+                # Fall back to the session's own name from the plan, then to
+                # the code itself. Never invents a template that doesn't exist.
+                session_name = next(
+                    (s.get("name") for s in plan["sessions"] if s.get("code") == code and s.get("name")),
+                    None,
+                )
+                label = PLANS.get(code, {}).get("name") or session_name or code
+                return f"🏋️ זה סביב שעת האימון הרגילה שלך (~{workout_hour}). רוצה להתחיל את {label}?"
     return None
 
 
