@@ -252,20 +252,31 @@ async def test_pin1_menu_workout_renders_personalized_payload_not_plans_template
 
 
 # ---------------------------------------------------------------------------
-# Pin 2: startworkout:A snapshots get_user_plan output (template exercises)
-# into sessions.plan.
+# Pin 2 (FLIPPED in Batch 7, per plan section M.1): startworkout:A routes
+# through the compatibility adapter -- a unique code match snapshots the
+# PERSONALIZED session, not the global template.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_pin2_startworkout_snapshots_template_not_personalized_exercises(
+async def test_pin2_startworkout_maps_to_personalized_session_via_adapter(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """KNOWN DEFECT: _handle_workout_start_actions (callback_plans.py:534-569)
-    calls get_user_plan(user_id, code) -- the global template resolver -- to
-    build the session snapshot, independently of whatever was shown in the
-    overview. The started session's plan JSON contains PLANS["A"]'s
-    exercises, not the personalized ones seeded above.
+    """BATCH 7 FLIP (was: KNOWN DEFECT), per plan section M.1.
+
+    Before Batch 7, _handle_workout_start_actions called
+    get_user_plan(user_id, code) -- the global template resolver -- to build
+    the snapshot, independently of whatever the overview showed. Batch 7
+    routes already-issued `startworkout:<code>` buttons through the
+    compatibility adapter: a UNIQUE code match in the user's current plan
+    resolves to that session's real identity and is handled by the v2 start
+    path, so the snapshot now carries the personalized "leg_press", not
+    PLANS["A"]'s "bench".
+
+    This is the migrated legacy path the approved transition map allows pin
+    #2 to change for. The template path itself is unchanged and still
+    reachable for a genuinely plan-less user (see the template_fallback
+    tests in test_workout_legacy_adapter.py).
     """
     db = await _make_db(tmp_path, "pin2")
     _bind(monkeypatch, db)
@@ -282,10 +293,13 @@ async def test_pin2_startworkout_snapshots_template_not_personalized_exercises(
     assert session is not None
     snapshot = json.loads(session["plan"])
     snapshot_exercise_ids = {ex["id"] for ex in snapshot["exercises"]}
-    # PIN: the snapshot contains the template's exercise ids ("bench" etc.),
-    # not the personalized plan's "leg_press".
-    assert "bench" in snapshot_exercise_ids
-    assert "leg_press" not in snapshot_exercise_ids
+    # FLIPPED: the legacy button now starts the PERSONALIZED session it maps
+    # to; the global template no longer leaks into the snapshot.
+    assert "leg_press" in snapshot_exercise_ids
+    assert "bench" not in snapshot_exercise_ids
+    # And it went through the v2 start path, so it carries full provenance.
+    assert snapshot["provenance"]["source"] == "active_plan"
+    assert snapshot["provenance"]["session_index"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -416,21 +430,30 @@ async def test_pin6_no_plan_shows_fallback_and_hardcoded_plans_keyboard(
 
 
 # ---------------------------------------------------------------------------
-# Pin 7: after regenerating/activating a NEW plan, old workout:A and
-# startworkout:A still silently resolve against PLANS["A"].
+# Pin 7 (FLIPPED in Batch 7, per plan section M.1): after regenerating, old
+# workout:A / startworkout:A map to the CURRENT plan's session -- never to
+# the stale global template.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_pin7_stale_legacy_callbacks_silently_resolve_to_plans_after_regeneration(
+async def test_pin7_legacy_callbacks_map_to_current_plan_after_regeneration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """KNOWN DEFECT (root cause 8, stale-callback unsafety): workout setup
-    callbacks carry no plan/session identity and no :v version token, so an
-    old Telegram message's workout:A / startworkout:A button keeps silently
-    resolving against the GLOBAL PLANS["A"] template even after the user's
-    active plan has been regenerated/replaced with a completely different
-    plan. Nothing here detects or refuses the staleness.
+    """BATCH 7 FLIP (was: KNOWN DEFECT, root cause 8, stale-callback unsafety).
+
+    Before Batch 7, workout setup callbacks carried no plan/session identity,
+    so an old Telegram message's workout:A / startworkout:A kept silently
+    resolving against the GLOBAL PLANS["A"] template even after the active
+    plan had been replaced with a completely different one -- the user tapped
+    a button and got a workout that existed nowhere in their plan.
+
+    Batch 7 routes those buttons through the compatibility adapter, which
+    re-resolves the code against the CURRENT plan. Here "A" still exists (as a
+    totally different session), so the tap maps to that session's real
+    identity: the user sees and starts what they actually have. When the code
+    matches nothing current, the adapter refuses instead -- covered by
+    test_workout_legacy_adapter.py's stale cases.
     """
     db = await _make_db(tmp_path, "pin7")
     _bind(monkeypatch, db)
@@ -470,9 +493,14 @@ async def test_pin7_stale_legacy_callbacks_silently_resolve_to_plans_after_regen
     query = FakeQuery()
     handled = await callback_plans_bot.handle_workout_setup_callback(query, _ctx(), 1, "workout:A")
     assert handled is True
-    # PIN: it silently shows the (unchanged) global template, oblivious to
-    # the plan swap -- no refusal, no staleness detection.
-    assert PLANS["A"]["exercises"][0]["name"] in query.messages[-1]
+    # FLIPPED: the overview shows the CURRENT plan's session A, and the stale
+    # global template no longer leaks in.
+    assert "totally_different" in query.messages[-1] or "X" in query.messages[-1]
+    assert PLANS["A"]["exercises"][0]["name"] not in query.messages[-1]
+    # The rendered Start button carries the NEW plan's identity.
+    datas = {b.callback_data for row in query.reply_markups[-1].inline_keyboard for b in row}
+    assert f"wk:start:{new_plan_id}:0" in datas
+    assert not any(d.startswith("startworkout:") for d in datas)
 
     query2 = FakeQuery()
     handled2 = await callback_plans_bot.handle_workout_setup_callback(query2, _ctx(), 1, "startworkout:A")
@@ -480,8 +508,10 @@ async def test_pin7_stale_legacy_callbacks_silently_resolve_to_plans_after_regen
     session = await db.fetch_one("SELECT * FROM sessions WHERE user_id=1 AND status='active'")
     snapshot = json.loads(session["plan"])
     snapshot_ids = {ex["id"] for ex in snapshot["exercises"]}
-    assert "bench" in snapshot_ids
-    assert "totally_different" not in snapshot_ids
+    # FLIPPED: it started the CURRENT plan's session, not the stale template.
+    assert "totally_different" in snapshot_ids
+    assert "bench" not in snapshot_ids
+    assert snapshot["provenance"]["plan_id"] == new_plan_id
 
 
 # ---------------------------------------------------------------------------

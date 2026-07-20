@@ -1134,24 +1134,114 @@ async def _handle_workout_v2_actions(
 
 
 @runtime_bound(RUNTIME_NAMES)
+async def _handle_legacy_workout_callback(
+    query: Any,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    data: str,
+) -> bool:
+    """Route one already-issued legacy workout callback through the Batch-7
+    compatibility adapter.
+
+    Returns True when the adapter fully handled it (mapped to the v2 flow,
+    refused as ambiguous, or refused as stale). Returns False ONLY for
+    `template_fallback` -- the caller then runs the preserved legacy template
+    path. Every outcome emits exactly one workout_legacy_callback event.
+    """
+    from noam_coach.bot import workout_compat
+
+    parsed = workout_compat.parse_legacy_callback(data)
+    if parsed is None:
+        return False  # not a legacy workout callback, or malformed -- caller decides
+
+    action = parsed["action"]
+    code = parsed["code"]
+    resolution = await workout_compat.resolve_legacy_code(DB, user_id, code)
+    outcome = resolution["outcome"]
+    ref = resolution["ref"]
+
+    await workout_compat.emit_legacy_event(
+        DB, user_id, prefix=parsed["prefix"], action=action, code=code,
+        outcome=outcome, ref=ref,
+        source=(
+            "plan_version" if (ref is not None and ref.tier == "plan")
+            else "weekly_fact_template" if (ref is not None and ref.tier == "fact")
+            else "template_fallback" if outcome == workout_compat.OUTCOME_TEMPLATE_FALLBACK
+            else None
+        ),
+    )
+
+    if outcome == workout_compat.OUTCOME_TEMPLATE_FALLBACK:
+        return False  # caller runs the explicit legacy template path
+
+    if outcome == workout_compat.OUTCOME_AMBIGUOUS:
+        # Two or more sessions share this code. A bare code cannot say which,
+        # and picking one would be exactly the silent-wrong-workout defect
+        # this architecture exists to remove. Ask.
+        await safe_answer_callback(query, "בחר את האימון המבוקש")
+        await _render_workout_selector(query, user_id)
+        return True
+
+    if outcome == workout_compat.OUTCOME_STALE or ref is None:
+        await _refuse_stale_workout_ref(
+            query, user_id, ref=ref, detail=f"legacy_{parsed['prefix']}_code_{code}"
+        )
+        return True
+
+    # outcome == mapped: hand off to the v2 handler with the real identity, so
+    # legacy taps inherit every v2 guard (active session, re-validation before
+    # INSERT, done-today `:again` confirmation, id-verified overrides).
+    from noam_coach.bot.ui import (
+        wk_exercise_callback,
+        wk_exercise_menu_callback,
+        wk_param_callback,
+        wk_select_callback,
+        wk_start_callback,
+    )
+
+    if action == workout_compat.ACTION_OVERVIEW:
+        v2 = wk_select_callback(ref)
+    elif action == workout_compat.ACTION_START:
+        v2 = wk_start_callback(ref)
+    elif action == workout_compat.ACTION_EDIT_MENU:
+        v2 = wk_exercise_menu_callback(ref)
+    elif action == workout_compat.ACTION_EDIT_EXERCISE:
+        v2 = wk_exercise_callback(ref, int(parsed["exercise_index"]))
+    elif action == workout_compat.ACTION_EDIT_PARAM:
+        v2 = wk_param_callback(
+            ref, int(parsed["exercise_index"]), str(parsed["field"]), float(parsed["delta"])
+        )
+    else:  # pragma: no cover - parse_legacy_callback yields no other action
+        return False
+
+    return await _handle_workout_v2_actions(query, context, user_id, v2)
+
+
+@runtime_bound(RUNTIME_NAMES)
 async def _handle_workout_start_actions(
     query: Any,
     context: ContextTypes.DEFAULT_TYPE,
     user_id: int,
     data: str,
 ) -> bool:
-    if data.startswith("workout:"):
-        code = data.split(":", 1)[1]
-        current = await active_session(user_id)
-        if current:
-            await show_session(query, user_id, current["id"])
+    if data.startswith(("workout:", "startworkout:")):
+        # Batch 7: already-issued legacy buttons route through the
+        # compatibility adapter so they resolve with the SAME catalog
+        # identity, normalization, override and staleness rules as `wk:`.
+        # A unique code match becomes a real identity and is handled by the
+        # v2 path; ambiguity refuses to the selector rather than guessing;
+        # only a genuinely plan-less user reaches the template path below.
+        handled = await _handle_legacy_workout_callback(query, context, user_id, data)
+        if handled:
             return True
 
-        await render_workout_overview(query, user_id, code)
-        return True
-
-    if data.startswith("startworkout:"):
+        # template_fallback only: no active plan of either tier, known
+        # PLANS code. This is the honest pre-v2 behavior, preserved.
         code = data.split(":", 1)[1]
+        if data.startswith("workout:"):
+            await render_workout_overview(query, user_id, code)
+            return True
+
         current = await active_session(user_id)
         if current:
             await show_session(query, user_id, current["id"])
@@ -1291,6 +1381,14 @@ async def _handle_workout_parameter_actions(
             ]),
         )
         return True
+
+    # Batch 7: legacy edit callbacks route through the adapter first, so an
+    # old "edit parameters" button targets the exercise by verified identity
+    # in the user's CURRENT plan instead of a bare (code, index) pair. Only a
+    # plan-less user (template_fallback) reaches the preserved legacy paths.
+    if data.startswith(("editparams_menu:", "editparams:", "param:")):
+        if await _handle_legacy_workout_callback(query, context, user_id, data):
+            return True
 
     if data.startswith("editparams_menu:"):
         code = data.split(":", 1)[1]
