@@ -587,8 +587,25 @@ async def _render_workout_selector(query: Any, user_id: int) -> None:
         return
 
     first = choices[0]
+    # E2 (plan section F, closed in Batch 8): two SEPARATE concepts.
+    #
+    # (a) Per-session ✅ is identity-specific -- `choice.done_today` matches a
+    #     completion to THIS session's code, so only the session actually
+    #     performed is marked.
+    # (b) The user-level banner must be truthful regardless of identity. Before
+    #     this fix the banner was derived from (a), so regenerating into a plan
+    #     with DIFFERENT codes made the selector silently claim the user had not
+    #     trained today -- the system appearing unaware of a real completion.
+    #     It now asks the completion-evidence source directly (real session rows
+    #     / HealthKit), which no plan change can invalidate.
+    #
+    # Valid alternative sessions are never suppressed: the banner informs, and
+    # every session stays selectable. Starting one already completed today
+    # still goes through the Batch-5 `:again` confirmation.
+    from noam_coach.services import daily_state as _daily_state
+
     banner = ""
-    if any(choice.done_today for choice in choices):
+    if await _daily_state.workout_completed_today(DB, user_id):
         banner = "כבר התאמנת היום ✅\n\n"
     await safe_edit(
         query,
@@ -833,6 +850,15 @@ async def _apply_workout_param_text_v2(
                 if not 0 <= idx < len(target_exercises):
                     continue
                 target_id = target_exercises[idx].get("id")
+                if not target_id:
+                    # Batch 8 (Scope 3): skip exercises with no stable identity
+                    # rather than writing a NULL-id row that would later be
+                    # re-applied by template POSITION to whatever sits at that
+                    # index. Silently skipping one malformed entry is correct
+                    # here -- an "all"/"program" scope edit should still apply
+                    # to every well-formed exercise -- and the count reported
+                    # to the user below reflects only what was really written.
+                    continue
                 if field == "reps":
                     rmin = int(update_item.get("rmin") or target_exercises[idx]["rmin"])
                     rmax = int(update_item.get("rmax") or target_exercises[idx]["rmax"])
@@ -1029,6 +1055,21 @@ async def _handle_workout_v2_actions(
             return True
 
         if data.startswith("wk:ex:"):
+            await render_exercise_params_v2(query, user_id, resolved, exercise_index)
+            return True
+
+        # Batch 8 (Scope 3): refuse to write an override against an exercise
+        # with no usable stable identity. A historical/malformed payload can
+        # carry an exercise with no `id` (or an empty one); writing a NULL-id
+        # row for it would later be re-applied BY TEMPLATE POSITION, i.e. to
+        # whatever exercise happens to sit at that index -- the same-index
+        # accidental mutation the approved override model forbids. Rendering
+        # such a session is fine (normalization repairs it for display); only
+        # the WRITE is refused.
+        if not resolved.session["exercises"][exercise_index].get("id"):
+            await safe_answer_callback(
+                query, "לא ניתן לשמור שינוי לתרגיל הזה", show_alert=True
+            )
             await render_exercise_params_v2(query, user_id, resolved, exercise_index)
             return True
 
