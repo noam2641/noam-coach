@@ -508,11 +508,14 @@ def workout_overview_keyboard_v2(ref: Any, *, single_choice: bool = False) -> In
     overview was rendered from -- display identity == start identity, the
     W2 defect this batch closes.
 
-    Parameter editing stays on the legacy `editparams_menu:<code>` route
-    until Batch 6 rebuilds it as `wk:exm`; it is omitted here rather than
-    minted against an identity the legacy handler cannot read.
+    Batch 6 restored parameter editing here as `wk:exm`, carrying the same
+    identity rather than the ambiguous bare `editparams_menu:<code>` route
+    (which stays live only for old Telegram messages until Batch 7).
     """
-    rows = [[button("✅ התחל אימון", wk_start_callback(ref))]]
+    rows = [
+        [button("✅ התחל אימון", wk_start_callback(ref))],
+        [button("⚙️ ערוך פרמטרים", wk_exercise_menu_callback(ref))],
+    ]
     # With only one selectable session there is no selector to go back TO;
     # Back goes home instead of to a one-row list (plan section J).
     rows.append([button("⬅️ חזרה", "menu:home" if single_choice else "wk:list")])
@@ -554,6 +557,121 @@ async def build_workout_overview_text_v2(user_id: int, resolved: Any) -> str:
     return (
         f"<b>{esc(resolved.choice.name)}</b>\n\n" + banner + "\n".join(lines) + "\n\nמוכן? לחץ <b>התחל</b>."
     )
+
+
+@runtime_bound(RUNTIME_NAMES)
+def wk_exercise_menu_callback(ref: Any) -> str:
+    """`wk:exm:<identity>:<sidx>` -- open the exercise picker for a resolved
+    session, carrying that session's identity rather than a bare code."""
+    return f"wk:exm:{_wk_ref_suffix(ref)}"
+
+
+@runtime_bound(RUNTIME_NAMES)
+def wk_exercise_callback(ref: Any, exercise_index: int) -> str:
+    """`wk:ex:<identity>:<sidx>:<exercise_index>`."""
+    return f"wk:ex:{_wk_ref_suffix(ref)}:{exercise_index}"
+
+
+@runtime_bound(RUNTIME_NAMES)
+def wk_param_callback(ref: Any, exercise_index: int, field: str, delta: float) -> str:
+    """`wk:par:<identity>:<sidx>:<exercise_index>:<field>:<delta>` -- the
+    longest callback this architecture mints. Budget checked by
+    tests/test_workout_param_edit_v2.py (worst case 38/64 bytes, plan
+    section N)."""
+    return f"wk:par:{_wk_ref_suffix(ref)}:{exercise_index}:{field}:{delta:g}"
+
+
+@runtime_bound(RUNTIME_NAMES)
+def exercise_picker_keyboard_v2(resolved: Any) -> InlineKeyboardMarkup:
+    """Pick an exercise to edit WITHIN the selected session (Batch 6).
+
+    Rows come from the resolved session's own normalized exercises -- the
+    personalized payload for Tier-1, the template-seeded content for Tier-2 --
+    so what the user edits is exactly what they saw and what Start will use.
+    The legacy builder above (keyed on a bare PLANS code) stays untouched for
+    old Telegram messages until Batch 7.
+    """
+    ref = resolved.choice.ref
+    rows = [
+        [button(exercise.get("name") or exercise.get("id") or f"#{index + 1}",
+                wk_exercise_callback(ref, index))]
+        for index, exercise in enumerate(resolved.session.get("exercises", []))
+    ]
+    rows.append([button("⬅️ חזרה לאימון", wk_select_callback(ref))])
+    return InlineKeyboardMarkup(rows)
+
+
+@runtime_bound(RUNTIME_NAMES)
+def exercise_params_keyboard_v2(ref: Any, exercise_index: int) -> InlineKeyboardMarkup:
+    """Stepper keyboard for one exercise inside one identified session."""
+    return InlineKeyboardMarkup([
+        [
+            button("➖ 2.5 ק״ג", wk_param_callback(ref, exercise_index, "weight", -2.5)),
+            button("➕ 2.5 ק״ג", wk_param_callback(ref, exercise_index, "weight", 2.5)),
+        ],
+        [
+            button("➖ סט", wk_param_callback(ref, exercise_index, "sets", -1)),
+            button("➕ סט", wk_param_callback(ref, exercise_index, "sets", 1)),
+        ],
+        [
+            button("➖ מנוחה", wk_param_callback(ref, exercise_index, "rest", -15)),
+            button("➕ מנוחה", wk_param_callback(ref, exercise_index, "rest", 15)),
+        ],
+        [button("⬅️ חזרה", wk_exercise_menu_callback(ref))],
+        [button("❌ ביטול", "wparamtext:cancel")],
+    ])
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def render_exercise_params_v2(query: Any, user_id: int, resolved: Any, exercise_index: int) -> None:
+    """Parameter editor for one exercise of a resolved session, and the point
+    where the v2 conversation-flow payload is armed.
+
+    The payload carries the FULL identity (tier + plan_id/fact_rev +
+    session_index + exercise_index + exercise_id + code), so a free-text edit
+    applied minutes later still re-validates against the same session instead
+    of falling back to an ambiguous bare code. Legacy code-only payloads keep
+    working -- meal_text reads the new keys defensively.
+    """
+    ref = resolved.choice.ref
+    exercises = resolved.session.get("exercises", [])
+    exercise_data = exercises[exercise_index]
+    muscle = exercise_data.get("muscle")
+    muscle_line = f"שריר מטרה: <b>{esc(muscle)}</b>\n" if muscle else ""
+    text = (
+        f"<b>עריכת פרמטרים</b>\n\n"
+        f"אימון: <b>{esc(resolved.choice.name)}</b>\n"
+        f"תרגיל: <b>{esc(exercise_data['name'])}</b>\n"
+        f"{muscle_line}\n"
+        f"משקל מתוכנן: <b>{exercise_data['weight']:g} ק״ג</b>\n"
+        f"סטים: <b>{exercise_data['sets']}</b>\n"
+        f"טווח חזרות: <b>{exercise_data['rmin']}–{exercise_data['rmax']}</b>\n"
+        f"מנוחה: <b>{exercise_data['rest'] // 60}:{exercise_data['rest'] % 60:02d}</b>\n"
+        f"מדרגת התקדמות: <b>{exercise_data['inc']:g}</b>\n\n"
+        "כתוב את השינוי, למשל:\n"
+        "\"משקל 22.5\"\n"
+        "\"4 סטים\"\n"
+        "\"8-12 חזרות\"\n"
+        "\"מנוחה 1:30\"\n"
+        "\"מנוחה 1:30 לכל התרגילים\""
+    )
+    await conversation.set_active_flow(
+        DB,
+        user_id,
+        conversation.FlowName.workout_parameter_edit,
+        step="awaiting_text",
+        payload={
+            "v": 2,
+            "tier": ref.tier,
+            "plan_id": ref.plan_id,
+            "fact_rev": ref.fact_rev,
+            "session_index": ref.session_index,
+            "exercise_index": exercise_index,
+            "exercise_id": exercise_data.get("id"),
+            "code": resolved.choice.code,
+        },
+    )
+    await safe_edit(query, text, exercise_params_keyboard_v2(ref, exercise_index))
 
 
 @runtime_bound(RUNTIME_NAMES)

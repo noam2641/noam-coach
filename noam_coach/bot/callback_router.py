@@ -147,6 +147,10 @@ _DEBOUNCE_PREFIXES = (
     # test_workout_start_provenance.py's debounce-coverage test.
     "wk:start:",
     "wk:fstart:",
+    # Batch 6: `wk:par:` is a persisted stepper write (one tap = one stored
+    # override), so a double-tap must not apply the delta twice. `wk:exm:`
+    # and `wk:ex:` are read-only navigation and stay undebounced.
+    "wk:par:",
     # Codex audit round: sensitive single-shot writes that advance a flow —
     # a double-tap must not apply/skip TWO steps (e.g. health:skip_item
     # tapped twice would silently discard the next wizard item too).

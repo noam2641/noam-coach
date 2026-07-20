@@ -582,6 +582,7 @@ async def _render_workout_selector(query: Any, user_id: int) -> None:
                 source="workout_selector", extra={"detail": str(exc)},
             )
             return
+        await _apply_overrides_to_resolved(user_id, resolved)
         await render_workout_overview_v2(query, user_id, resolved, single_choice=True)
         return
 
@@ -640,6 +641,302 @@ def _parse_wk_ref(data: str) -> Any:
     return None
 
 
+@runtime_bound(RUNTIME_NAMES)
+async def _apply_overrides_to_resolved(user_id: int, resolved: Any) -> None:
+    """Overlay the user's stored overrides onto a resolved session IN PLACE.
+
+    The catalog resolves plan/template content; overrides are a separate,
+    per-user layer. Every read-side edit screen must show the effective value
+    (what Start would snapshot), so this applies exactly the same
+    collect_overrides result materialize_snapshot would -- code-scoped and
+    id-verified per plan section G, never by bare index.
+    """
+    from noam_coach.services import workout_catalog
+
+    overrides = await workout_catalog.collect_overrides(DB, user_id, resolved.session)
+    if not overrides:
+        return
+    for exercise in resolved.session.get("exercises", []):
+        for override_field, value in overrides.get(exercise.get("id"), {}).items():
+            exercise[override_field] = value
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def _apply_workout_param_delta(
+    user_id: int, resolved: Any, exercise_index: int, field: str, delta: float
+) -> None:
+    """Persist ONE stepper delta against the identified session's exercise.
+
+    Writes are code-scoped and carry the stable ``exercise_id`` (plan section
+    G.6), so a later read verifies identity rather than trusting position.
+    The positional ``exercise_index`` still goes into the row because it is
+    part of the table's primary key -- but note it is the index within THIS
+    session, which for Tier-1 is the personalized payload's ordering. That is
+    exactly why the id is written alongside: collect_overrides matches on the
+    id first and only falls back to a verified template position for legacy
+    NULL-id rows.
+    """
+    exercises = resolved.session.get("exercises", [])
+    current = exercises[exercise_index]
+    code = resolved.choice.code
+    exercise_id = current.get("id")
+
+    new_min, new_max = int(current["rmin"]), int(current["rmax"])
+    if field == "weight":
+        new_value: float = max(0.0, round(float(current["weight"]) + delta, 2))
+    elif field == "sets":
+        new_value = max(1, int(current["sets"] + delta))
+    elif field == "rmin":
+        new_min = max(1, int(current["rmin"] + delta))
+        new_value = new_min
+        if new_min > new_max:
+            new_max = new_min
+            await set_exercise_override(
+                user_id, code, exercise_index, "rmax", new_max, exercise_id=exercise_id
+            )
+    elif field == "rmax":
+        new_max = max(int(current["rmin"]), int(current["rmax"] + delta))
+        new_value = new_max
+    elif field == "rest":
+        new_value = max(30, int(current["rest"] + delta))
+    else:
+        return
+
+    await set_exercise_override(
+        user_id, code, exercise_index, field, new_value, exercise_id=exercise_id
+    )
+
+
+def _wk_back_callback_for_payload(payload: dict[str, Any] | None) -> str | None:
+    """The `wk:sel`/`wk:fsel` callback that returns to the overview a v2 edit
+    flow was started from, or None for a legacy (code-only) payload.
+
+    Kept here rather than in ui.py so both callback_plans and meal_text share
+    one definition of "where does Back go" -- the selection must survive the
+    whole edit loop (plan section M, Batch 6 objective).
+    """
+    payload = payload or {}
+    if int(payload.get("v") or 0) < 2:
+        return None
+    tier = str(payload.get("tier") or "")
+    session_index = payload.get("session_index")
+    if session_index is None:
+        return None
+    if tier == "plan" and payload.get("plan_id") is not None:
+        return f"wk:sel:{payload['plan_id']}:{session_index}"
+    if tier == "fact" and payload.get("fact_rev"):
+        return f"wk:fsel:{payload['fact_rev']}:{session_index}"
+    return None
+
+
+def _wk_edit_callback_for_payload(payload: dict[str, Any] | None) -> str | None:
+    """The `wk:ex:...` callback that reopens the SAME exercise editor, used by
+    the 'write a different correction' button."""
+    payload = payload or {}
+    back = _wk_back_callback_for_payload(payload)
+    if not back:
+        return None
+    exercise_index = payload.get("exercise_index")
+    if exercise_index is None:
+        return None
+    # wk:sel:<identity>:<sidx> -> wk:ex:<identity>:<sidx>:<exercise_index>
+    identity_and_index = back.split(":", 2)[2]
+    return f"wk:ex:{identity_and_index}:{exercise_index}"
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def _apply_workout_param_text_v2(
+    query: Any, user_id: int, payload: dict[str, Any], pending_updates: list[Any]
+) -> bool:
+    """Apply a confirmed free-text parameter edit against a v2 flow payload.
+
+    Re-validates the carried identity immediately before writing (the
+    compose->confirm window is exactly where a regeneration can land), then
+    applies each update with the plan's approved scope rules:
+
+      * scope "current"  -> the one edited exercise, by stable id
+      * scope "all"      -> every exercise in THIS session only
+      * scope "program"  -> every exercise of every session in the user's
+                            current plan, each resolved through the catalog
+                            so writes stay code-scoped and id-verified
+
+    Returns True when the edit was applied (or explicitly refused and
+    rendered); the caller always returns True afterwards.
+    """
+    from noam_coach.services import workout_catalog
+    from noam_coach.services.workout_catalog import WorkoutSelectionRef
+
+    ref = WorkoutSelectionRef(
+        tier=str(payload.get("tier") or "plan"),
+        plan_id=payload.get("plan_id"),
+        fact_rev=payload.get("fact_rev"),
+        session_index=int(payload.get("session_index") or 0),
+    )
+    exercise_index = int(payload.get("exercise_index") or 0)
+    expected_exercise_id = payload.get("exercise_id")
+
+    try:
+        resolved = await workout_catalog.resolve_selection(DB, user_id, ref)
+    except workout_catalog.StalePlanReference as exc:
+        await conversation.clear_active_flow(DB, user_id)
+        await _refuse_stale_workout_ref(query, user_id, ref=ref, detail=str(exc))
+        return True
+
+    exercises = resolved.session.get("exercises", [])
+    if not 0 <= exercise_index < len(exercises):
+        await conversation.clear_active_flow(DB, user_id)
+        await _refuse_stale_workout_ref(query, user_id, ref=ref, detail="exercise_index_out_of_range")
+        return True
+
+    # Identity cross-check: the exercise this edit was composed against must
+    # still be the exercise at that position. Immutable payloads make this
+    # nearly always true, but a Tier-2 template revision could change it --
+    # and applying a "bench" edit to whatever now sits at index 2 is exactly
+    # the class of bug this architecture exists to prevent.
+    actual_exercise_id = exercises[exercise_index].get("id")
+    if expected_exercise_id and actual_exercise_id != expected_exercise_id:
+        await conversation.clear_active_flow(DB, user_id)
+        await _refuse_stale_workout_ref(query, user_id, ref=ref, detail="exercise_identity_changed")
+        return True
+
+    await _apply_overrides_to_resolved(user_id, resolved)
+
+    # Build the target list per scope. "program" walks the user's whole plan
+    # via the catalog (never a bare code list), so every write is scoped to a
+    # real resolved session and carries that session's own exercise ids.
+    async def _targets(scope: str) -> list[tuple[Any, list[int]]]:
+        if scope == "program":
+            out: list[tuple[Any, list[int]]] = []
+            for choice in await workout_catalog.list_selectable_workouts(DB, user_id):
+                try:
+                    other = await workout_catalog.resolve_selection(DB, user_id, choice.ref)
+                except workout_catalog.StalePlanReference:
+                    continue
+                await _apply_overrides_to_resolved(user_id, other)
+                out.append((other, list(range(len(other.session.get("exercises", []))))))
+            return out
+        if scope == "all":
+            return [(resolved, list(range(len(exercises))))]
+        return [(resolved, [exercise_index])]
+
+    applied: list[str] = []
+    affected_count = 0
+    for update_item in pending_updates:
+        if not isinstance(update_item, dict):
+            continue
+        scope = str(update_item.get("scope") or "current")
+        field = str(update_item.get("field") or "")
+        for target_resolved, indices in await _targets(scope):
+            target_exercises = target_resolved.session.get("exercises", [])
+            target_code = target_resolved.choice.code
+            for idx in indices:
+                if not 0 <= idx < len(target_exercises):
+                    continue
+                target_id = target_exercises[idx].get("id")
+                if field == "reps":
+                    rmin = int(update_item.get("rmin") or target_exercises[idx]["rmin"])
+                    rmax = int(update_item.get("rmax") or target_exercises[idx]["rmax"])
+                    await set_exercise_override(
+                        user_id, target_code, idx, "rmin", rmin, exercise_id=target_id
+                    )
+                    await set_exercise_override(
+                        user_id, target_code, idx, "rmax", max(rmin, rmax), exercise_id=target_id
+                    )
+                    affected_count += 1
+                elif field in {"weight", "sets", "rest"}:
+                    await set_exercise_override(
+                        user_id, target_code, idx, field, float(update_item["value"]),
+                        exercise_id=target_id,
+                    )
+                    affected_count += 1
+        label = str(update_item.get("label") or field)
+        if label:
+            applied.append(label)
+
+    await conversation.clear_active_flow(DB, user_id)
+    summary = ", ".join(applied) if applied else "השינוי"
+    scope_label = str(payload.get("scope_label") or "")
+    if affected_count:
+        scope_label = f"{scope_label} ({affected_count} תרגילים הושפעו)"
+    from noam_coach.bot.ui import wk_exercise_menu_callback, wk_select_callback
+
+    await safe_edit(
+        query,
+        f"שמרתי: {summary} {scope_label} ✅",
+        InlineKeyboardMarkup([
+            [button("⬅️ חזרה לאימון", wk_select_callback(ref))],
+            [button("✏️ ערוך עוד", wk_exercise_menu_callback(ref))],
+        ]),
+    )
+    return True
+
+
+def _parse_wk_edit_ref(data: str) -> tuple[Any, int, str | None, float | None] | None:
+    """Parse the Batch-6 edit callbacks into
+    (ref, exercise_index, field, delta):
+
+        wk:exm:<identity>:<sidx>                              -> (ref, -1, None, None)
+        wk:ex:<identity>:<sidx>:<exercise_index>              -> (ref, idx, None, None)
+        wk:par:<identity>:<sidx>:<exercise_index>:<field>:<d> -> (ref, idx, field, d)
+
+    Returns None for any malformed payload -- a corrupted or hand-crafted
+    callback must refuse, never raise, and never fall back to a bare code.
+    """
+    from exercise_plans import OVERRIDE_FIELDS
+    from noam_coach.services.workout_catalog import WorkoutSelectionRef
+
+    parts = data.split(":")
+    if len(parts) < 4:
+        return None
+    action, identity, index_text = parts[1], parts[2], parts[3]
+    if action not in ("exm", "ex", "par"):
+        return None
+    try:
+        session_index = int(index_text)
+    except (TypeError, ValueError):
+        return None
+    if session_index < 0:
+        return None
+
+    # `exm` and `par` are minted from the SAME identity segment shape as the
+    # selector: numeric plan_id for Tier-1, 8-hex fingerprint for Tier-2. The
+    # action name alone decides the tier, exactly as with sel/fsel.
+    if identity.lstrip("-").isdigit():
+        ref = WorkoutSelectionRef(tier="plan", plan_id=int(identity), fact_rev=None,
+                                  session_index=session_index)
+    elif identity:
+        ref = WorkoutSelectionRef(tier="fact", plan_id=None, fact_rev=identity,
+                                  session_index=session_index)
+    else:
+        return None
+
+    if action == "exm":
+        return (ref, -1, None, None) if len(parts) == 4 else None
+
+    if len(parts) < 5:
+        return None
+    try:
+        exercise_index = int(parts[4])
+    except (TypeError, ValueError):
+        return None
+    if exercise_index < 0:
+        return None
+
+    if action == "ex":
+        return (ref, exercise_index, None, None) if len(parts) == 5 else None
+
+    if len(parts) != 7:
+        return None
+    field = parts[5]
+    if field not in OVERRIDE_FIELDS:
+        return None
+    try:
+        delta = float(parts[6])
+    except (TypeError, ValueError):
+        return None
+    return ref, exercise_index, field, delta
+
+
 def _wk_is_again(data: str) -> bool:
     """True when a start callback carries the Batch-5 repeat-confirmation
     marker. `:again` skips ONLY the done-today interstitial -- identity
@@ -680,12 +977,69 @@ async def _handle_workout_v2_actions(
         except workout_catalog.StalePlanReference as exc:
             await _refuse_stale_workout_ref(query, user_id, ref=ref, detail=str(exc))
             return True
+        # Show EFFECTIVE values (Batch 6): the overview must display what
+        # Start will actually snapshot, overrides included, or the user edits
+        # a number and sees the un-edited one on the way back.
+        await _apply_overrides_to_resolved(user_id, resolved)
         await render_workout_overview_v2(query, user_id, resolved)
         await track_event(
             user_id, "workout_selection_activated",
             tier=ref.tier, session_index=ref.session_index,
             followed_recommendation=resolved.choice.recommended,
         )
+        return True
+
+    if data.startswith(("wk:exm:", "wk:ex:", "wk:par:")):
+        # Batch 6: identity-safe parameter editing. Every one of these
+        # re-resolves the carried identity BEFORE doing anything, so an edit
+        # can never be applied to a session other than the one displayed --
+        # and a regenerated plan refuses instead of silently retargeting.
+        from noam_coach.bot.ui import (
+            exercise_picker_keyboard_v2,
+            render_exercise_params_v2,
+        )
+
+        parsed = _parse_wk_edit_ref(data)
+        if parsed is None:
+            await _refuse_stale_workout_ref(query, user_id, detail="malformed_edit_ref")
+            return True
+        ref, exercise_index, field, delta = parsed
+
+        try:
+            resolved = await workout_catalog.resolve_selection(DB, user_id, ref)
+        except workout_catalog.StalePlanReference as exc:
+            await _refuse_stale_workout_ref(query, user_id, ref=ref, detail=str(exc))
+            return True
+
+        await _apply_overrides_to_resolved(user_id, resolved)
+        exercises = resolved.session.get("exercises", [])
+        if data.startswith("wk:exm:"):
+            await safe_edit(
+                query,
+                f"<b>בחר תרגיל לעריכת פרמטרים</b>\n{esc(resolved.choice.name)}",
+                exercise_picker_keyboard_v2(resolved),
+            )
+            return True
+
+        if not 0 <= exercise_index < len(exercises):
+            # The session no longer has that many exercises (a regenerated
+            # plan of the same id is impossible -- payloads are immutable --
+            # but a hand-crafted index must still refuse).
+            await _refuse_stale_workout_ref(query, user_id, ref=ref, detail="exercise_index_out_of_range")
+            return True
+
+        if data.startswith("wk:ex:"):
+            await render_exercise_params_v2(query, user_id, resolved, exercise_index)
+            return True
+
+        # wk:par -- apply one stepper delta, then re-render from freshly
+        # resolved+overridden state so the screen always reflects storage.
+        await _apply_workout_param_delta(
+            user_id, resolved, exercise_index, str(field), float(delta)
+        )
+        refreshed = await workout_catalog.resolve_selection(DB, user_id, ref)
+        await _apply_overrides_to_resolved(user_id, refreshed)
+        await render_exercise_params_v2(query, user_id, refreshed, exercise_index)
         return True
 
     if data.startswith(("wk:start:", "wk:fstart:")):
@@ -847,10 +1201,13 @@ async def _handle_workout_parameter_actions(
         payload = flow.payload if flow.name == conversation.FlowName.workout_parameter_edit else {}
         code = str(payload.get("code") or "A")
         await conversation.clear_active_flow(DB, user_id)
+        # Batch 6: cancel returns to the SAME selected overview when the flow
+        # carried a v2 identity, instead of the ambiguous bare-code screen.
+        back = _wk_back_callback_for_payload(payload) or f"workout:{code}"
         await safe_edit(
             query,
             "ביטלתי את עריכת הפרמטרים. לא שמרתי שינוי.",
-            InlineKeyboardMarkup([[button("⬅️ חזרה לאימון", f"workout:{code}")]]),
+            InlineKeyboardMarkup([[button("⬅️ חזרה לאימון", back)]]),
         )
         return True
 
@@ -875,6 +1232,19 @@ async def _handle_workout_parameter_actions(
                 InlineKeyboardMarkup([[button("🏠 תפריט", "menu:home")]]),
             )
             return True
+        # Batch 6: a v2 payload carries the full session identity, so a
+        # free-text edit confirmed minutes later still applies to the SAME
+        # session -- re-validated here, immediately before the write. A
+        # regenerated plan refuses rather than retargeting the edit. Legacy
+        # code-only payloads (v absent) keep the old positional behavior
+        # untouched until Batch 7 retires them.
+        if int(payload.get("v") or 0) >= 2:
+            applied_v2 = await _apply_workout_param_text_v2(query, user_id, payload, pending_updates)
+            if applied_v2:
+                return True
+            # _apply_workout_param_text_v2 already rendered a refusal.
+            return True
+
         plan = await get_user_plan(user_id, code)
         active_plan = await user_model.get_value(DB, user_id, "active_workout_plan")
         program_codes = []
