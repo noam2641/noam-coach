@@ -790,6 +790,16 @@ async def render_meal(target: Any, user_id: int, approval_id: str, refine_count:
             "אם הניתוח אינו מדויק — אפשר לבחור מהרשימה, לכתוב לי תיאור נוסף, "
             "או פשוט לאשר אם זה תקין." + restriction_block + refine_hint
         )
+        # Batch 6: a quantity clarification ends with an escape option ("type
+        # grams" / "cancel"). Truncating to a fixed 4 would silently drop it
+        # and trap the user in a question with no way out, so the cap keeps
+        # the LAST options (the exits) rather than only the first ones.
+        _MAX_CLARIFY_BUTTONS = 6
+        visible_options = list(enumerate(analysis.options))
+        if len(visible_options) > _MAX_CLARIFY_BUTTONS:
+            head = visible_options[: _MAX_CLARIFY_BUTTONS - 2]
+            tail = visible_options[-2:]
+            visible_options = head + tail
         option_rows = [
             [
                 button(
@@ -797,7 +807,7 @@ async def render_meal(target: Any, user_id: int, approval_id: str, refine_count:
                     f"clarify:{approval_id}:{index}",
                 )
             ]
-            for index, option in enumerate(analysis.options[:4])
+            for index, option in visible_options
         ]
         # TASK-22: no dedicated "correct by text" button — the user can just
         # write a correction directly while this meal is awaiting approval.

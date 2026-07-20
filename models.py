@@ -72,6 +72,14 @@ class ClarificationOption(BaseModel):
     protein_delta: float = 0
     carbs_delta: float = 0
     fat_delta: float = 0
+    # Batch 6 — quantity clarification. A macro-delta option leaves these at
+    # their defaults and behaves exactly as before; a quantity option sets
+    # ``apply_kind`` and is routed to the quantity path instead of the deltas.
+    # Optional and defaulted so every previously persisted option still
+    # validates (no migration).
+    apply_kind: str | None = None
+    set_grams: float | None = Field(default=None, ge=0, le=5000)
+    set_size: str | None = None
 
 
 def _title_word_set(text: str) -> set[str]:

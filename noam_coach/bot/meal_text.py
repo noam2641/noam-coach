@@ -114,6 +114,93 @@ from noam_coach.services.nutrition_context import (
 RUNTIME_NAMES = ('ContextTypes', 'DB', 'Exception', 'InlineKeyboardMarkup', 'LOGGER', 'MealAnalysis', 'RuntimeError', 'Update', '_CANCEL_WORDS', '_handle_meal_correction_text', 'approval_id', 'button', 'candidate_ids', 'clear_meal_fix', 'conversation', 'corrected_analysis', 'correction_text', 'count', 'decision', 'ensure_user', 'event_log', 'exc', 'fetch_approval', 'flow', 'friendly_error', 'get_meal_fix', 'handle_onboarding_text', 'home_keyboard', 'image_path', 'index', 'int', 'is_allowed', 'json', 'len', 'list', 'original_analysis', 'pc', 'planning', 'prior_locked', 'progress', 'rc', 'reanalyze_meal_with_text_and_image', 'refine_count', 'removal_corrections', 'render_meal', 'route_free_text', 'row', 'selected', 'set_meal_fix', 'str', 'suppress', 'text', 'track_event', 'update', 'user_id', 'write_audit')
 
 
+def _apply_quantity_clarification_stage(
+    row: Any,
+    analysis: "MealAnalysis",
+    correction_text: str,
+) -> "MealAnalysis":
+    """Resolve an answered quantity question, then ask the next one if needed.
+
+    Mutates ``row["data"]["pending_clarification"]`` so the approval payload
+    can reconstruct both the pending question and its resolution. Never raises
+    into the correction handler: any failure leaves the analysis untouched and
+    the card renders as it would have before Batch 6.
+    """
+    from noam_coach.services.meal_clarification import (
+        PendingClarification,
+        build_clarification_options,
+        detect_quantity_clarification,
+        resolve_typed_grams,
+    )
+    from models import ClarificationOption
+
+    try:
+        pending = PendingClarification.from_payload(
+            row["data"].get("pending_clarification")
+        )
+
+        # (1) The user typed grams while a question was open. parse_locked_
+        # quantities already applied them to a MATCHED item above; this
+        # closes the question so the same answer can never be applied twice
+        # and the card stops asking.
+        if pending is not None and not pending.is_resolved:
+            locked = meal_intelligence.parse_locked_quantities(correction_text)
+            typed_grams = None
+            for entry in locked or []:
+                grams_value = float(getattr(entry, "grams", 0) or 0)
+                if grams_value > 0:
+                    typed_grams = grams_value
+                    break
+            if typed_grams is not None:
+                resolve_typed_grams(analysis, pending, typed_grams)
+                row["data"]["pending_clarification"] = pending.to_payload()
+                if pending.is_resolved:
+                    analysis.question = None
+                    analysis.options = []
+                    return analysis
+
+        # (2) Ask about unresolved quantity evidence — but never overwrite a
+        # question the analyzer itself is already asking.
+        if analysis.question:
+            return analysis
+
+        next_pending = detect_quantity_clarification(analysis)
+        if next_pending is None:
+            return analysis
+
+        # Do not re-ask a question this payload already answered.
+        if (
+            pending is not None
+            and pending.is_resolved
+            and pending.token == next_pending.token
+        ):
+            return analysis
+
+        # Preserve an in-flight question's resolution state across re-renders
+        # so its token (and idempotency) survives an unrelated correction.
+        if pending is not None and pending.token == next_pending.token:
+            next_pending.resolved_token = pending.resolved_token
+            next_pending.resolution = pending.resolution
+            next_pending.resolved_grams = pending.resolved_grams
+
+        analysis.question = next_pending.question
+        analysis.options = [
+            ClarificationOption(
+                label=str(opt.get("label") or ""),
+                item_index=opt.get("item_index"),
+                item_name=next_pending.item_name,
+                apply_kind=opt.get("apply_kind"),
+                set_grams=opt.get("set_grams"),
+                set_size=opt.get("set_size"),
+            )
+            for opt in build_clarification_options(next_pending)
+        ]
+        row["data"]["pending_clarification"] = next_pending.to_payload()
+    except Exception:  # noqa: BLE001 — clarification must never break a correction
+        LOGGER.exception("quantity clarification stage failed")
+    return analysis
+
+
 @runtime_bound(RUNTIME_NAMES)
 async def _handle_meal_correction_text(
     update: Update,
@@ -255,6 +342,16 @@ async def _handle_meal_correction_text(
             + corrected_analysis.notes
             + [f"תיקון: {correction_text}"]
         )[-10:]
+
+        # --- Batch 6: quantity clarification ------------------------------
+        # Two directions, in this order:
+        #   1. the user was ASKED for grams and just typed them → resolve the
+        #      open question through the same gram-locking write a button uses;
+        #   2. the (possibly corrected) analysis still has quantity evidence we
+        #      must not resolve alone → ask, instead of guessing.
+        corrected_analysis = _apply_quantity_clarification_stage(
+            row, corrected_analysis, correction_text
+        )
 
         # Bump revision in payload
         revision = row["data"].get("revision", 0) + 1

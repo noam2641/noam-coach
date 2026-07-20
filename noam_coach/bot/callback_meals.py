@@ -110,6 +110,115 @@ from noam_coach.bot.ui import safe_answer_callback
 RUNTIME_NAMES = ('render_post_meal_confirmation_day_status', 'APP_VERSION', 'Any', 'CALLBACK_DEBOUNCE_SECONDS', 'CONFIRM_PENDING', 'ContextTypes', 'DB', 'EXERCISE_MUSCLES', 'Exception', 'GOAL_STATUS_PROPOSED', 'GOAL_STATUS_PROVISIONAL', 'InlineKeyboardButton', 'InlineKeyboardMarkup', 'KeyError', 'LOGGER', 'MealAnalysis', 'PENDING_QUESTION', 'Path', 'RIR_UNKNOWN', 'SESSION_SCOPED_ACTIONS', 'SETTINGS', 'TypeError', 'Update', 'ValueError', 'WebAppInfo', '_DEBOUNCE_PREFIXES', '_LAST_CALLBACK', '_StaleSetStep', '_duration_s', '_home_hint', '_is_duplicate_tap', '_plan_type_label', '_started', 'action', 'activate_goal_version_provisional', 'active_flow', 'active_session', 'actual_reps', 'actual_rir', 'actual_weight', 'aiosqlite', 'alt', 'alt_muscle', 'alternative', 'alternative_index', 'analysis', 'analyze_duplicate_candidate', 'apply_reconcile_proposal', 'approval_id', 'bool', 'build_daily_status', 'build_evening_summary_text', 'build_health_status_text', 'build_morning_menu_text', 'build_next_meal_text', 'build_now_action_text', 'build_weekly_summary_text', 'button', 'buttons', 'callback_flow_id', 'callback_version', 'cancel_rest_timer', 'candidate', 'center', 'changed', 'check_duplicate_meal', 'choices', 'chosen_reps', 'chosen_weight', 'claimed', 'clear_confirm_pending', 'clear_meal_fix', 'clear_pending', 'clear_split_state', 'code', 'command_profile_query', 'completed', 'conn', 'connection', 'constraint_id', 'context', 'conversation', 'create_approval', 'create_goal_version', 'create_meal_edit_approval', 'cur', 'current', 'cursor', 'cutoff', 'data', 'datetime', 'decide_approval', 'deleted', 'delta', 'delta_text', 'dict', 'done', 'draft', 'dup', 'duplicate_approval_id', 'edit_approval_id', 'ensure_user', 'enumerate', 'error_id', 'esc', 'event_log', 'ex', 'exc', 'exercise_index', 'exercise_index_text', 'exercise_picker_keyboard', 'existing', 'extra', 'extra_seconds', 'fetch_approval', 'fetch_goal', 'field', 'final_rir', 'first_reps', 'first_weight', 'flags', 'float', 'frequency', 'friendly_error', 'get_daily_flags', 'get_meal_fix', 'get_split_state', 'get_user_plan', 'getattr', 'goal', 'goal_id', 'gv_id', 'handle_checkin_callback', 'handle_flags_callback', 'handle_goal_callback', 'handle_meal_callback', 'handle_menu_callback', 'handle_onboarding_callback', 'handle_plan_callback', 'handle_session_action_callback', 'handle_workout_setup_callback', 'home_keyboard', 'index', 'int', 'is_allowed', 'is_current_session_step', 'is_partial', 'is_provisional', 'isinstance', 'item', 'item_index', 'item_index_text', 'job', 'jobs', 'json', 'k', 'kb', 'key', 'kind', 'label', 'labels', 'last', 'len', 'level', 'list', 'logged_sets', 'max', 'meal', 'meal_id', 'meal_id_text', 'min', 'mini_app_url', 'missing', 'missing_labels', 'more_keyboard', 'msg', 'new_grams', 'new_max', 'new_min', 'new_val', 'new_weight', 'note', 'notify_admin', 'now', 'nutrition', 'object', 'ok', 'old_grams', 'option', 'option_index', 'pain_location', 'part', 'parts', 'parts_v2', 'payload', 'persist_meal', 'plan', 'plan_id', 'plan_now', 'plan_type', 'planned_sets', 'planning', 'plans_keyboard', 'progress', 'quality', 'query', 'range', 'ratio', 'rc', 'readiness', 'recommend_load', 'refreshed', 'render_candidate_list', 'render_exercise_params', 'render_meal', 'render_profile_snapshot', 'render_quantity_editor', 'render_smart_plan_hub', 'render_unified_plan', 'render_workout_overview', 'reopened', 'replacement', 'reps', 'reps_value', 'rest', 'rest_job_name', 'result', 'round', 'route_decision', 'row', 'rows', 'safe_edit', 'save_medical_constraint', 'save_split_set', 'second_base', 'second_reps', 'second_weight', 'secrets', 'select_todays_workout_code', 'selected', 'send_weight_chart', 'session', 'session_action_arg', 'session_action_data', 'session_id', 'set', 'set_daily_flags', 'set_exercise_override', 'set_goal_weight', 'set_meal_fix', 'set_pending', 'set_split_state', 'severity', 'show_session', 'split_reps_keyboard', 'split_rir_keyboard', 'split_state', 'split_summary_line', 'split_weight_keyboard', 'start_rest_timer', 'status', 'status_line', 'step', 'str', 'sum', 'summary_line', 'suppress', 't', 'tail', 'target_change_note', 'text', 'time', 'total_reps', 'track_event', 'training_intelligence', 'try_save_set', 'tuple', 'undo_last_set', 'undone', 'update', 'update_rest_message', 'update_session_step', 'url', 'user_choice', 'user_id', 'user_model', 'utc_now', 'value', 'value_text', 'warn', 'weight', 'workout', 'workout_summary', 'write_audit')
 
 @runtime_bound(RUNTIME_NAMES)
+async def _resolve_quantity_clarification(
+    query: Any,
+    user_id: int,
+    approval_id: str,
+    row: Any,
+    analysis: Any,
+    option: Any,
+) -> None:
+    """Apply a Batch 6 quantity-clarification answer and re-render.
+
+    Idempotent by construction: the pending record in the approval payload
+    carries the token of the question it answers, so a repeated tap on the
+    same button finds it already resolved and only re-renders. Cancel keeps
+    the previous draft untouched; "type grams" hands off to the existing
+    gram-locking correction path.
+    """
+    from noam_coach.services.meal_clarification import (
+        APPLY_ASK_GRAMS,
+        APPLY_CANCEL,
+        PendingClarification,
+        apply_quantity_clarification,
+    )
+    from noam_coach.services.meal_approval_lifecycle import payload_revision_json
+
+    pending = PendingClarification.from_payload(row["data"].get("pending_clarification"))
+    if pending is None:
+        # The question is on the card but its state is gone (e.g. an older
+        # payload). Re-render rather than guessing a quantity.
+        await render_meal(query, user_id, approval_id)
+        return
+
+    already_resolved = pending.is_resolved
+    changed = apply_quantity_clarification(
+        analysis, pending, option.model_dump()
+    )
+
+    if option.apply_kind == APPLY_ASK_GRAMS:
+        # Keep the question open and route the user into the existing text
+        # correction flow, where typed grams lock through the normal path.
+        row["data"]["pending_clarification"] = pending.to_payload()
+        await DB.execute(
+            "UPDATE approvals SET payload=? WHERE id=?",
+            (payload_revision_json(row["data"]), approval_id),
+        )
+        _, rc_grams = await get_meal_fix(user_id)
+        await set_meal_fix(user_id, approval_id, rc_grams)
+        await safe_edit(
+            query,
+            (
+                f"<b>{esc(pending.item_name)}</b>\n\n"
+                "כתוב לי בערך כמה גרם הכל יחד (למשל <code>450 גרם</code>).\n"
+                "אפשר גם לחזור לארוחה בלי לשנות."
+            ),
+            InlineKeyboardMarkup([[button("⬅️ חזרה לארוחה", f"backmeal:{approval_id}")]]),
+        )
+        return
+
+    if option.apply_kind == APPLY_CANCEL:
+        # Preserve the previous draft exactly: clear the question, change no
+        # quantity. Approve/reject remain available on the re-rendered card.
+        analysis.question = None
+        analysis.options = []
+        row["data"]["analysis"] = analysis.model_dump()
+        row["data"]["pending_clarification"] = pending.to_payload()
+        await DB.execute(
+            "UPDATE approvals SET payload=? WHERE id=?",
+            (payload_revision_json(row["data"]), approval_id),
+        )
+        _, rc_cancel = await get_meal_fix(user_id)
+        await render_meal(query, user_id, approval_id, refine_count=rc_cancel)
+        return
+
+    if not changed and already_resolved:
+        # Repeat tap on an answered question: never double-apply.
+        await safe_answer_callback(query, "כבר עדכנתי את הכמות")
+        _, rc_dup = await get_meal_fix(user_id)
+        await render_meal(query, user_id, approval_id, refine_count=rc_dup)
+        return
+
+    if changed:
+        analysis.question = None
+        analysis.options = []
+        row["data"]["analysis"] = analysis.model_dump()
+
+    row["data"]["pending_clarification"] = pending.to_payload()
+    await DB.execute(
+        "UPDATE approvals SET payload=? WHERE id=?",
+        (payload_revision_json(row["data"]), approval_id),
+    )
+    with suppress(Exception):
+        await event_log.append_event(
+            DB,
+            user_id,
+            "meal_clarification_resolved",
+            entity="approval",
+            entity_id=approval_id,
+            source="user",
+            properties={
+                "reason": pending.reason,
+                "resolution": pending.resolution,
+                "grams": pending.resolved_grams,
+                "item": pending.item_name,
+            },
+        )
+    _, rc_done = await get_meal_fix(user_id)
+    await render_meal(query, user_id, approval_id, refine_count=rc_done)
+
+
+@runtime_bound(RUNTIME_NAMES)
 async def _handle_meal_clarification_actions(
     query: Any,
     user_id: int,
@@ -129,7 +238,20 @@ async def _handle_meal_clarification_actions(
             return True
 
         analysis = MealAnalysis.model_validate(row["data"]["analysis"])
+        if not (0 <= option_index < len(analysis.options)):
+            # A stale card (the question already moved on) must not raise —
+            # re-render so the user sees the current state.
+            await render_meal(query, user_id, approval_id)
+            return True
         option = analysis.options[option_index]
+
+        # --- Batch 6: quantity clarification options ---------------------
+        if option.apply_kind:
+            await _resolve_quantity_clarification(
+                query, user_id, approval_id, row, analysis, option
+            )
+            return True
+
         item = None
         if option.item_index is not None and 0 <= option.item_index < len(analysis.items):
             item = analysis.items[option.item_index]
