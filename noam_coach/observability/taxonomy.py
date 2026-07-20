@@ -64,6 +64,28 @@ DELIVERY_FAILED = "delivery.failed"
 ERROR_CAPTURED = "error.captured"
 OBSERVABILITY_WRITE_FAILED = "observability.write_failed"
 
+# meal.* — the meal correction/quantity lifecycle (Batch 7).
+#
+# These make the identity → count → conversion → plausibility → clarification
+# chain reconstructable. Join on ``entity_id`` (the approval id) plus the
+# ambient trace/interaction correlation; ``revision`` orders them within one
+# approval.
+MEAL_QUANTITY_CONVERSION_EVALUATED = "meal.quantity.conversion_evaluated"
+MEAL_PLAUSIBILITY_EVALUATED = "meal.plausibility.evaluated"
+MEAL_CLARIFICATION_RAISED = "meal.clarification.raised"
+MEAL_RENDER_QUANTITY_MODE = "meal.render.quantity_mode"
+
+# Pre-existing meal lifecycle names, kept VERBATIM.
+#
+# They predate the dot-namespaced convention and are read by existing tests
+# and operator docs, so Batch 7 moved them to the canonical emit boundary
+# (for redaction + mode policy) WITHOUT renaming them. Registering them here
+# keeps every meal call site importing from the taxonomy rather than passing
+# string literals, which is what the module docstring asks for.
+MEAL_CORRECTION_APPLIED = "meal_correction_applied"
+MEAL_CORRECTION_ERROR = "meal_correction_error"
+MEAL_CLARIFICATION_RESOLVED = "meal_clarification_resolved"
+
 # Envelope version for events emitted by the canonical emit boundary.
 EVENT_VERSIONS: dict[str, int] = {}
 
