@@ -150,3 +150,70 @@ async def run_user_turn(
     if trace is None:
         raise AssertionError("run_user_turn: no events recorded for the interaction")
     return trace
+
+
+async def run_failing_user_turn(
+    db: Any,
+    user_id: int,
+    handler: Callable[[Any, Any], Awaitable[Any]],
+    *,
+    text: str | None = None,
+    caption: str | None = None,
+    callback_data: str | None = None,
+    source_message_id: int | None = None,
+    photo: list[Any] | None = None,
+    document: Any | None = None,
+    query: HarnessQuery | None = None,
+    context: Any = None,
+) -> tuple[BaseException, InteractionTrace]:
+    """Run one turn whose handler is EXPECTED to raise; return (exception, trace).
+
+    R1 companion to :func:`run_user_turn`, which (correctly) propagates
+    handler exceptions before the trace can be loaded. This helper drives
+    the same real ingress envelope, requires the exception to escape it
+    (proving the boundary re-raised — production propagation is unchanged),
+    and then loads the interaction so tests can assert on the recorded
+    ``error.captured`` evidence. It never swallows an exception silently:
+    a handler that does NOT raise is an assertion failure.
+    """
+    if callback_data is not None:
+        kind = "callback"
+    elif photo:
+        kind = "photo"
+    elif document is not None:
+        kind = "document"
+    else:
+        kind = "text"
+    update = build_update(
+        user_id,
+        text=text,
+        caption=caption,
+        callback_data=callback_data,
+        source_message_id=source_message_id,
+        photo=photo,
+        document=document,
+        query=query,
+    )
+
+    captured: dict[str, str | None] = {"interaction_id": None}
+
+    async def capturing_handler(handler_update: Any, handler_context: Any) -> Any:
+        captured["interaction_id"] = current_interaction_id()
+        return await handler(handler_update, handler_context)
+
+    raised: BaseException | None = None
+    try:
+        await observed_handler(kind, capturing_handler)(update, context)
+    except Exception as exc:  # noqa: BLE001 — the expectation under test.
+        raised = exc
+    if raised is None:
+        raise AssertionError("run_failing_user_turn: the handler did not raise")
+    interaction_id = captured["interaction_id"]
+    if interaction_id is None:
+        raise AssertionError(
+            "run_failing_user_turn: the handler never ran inside an interaction scope"
+        )
+    trace = await load_interaction(db, user_id, interaction_id)
+    if trace is None:
+        raise AssertionError("run_failing_user_turn: no events recorded for the interaction")
+    return raised, trace

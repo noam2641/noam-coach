@@ -2,6 +2,11 @@
 .env.*
 !.env.example
 .venv/
+# The entire .claude/ directory is local operator configuration — never
+# tracked (CI's forbidden-files check rejects ANY tracked .claude path).
+# The /review-session and /implement-review skills therefore live only on
+# the operator's machine; docs/REVIEW_PROTOCOL.md and
+# docs/CONTINUOUS_IMPROVEMENT_WORKFLOW.md are the versioned counterparts.
 .claude/
 __pycache__/
 *.py[cod]
@@ -51,3 +56,11 @@ compileall.log
 ruff.log
 eval.log
 *.tmp
+
+# Review workflow (R4): raw evidence stays local — committable artifacts are
+# manifest/stats/signals/findings/report only (see docs/CONTINUOUS_IMPROVEMENT_WORKFLOW.md)
+reviews/state.json
+reviews/state.json.tmp
+reviews/.building_*
+reviews/*/events.jsonl
+reviews/*/timeline.md

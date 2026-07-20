@@ -363,11 +363,14 @@ ON product_events(user_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_product_events_flow
 ON product_events(user_id, flow_id, id DESC);
 
-CREATE INDEX IF NOT EXISTS idx_product_events_trace
-ON product_events(user_id, trace_id, id);
-
-CREATE INDEX IF NOT EXISTS idx_product_events_interaction
-ON product_events(user_id, interaction_id, id);
+-- NOTE (migration-order contract): the correlation indexes
+-- idx_product_events_trace / idx_product_events_interaction are created by
+-- migration 13 (observability_correlation), NOT here. Base-SCHEMA indexes
+-- must never reference columns added by a migration: executescript(SCHEMA)
+-- runs BEFORE run_migrations(), and on an existing database
+-- CREATE TABLE IF NOT EXISTS leaves the old table shape in place — an index
+-- here on a migration-added column aborts startup with
+-- "no such column" before the migration ever gets the chance to add it.
 
 CREATE TABLE IF NOT EXISTS plan_versions(
     id INTEGER PRIMARY KEY AUTOINCREMENT,

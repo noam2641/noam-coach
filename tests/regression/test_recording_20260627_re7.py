@@ -219,6 +219,11 @@ async def test_scenario3_reject_option_is_temporary_and_different(tmp_path: Path
 
     initial = await generate_next_meal_recommendation(db, 1)
     rejected_fp = option_fingerprint(initial.options[0])
+    # B5/ARCH-06: in the recording the user rejected a DISPLAYED card; the
+    # dislike anchor resolves against the active recommendation, so record it.
+    from noam_coach.services.next_meal import remember_active_recommendation
+
+    await remember_active_recommendation(db, 1, initial)
 
     query = FakeQuery()
     await callback_menu_bot.handle_menu_callback(query, 1, "nextmeal:dislike:1")

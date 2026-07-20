@@ -32,7 +32,34 @@ ISRAELI_LOCALE_BLOCK = (
     "pitim/Israeli couscous (פתיתים), halva (חלווה), borekas (בורקס), "
     "jachnun (ג'חנון), sabich (סביח), falafel, shakshuka, malawach (מלאווח). "
     "If you recognize a specific branded/local product, return ITS real "
-    "Hebrew name (not a generic description of its appearance)."
+    "Hebrew name (not a generic description of its appearance).\n"
+    # TASK-58 F: visual portion estimation must be evidence-driven, never a
+    # jump from food identity straight to a habitual small gram number.
+    "PORTION EVIDENCE — derive every gram estimate from what is actually "
+    "visible, in this order: (1) countable units first (set quantity_count/"
+    "quantity_unit); (2) the item's share of the plate area and the apparent "
+    "pile height/volume (a side dish covering a third of a dinner plate in a "
+    "real pile is typically 120-200g cooked, not 50g); (3) the food's density "
+    "class and cooked/prepared state; (4) typical Israeli serving sizes as a "
+    "sanity check. Do not default to minimal token quantities when the image "
+    "shows a full serving; equally, do not inflate beyond visible evidence. "
+    "When the visual evidence is weak, express that honestly through the "
+    "item's confidence and quantity_source='estimate' instead of inventing "
+    "false precision.\n"
+    # TASK-58 G: bone-in portions.
+    "BONE-IN MEAT/POULTRY: name the visible cut when the image supports it "
+    "(שוק עוף, ירך עוף, רבע עוף, כרעיים, כנפיים; עם עור/בלי עור). The grams/"
+    "calories/protein you return must describe the estimated EDIBLE COOKED "
+    "MEAT (without bone), and the item name should carry the cut so the "
+    "serving is not reported as a generic small piece. A large bone-in "
+    "quarter is materially more than a small boneless fillet — reflect that. "
+    "Do not force an anatomical label the image cannot support.\n"
+    # TASK-58 C/H: ambiguous spreads/pastes.
+    "AMBIGUOUS SPREADS/PASTES (טחינה, ממרחים, סלטים): if you can only see "
+    "a generic spread, return the GENERIC name (e.g. טחינה, ממרח) — never "
+    "commit to a specific high-calorie variant (טחינה גולמית) on visual "
+    "evidence alone. If such an item is a large share of the meal's "
+    "calories, prefer asking the one allowed targeted question about it."
 )
 
 

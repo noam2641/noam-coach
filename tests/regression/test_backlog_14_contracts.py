@@ -70,7 +70,10 @@ def test_task04_task14_meal_state_and_short_post_meal_status_are_connected() -> 
     post = block(workout, "async def render_post_meal_confirmation_day_status", "async def _exercise_pain_warning_line")
     assert "נשמר" in post
     assert "מצב היום" in post
-    assert "המשך היום" in post
+    # TASK-59: the continuation timeline is built by the SHARED day_timeline
+    # service (the "המשך היום:" heading now lives there, reused by every
+    # remaining-day surface instead of being reconstructed per renderer).
+    assert "format_remaining_day_lines" in post
 
 
 def test_task05_task06_daily_menu_has_one_canonical_route_and_standalone_text() -> None:

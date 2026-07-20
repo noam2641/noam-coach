@@ -35,17 +35,17 @@ def _norm(value: Any) -> str:
 
 
 def _meal_matches_any_consumed(planned_name: str, consumed_names: set[str]) -> bool:
-    """FIX 49 (partial): exact-string equality between a planned meal's name
-    and a consumed meal's logged name is not a sufficient resolver -- a
-    consumed meal is very often logged with a slightly different title than
-    the plan's ("חזה עוף עם אורז" planned, "חזה עוף" or "עוף ואורז" logged),
-    so the follow-up would incorrectly nag about a meal the user already
-    ate. Full durable planned-meal identity (a persisted ID with lifecycle
-    transitions, matched by confirmed user action rather than text) is
-    tracked as remaining FIX 49 work; this widens the heuristic from exact
-    match to substring containment either direction, which catches the
-    common "same meal, shorter/longer logged title" case without inventing
-    new persisted identity.
+    """Text-log FALLBACK matcher only (B12/ARCH-13 closes FIX 49).
+
+    The PRIMARY resolver is now the persisted planned-meal lifecycle: a
+    planned meal saved through the recommendation flow transitions to
+    status=consumed by fingerprint identity and never reaches this function
+    (nutrition_context surfaces only effectively-planned entries). What
+    remains here is the genuinely fuzzy case — the user logged the meal as
+    FREE TEXT/photo with a different title ("חזה עוף עם אורז" planned,
+    "חזה עוף" logged) where no fingerprint exists to match; substring
+    containment either direction keeps the follow-up from nagging about a
+    meal that was clearly already eaten.
     """
     if not planned_name:
         return False

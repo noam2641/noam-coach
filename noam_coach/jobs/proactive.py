@@ -145,6 +145,20 @@ NUTRITION_DAY_QUALITY_KEYS = frozenset(
 )
 
 
+# B6/ARCH-09: proactive prompts whose message assumes today's workout is
+# still PENDING ("planned for today — want to start?", pre-workout
+# motivation). Suppressed at the delivery boundary after an explicit
+# same-day cancellation (next_meal_workout_status=cancelled) or a completed
+# workout. Keys NOT here (evening summary, weekly, nutrition nudges) handle
+# workout wording themselves and stay untouched.
+WORKOUT_PENDING_ASSUMING_KEYS = frozenset(
+    {
+        "workout_prompt",
+        "motivation_pre_workout",
+    }
+)
+
+
 @dataclass(frozen=True)
 class JobDeliveryClaim:
     user_id: int
@@ -443,11 +457,44 @@ async def deliver_proactive_message(
     retry_callback: Callable[[CallbackContext], Awaitable[None]] | None = None,
 ) -> bool:
     user_id = SETTINGS.telegram_allowed_user_id
+    # B6/ARCH-09: prompts that assume the workout is still PENDING must not
+    # fire after the user said the day's workout is cancelled (FIX 39's
+    # whole-day claim) or after it is already done. The check runs before
+    # the claim and before delivery.attempted, so a suppressed prompt leaves
+    # only the decision trace — no delivery events, no budget consumption.
+    # The three-way distinction is preserved: completed and cancelled get
+    # DIFFERENT reasons, and the pending case delivers as before.
+    if key in WORKOUT_PENDING_ASSUMING_KEYS:
+        flags = await get_daily_flags(user_id)
+        status = str(flags.get("next_meal_workout_status") or "")
+        suppress_reason = None
+        if status == "cancelled":
+            suppress_reason = "workout_cancelled_today"
+        elif status == "completed" or await workout_completed_today(user_id):
+            suppress_reason = "workout_already_completed"
+        if suppress_reason:
+            from noam_coach.observability import emit_event, interaction_scope, taxonomy
+
+            with interaction_scope(user_id=user_id):
+                await emit_event(
+                    DB, user_id, taxonomy.DECISION_FALLBACK_SELECTED,
+                    entity="proactive_job", entity_id=key,
+                    source="job", status="selected", outcome="suppressed",
+                    properties={
+                        "operation": "proactive_job", "key": key,
+                        "reason": suppress_reason,
+                        "workout_status_flag": status or None,
+                    },
+                )
+            LOGGER.info("Proactive message suppressed (%s): %s", key, suppress_reason)
+            return False
     goal_quality_sensitive = key in NUTRITION_GOAL_QUALITY_KEYS
     nutrition_sensitive = key in NUTRITION_DAY_QUALITY_KEYS
     start_utc = end_utc = None
     if nutrition_sensitive:
-        start_utc, end_utc = daily_state.local_day_bounds_utc()
+        # B3/ARCH-02: proactive NUTRITION-quality gating reads the coaching
+        # day's window (send-time scheduling itself stays wall-clock).
+        start_utc, end_utc = await daily_state.coaching_day_bounds_utc(DB, user_id)
     allowed, reason = await data_quality.can_send_proactive(
         DB,
         user_id,

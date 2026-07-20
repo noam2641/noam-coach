@@ -276,20 +276,29 @@ async def get_goal_history(user_id: int, limit: int = 10) -> list[dict[str, Any]
 
 @runtime_bound(RUNTIME_NAMES)
 async def compute_personal_targets(user_id: int) -> targets.Targets | None:
-    """Derive personalized targets from the user model, or None if no weight."""
-    weight = await user_model.get_value(DB, user_id, "weight_kg")
+    """Derive personalized targets from the user model, or None if no weight.
+
+    B11/ARCH-15 read policy: every body metric here DRIVES the calorie/protein
+    targets, so all reads are decision-grade (get_decision_value) — an
+    unconfirmed AI/derived estimate returns None instead of silently steering
+    the goal. Onboarding/confirmation screens still see such estimates via
+    their own display reads.
+    """
+    weight = await user_model.get_decision_value(DB, user_id, "weight_kg")
     if weight is None:
         return None
-    avg_steps = await user_model.get_value(DB, user_id, "avg_steps")
-    height = await user_model.get_value(DB, user_id, "height_cm")
-    sex = await user_model.get_value(DB, user_id, "sex")
-    age = await user_model.get_value(DB, user_id, "age")
-    goal_weight = await user_model.get_value(DB, user_id, "goal_weight_kg")
-    body_fat = await user_model.get_value(DB, user_id, "body_fat_pct")
-    timeframe = await user_model.get_value(DB, user_id, "goal_timeframe_weeks")
+    avg_steps = await user_model.get_decision_value(DB, user_id, "avg_steps")
+    height = await user_model.get_decision_value(DB, user_id, "height_cm")
+    sex = await user_model.get_decision_value(DB, user_id, "sex")
+    age = await user_model.get_decision_value(DB, user_id, "age")
+    goal_weight = await user_model.get_decision_value(DB, user_id, "goal_weight_kg")
+    body_fat = await user_model.get_decision_value(DB, user_id, "body_fat_pct")
+    timeframe = await user_model.get_decision_value(DB, user_id, "goal_timeframe_weeks")
     profile = await load_routine_profile(user_id)
     workouts = (profile.get("workout") or {}).get("weekly_frequency")
-    goal_type = _goal_type_from_fact(await user_model.get_value(DB, user_id, "primary_goal"))
+    goal_type = _goal_type_from_fact(
+        await user_model.get_decision_value(DB, user_id, "primary_goal")
+    )
     return targets.compute_targets(
         float(weight),
         avg_steps=float(avg_steps) if avg_steps is not None else None,

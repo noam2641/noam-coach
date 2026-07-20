@@ -217,6 +217,12 @@ class WorkoutPattern:
     # many such weeks the average is based on.
     wear_filtered: bool = False
     valid_weeks_sampled: int = 0
+    # TASK-60: per-weekday circular-mean workout start times ("0"=Mon …
+    # "6"=Sun, string keys for JSON round-trips) with per-day sample counts —
+    # only weekdays with enough sessions get an average (sparse data must not
+    # create false day-specific precision).
+    weekday_hours: dict[str, str] = field(default_factory=dict)
+    weekday_hour_samples: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -1123,9 +1129,39 @@ async def learn_workout_pattern(
         weekday_counts[day.weekday()] = weekday_counts.get(day.weekday(), 0) + 1
     common = sorted(weekday_counts, key=lambda d: weekday_counts[d], reverse=True)
 
+    # TASK-60: per-weekday time evidence. Group ALL sampled sessions by local
+    # weekday and take a circular mean per weekday; a weekday needs at least
+    # two sessions to earn a day-specific average. The DEFAULT typical hour
+    # is the circular mean of the per-day means — each recurring training day
+    # contributes equally, so a weekday with many records cannot dominate the
+    # global suggestion. With no weekday reaching the sample floor, the
+    # legacy pooled mean remains the fallback.
+    hours_by_weekday: dict[int, list[float]] = {}
+    for row in rows:
+        local = _to_local(row["start_time"], tz)
+        hours_by_weekday.setdefault(local.weekday(), []).append(_hour_of_day(local))
+    weekday_hours: dict[str, str] = {}
+    weekday_hour_samples: dict[str, int] = {}
+    day_means: list[float] = []
+    for weekday, day_hours in sorted(hours_by_weekday.items()):
+        weekday_hour_samples[str(weekday)] = len(day_hours)
+        if len(day_hours) < 2:
+            continue
+        mean_hour = circular_hour_mean(day_hours)
+        hhmm = hour_to_hhmm(mean_hour)
+        if mean_hour is None or hhmm is None:
+            continue
+        weekday_hours[str(weekday)] = hhmm
+        day_means.append(mean_hour)
+    typical_hour = (
+        hour_to_hhmm(circular_hour_mean(day_means))
+        if day_means
+        else hour_to_hhmm(circular_hour_mean(hours))
+    )
+
     return WorkoutPattern(
         weekly_frequency=weekly_frequency,
-        typical_hour=hour_to_hhmm(circular_hour_mean(hours)),
+        typical_hour=typical_hour,
         common_weekdays=[d for d in common if weekday_counts[d] >= 2][:4] or common[:2],
         avg_duration_minutes=(round(_mean_duration, 1) if _mean_duration is not None else None),
         sessions_sampled=len(rows),
@@ -1133,6 +1169,8 @@ async def learn_workout_pattern(
         recent_sessions_sampled=recent_sessions_sampled,
         wear_filtered=bool(valid_weeks),
         valid_weeks_sampled=len(valid_weeks),
+        weekday_hours=weekday_hours,
+        weekday_hour_samples=weekday_hour_samples,
     )
 
 

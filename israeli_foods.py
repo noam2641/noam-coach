@@ -137,11 +137,28 @@ _FOODS: tuple[IsraeliFood, ...] = (
         calories_per_100g=250, protein_per_100g=9, carbs_per_100g=48, fat_per_100g=2.5,
         typical_serving_g=60,
     ),
+    # TASK-58 (Israeli food override safety): the generic word "טחינה" is
+    # AMBIGUOUS in normal Israeli usage — raw paste (595 kcal/100g), prepared/
+    # diluted tahini (~230 kcal/100g), or another visually similar spread.
+    # A deterministic macro override may therefore match only genuinely
+    # SPECIFIC names; a generic "טחינה" item keeps the AI's own estimate.
     IsraeliFood(
         "טחינה גולמית",
-        ("tahini", "טחינה"),
+        ("raw tahini", "tahini paste", "טחינה גולמית"),
         calories_per_100g=595, protein_per_100g=17, carbs_per_100g=21, fat_per_100g=54,
         typical_serving_g=30,
+    ),
+    IsraeliFood(
+        "טחינה מוכנה",
+        ("prepared tahini", "סלט טחינה", "טחינה מוכנה"),
+        calories_per_100g=230, protein_per_100g=7, carbs_per_100g=10, fat_per_100g=19,
+        typical_serving_g=50,
+    ),
+    IsraeliFood(
+        "חציל במיונז",
+        ("סלט חצילים במיונז", "חציל עם מיונז", "חציל במיונז"),
+        calories_per_100g=165, protein_per_100g=1.5, carbs_per_100g=6, fat_per_100g=15,
+        typical_serving_g=100,
     ),
     IsraeliFood(
         "שניצל (מטוגן)",
@@ -243,10 +260,14 @@ _NORMALIZED_INDEX: tuple[tuple[str, IsraeliFood], ...] = tuple(
 def lookup(name: str) -> IsraeliFood | None:
     """Return the matching curated food for a name, or None.
 
-    Matching is intentionally conservative: the normalized query must contain
-    (or be contained by) a known alias as a whole normalized string, not just
-    share a short common substring — this avoids "תפוחי אדמה" spuriously
-    matching a short alias.
+    Matching is intentionally conservative: the query matches when it EQUALS
+    a known alias or CONTAINS one as a whole normalized string ("במבה אסם"
+    contains "במבה"). TASK-58 evidence-aware canonicalization: the reverse
+    direction — a query that is merely a SUBSTRING of a longer, more specific
+    alias — no longer matches, because a generic name ("טחינה") carries less
+    evidence than the specific alias ("טחינה גולמית") and must not receive
+    that food's deterministic macros. Specificity must come from the item
+    name itself, never be invented by canonicalization.
     """
     if not name or not name.strip():
         return None
@@ -258,7 +279,7 @@ def lookup(name: str) -> IsraeliFood | None:
     for alias, food in _NORMALIZED_INDEX:
         if not alias:
             continue
-        if alias in normalized_query or normalized_query in alias:
+        if alias == normalized_query or alias in normalized_query:
             if len(alias) > best_len:
                 best = food
                 best_len = len(alias)

@@ -43,10 +43,14 @@ async def _db(tmp_path: Path, *, calories: int = 2100, protein: int = 160) -> Da
 
 @pytest.mark.asyncio
 async def test_re9_recommendation_shows_after_meal_remaining(tmp_path: Path) -> None:
-    """RE9-020: the recommendation list shows 'after the meal' remaining per option."""
+    """RE9-020 (evolved by TASK-65): the 'after the meal' remaining
+    projection lives on the detail surface — the first screen is
+    answer-only."""
+    from noam_coach.services.next_meal import format_next_meal_explanation
+
     db = await _db(tmp_path)
     rec = await generate_next_meal_recommendation(db, 1)
-    text = format_next_meal_recommendation(rec)
+    text = format_next_meal_explanation(rec)
     assert "אחרי הארוחה" in text
     # The number equals consumed-based balance minus the option calories.
     option = rec.options[0]
@@ -110,14 +114,16 @@ async def test_re9_options_sorted_by_score_desc(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_re9_timeline_in_detail_view(tmp_path: Path) -> None:
-    """RE9-002: the 'why it fits' detail view includes a rest-of-day timeline."""
+    """RE9-002 (evolved by TASK-59): the 'why it fits' detail view includes
+    the SHARED chronological rest-of-day timeline with allocation totals."""
     db = await _db(tmp_path)
     rec = await generate_next_meal_recommendation(db, 1)
     steps = build_day_timeline(rec.context)
-    assert steps  # non-empty
+    assert steps  # the legacy fallback stays available
     detail = format_next_meal_explanation(rec)
     assert "המשך היום" in detail
-    assert "סוף היום" in detail
+    assert "סך התכנון" in detail
+    assert "🍽️" in detail  # chronological meal events, not prose steps
 
 
 @pytest.mark.asyncio

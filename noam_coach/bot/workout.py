@@ -312,63 +312,36 @@ async def render_post_meal_confirmation_day_status(user_id: int, totals: dict[st
     except Exception:  # noqa: BLE001 - this short screen must still render on failure
         workout_context = None
 
-    # TASK-22: replace the generic "המשך היום: ארוחה" line with a real
-    # chronological timeline for the rest of the day — approximate time, meal
-    # role, and calorie/protein allocation per remaining meal, plus the
-    # workout event (at its day-specific time) and a valid sleep event. The
-    # allocations are recomputed from the CURRENT remaining budget on every
-    # call, so each approved meal shrinks the plan.
-    from noam_coach.services.next_meal import _hhmm_from_iso
-
-    # TASK-11: build the continuation as (time, text) events and sort them by
-    # full clock time. Times are always HH:MM — never a raw ISO/RFC3339 stamp.
-    # "99:99" is a sentinel that keeps untimed items at the end, stably.
-    events: list[tuple[str, str]] = []
-    status_line: str | None = None
+    # TASK-59: ONE chronological remaining-day timeline, built by the shared
+    # day_timeline service (the same semantics the next-meal detail view
+    # uses — never reconstructed per surface). Every meal slot carries a
+    # concrete time and its ALLOCATED share of the remaining budget; ordering
+    # is minutes-from-now, so an after-midnight bedtime closes the day; B12
+    # planned meals appear until their lifecycle says consumed/expired; and
+    # no prose is rendered under the timeline — the timeline IS the state
+    # (a future workout shows as its own event, so the old
+    # "יש אימון מתוכנן היום, עדיין לפניו" line is gone; the status line
+    # remains only when there is no timeline to speak for the day).
     if workout_context is not None:
-        # A future workout appears in the timeline at its scheduled time, even
-        # when it is many hours away (so it is not the immediate meal context);
-        # a completed/uncertain one is surfaced via the status line, not as a
-        # future event. TASK-11/12.
-        phase = workout_context.workout_phase.value
-        future_workout = (
-            phase.startswith("pre_workout")
-            or (phase == "rest_day" and workout_context.minutes_until_workout not in (None, 0))
+        from noam_coach.services.day_timeline import (
+            active_planned_meals,
+            build_remaining_day_events,
+            format_remaining_day_lines,
         )
-        if future_workout:
-            workout_hhmm = _hhmm_from_iso(workout_context.planned_workout_start)
-            if workout_hhmm:
-                events.append((workout_hhmm, f"🏋️ {esc(workout_hhmm)} אימון"))
 
-        for allocation in build_remaining_slot_allocations(workout_context):
-            time_hint = allocation.time_hint or ""
-            time_part = f"{esc(time_hint)} · " if time_hint else ""
-            events.append((
-                time_hint or "99:99",
-                f"🍽️ {time_part}{esc(allocation.label)}: "
-                f"כ-{allocation.calories} קל׳ | כ-{allocation.protein} ג׳ חלבון",
-            ))
-
-        status_line = _WORKOUT_STATUS_LINE_BY_PHASE.get(workout_context.workout_phase.value)
-
-        # Only show a concrete bedtime when the sleep time is actually known /
-        # confirmed — never present an unconfirmed inference as fact.
-        if (
-            workout_context.sleep_reference in {"confirmed_fact", "routine_profile"}
-            and workout_context.hours_until_bedtime is not None
-            and workout_context.hours_until_bedtime > 0
-        ):
-            bedtime = _bedtime_clock(context.current_local_time, workout_context.hours_until_bedtime)
-            if bedtime:
-                events.append((bedtime, f"😴 {esc(bedtime)} שינה"))
-
-    if events:
-        events.sort(key=lambda item: item[0])
-        lines.append("")
-        lines.append("המשך היום:")
-        lines.extend(text for _time, text in events)
-        if status_line:
-            lines.append(status_line)
+        planned_meals = await active_planned_meals(DB, user_id, shared_state.now)
+        events = build_remaining_day_events(
+            workout_context, planned_meals=planned_meals, now=shared_state.now
+        )
+        timeline_lines = format_remaining_day_lines(events)
+        if timeline_lines:
+            lines.append("")
+            lines.extend(timeline_lines)
+        else:
+            status_line = _WORKOUT_STATUS_LINE_BY_PHASE.get(workout_context.workout_phase.value)
+            if status_line:
+                lines.append("")
+                lines.append(status_line)
 
     return "\n".join(lines)
 

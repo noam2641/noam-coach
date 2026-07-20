@@ -61,16 +61,20 @@ def test_elbow_pain_backfills_gutted_session_cross_pattern() -> None:
     )
     # Session is refilled, not emptied.
     assert len(adapted) >= ti._MIN_SESSION_EXERCISES
-    # None of the kept exercises load the injured joint.
+    # TASK_61 contract: nothing replace-level for the injured joint survives;
+    # reduce-level exercises may stay, but only load-reduced and annotated.
     for exercise in adapted:
         profile = ti.CATALOG.get(str(exercise.get("id")))
         assert profile is not None
-        assert "elbow" not in profile.joint_load
+        level = ti.region_load_level(profile, "elbow")
+        assert level != "replace"
+        if level == "reduce":
+            assert exercise.get("adaptation_note")
     # No raw English ids leak into user-facing names.
     for exercise in adapted:
-        assert exercise["id"] in ti._CATALOG_NAMES_HE or "elbow" not in ti.CATALOG[exercise["id"]].joint_load
-    # The backfill is recorded so a limitation note can be surfaced.
-    assert any("backfilled" in change for change in changes)
+        assert exercise.get("name") and str(exercise["name"]) != str(exercise["id"])
+    # The adaptation is recorded so a limitation note can be surfaced.
+    assert changes
 
 
 def test_backfill_diversifies_across_muscle_groups() -> None:

@@ -12,7 +12,6 @@ only path that writes a consumed meal.
 
 from __future__ import annotations
 
-import json
 import re
 from contextlib import suppress
 from dataclasses import dataclass
@@ -191,28 +190,29 @@ def _fallback_suggestion(intent: DailyMenuEditIntent) -> tuple[str, int, int, st
 
 
 async def _remember_request(db: Any, user_id: int, intent: DailyMenuEditIntent) -> None:
-    day = datetime.now(TZ).date().isoformat()
-    row = await db.fetch_one("SELECT flags FROM daily_flags WHERE user_id=? AND day=?", (user_id, day))
-    flags: dict[str, Any]
-    if row:
-        try:
-            flags = json.loads(row["flags"] or "{}")
-        except (TypeError, json.JSONDecodeError):
-            flags = {}
-    else:
-        flags = {}
-    flags["daily_menu_last_edit_request"] = {
+    """ARCH-03: single-key CAS patch — this writer owns exactly
+    ``daily_menu_last_edit_request`` and must never rewrite (and thereby
+    race) the rest of the day's flags document."""
+    from noam_coach.services.daily_flags_cas import patch_daily_flags
+    from noam_coach.services.daily_state import coaching_day_key
+
+    # B4/ARCH-02: menu-edit memory is nutrition day state → coaching day
+    # (one instant drives both the key and the saved_at stamp).
+    day = await coaching_day_key(db, user_id, datetime.now(TZ))
+    request = {
         "slot": intent.slot,
         "instruction": intent.instruction,
         "saved_at": datetime.now(TZ).isoformat(),
     }
-    await db.execute(
-        """
-        INSERT INTO daily_flags(user_id, day, flags, created_at)
-        VALUES(?, ?, ?, ?)
-        ON CONFLICT(user_id, day) DO UPDATE SET flags=excluded.flags
-        """,
-        (user_id, day, json.dumps(flags, ensure_ascii=False), datetime.now(TZ).isoformat()),
+
+    def _apply(flags: dict[str, Any]) -> dict[str, Any]:
+        flags["daily_menu_last_edit_request"] = request
+        return flags
+
+    await patch_daily_flags(
+        db, user_id, day, _apply,
+        owner="daily_menu_edit",
+        touched_keys=["daily_menu_last_edit_request"],
     )
 
 

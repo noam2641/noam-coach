@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, time, timedelta, timezone
 from typing import Any
@@ -303,14 +304,13 @@ def _option_from_payload(payload: dict[str, Any]) -> MealOption:
 
 
 async def _daily_flags(db: Any, user_id: int, local_day: str) -> dict[str, Any]:
-    row = await db.fetch_one(
-        "SELECT flags FROM daily_flags WHERE user_id=? AND day=?",
-        (user_id, local_day),
-    )
-    if not row:
-        return {}
+    """Read the day's flags via the canonical CAS boundary (ARCH-03): the
+    snapshot is remembered task-locally so a following ``_save_daily_flags``
+    patches only the keys this writer actually changed."""
+    from noam_coach.services.daily_flags_cas import read_flags_for_update
+
     try:
-        data = json.loads(row["flags"] or "{}")
+        data = await read_flags_for_update(db, user_id, local_day)
     except (TypeError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
@@ -325,7 +325,8 @@ async def save_next_meal_workout_status(
 ) -> None:
     """Persist today's explicit workout clarification from a Telegram button."""
     local_now = (now or datetime.now(TZ)).astimezone(TZ)
-    local_day = local_now.date().isoformat()
+    # B3/ARCH-02: nutrition day = canonical coaching day.
+    local_day = await daily_state.coaching_day_key(db, user_id, local_now)
     flags = await _daily_flags(db, user_id, local_day)
     flags["next_meal_workout_status"] = status
     # REC-ARCH-01 pass 3 fix: this used to always write the REAL wall-clock
@@ -342,15 +343,42 @@ async def save_next_meal_workout_status(
     await _save_daily_flags(db, user_id, local_day, flags)
 
 
-async def _save_daily_flags(db: Any, user_id: int, local_day: str, flags: dict[str, Any]) -> None:
-    await db.execute(
-        """
-        INSERT INTO daily_flags(user_id, day, flags, created_at)
-        VALUES(?, ?, ?, ?)
-        ON CONFLICT(user_id, day) DO UPDATE SET flags=excluded.flags
-        """,
-        (user_id, local_day, json.dumps(flags, ensure_ascii=False), utc_now()),
+async def save_workout_reschedule_time(
+    db: Any,
+    user_id: int,
+    expected: datetime,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Persist a CONCRETE rescheduled workout time (B12/ARCH-14).
+
+    The resolved product contract: reschedule must collect an actual time —
+    a vague "later" is never persisted as if it were a scheduling decision.
+    This is the only writer of ``next_meal_workout_expected_at``; the
+    canonical resolver (user_state._explicit_clarification_candidate) turns
+    it into a real user-clarification candidate with phase derived from the
+    user-stated time.
+    """
+    local_now = (now or datetime.now(TZ)).astimezone(TZ)
+    local_day = await daily_state.coaching_day_key(db, user_id, local_now)
+    flags = await _daily_flags(db, user_id, local_day)
+    flags["next_meal_workout_status"] = "later"
+    flags["next_meal_workout_status_at"] = local_now.astimezone(timezone.utc).isoformat()
+    flags["next_meal_workout_expected_at"] = expected.astimezone(TZ).isoformat()
+    await _save_daily_flags(db, user_id, local_day, flags)
+    await _log_event(
+        db, user_id, "next_meal_workout_rescheduled",
+        {"expected_at": expected.astimezone(TZ).isoformat()},
     )
+
+
+async def _save_daily_flags(db: Any, user_id: int, local_day: str, flags: dict[str, Any]) -> None:
+    """ARCH-03: per-key CAS patch instead of the historical full-JSON upsert
+    (which silently dropped concurrent writers' keys). Diffs against the
+    snapshot this task read via ``_daily_flags``."""
+    from noam_coach.services.daily_flags_cas import commit_flags_update
+
+    await commit_flags_update(db, user_id, local_day, flags, owner="next_meal")
 
 
 async def _today_meals(db: Any, user_id: int, now: datetime | None = None) -> list[dict[str, Any]]:
@@ -453,6 +481,8 @@ async def _recent_meal(db: Any, user_id: int, now: datetime) -> tuple[str | None
 
 
 async def _restrictions(db: Any, user_id: int) -> list[DietaryRestriction]:
+    # B11/ARCH-15: deliberate RAW reads — restrictions fail closed (an
+    # unconfirmed allergy estimate must still restrict the options).
     diet = await user_model.get_value(db, user_id, "diet_restrictions")
     allergies = await user_model.get_value(db, user_id, "allergies")
     base = load_restrictions_from_facts(
@@ -575,7 +605,8 @@ async def build_workout_nutrition_context(
     this function still resolves it itself in that case, unchanged.
     """
     local_now = (now or datetime.now(TZ)).astimezone(TZ)
-    local_day = local_now.date().isoformat()
+    # B3/ARCH-02: nutrition day = canonical coaching day.
+    local_day = await daily_state.coaching_day_key(db, user_id, local_now)
     flags = await _daily_flags(db, user_id, local_day)
     nutrition, _goal = await _nutrition_totals(db, user_id, now=local_now)
     workout = await _workout_state(db, user_id, local_now, flags, precomputed=workout_state)
@@ -1548,19 +1579,27 @@ async def save_next_meal_option_feedback(
     fingerprint with an expiry, exclude it (and near-identical options) from the
     next generation, and return a genuinely different alternative. The user's
     standing preferences are untouched.
-    """
-    recommendation = await generate_next_meal_recommendation(db, user_id, now=now)
-    if option_number < 1 or option_number > len(recommendation.options):
-        raise ValueError("Unknown next-meal option")
-    option = recommendation.options[option_number - 1]
-    fingerprint = option_fingerprint(option)
 
-    await _record_temporary_rejection(
-        db, user_id, recommendation, fingerprint, now=now, reason="not_suitable_now"
-    )
+    B5/ARCH-06 identity anchor: the rejected option is resolved from the
+    ACTIVE stored recommendation — the card the user is looking at — never
+    from a fresh regeneration (TASK-03 exposes one top-ranked option and
+    re-ranking/rotation can swap it, so "לא מתאים לי 1" against a
+    regenerated list could reject a different meal than the one displayed).
+    With no active recommendation the action is refused (ValueError → the
+    callback layer renders the safe refresh message) instead of silently
+    acting on a regenerated meal.
+    """
+    active_options = await get_active_recommendation_options(db, user_id, now=now)
+    if not active_options or option_number < 1 or option_number > len(active_options):
+        raise ValueError("Unknown next-meal option")
+    option = active_options[option_number - 1]
+    fingerprint = option_fingerprint(option)
     # Regenerate excluding the rejected fingerprint -> a truly different option.
     refreshed = await generate_next_meal_recommendation(
         db, user_id, now=now, excluded_fingerprints={fingerprint}
+    )
+    await _record_temporary_rejection(
+        db, user_id, refreshed, fingerprint, now=now, reason="not_suitable_now"
     )
     return option.title, refreshed
 
@@ -1614,12 +1653,23 @@ async def regenerate_with_size(
     smaller: bool,
     now: datetime | None = None,
 ) -> NextMealRecommendation:
-    """"קטן יותר"/"גדול יותר": rebuild with a size hint, respecting the budget cap."""
-    flags = await _daily_flags(db, user_id, (now or datetime.now(TZ)).astimezone(TZ).date().isoformat())
+    """"קטן יותר"/"גדול יותר": rebuild with a size hint, respecting the budget cap.
+
+    B5/ARCH-06: the rebuild semantics are the documented product contract
+    (unlike ➖/➕ qty, which rescales the SAME option in place). Staleness is
+    enforced at the callback layer (recommendation_identity gate): the
+    control is honored only for the live active card, so the size hint is
+    always an instruction about the recommendation the user is looking at.
+    """
+    # B3/ARCH-02: nutrition day = canonical coaching day (one key for the
+    # read and the write — a midnight crossing between them must not split
+    # the state across two rows).
+    local_day = await daily_state.coaching_day_key(db, user_id, now)
+    flags = await _daily_flags(db, user_id, local_day)
     # A "bigger" request may justify an explicit overage; "smaller" never does.
     allow_overage = not smaller and bool(flags.get("next_meal_size_pref") == "bigger")
     flags["next_meal_size_pref"] = "smaller" if smaller else "bigger"
-    await _save_daily_flags(db, user_id, (now or datetime.now(TZ)).astimezone(TZ).date().isoformat(), flags)
+    await _save_daily_flags(db, user_id, local_day, flags)
     return await generate_next_meal_recommendation(db, user_id, now=now, allow_overage=allow_overage)
 
 
@@ -1726,6 +1776,13 @@ def next_meal_action_rows(recommendation: NextMealRecommendation) -> list[list[t
             ("🔄 רענן הצעה", "nextmeal:refresh"),
             ("✏️ שנה כמויות", "nextmeal:editqty:1"),
         ])
+        # TASK-65: the first screen is answer-only — the calculation, day
+        # status and remaining-day details live one tap away.
+        rows.append([
+            ("❓ למה זה מתאים", "nextmeal:why"),
+            ("📊 מצב היום", "menu:status"),
+        ])
+        return rows
     rows.append([("📊 חזור לסיכום היום", "menu:status")])
     return rows
 
@@ -1896,27 +1953,26 @@ def _slot_time_hint(context: WorkoutNutritionContext, allocation: RemainingSlotA
 
 
 def _remaining_day_timeline_lines(context: WorkoutNutritionContext) -> list[str]:
+    """TASK-59: the detail-view timeline reuses the SHARED chronological
+    builder (noam_coach.services.day_timeline) — the same event semantics
+    the post-meal continuation renders — plus the allocation total line."""
+    from noam_coach.services.day_timeline import build_remaining_day_events
+
     allocations = build_remaining_slot_allocations(context)
     if not allocations:
         return []
-    lines: list[str] = []
+    events = build_remaining_day_events(context)
+    lines = [f"• {event.line()}" for event in events]
     planned = _hhmm_from_iso(context.planned_workout_start)
-    for index, allocation in enumerate(allocations):
-        time_hint = _slot_time_hint(context, allocation, index)
-        lines.append(
-            f"• {esc(time_hint)} · {esc(allocation.label)}: "
-            f"כ-{allocation.calories} קל׳ | כ-{allocation.protein} ג׳ חלבון"
-        )
-        if (
-            planned
-            and index == 0
-            and context.workout_phase in {
-                WorkoutPhase.PRE_WORKOUT_EARLY,
-                WorkoutPhase.PRE_WORKOUT_NEAR,
-                WorkoutPhase.PRE_WORKOUT_IMMEDIATE,
-            }
-        ):
-            lines.append(f"• {esc(planned)} · אימון מתוכנן")
+    if planned and not any("אימון" in line and "🏋️" in line for line in lines):
+        # Keep the planned-workout marker visible in pre-workout phases even
+        # when the shared builder classified the phase as non-future.
+        if context.workout_phase in {
+            WorkoutPhase.PRE_WORKOUT_EARLY,
+            WorkoutPhase.PRE_WORKOUT_NEAR,
+            WorkoutPhase.PRE_WORKOUT_IMMEDIATE,
+        }:
+            lines.append(f"• 🏋️ {esc(planned)} אימון מתוכנן")
     total_calories = sum(item.calories for item in allocations)
     total_protein = sum(item.protein for item in allocations)
     lines.append(f"<i>סך התכנון: כ-{total_calories} קל׳ | כ-{total_protein} ג׳ חלבון.</i>")
@@ -1974,58 +2030,46 @@ def _natural_ingredients(option: "MealOption") -> str:
 
 
 def format_next_meal_recommendation(recommendation: NextMealRecommendation) -> str:
-    """Answer-first message (re7 P1-10): remaining + options first, short note,
-    and the long explanation only via the 'why it fits' detail view."""
-    context = recommendation.context
-    nutrition = context.nutrition
-    goal_note = ""
-    if nutrition.goal_status == "active_provisional":
-        goal_note = " (יעד זמני)"
-    elif nutrition.goal_status == "default":
-        goal_note = " (ברירת מחדל עד לאישור יעד)"
+    """TASK-65: the first screen answers ONLY "what should I eat now".
 
-    lines = [_remaining_headline(nutrition) + goal_note, _nutrition_status_line(nutrition)]
-    sleep_line = _sleep_status_line(context)
-    if sleep_line:
-        lines.append(f"<i>{esc(sleep_line)}</i>")
-    lines += [
-        "",
-        "<b>סטטוס אימון</b>",
-        f"• {esc(_workout_status_line(context))}",
-        "",
-    ]
-    timeline = _remaining_day_timeline_lines(context)
-    if timeline:
-        lines += ["<b>תכנון שאר היום</b>", *timeline, ""]
-
+    One immediate recommendation with its macros and a short reason, plus
+    caveats that qualify THIS meal (safety notices, budget overage, a
+    provisional/default goal, the workout-clarification hint). The daily
+    status, workout-status section, remaining-day timeline and after-meal
+    projections all moved behind the detail surfaces (nextmeal:why →
+    format_next_meal_explanation, menu:status) — the buttons render them
+    one tap away, never inside the first answer.
+    """
+    nutrition = recommendation.context.nutrition
+    lines = ["<b>הארוחה המומלצת עכשיו</b>"]
     # TASK-03: a single immediate suggestion, not a numbered list to compare —
-    # no "אפשרות N" label, no per-option "recommended" star (there is nothing
-    # else here to be recommended over).
-    lines.append("<b>הארוחה המומלצת עכשיו</b>")
+    # no "אפשרות N" label, no per-option "recommended" star. TASK-8: no
+    # internal scoring in user-facing UX; render the food naturally.
     for option in recommendation.options:
-        after = _after_meal_line(nutrition, option)
         reason = option.recommended_reason or option.rationale or recommendation.budget.rationale
-        # TASK-8: no internal scoring / match percentages in user-facing UX;
-        # render the food naturally (combine items, no exact side-veg grams).
         lines += [
             f"<b>{esc(option.title)}</b>",
             f"{esc(_natural_ingredients(option))}",
             f"כ-{option.calories} קל׳ | כ-{option.protein} גרם חלבון | "
             f"ארוחה {meal_size_label_he(option.calories)}",
+            f"<i>למה עכשיו: {esc(reason)}</i>",
+            "",
         ]
-        lines.append(f"<i>למה עכשיו: {esc(reason)}</i>")
-        if after:
-            lines.append(after)
-        lines.append("")
+    if nutrition.meals_logged_count == 0:
+        # Honesty caveat about THIS suggestion (not a status dump): with
+        # nothing logged, the budget assumes this is the first meal.
+        lines.append("<i>עוד לא נרשמו ארוחות היום — ההצעה מניחה שזו הארוחה הראשונה.</i>")
+    if nutrition.goal_status == "active_provisional":
+        lines.append("<i>היעד זמני — ההצעה שמרנית בהתאם.</i>")
+    elif nutrition.goal_status == "default":
+        lines.append("<i>היעד בערכי ברירת מחדל עד לאישור יעד.</i>")
     for notice in recommendation.notices[:2]:
         lines.append(f"<i>{esc(notice)}</i>")
     if recommendation.options and recommendation.budget.allows_overage and recommendation.budget.overage_reason:
         lines.append(f"שים לב: ההצעה חורגת מעט מהיתרה ({esc(recommendation.budget.overage_reason)}).")
     if recommendation.needs_workout_clarification:
-        # The message used to also promise a free-text fallback ("אפשר גם
-        # לכתוב: כן, סיימתי / ..."), but no NLU anywhere recognized those
-        # phrases — the buttons below (now rendered in next_meal_action_rows,
-        # not just the Mini App) are the only real way to answer this.
+        # The buttons below (workout_clarification_actions) are the only real
+        # way to answer this — the hint must match the rendered keyboard.
         lines.append("לא אניח שהאימון קרה בלי דיווח — אפשר לעדכן את סטטוס האימון עם הכפתורים למטה.")
     return "\n".join(lines).strip()
 
@@ -2061,7 +2105,17 @@ def format_next_meal_explanation(recommendation: NextMealRecommendation) -> str:
     ]
     if context.meals_remaining_estimate:
         lines.append(f"• הערכת ארוחות שנותרו היום: {context.meals_remaining_estimate}")
-    timeline = build_day_timeline(context)
+    # TASK-65: the after-meal projection and workout-status line moved here
+    # from the first screen (the first answer is answer-only).
+    for option in recommendation.options[:1]:
+        after = _after_meal_line(nutrition, option)
+        if after:
+            lines.append(after)
+    lines.append(f"• {esc(_workout_status_line(context))}")
+    sleep_line = _sleep_status_line(context)
+    if sleep_line:
+        lines.append(f"<i>{esc(sleep_line)}</i>")
+    timeline = _remaining_day_timeline_lines(context) or build_day_timeline(context)
     if timeline:
         lines += ["", "<b>המשך היום</b>", *timeline]
     for notice in recommendation.notices:
@@ -2629,7 +2683,8 @@ async def save_chosen_meal(
     """
     current = (now or datetime.now(TZ)).astimezone(TZ)
     fingerprint = option_fingerprint(option)
-    local_day = current.date().isoformat()
+    # B3/ARCH-02: nutrition day = canonical coaching day.
+    local_day = await daily_state.coaching_day_key(db, user_id, current)
     flags = await _daily_flags(db, user_id, local_day)
     saved = flags.get("next_meal_saved") or {}
     last_at = _parse_dt(saved.get(fingerprint)) if isinstance(saved, dict) else None
@@ -2678,8 +2733,37 @@ async def save_chosen_meal(
         saved = {}
     saved[fingerprint] = current.isoformat()
     flags["next_meal_saved"] = saved
+    # B12/ARCH-13: a planned meal saved as eaten transitions planned →
+    # consumed by FINGERPRINT identity (same flags write; the durable link
+    # is the created meals row id).
+    planned_entries = flags.get("next_meal_planned")
+    consumed_plan_id: str | None = None
+    if isinstance(planned_entries, list):
+        for planned_meal in planned_entries:
+            if (
+                isinstance(planned_meal, dict)
+                and planned_meal.get("fingerprint") == fingerprint
+                and str(planned_meal.get("status") or "planned") == "planned"
+            ):
+                planned_meal["status"] = "consumed"
+                planned_meal["status_at"] = current.isoformat()
+                planned_meal["meal_id"] = meal_id
+                consumed_plan_id = str(
+                    planned_meal.get("plan_id") or planned_meal.get("fingerprint") or ""
+                )
+                break
     await _save_daily_flags(db, user_id, local_day, flags)
     await _log_event(db, user_id, "next_meal_saved_as_meal", {"title": option.title, "calories": option.calories})
+    if consumed_plan_id:
+        with suppress(Exception):
+            from noam_coach.observability import emit_event, taxonomy
+
+            await emit_event(
+                db, user_id, taxonomy.STATE_MUTATED,
+                entity="planned_meal", entity_id=consumed_plan_id,
+                source="next_meal", status="mutated", outcome="consumed",
+                properties={"transition": "consumed", "meal_id": meal_id},
+            )
     return True
 
 
@@ -2698,14 +2782,23 @@ async def plan_chosen_meal(
     """
     current = (now or datetime.now(TZ)).astimezone(TZ)
     fingerprint = option_fingerprint(option)
-    local_day = current.date().isoformat()
+    # B3/ARCH-02: nutrition day = canonical coaching day.
+    local_day = await daily_state.coaching_day_key(db, user_id, current)
     flags = await _daily_flags(db, user_id, local_day)
     planned = flags.get("next_meal_planned")
     if not isinstance(planned, list):
         planned = []
     if any(isinstance(m, dict) and m.get("fingerprint") == fingerprint for m in planned):
         return False  # already planned -> no duplicate
+    # B12/ARCH-13: durable identity + lifecycle. Every planned meal carries a
+    # stable plan_id and an explicit status (planned → consumed/expired);
+    # consumption is matched by fingerprint/plan_id, never by title text.
+    import secrets as _secrets
+
     planned.append({
+        "plan_id": f"pm-{user_id}-{_secrets.token_hex(4)}",
+        "status": "planned",
+        "status_at": current.isoformat(),
         "fingerprint": fingerprint,
         "name": option.title,
         "calories": int(option.calories),
@@ -2716,6 +2809,77 @@ async def plan_chosen_meal(
     await _save_daily_flags(db, user_id, local_day, flags)
     await _log_event(db, user_id, "next_meal_planned_for_later", {"title": option.title, "calories": option.calories})
     return True
+
+
+_PLANNED_MEAL_EXPIRY_HOURS = 6
+
+
+def planned_meal_view_status(meal: dict[str, Any], now: datetime) -> str:
+    """The EFFECTIVE lifecycle status of a planned-meal entry (B12/ARCH-13).
+
+    Persisted transitions (consumed/replaced) always win; an entry still
+    "planned" whose planned_at is older than the expiry window reads as
+    expired without requiring a write on the read path. Legacy entries
+    (pre-B12, no status) behave as planned.
+    """
+    status = str(meal.get("status") or "planned")
+    if status != "planned":
+        return status
+    planned_at = _parse_dt(meal.get("planned_at"))
+    if planned_at is not None and now - planned_at > timedelta(hours=_PLANNED_MEAL_EXPIRY_HOURS):
+        return "expired"
+    return "planned"
+
+
+async def transition_planned_meal(
+    db: Any,
+    user_id: int,
+    *,
+    fingerprint: str | None = None,
+    plan_id: str | None = None,
+    status: str,
+    meal_id: int | None = None,
+    now: datetime | None = None,
+) -> str | None:
+    """Persist a lifecycle transition on a planned meal, addressed by its
+    durable identity (plan_id) or fingerprint. Returns the plan_id when an
+    entry transitioned, None when nothing matched."""
+    current = (now or datetime.now(TZ)).astimezone(TZ)
+    local_day = await daily_state.coaching_day_key(db, user_id, current)
+    flags = await _daily_flags(db, user_id, local_day)
+    planned = flags.get("next_meal_planned")
+    if not isinstance(planned, list):
+        return None
+    matched_id: str | None = None
+    for meal in planned:
+        if not isinstance(meal, dict):
+            continue
+        if plan_id is not None and meal.get("plan_id") != plan_id:
+            continue
+        if plan_id is None and (fingerprint is None or meal.get("fingerprint") != fingerprint):
+            continue
+        if str(meal.get("status") or "planned") != "planned":
+            continue
+        meal["status"] = status
+        meal["status_at"] = current.isoformat()
+        if meal_id is not None:
+            meal["meal_id"] = meal_id
+        matched_id = str(meal.get("plan_id") or meal.get("fingerprint") or "")
+        break
+    if matched_id is None:
+        return None
+    flags["next_meal_planned"] = planned
+    await _save_daily_flags(db, user_id, local_day, flags)
+    with suppress(Exception):
+        from noam_coach.observability import emit_event, taxonomy
+
+        await emit_event(
+            db, user_id, taxonomy.STATE_MUTATED,
+            entity="planned_meal", entity_id=matched_id,
+            source="next_meal", status="mutated", outcome=status,
+            properties={"transition": status, "meal_id": meal_id},
+        )
+    return matched_id
 
 
 async def invalidate_daily_nutrition_cache(
@@ -2729,7 +2893,8 @@ async def invalidate_daily_nutrition_cache(
     The budget is always recomputed live from the active goal, but stale recent
     titles / size preference could bias the next recommendation, so clear them.
     """
-    local_day = (now or datetime.now(TZ)).astimezone(TZ).date().isoformat()
+    # B3/ARCH-02: nutrition day = canonical coaching day.
+    local_day = await daily_state.coaching_day_key(db, user_id, now)
     flags = await _daily_flags(db, user_id, local_day)
     for key in ("next_meal_recent_titles", "next_meal_recent_titles_at", "next_meal_size_pref"):
         flags.pop(key, None)

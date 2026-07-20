@@ -291,23 +291,40 @@ def local_day_str() -> str:
     return datetime.now(TZ).date().isoformat()
 
 
+async def _flags_day(user_id: int) -> str:
+    """B3/ARCH-02: day check-in flags are nutrition/day state — their day
+    identity is the canonical coaching day (calendar fallback without a
+    confirmed bedtime fact). ``local_day_str`` remains calendar-only for
+    Health-import date attribution."""
+    from noam_coach.services.daily_state import coaching_day_key
+
+    return await coaching_day_key(_current_db(), user_id)
+
+
 async def get_daily_flags(user_id: int, day: str | None = None) -> dict[str, Any]:
-    day = day or local_day_str()
-    row = await _current_db().fetch_one(
-        "SELECT flags FROM daily_flags WHERE user_id=? AND day=?",
-        (user_id, day),
-    )
-    return json.loads(row["flags"]) if row else {}
+    """Read the day's flags, remembering (task-locally) what was read so a
+    following ``set_daily_flags`` in the same handler patches only the keys
+    it actually changed (ARCH-03 canonical write contract)."""
+    from noam_coach.services.daily_flags_cas import read_flags_for_update
+
+    day = day or await _flags_day(user_id)
+    return await read_flags_for_update(_current_db(), user_id, day)
 
 
 async def set_daily_flags(user_id: int, flags: dict[str, Any]) -> None:
-    await _current_db().execute(
-        """
-        INSERT INTO daily_flags(user_id, day, flags, created_at)
-        VALUES(?, ?, ?, ?)
-        ON CONFLICT(user_id, day) DO UPDATE SET flags=excluded.flags
-        """,
-        (user_id, local_day_str(), json.dumps(flags, ensure_ascii=False), utc_now()),
+    """Persist a check-in/health flags update as a per-key CAS patch.
+
+    ARCH-03: this used to write the caller's full (possibly stale) JSON
+    snapshot with an unconditional upsert, silently dropping any key another
+    writer (next-meal, daily menu, jobs, Mini App) committed since the
+    caller's read. It now diffs against the snapshot this task read via
+    ``get_daily_flags`` and patches only the changed/removed keys under the
+    revision CAS, so unrelated concurrent updates survive.
+    """
+    from noam_coach.services.daily_flags_cas import commit_flags_update
+
+    await commit_flags_update(
+        _current_db(), user_id, await _flags_day(user_id), flags, owner="day_checkin"
     )
 
 

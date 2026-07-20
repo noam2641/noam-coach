@@ -153,10 +153,11 @@ async def test_next_meal_keyboard_is_direct_and_keeps_planned_consumed_explicit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """TASK-03: "מה לאכול עכשיו" is a single immediate recommendation — the
-    keyboard offers at most 4 actions on that one option (confirm eaten,
-    refresh, change quantities, back to status), never multiple numbered
-    options or a "plan for later" per-option button.
+    """TASK-03 (evolved by TASK-65): "מה לאכול עכשיו" is a single immediate
+    recommendation — the keyboard offers a compact action set on that one
+    option (confirm eaten, refresh, change quantities, "why it fits", day
+    status), never multiple numbered options or a "plan for later"
+    per-option button.
     """
     db = await _ready_db(tmp_path)
     _bind(monkeypatch, db)
@@ -165,7 +166,8 @@ async def test_next_meal_keyboard_is_direct_and_keeps_planned_consumed_explicit(
 
     rows = next_meal_action_rows(rec)
     callbacks = [callback for row in rows for _label, callback in row]
-    assert len(callbacks) <= 4
+    assert len(callbacks) <= 5
+    assert "nextmeal:why" in callbacks
     assert callbacks.count("nextmeal:save:1") == 1
     assert "nextmeal:refresh" in callbacks
     assert "nextmeal:editqty:1" in callbacks

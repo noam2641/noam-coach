@@ -17,7 +17,7 @@ import planning
 import user_model
 from config import SETTINGS, TZ
 from helpers import utc_now
-from noam_coach.services.daily_state import local_day_bounds_utc
+from noam_coach.services.daily_state import coaching_day_bounds_utc, coaching_day_key
 from noam_coach.services.dietary_restrictions import (
     load_restrictions_from_facts,
 )
@@ -209,7 +209,7 @@ async def _routine_profile(db: Any, user_id: int) -> dict[str, Any]:
 
 
 async def _reported_meals(db: Any, user_id: int, local_now: datetime | None = None) -> list[MealSnapshot]:
-    start_utc, end_utc = local_day_bounds_utc(local_now)
+    start_utc, end_utc = await coaching_day_bounds_utc(db, user_id, local_now)
     rows = await db.fetch_all(
         """
         SELECT id, name, calories, protein, carbs, fat, confidence, eaten_at, COALESCE(status, 'consumed') AS status
@@ -287,19 +287,31 @@ def _planned_next_meals(flags: dict[str, Any]) -> list[dict[str, Any]]:
 
     Stored in daily_flags by next_meal.plan_chosen_meal. Surfaced as planned —
     never folded into consumed, preserving the planned/consumed separation.
+
+    B12/ARCH-13: entries carry a durable lifecycle now — only EFFECTIVELY
+    planned entries (status=planned and not view-expired) surface here;
+    consumed entries already live in the meals table, expired ones must not
+    keep steering "expected meals" hours after their moment passed.
     """
+    from noam_coach.services.next_meal import planned_meal_view_status
+
+    now = datetime.now(TZ)
     planned = flags.get("next_meal_planned") or []
     result: list[dict[str, Any]] = []
     for meal in planned:
-        if isinstance(meal, dict) and meal.get("name"):
-            result.append({
-                "fingerprint": meal.get("fingerprint"),
-                "name": str(meal.get("name")),
-                "calories": int(meal.get("calories") or 0),
-                "protein": int(meal.get("protein") or 0),
-                "planned_at": meal.get("planned_at"),
-                "source": "next_meal_plan",
-            })
+        if not (isinstance(meal, dict) and meal.get("name")):
+            continue
+        if planned_meal_view_status(meal, now) != "planned":
+            continue
+        result.append({
+            "plan_id": meal.get("plan_id"),
+            "fingerprint": meal.get("fingerprint"),
+            "name": str(meal.get("name")),
+            "calories": int(meal.get("calories") or 0),
+            "protein": int(meal.get("protein") or 0),
+            "planned_at": meal.get("planned_at"),
+            "source": "next_meal_plan",
+        })
     return result
 
 
@@ -374,7 +386,7 @@ async def build_nutrition_context(
         or datetime.now(TZ)
     )
     local_now = resolved_now.astimezone(TZ)
-    local_day = local_now.date().isoformat()
+    local_day = await coaching_day_key(db, user_id, local_now)
     flags = dict(getattr(daily_ctx, "flags", None) or await _daily_flags(db, user_id, local_day))
     profile = dict(getattr(daily_ctx, "profile", None) or await _routine_profile(db, user_id))
     meals = await _reported_meals(db, user_id, local_now)
@@ -388,7 +400,7 @@ async def build_nutrition_context(
     today_plan = _today_plan(nutrition_plan, local_now)
     planned_meals = [*_planned_meals(today_plan), *_planned_next_meals(flags)]
     expected_meals = max(1, len(planned_meals) or len(((profile.get("eating") or {}).get("typical_meal_hours") or [])) or 3)
-    start_utc, end_utc = local_day_bounds_utc(local_now)
+    start_utc, end_utc = await coaching_day_bounds_utc(db, user_id, local_now)
     quality = await data_quality.assess_day(db, user_id, start_utc, end_utc, expected_meals=expected_meals)
     workout_context = await build_workout_nutrition_context(
         db,
@@ -397,6 +409,8 @@ async def build_nutrition_context(
         workout_state=shared_state.workout if shared_state is not None else None,
     )
 
+    # B11/ARCH-15: deliberate RAW reads — an unconfirmed restriction failing
+    # CLOSED (over-restricting) is the safe direction for diet/allergy data.
     diet_value = await user_model.get_value(db, user_id, "diet_restrictions")
     allergy_value = await user_model.get_value(db, user_id, "allergies")
     restrictions = load_restrictions_from_facts(
@@ -404,7 +418,11 @@ async def build_nutrition_context(
         str(allergy_value) if allergy_value not in (None, "", "none") else None,
     )
     allergies, intolerances, dietary_rules = _restriction_groups(restrictions)
-    food_environment_value = await user_model.get_value(db, user_id, "food_environment_context")
+    # B11/ARCH-15: menu-style decisions are confirmed-only — an unconfirmed
+    # derived environment profile must not silently steer menu generation.
+    food_environment_value = await user_model.get_decision_value(
+        db, user_id, "food_environment_context"
+    )
     food_environment_context = (
         normalize_food_environment_context(food_environment_value)
         if food_environment_value not in (None, "", "none")
@@ -480,6 +498,7 @@ async def build_nutrition_context(
         intolerances=intolerances,
         dietary_rules=dietary_rules,
         medical_food_constraints=list(getattr(daily_ctx, "active_constraints", []) or []),
+        # RAW by policy: avoiding a maybe-disliked food is failing safe.
         disliked_foods=_list_fact(await user_model.get_value(db, user_id, "disliked_foods")),
         preferred_foods=_list_fact(await user_model.get_value(db, user_id, "preferred_foods")),
         # TASK-4: daily-menu/next-meal personalization must use the module's

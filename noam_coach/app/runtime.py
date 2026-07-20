@@ -157,7 +157,12 @@ def schedule_jobs(application: Application) -> None:
         return
     morning = dttime(hour=8, minute=0, tzinfo=TZ)
     evening = dttime(hour=22, minute=0, tzinfo=TZ)
-    jq.run_daily(job_morning, time=morning, name="morning")
+    # TASK-62: the scheduled morning delivery is the SHORT briefing (same
+    # semantics as menu:morning) + check-in; the full daily menu flows
+    # through the same job but is opt-in-gated at the delivery boundary.
+    from noam_coach.services.morning_policy import job_morning_briefing
+
+    jq.run_daily(job_morning_briefing, time=morning, name="morning")
     jq.run_daily(job_evening, time=evening, name="evening")
     jq.run_repeating(job_calorie_watch, interval=1800, first=300, name="calorie_watch")
     jq.run_repeating(job_motivation, interval=1800, first=900, name="motivation")
@@ -204,6 +209,7 @@ def build_telegram_app() -> Application:
     from noam_coach.observability.telegram_egress import install_telegram_egress
     from noam_coach.observability.telegram_ingress import (
         install_routing_observer,
+        observed_error_callback,
         observed_handler,
     )
 
@@ -228,6 +234,87 @@ def build_telegram_app() -> Application:
     from noam_coach.observability.state_trace import install_state_trace
 
     install_state_trace()
+    # B2 (ARCH-04/05): strict callback grammar — ordinary payload segments
+    # can no longer be misread as flow/version identity — and the
+    # entity-addressed confirmation gate for confirm:* callbacks.
+    from noam_coach.services.callback_grammar import (
+        install_callback_grammar,
+        install_confirmation_gate,
+    )
+
+    install_callback_grammar()
+    install_confirmation_gate()
+    # B5 (ARCH-06): next-meal option controls are honored only for the LIVE
+    # active recommendation card; controls from superseded/expired cards are
+    # refused instead of silently acting on a regenerated meal.
+    from noam_coach.services.recommendation_identity import (
+        install_recommendation_identity_gate,
+    )
+
+    install_recommendation_identity_gate()
+    # B6 (ARCH-11): restart-safe resume — preserve live deferred-plan
+    # continuation rows across load_pending_state and offer to continue the
+    # interrupted flow on the first menu interaction after a restart.
+    from noam_coach.services.flow_resume import install_restart_resume
+
+    install_restart_resume()
+    # B7 (ARCH-01 phase 1): canonical flow convergence — goal-wizard
+    # scratchpad liveness derives from the active_flow lifecycle (expiry
+    # cleanup, orphan-answer refusal) and Home suspends meaningful wizard
+    # work instead of destroying it.
+    from noam_coach.services.flow_convergence import (
+        install_flow_convergence,
+        terminal_cancel_command,
+    )
+
+    install_flow_convergence()
+    # B12 (ARCH-14): "the workout is later" collects a CONCRETE time (slots +
+    # text input) before anything is persisted as a scheduling decision.
+    # Installed BEFORE turn_context so its free-text time parsing sits under
+    # the B9 pipeline (deterministic reference resolution first).
+    from noam_coach.services.workout_reschedule import install_workout_reschedule
+
+    install_workout_reschedule()
+    # B9 (ARCH-08/16): AssistantTurnContext — free-text turns build a bounded
+    # context, deterministic references (כן/השני/תשמור את זה/תחזור) dispatch
+    # through the gated canonical handlers, unresolved candidates go to the
+    # classifier as structured context.
+    from noam_coach.services.turn_context import install_turn_context
+
+    install_turn_context()
+    # B10 (ARCH-12): coaching-memory capture — explicit gram corrections on a
+    # meal instance accumulate toward food-identity proposals; decision-grade
+    # only after the explicit "קבע ..." confirmation (turn_context resolves it).
+    from noam_coach.services.coaching_memory import install_coaching_memory_capture
+
+    install_coaching_memory_capture()
+    # TASK-58: deterministic item-identity enforcement after AI reanalysis
+    # (a rejected identity can never return) + the high-impact uncertainty
+    # gate on first-pass image analysis.
+    from noam_coach.services.meal_identity import install_meal_identity_enforcement
+
+    install_meal_identity_enforcement()
+    # TASK-63: plan-completion answer invariant — a saved answer never
+    # re-renders the same question; dietary classification is a real,
+    # resumable pending sub-question (text-answerable, restart-safe).
+    from noam_coach.services.question_dedup import install_plan_question_dedup
+
+    install_plan_question_dedup()
+    # TASK-64: multi-fact free-text updates during active flows — installed
+    # AFTER question_dedup so the multi-fact check runs first and single-fact
+    # answers fall through to the dedup/classification layer unchanged.
+    from noam_coach.services.multi_fact import install_multi_fact_updates
+
+    install_multi_fact_updates()
+    # TASK-62: the morning-menu opt-in/out toggle callbacks.
+    from noam_coach.services.morning_policy import install_morning_policy
+
+    install_morning_policy()
+    # TASK-60: per-weekday workout-time evidence in the Health wizard's hour
+    # step + entity-addressed outlier-day approvals.
+    from noam_coach.services.workout_hours import install_workout_hour_evidence
+
+    install_workout_hour_evidence()
     for command_name, command_handler in (
         ("start", command_start),
         ("import", command_import),
@@ -237,7 +324,9 @@ def build_telegram_app() -> Application:
         ("weekly", command_weekly),
         ("chart", command_chart),
         ("app", command_app),
-        ("cancel", command_cancel),
+        # B8 (ARCH-10): /cancel is terminal — it must invalidate every
+        # continuation store, not only active_flow (see flow_convergence).
+        ("cancel", terminal_cancel_command),
     ):
         application.add_handler(
             CommandHandler(
@@ -256,7 +345,10 @@ def build_telegram_app() -> Application:
             observed_handler("text", handle_text_message),
         )
     )
-    application.add_error_handler(on_error)
+    # R1: the dispatch/error boundary is the safety net for scheduled jobs
+    # and every other path PTB routes to error handling; on_error itself is
+    # unchanged (wrapped at registration, not edited).
+    application.add_error_handler(observed_error_callback(on_error))
     schedule_jobs(application)
     return application
 
