@@ -66,6 +66,269 @@ def parse_locked_quantities(text: str) -> list[LockedQuantity]:
 
 
 # ---------------------------------------------------------------------------
+# Batch 4 — count/portion quantity domain
+#
+# The historical incident (private trace event 1225) wrote a serving COUNT
+# ("3 כדור") into the grams field, so "3 balls" became "3 grams". This module
+# gives count and portion quantities a first-class representation that is
+# NEVER a gram lock: a ParsedQuantity records how many units (count), of what
+# unit (unit_label), at what size (size), for which food (food_text) — and
+# deliberately carries NO grams. Converting a count to grams is Batch 5's
+# job; Batch 4 only interprets the language deterministically and records the
+# evidence on the FoodItem's existing quantity_count/quantity_unit fields
+# (grams untouched).
+# ---------------------------------------------------------------------------
+
+# Meal-count number words. Deliberately scoped to this module rather than
+# reusing food_environment.HEBREW_NUMBERS, whose frequency mappings
+# (פעם→1, פעמיים→2) are wrong for "how many units of a food". Values are
+# floats so fractions compose ("שניים וחצי" → 2.5).
+_HEBREW_COUNT_WORDS: dict[str, float] = {
+    "אחד": 1.0, "אחת": 1.0,
+    "שני": 2.0, "שתי": 2.0, "שניים": 2.0, "שתיים": 2.0,
+    "שלוש": 3.0, "שלושה": 3.0,
+    "ארבע": 4.0, "ארבעה": 4.0,
+    "חמש": 5.0, "חמישה": 5.0,
+    "שש": 6.0, "שישה": 6.0,
+    "שבע": 7.0, "שבעה": 7.0,
+    "שמונה": 8.0,
+    "תשע": 9.0, "תשעה": 9.0,
+    "עשר": 10.0, "עשרה": 10.0,
+}
+
+# Standalone fraction words and the value they add.
+_HEBREW_FRACTION_WORDS: dict[str, float] = {
+    "חצי": 0.5,
+    "רבע": 0.25,
+    "שליש": 1.0 / 3.0,
+    "שלישית": 1.0 / 3.0,
+}
+
+# Portion/serving unit nouns (singular + construct/plural forms map to a
+# canonical singular label). These are measure words, not foods — "3 כפות"
+# is three tablespoons OF something, so the food itself is matched separately.
+_PORTION_UNITS: dict[str, str] = {
+    "כף": "כף", "כפות": "כף",
+    "כפית": "כפית", "כפיות": "כפית",
+    "כוס": "כוס", "כוסות": "כוס",
+    "פרוסה": "פרוסה", "פרוסות": "פרוסה", "פרוסת": "פרוסה",
+    "יחידה": "יחידה", "יחידות": "יחידה", "יחידת": "יחידה",
+    "חתיכה": "חתיכה", "חתיכות": "חתיכה", "חתיכת": "חתיכה",
+    "כדור": "כדור", "כדורים": "כדור", "כדורי": "כדור",
+    "קציצה": "קציצה", "קציצות": "קציצה", "קציצת": "קציצה",
+}
+
+# Size modifiers → canonical size. Feminine/plural inflections included so the
+# parser generalizes across noun genders ("גדול/גדולה/גדולים").
+_SIZE_WORDS: dict[str, str] = {
+    "קטן": "small", "קטנה": "small", "קטנים": "small", "קטנות": "small",
+    "בינוני": "medium", "בינונית": "medium", "בינוניים": "medium", "בינוניות": "medium",
+    "גדול": "large", "גדולה": "large", "גדולים": "large", "גדולות": "large",
+}
+
+# Approximate-language markers, stripped before matching so "בערך שני שניצלים"
+# and "כ-3 קציצות" parse identically to the bare forms.
+_APPROX_WORDS = ("בערך", "סביב", "כאילו", "בערבון")
+
+# The definite article and a few connective particles that may sit between a
+# number and its unit/food ("שלוש כפות של סוכר").
+_QUANTITY_FILLER = frozenset({"של", "את", "עוד", "יש", "לי"})
+
+# Scale/multiplier words that must NEVER be read as a food or unit — they mean
+# "half a serving" / "times N", which is the SCALE parser's job, not a count.
+_QUANTITY_SCALE_WORDS = frozenset({"מנה", "מנת", "פי", "כפול", "כפולה", "הכל", "כולה"})
+
+# Command verbs (remove/add/change). A count expression describes a quantity
+# of food, never an imperative — "תוריד חצי" ("reduce by half") is a SCALE,
+# not a count of a food called "תוריד". Encountering one means this is not a
+# count expression; bail so the removal/scale parsers handle it.
+_QUANTITY_COMMAND_VERBS = frozenset({
+    "תוריד", "הורד", "להוריד", "תסיר", "הסר", "להסיר", "תוציא", "הוצא", "להוציא",
+    "תוסיף", "הוסף", "להוסיף", "תשים", "שים", "תחליף", "החלף", "להחליף",
+    "תשנה", "שנה", "תתקן", "תעדכן",
+})
+
+
+@dataclass(frozen=True)
+class ParsedQuantity:
+    """A deterministic count/portion reading of user text (Batch 4).
+
+    NEVER carries grams — a count is not a weight. ``count`` is how many
+    ``unit_label`` units (unit_label="" means the food itself is the unit,
+    e.g. "3 schnitzels"). ``size`` is small/medium/large or "". ``food_text``
+    is the food the quantity applies to, or "" when the text names only a
+    unit ("שלוש כפות"). ``source`` is always "user_count" here (the user
+    stated it); grams derivation and its provenance are Batch 5's concern.
+    """
+
+    count: float
+    unit_label: str
+    size: str
+    food_text: str
+    source: str = "user_count"
+
+
+def _strip_approx(text: str) -> str:
+    cleaned = text
+    for word in _APPROX_WORDS:
+        cleaned = cleaned.replace(word, " ")
+    # "כ-3" / "כ3" approximate prefix on a digit.
+    cleaned = re.sub(r"\bכ[-־]?\s*(?=\d)", " ", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _count_from_token(token: str) -> float | None:
+    if token in _HEBREW_COUNT_WORDS:
+        return _HEBREW_COUNT_WORDS[token]
+    if re.fullmatch(r"\d+(?:[.,]\d+)?", token):
+        return float(token.replace(",", "."))
+    return None
+
+
+def _strip_leading_article(word: str) -> str:
+    """Comparison-only definite-article strip, mirroring _tokens (Batch 3)."""
+    if word.startswith("ה") and len(word) > 2:
+        return word[1:]
+    return word
+
+
+def parse_quantity_expression(text: str) -> ParsedQuantity | None:
+    """Parse a single count/portion expression, or None when the text is not
+    a deterministic count/portion phrase.
+
+    Generalizes over: leading or trailing numbers/number-words, standalone
+    fractions ("חצי שניצל"), a food followed by "וחצי" ("שניצל וחצי"),
+    portion units ("שלוש כפות", "רבע פיתה"), and size modifiers ("שני
+    שניצלים גדולים"). It deliberately does NOT fire on:
+    - gram phrases (handled by parse_locked_quantities);
+    - "חצי מהאורז" / "חצי מנה" / bare "חצי" (whole-meal or of-item SCALE,
+      handled by the scale parser — the "מ/מן/מה" preposition or a bare
+      fraction with no food/unit means scale, not a discrete count);
+    - "x2" / "פי 2" multipliers (scale).
+    """
+    raw = _strip_approx(text.strip())
+    if not raw:
+        return None
+    # Grams are a different domain — never treat a gram phrase as a count.
+    if re.search(r"\d+(?:[.,]\d+)?\s*(?:גרם|גר'|ג\b|g\b)", raw, re.IGNORECASE):
+        return None
+
+    tokens = raw.split()
+    if not tokens:
+        return None
+
+    count: float | None = None
+    fraction = 0.0
+    joined_fraction = False  # True for "וחצי" (adds to a whole count)
+    size = ""
+    unit_label = ""
+    food_words: list[str] = []
+    bail_to_other_parser = False
+
+    index = 0
+    n = len(tokens)
+    while index < n:
+        token = tokens[index]
+        bare = _strip_leading_article(token)
+
+        # "וחצי" / "ורבע" — a trailing fraction joined with the vav
+        # conjunction: ADDS to the count ("שניצל וחצי" = 1 + 0.5).
+        if token.startswith("ו") and token[1:] in _HEBREW_FRACTION_WORDS:
+            fraction += _HEBREW_FRACTION_WORDS[token[1:]]
+            joined_fraction = True
+            index += 1
+            continue
+        if token in _HEBREW_FRACTION_WORDS:
+            # A standalone fraction: "חצי שניצל" = 0.5 of a schnitzel (leading,
+            # no implicit 1). "אחד וחצי" style is handled by the vav branch.
+            fraction += _HEBREW_FRACTION_WORDS[token]
+            index += 1
+            continue
+
+        value = _count_from_token(token)
+        if value is not None:
+            # Two adjacent counts don't compose (except number + fraction,
+            # handled above) — the first is the count, later digits are food.
+            if count is None:
+                count = value
+            else:
+                food_words.append(token)
+            index += 1
+            continue
+
+        if bare in _SIZE_WORDS:
+            size = _SIZE_WORDS[bare]
+            index += 1
+            continue
+
+        if bare in _PORTION_UNITS:
+            unit_label = _PORTION_UNITS[bare]
+            index += 1
+            continue
+
+        # "מ/מן/מה<food>" preposition ⇒ this is a SCALE ("חצי מהאורז"),
+        # never a discrete count. Bail so the scale parser handles it.
+        if token in {"מ", "מן", "מה"} or token.startswith("מה") or token.startswith("מן"):
+            bail_to_other_parser = True
+            break
+
+        if token in _QUANTITY_FILLER:
+            index += 1
+            continue
+
+        # A scale/multiplier word ("מנה", "פי", "כפול") means this is a SCALE
+        # expression, not a discrete count — bail to the scale parser.
+        if bare in _QUANTITY_SCALE_WORDS:
+            bail_to_other_parser = True
+            break
+
+        # A command verb ("תוריד", "תוסיף", "תחליף") means this is an
+        # imperative correction, not a count — bail so the removal/scale/
+        # replacement parsers handle it.
+        if token in _QUANTITY_COMMAND_VERBS or bare in _QUANTITY_COMMAND_VERBS:
+            bail_to_other_parser = True
+            break
+
+        # Anything else is part of the food name.
+        food_words.append(token)
+        index += 1
+
+    if bail_to_other_parser:
+        return None
+
+    food_text = " ".join(food_words).strip()
+
+    # A vav-joined fraction ("שניצל וחצי", "אחד וחצי") with no explicit number
+    # implies a leading 1: 1 + 0.5 = 1.5. A LEADING standalone fraction
+    # ("חצי שניצל" = 0.5) does not — it is a fraction OF one unit.
+    if count is None and joined_fraction and (food_text or unit_label):
+        count = 1.0
+
+    total = (count or 0.0) + fraction
+    if total <= 0:
+        return None
+
+    # A bare fraction with no explicit count word, no food, and no unit
+    # ("חצי" alone) is a whole-meal SCALE, not a count — leave it to the
+    # scale parser. But an explicit count ("אחד וחצי" → 1.5) is a real count
+    # even without a food, because it applies to the meal's existing item.
+    if count is None and not food_text and not unit_label:
+        return None
+
+    # A lone number with no unit and no food ("3") is not a count expression.
+    if count is not None and fraction == 0 and not food_text and not unit_label:
+        return None
+
+    return ParsedQuantity(
+        count=round(total, 4),
+        unit_label=unit_label,
+        size=size,
+        food_text=food_text,
+        source="user_count",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Preparation-method correction parser  (REC-MEAL-01 / REC-MEAL-04)
 # ---------------------------------------------------------------------------
 
@@ -144,31 +407,89 @@ PREPARATION_CALORIE_FACTORS: dict[str, float] = {
 @dataclass(frozen=True)
 class MealCorrection:
     """A structured correction parsed from user text."""
-    kind: str  # "preparation", "quantity", "remove", "add", "rename", "replace"
+    kind: str  # "preparation", "quantity", "count", "remove", "add", "rename", "replace"
     item_hint: str  # food item the correction targets ("" = whole meal)
     value: str  # new value: preparation method key, grams, replacement name, etc.
     original_text: str  # the user's raw text for logging
+    # Batch 4: for kind=="count", the structured count/portion reading. None
+    # for every other kind. Kept off ``value`` (a str) so count/unit/size stay
+    # first-class and can never be misread as grams.
+    quantity: "ParsedQuantity | None" = None
 
 
 # ---------------------------------------------------------------------------
 # Item-removal patterns  (REC-PLAN-MEAL-03-12)
 # ---------------------------------------------------------------------------
 
+# Natural Hebrew removal language (Batch 2, audit Finding B): the negation
+# words the parser always knew (בלי/ללא/הוצא/הסר) plus imperative/infinitive
+# remove verbs (תוריד/תסיר/תוציא and their inflections).
+_REMOVAL_VERBS = r"(?:בלי|ללא|הוצא|תוציא|להוציא|הסר|תסיר|להסיר|תוריד|הורד|להוריד)"
+
 # Each tuple is (compiled_pattern, canonical_item_name).
 # The canonical name is a Hebrew term used for similarity matching against
 # the analysis items.  Use the most common Hebrew name for the ingredient.
 _REMOVAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    # "בלי שמן" / "ללא שמן" / "הוצא שמן" / "בלי שמן זית"
-    (re.compile(r"(?:בלי|ללא|הוצא|הסר)\s+שמן(?:\s+זית)?", re.IGNORECASE), "שמן"),
-    # Generic "בלי <item>" / "ללא <item>" for other common additions
-    # Captures the item after the negation keyword so it can be used as item_hint.
-    (re.compile(r"(?:בלי|ללא|הוצא|הסר)\s+([\u0590-\u05FF][\u0590-\u05FF\s]{1,30})", re.IGNORECASE), ""),
+    # "בלי שמן" / "ללא שמן" / "הוצא שמן" / "תוריד שמן" / "בלי שמן זית"
+    (re.compile(_REMOVAL_VERBS + r"\s+שמן(?:\s+זית)?", re.IGNORECASE), "שמן"),
+    # Generic "בלי <item>" / "תוריד <item>" for other items.
+    # Captures the item after the keyword so it can be used as item_hint.
+    (re.compile(_REMOVAL_VERBS + r"\s+([֐-׿][֐-׿\s]{1,30})", re.IGNORECASE), ""),
 ]
+
+# Batch 2, audit Finding A: the generic capture above is greedy and used to
+# swallow a trailing add clause, producing the destructive polluted hint
+# "פלאפל והוסף שניצל" (which removed the falafel and added nothing). The
+# captured hint is truncated at the first add/replace connector token.
+_REMOVAL_HINT_STOP_TOKENS = frozenset({
+    "ותוסיף", "והוסף", "ולהוסיף", "ותשים", "ושים", "ובמקום", "במקום",
+    "ותחליף", "והחלף", "אלא", "וגם", "תוסיף", "הוסף", "להוסיף", "תשים",
+    # Batch 3: "תוריד פלאפל ולא שניצל" is remove-only — the hint must
+    # stop before the clarifying "not Y" clause (and any chained בלי).
+    "שים", "ולא", "ובלי", "וללא",
+})
+
+# Leading filler tokens that may precede the actual food ("תוריד לי את הפלאפל").
+_REMOVAL_HINT_FILLER_TOKENS = frozenset({"לי", "את", "בבקשה", "רק", "גם"})
+
+# If the hint STARTS with one of these, the text is a quantity/scale/general
+# instruction ("תוריד חצי", "תוריד קצת מהכמות"), not an item removal — the
+# parser must fall through to the scale/quantity/AI paths untouched.
+_REMOVAL_HINT_NON_ITEM_TOKENS = frozenset({
+    "חצי", "רבע", "שליש", "קצת", "מעט", "עוד", "כמות", "הכמות", "מהכמות",
+    "מנה", "קלוריות", "גרם", "זה", "זו", "זאת", "אותו", "אותה", "הכל", "הכול",
+})
+
+
+def _clean_removal_hint(raw_hint: str) -> str | None:
+    """Reduce a captured removal hint to the removed item only.
+
+    Truncates at the first add/replace connector, skips leading filler
+    tokens, and refuses hints that describe amounts rather than items.
+    Returns None when no safe item hint remains.
+    """
+    kept: list[str] = []
+    for token in raw_hint.split():
+        if token in _REMOVAL_HINT_STOP_TOKENS:
+            break
+        kept.append(token)
+    while kept and kept[0] in _REMOVAL_HINT_FILLER_TOKENS:
+        kept.pop(0)
+    if not kept or kept[0] in _REMOVAL_HINT_NON_ITEM_TOKENS:
+        return None
+    return " ".join(kept)
 
 
 def _parse_removal_corrections(text: str) -> list[MealCorrection]:
-    """Extract explicit item-removal instructions from *text*."""
-    normalized = text.strip()
+    """Extract explicit item-removal instructions from *text*.
+
+    NOTE: remove-and-add phrasing ("תוריד פלאפל ותוסיף שניצל") is a
+    REPLACEMENT, parsed by ``_parse_replacement_corrections`` which
+    ``parse_meal_correction`` consults first. Even when this function is
+    called directly on such text, the hint is cleaned so it can never
+    carry a trailing add clause.
+    """
+    normalized = re.sub(r"\s+", " ", text.strip())
     found: list[MealCorrection] = []
 
     # First try the oil-specific pattern (highest priority).
@@ -182,14 +503,14 @@ def _parse_removal_corrections(text: str) -> list[MealCorrection]:
         ))
         return found  # oil removal found; don't also emit a generic removal
 
-    # Generic negation pattern.
+    # Generic pattern.
     gen_pat, _ = _REMOVAL_PATTERNS[1]
     m = gen_pat.search(normalized)
     if m:
-        item_hint = m.group(1).strip()
-        # Skip if the captured text looks like a preparation method
-        # (those are handled by _PREP_ITEM_PATTERNS).
-        if item_hint not in PREPARATION_ALIASES:
+        item_hint = _clean_removal_hint(m.group(1).strip())
+        # Skip if nothing safe remains or the captured text looks like a
+        # preparation method (those are handled by _PREP_ITEM_PATTERNS).
+        if item_hint and item_hint not in PREPARATION_ALIASES:
             found.append(MealCorrection(
                 kind="remove",
                 item_hint=item_hint,
@@ -217,6 +538,22 @@ def _parse_removal_corrections(text: str) -> list[MealCorrection]:
 # covered by _REMOVAL_PATTERNS above.
 
 _HEB = r"[\u0590-\u05FF][\u0590-\u05FF\s'\u05F3]{0,40}"  # Hebrew words (incl. geresh: \u05E7\u05D5\u05D8\u05D2')
+
+# Batch 2: verbs for explicit remove-and-add replacement phrasing. בלי/ללא
+# are deliberately EXCLUDED — "בלי שמן ותוסיף מלח" stays a removal, not a
+# rename that would inherit the removed item's grams.
+_RA_REMOVE_VERBS = r"(?:תוריד|הורד|להוריד|הסר|תסיר|להסיר|תוציא|הוצא|להוציא)"
+_RA_ADD_VERBS = r"(?:תוסיף|הוסף|להוסיף|תשים|שים)"
+
+# Batch 3: a replacement side that BEGINS with command/hedge language is
+# not a food identity — "תוריד פלאפל ולא שניצל" must never become
+# replace(שניצל→"תוריד פלאפל"). Matches with such a side are skipped so
+# the text falls through to the removal/AI paths instead.
+_UNSAFE_REPLACEMENT_SIDE_TOKENS = frozenset({
+    "תוריד", "הורד", "להוריד", "הסר", "תסיר", "להסיר", "תוציא", "הוצא",
+    "להוציא", "תוסיף", "הוסף", "להוסיף", "תשים", "שים", "תחליף", "החלף",
+    "להחליף", "בלי", "ללא", "אולי", "כנראה", "לדעתי", "אני",
+})
 
 _REPLACEMENT_PATTERNS: list[re.Pattern[str]] = [
     # TASK-58: negation-FIRST identity corrections — the production incident
@@ -265,6 +602,37 @@ _REPLACEMENT_PATTERNS: list[re.Pattern[str]] = [
         r"^(?P<replacement>" + _HEB + r")\s+לא\s+(?P<target>" + _HEB + r")$",
         re.IGNORECASE,
     ),
+    # ------------------------------------------------------------------
+    # Batch 2 (audit Finding A) — explicit-verb replacement forms. These
+    # normalize natural remove-and-add / swap phrasing into the SAME
+    # canonical replace correction as the forms above (one representation,
+    # one enforcement path — never a second remove+add mechanism). All are
+    # fully anchored, so they can never match mid-sentence commentary, and
+    # none of them can collide with the לא-based forms above.
+    # ------------------------------------------------------------------
+    # "תוריד X ותוסיף Y" / "הסר X, והוסף Y" / "תוציא X - ותשים Y"
+    re.compile(
+        r"^" + _RA_REMOVE_VERBS + r"\s+(?:את\s+)?"
+        r"(?P<target>[֐-׿][֐-׿\s]{0,40}?)"
+        r"[\s,;.:–—-]*ו?" + _RA_ADD_VERBS + r"\s+(?:את\s+)?"
+        r"(?P<replacement>" + _HEB + r")$",
+        re.IGNORECASE,
+    ),
+    # "תחליף X בY" / "החלף את X ב-Y"
+    re.compile(
+        r"^(?:תחליף|החלף|להחליף)\s+(?:את\s+)?"
+        r"(?P<target>[֐-׿][֐-׿\s]{0,40}?)"
+        r"\s+ב-?\s*(?P<replacement>" + _HEB + r")$",
+        re.IGNORECASE,
+    ),
+    # "במקום X יש Y" / "במקום X זה Y"
+    re.compile(
+        r"^במקום\s+(?:את\s+)?"
+        r"(?P<target>[֐-׿][֐-׿\s]{0,40}?)"
+        r"\s+(?:יש|זה|זו|זאת|היה|הייתה|תשים|שים)\s+(?:את\s+)?"
+        r"(?P<replacement>" + _HEB + r")$",
+        re.IGNORECASE,
+    ),
 ]
 
 
@@ -275,7 +643,9 @@ def _parse_replacement_corrections(text: str) -> list[MealCorrection]:
     The ``item_hint`` field holds the *target* (old item to swap out) and
     ``value`` holds the *replacement* (new item name).
     """
-    normalized = text.strip()
+    # Batch 2: tolerate punctuation/whitespace variants — collapse runs of
+    # whitespace and strip trailing sentence punctuation before matching.
+    normalized = re.sub(r"\s+", " ", text.strip()).strip(" .,;:!?")
     for pattern in _REPLACEMENT_PATTERNS:
         m = pattern.match(normalized)
         if m is None:
@@ -284,6 +654,13 @@ def _parse_replacement_corrections(text: str) -> list[MealCorrection]:
         replacement = m.group("replacement").strip()
         # Sanity: both sides must be non-empty and differ.
         if not target or not replacement or target == replacement:
+            continue
+        # Batch 3: sides starting with command/hedge words are not
+        # identities (see _UNSAFE_REPLACEMENT_SIDE_TOKENS).
+        if (
+            target.split()[0] in _UNSAFE_REPLACEMENT_SIDE_TOKENS
+            or replacement.split()[0] in _UNSAFE_REPLACEMENT_SIDE_TOKENS
+        ):
             continue
         # Skip if either side matches a pure preparation alias (those are not
         # item names and should be handled by the preparation-correction path).
@@ -296,6 +673,37 @@ def _parse_replacement_corrections(text: str) -> list[MealCorrection]:
                 value=replacement,
                 original_text=text,
             )
+        ]
+    return []
+
+
+# Batch 3: add-only commands. They never apply deterministically (macros
+# for a new item come from the AI path), but the parsed intent joins the
+# identity-constraint history — an explicit later add REVERSES an earlier
+# rejection of the same food (see identity_constraints_from_texts).
+_ADDITION_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"^ו?(?:תוסיף|הוסף|להוסיף|תשים|שים)\s+(?:את\s+)?"
+        r"(?P<item>" + _HEB + r")$",
+        re.IGNORECASE,
+    ),
+]
+
+
+def _parse_addition_corrections(text: str) -> list[MealCorrection]:
+    """Parse an anchored add-only command into kind="add" (value=item)."""
+    normalized = re.sub(r"\s+", " ", text.strip()).strip(" .,;:!?")
+    for pattern in _ADDITION_PATTERNS:
+        m = pattern.match(normalized)
+        if m is None:
+            continue
+        item = m.group("item").strip()
+        if not item or item in PREPARATION_ALIASES:
+            continue
+        if item.split()[0] in _REMOVAL_HINT_NON_ITEM_TOKENS:
+            continue
+        return [
+            MealCorrection(kind="add", item_hint="", value=item, original_text=text)
         ]
     return []
 
@@ -374,29 +782,65 @@ _PREP_ITEM_PATTERNS = [
 def parse_meal_correction(text: str) -> list[MealCorrection]:
     """Parse user correction text into structured :class:`MealCorrection` objects.
 
-    Priority order:
-    1. Item-removal corrections ("בלי שמן", "ללא שמן", generic "בלי X").
-    2. Item-replacement corrections ("X לא Y", "X ולא Y", "X במקום Y", "זה X לא Y").
-    3. Preparation-method corrections.
-    4. Quantity corrections (delegate to parse_locked_quantities).
+    Priority order (Batch 2 — replacement language wins first so
+    remove-and-add phrasing is one canonical replace, never a bare removal;
+    audit Finding A):
+    1. Item-replacement corrections ("לא X, Y", "X במקום Y",
+       "תוריד X ותוסיף Y", "תחליף X בY", "במקום X יש Y").
+    2. Item-removal corrections ("בלי שמן", "תוריד X", generic "בלי X").
+    3. Relative scale corrections ("חצי מהאורז", "x2").
+    4. Preparation-method corrections.
+    5. Quantity corrections (delegate to parse_locked_quantities).
     """
     normalized = text.strip().lower()
     corrections: list[MealCorrection] = []
 
+    # --- Item-replacement corrections (REC-PROGRAM-04-12 / Batch 2) ---
+    # Checked FIRST: explicit replacement language (including remove-and-add
+    # phrasing like "תוריד פלאפל ותוסיף שניצל") must win before the generic
+    # removal parser can misread its removal half (audit Finding A), and
+    # before preparation so "שניצל רגיל לא טופו" is a replace, not a
+    # prep-method change. Replacement patterns are fully anchored, so plain
+    # removal texts ("בלי שמן") can never match them.
+    replacement_corrections = _parse_replacement_corrections(text)
+    if replacement_corrections:
+        corrections.extend(replacement_corrections)
+        return corrections  # replacement is unambiguous; skip further parsing
+
     # --- Item-removal corrections (REC-PLAN-MEAL-03-12) ---
-    # Checked first so "בלי שמן" is an explicit removal, not a prep change.
+    # Checked before preparation so "בלי שמן" is an explicit removal, not
+    # a prep change.
     removal_corrections = _parse_removal_corrections(text)
     if removal_corrections:
         corrections.extend(removal_corrections)
         return corrections  # removal is unambiguous; skip further parsing
 
-    # --- Item-replacement corrections (REC-PROGRAM-04-12) ---
-    # Checked before preparation so "שניצל רגיל לא טופו" is a replace, not a
-    # prep-method change.
-    replacement_corrections = _parse_replacement_corrections(text)
-    if replacement_corrections:
-        corrections.extend(replacement_corrections)
-        return corrections  # replacement is unambiguous; skip further parsing
+    # --- Add-only commands (Batch 3) ---
+    # Returned for intent/history (constraint reversal); the handler still
+    # routes them to the AI path because nothing deterministic can price a
+    # newly added item.
+    addition_corrections = _parse_addition_corrections(text)
+    if addition_corrections:
+        return addition_corrections
+
+    # --- Count/portion corrections (Batch 4) ---
+    # Checked before SCALE so "חצי שניצל" (half a schnitzel — a fractional
+    # count of a discrete item) is a count, not a whole-meal 0.5 scale. The
+    # count parser deliberately declines gram phrases and "מ/מן/מה"/"מנה"/"פי"
+    # scale phrasing, so genuine scale corrections still reach _parse_scale_
+    # corrections. A count NEVER becomes a gram lock (kind is "count", never
+    # "quantity").
+    parsed_quantity = parse_quantity_expression(text)
+    if parsed_quantity is not None:
+        return [
+            MealCorrection(
+                kind="count",
+                item_hint=parsed_quantity.food_text,
+                value=f"{parsed_quantity.count:g}",
+                original_text=text,
+                quantity=parsed_quantity,
+            )
+        ]
 
     scale_corrections = _parse_scale_corrections(text)
     if scale_corrections:
@@ -701,6 +1145,16 @@ def apply_item_replacement_correction(
     # ------------------------------------------------------------------
     best.name = replacement_name
 
+    # Batch 5: a count-derived gram estimate belongs to the OLD identity's
+    # per-unit weight (one schnitzel != one falafel ball). On replacement the
+    # count evidence survives (quantity_count is untouched) but its DERIVED
+    # provenance is invalidated back to "user_count", so a later
+    # materialization re-derives grams from the NEW identity's portion model
+    # rather than carrying the wrong per-unit weight forward. Explicit user
+    # grams / package labels are left alone.
+    if str(getattr(best, "quantity_source", "") or "") == QSOURCE_COUNT_DERIVED:
+        best.quantity_source = QSOURCE_USER_COUNT
+
     note = f"הוחלף: {old_name} → {replacement_name}"
     if note not in analysis.notes:
         analysis.notes.append(note)
@@ -759,11 +1213,24 @@ def apply_scale_correction(
 
 
 def _tokens(text: str) -> set[str]:
-    return {
-        token
-        for token in re.findall(r"[\w\u0590-\u05FF]+", text.casefold())
-        if len(token) > 1 and token not in {"מבושל", "נא", "גרם"}
-    }
+    """Comparison token set for identity/quantity matching.
+
+    Batch 3: tokens are normalized for the Hebrew definite article — a
+    leading ה on a token of 3+ letters is stripped FOR COMPARISON ONLY
+    ("הפלאפל" and "פלאפל" yield the same token, so a correction naming an
+    item with the definite article matches the bare analysis item).
+    Stored item names are never rewritten, and both sides of every
+    comparison normalize identically, so genuine ה-initial food names
+    ("הודו", "המבורגר") keep matching themselves exactly as before.
+    """
+    tokens: set[str] = set()
+    for token in re.findall(r"[\w\u0590-\u05FF]+", text.casefold()):
+        if len(token) <= 1 or token in {"מבושל", "נא", "גרם"}:
+            continue
+        if token.startswith("ה") and len(token) > 2:
+            token = token[1:]
+        tokens.add(token)
+    return tokens
 
 
 def _similarity(a: str, b: str) -> float:
@@ -797,11 +1264,360 @@ def apply_locked_quantities(
         item.carbs = round(item.carbs * ratio, 1)
         item.fat = round(item.fat * ratio, 1)
         item.confidence = max(float(item.confidence), 0.95)
+        # Batch 5: an explicit user gram lock is the STRONGEST gram evidence —
+        # label it so a later count correction can never overwrite it.
+        item.quantity_source = "user"
         if constraint.measurement_state == "cooked" and "מבושל" not in item.name:
             item.name = f"{item.name} (מבושל)"
         elif constraint.measurement_state == "raw" and "יבש" not in item.name and "נא" not in item.name:
             item.name = f"{item.name} (משקל לפני בישול)"
     return analysis, unmatched
+
+
+def _singular_stem(word: str) -> str:
+    """Strip a common Hebrew plural suffix for MATCHING only (not display).
+
+    Hebrew plurals ("שניצלים", "קציצות") don't token-match their singular
+    item names ("שניצל", "קציצה"). Dropping a trailing ים/ות yields a stem
+    that is a substring of the singular ("קציצ" ⊂ "קציצה"), which is enough
+    for the substring-based count matcher below. Never used to rewrite a
+    stored name.
+    """
+    stripped = _strip_leading_article(word)
+    if len(stripped) > 3 and stripped.endswith(("ים", "ות")):
+        return stripped[:-2]
+    return stripped
+
+
+def _count_matches_item(food_text: str, item_name: str) -> bool:
+    """Plural/definite-article-tolerant match of a count food to an item.
+
+    Mirrors apply_locked_quantities' intent (token similarity) but adds
+    singular-stem substring matching so "3 שניצלים" finds the "שניצל" item.
+    """
+    if _similarity(food_text, item_name) >= 0.2:
+        return True
+    item_tokens = {_singular_stem(t) for t in _tokens(item_name)}
+    for token in _tokens(food_text):
+        stem = _singular_stem(token)
+        if not stem:
+            continue
+        if any(stem in it or it in stem for it in item_tokens if it):
+            return True
+    return False
+
+
+def apply_count_correction(
+    analysis: MealAnalysis,
+    correction: MealCorrection,
+) -> MealAnalysis:
+    """Record a count/portion correction on the matched item (Batch 4).
+
+    Sets the item's VISIBLE quantity evidence — ``quantity_count``,
+    ``quantity_unit`` (a portion unit like "כדור" when present, otherwise the
+    item is its own unit) and ``quantity_source="user_count"`` — WITHOUT
+    touching ``grams``, ``calories`` or any macro. A count is not a weight:
+    turning "3 schnitzels" into grams is Batch 5's deterministic-conversion
+    job. Until then the count is preserved as evidence and never silently
+    becomes "3 grams".
+
+    Item matching mirrors ``apply_locked_quantities``: best token similarity
+    on ``food_text``. When the text named no food ("שלוש כפות", "אחד וחצי")
+    the count applies to the meal's single item if there is exactly one;
+    otherwise a note records that the target was ambiguous (Batch 6 will
+    turn that into a clarification).
+    """
+    if correction.kind != "count" or correction.quantity is None:
+        return analysis
+    quantity = correction.quantity
+
+    target = None
+    if quantity.food_text:
+        matches = [
+            item for item in analysis.items
+            if _count_matches_item(quantity.food_text, item.name)
+        ]
+        if matches:
+            # Prefer the highest raw similarity among the tolerant matches.
+            target = max(
+                matches, key=lambda item: _similarity(quantity.food_text, item.name)
+            )
+    elif len(analysis.items) == 1:
+        target = analysis.items[0]
+
+    if target is None:
+        note = (
+            f"כמות לא שויכה לפריט: {quantity.count:g}"
+            + (f" {quantity.unit_label}" if quantity.unit_label else "")
+        )
+        if note not in analysis.notes:
+            analysis.notes.append(note)
+        return analysis
+
+    prior_source = str(getattr(target, "quantity_source", "") or "")
+    target.quantity_count = quantity.count
+    # Prefer an explicit portion unit ("כדור"); otherwise the item itself is
+    # the counted unit and quantity_unit stays empty (rendering uses the name).
+    if quantity.unit_label:
+        target.quantity_unit = quantity.unit_label
+    # Record the count, but NEVER downgrade a stronger gram provenance
+    # (explicit user grams / package label): a bare count must not relabel or
+    # overwrite grams the user already pinned (Batch 5 evidence hierarchy).
+    if prior_source not in _STRONGER_THAN_COUNT:
+        target.quantity_source = QSOURCE_USER_COUNT
+
+    unit_text = f" {quantity.unit_label}" if quantity.unit_label else ""
+    size_text = f" ({quantity.size})" if quantity.size else ""
+    note = f"כמות עודכנה: {target.name} — {quantity.count:g}{unit_text}{size_text}"
+    if note not in analysis.notes:
+        analysis.notes.append(note)
+
+    # Batch 5: try to derive grams from the count — only when the food/unit has
+    # a supported portion model and the result is plausible and stronger than
+    # the item's current gram evidence. materialize_count_quantity itself
+    # declines when the current source is stronger, so explicit user grams are
+    # safe even though the count was recorded above.
+    materialize_count_quantity(target)
+    return analysis
+
+
+# ---------------------------------------------------------------------------
+# Batch 5 — count → grams materialization
+#
+# A count is EVIDENCE; grams are a DERIVED estimate. Grams are materialized
+# from a count ONLY when every eligibility rule holds (identified food, a
+# SUPPORTED per-unit/per-portion-unit weight, a plausible result, and count
+# evidence that is stronger than the item's current gram source). Otherwise
+# the count is preserved and grams are left unchanged. Conversion is a pure,
+# idempotent function of (count, unit, size, food, model), so replay and
+# re-materialization always converge to the same grams — never compounding.
+# ---------------------------------------------------------------------------
+
+# Provenance markers.
+QSOURCE_USER_COUNT = "user_count"       # a stated count, grams not derived
+QSOURCE_COUNT_DERIVED = "count_derived"  # grams derived here from a count
+# Gram sources STRONGER than a count-derived estimate — never overwrite these.
+_STRONGER_THAN_COUNT = frozenset({"user", "user_grams", "package_label"})
+
+# Discrete-item weights: grams for ONE whole item, (min, default, max).
+# Deliberately small and high-confidence. NOTE: this is NOT
+# israeli_foods.typical_serving_g, which is a "serving" (a plate of falafel is
+# ~100 g of MANY balls) — a per-unit weight must be per single item.
+_DISCRETE_UNIT_GRAMS: dict[str, tuple[float, float, float]] = {
+    "שניצל": (120.0, 150.0, 200.0),
+    "פלאפל": (15.0, 18.0, 25.0),      # ONE ball
+    "קציצה": (30.0, 45.0, 60.0),
+    "פיתה": (50.0, 60.0, 70.0),
+    "בורקס": (80.0, 100.0, 120.0),
+}
+
+# Portion-unit weights. A unit does NOT have one universal weight, so this is
+# keyed by (canonical_unit, food_key) with a small "" generic fallback ONLY
+# where a generic value is defensible. (min, default, max) grams per 1 unit.
+_PORTION_UNIT_GRAMS: dict[tuple[str, str], tuple[float, float, float]] = {
+    ("כף", "שמן"): (12.0, 14.0, 16.0),
+    ("כפית", "שמן"): (4.0, 5.0, 6.0),
+    ("כף", ""): (12.0, 15.0, 20.0),      # a heaped tablespoon of a solid
+    ("כפית", ""): (4.0, 5.0, 7.0),
+    ("פרוסה", "לחם"): (20.0, 25.0, 35.0),
+    ("פרוסה", "גבינה"): (15.0, 20.0, 25.0),
+    ("כוס", "אורז"): (140.0, 158.0, 180.0),  # cooked white rice, ~1 cup
+}
+
+# Measure units (volume/portion) whose weight depends entirely on the food.
+# For these, an unmapped (unit, food) combination DECLINES — "כוס שניצל" (a
+# cup of schnitzel) is nonsense and must NOT fall back to a per-schnitzel
+# weight. Non-measure units (כדור, יחידה, and the food's own name as a unit)
+# describe a discrete piece and may use the discrete-item table.
+_MEASURE_UNITS = frozenset({"כף", "כפית", "כוס"})
+
+_SIZE_MULTIPLIER = {"small": 0.7, "medium": 1.0, "large": 1.3, "": 1.0}
+
+# Guards against absurd counts / totals (also keeps derived grams inside the
+# FoodItem schema's 0..5000 g bound so materialization can never raise).
+_MAX_REASONABLE_COUNT = 30.0
+_MAX_DERIVED_GRAMS = 3000.0
+
+
+def _food_stems(name: str) -> set[str]:
+    """All singular stems of a food name, for portion-model matching (handles
+    multi-word names like "אורז לבן" deterministically — never picks one
+    arbitrary token)."""
+    return {_singular_stem(t) for t in _tokens(name) if _singular_stem(t)}
+
+
+def _discrete_weight_for(name: str) -> tuple[float, float, float] | None:
+    """(min, default, max) grams for ONE whole item, or None. Matches the
+    discrete table against the food's own name (any token/stem)."""
+    stems = _food_stems(name)
+    for food, weights in _DISCRETE_UNIT_GRAMS.items():
+        if food in name or _singular_stem(food) in stems:
+            return weights
+    return None
+
+
+def _per_unit_weight(item: Any) -> tuple[float, float, float] | None:
+    """Return (min, default, max) grams for ONE unit of this item, or None
+    when the food/unit combination has no supported portion model.
+
+    Precedence:
+    - an explicit portion unit (כף/פרוסה/כוס...) → keyed by (unit, food-stem)
+      then (unit, generic "");
+    - a unit that is itself a discrete FOOD (e.g. "קציצה", "פיתה") → the
+      discrete-item table for that food;
+    - no unit → the item's own name in the discrete-item table.
+    No generic per-item weight exists: an unknown discrete food declines
+    rather than receiving an unsafe default.
+    """
+    name = str(getattr(item, "name", "") or "")
+    unit = str(getattr(item, "quantity_unit", "") or "")
+
+    if unit:
+        # Explicit portion unit: weight depends on the food.
+        stems = _food_stems(name)
+        for (u, food_key), weights in _PORTION_UNIT_GRAMS.items():
+            if u != unit or food_key == "":
+                continue  # try specific (unit, food) before the generic ("")
+            if food_key in name or _singular_stem(food_key) in stems:
+                return weights
+        # A measure unit (כף/כפית/כוס) with no specific mapping: a small,
+        # defensible generic exists ONLY for כף/כפית. An unmapped measure
+        # unit (e.g. "כוס שניצל") DECLINES — it must never borrow the food's
+        # per-item weight.
+        if unit in _MEASURE_UNITS:
+            return _PORTION_UNIT_GRAMS.get((unit, ""))
+        # A discrete-piece unit ("כדור", "יחידה", or the food's own name):
+        # the piece IS the item, so use the discrete-item table.
+        return _DISCRETE_UNIT_GRAMS.get(unit) or _discrete_weight_for(name)
+    # No explicit unit — the food itself is the counted unit.
+    return _discrete_weight_for(name)
+
+
+def materialize_count_quantity(item: Any) -> bool:
+    """Derive grams for one item from its count evidence, or leave it as-is.
+
+    Returns True when grams were materialized. Idempotent: an item already
+    carrying ``count_derived`` grams for the same count is a no-op, and a
+    changed count re-derives from the per-unit weight (never from the
+    already-derived grams, so counts never compound). Declines — preserving
+    the count and leaving grams untouched — when the food/unit is unsupported,
+    the current gram source is stronger, the result is implausible, or macros
+    cannot be kept coherent.
+    """
+    count = getattr(item, "quantity_count", None)
+    if not count or float(count) <= 0:
+        return False
+    count = float(count)
+    source = str(getattr(item, "quantity_source", "") or "")
+
+    # (5) Never overwrite stronger gram evidence.
+    if source in _STRONGER_THAN_COUNT:
+        return False
+
+    # Unreasonable-count guard: an absurd count ("100 שניצלים") is not a
+    # portion the deterministic model should price — decline and keep the
+    # count evidence for review rather than fabricate kilos of food.
+    if count > _MAX_REASONABLE_COUNT:
+        return False
+
+    weights = _per_unit_weight(item)
+    if weights is None:
+        return False  # (3) no supported portion model → decline, keep count
+
+    _lo, default, _hi = weights
+    size = ""  # size is captured on ParsedQuantity, not persisted on the item;
+    # size adjustment is applied at parse→apply time via a note. Kept neutral
+    # here so re-materialization on reload is deterministic.
+    per_unit = default * _SIZE_MULTIPLIER.get(size, 1.0)
+    derived = round(per_unit * count, 1)
+
+    # Total-weight ceiling: never produce grams the model (or the FoodItem
+    # schema) cannot hold. A result over the ceiling means the count is
+    # implausible for this food → decline.
+    if derived > _MAX_DERIVED_GRAMS:
+        return False
+
+    old_grams = float(getattr(item, "grams", 0) or 0)
+
+    # (7) Idempotency: already derived to exactly this from the same count.
+    if source == QSOURCE_COUNT_DERIVED and abs(old_grams - derived) < 0.05:
+        return False
+
+    # (4) Recompute macros coherently BEFORE mutating, so a food we cannot
+    # price never leaves changed grams with stale macros.
+    new_macros = _recompute_macros_for_grams(item, derived, old_grams)
+    if new_macros is None:
+        return False
+
+    # (4b) Plausibility trial on the candidate result — the final safety net.
+    trial = _trial_item(item, derived, new_macros, count)
+    from noam_coach.services.meal_plausibility import check_item
+
+    if any(issue.severity == "block" for issue in check_item(trial)):
+        note = f"המרה לגרמים נדחתה (לא סבירה): {item.name}"
+        _append_item_note(item, note)
+        return False
+
+    # Assign atomically; any schema rejection declines rather than crashes
+    # (the ceilings above already keep values in-range — this is belt-and-
+    # suspenders so materialization can never raise into the handler).
+    try:
+        item.grams = derived
+        item.calories = new_macros["calories"]
+        item.protein = new_macros["protein"]
+        item.carbs = new_macros["carbs"]
+        item.fat = new_macros["fat"]
+        item.quantity_source = QSOURCE_COUNT_DERIVED
+    except Exception:  # noqa: BLE001 — decline on any validation failure
+        return False
+    return True
+
+
+def _recompute_macros_for_grams(
+    item: Any, new_grams: float, old_grams: float
+) -> dict[str, float] | None:
+    """Coherent macros for ``new_grams``. Prefers the curated per-100g source;
+    falls back to ratio-scaling the item's current macros; returns None when
+    neither is safe (so the caller declines the gram change)."""
+    try:
+        import israeli_foods
+
+        food = israeli_foods.lookup(str(getattr(item, "name", "") or ""))
+        if food is not None:
+            return israeli_foods.scaled_macros(food, new_grams)
+    except Exception:  # noqa: BLE001 — fall through to ratio scaling
+        pass
+    if old_grams and old_grams > 0:
+        ratio = new_grams / old_grams
+        return {
+            "calories": round(float(getattr(item, "calories", 0) or 0) * ratio, 1),
+            "protein": round(float(getattr(item, "protein", 0) or 0) * ratio, 1),
+            "carbs": round(float(getattr(item, "carbs", 0) or 0) * ratio, 1),
+            "fat": round(float(getattr(item, "fat", 0) or 0) * ratio, 1),
+        }
+    return None
+
+
+def _trial_item(item: Any, grams: float, macros: dict[str, float], count: float) -> Any:
+    """A lightweight stand-in carrying the candidate values for plausibility."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        name=str(getattr(item, "name", "") or ""),
+        grams=grams,
+        calories=macros["calories"],
+        protein=macros["protein"],
+        carbs=macros["carbs"],
+        fat=macros["fat"],
+        quantity_count=count,
+        quantity_unit=getattr(item, "quantity_unit", None),
+    )
+
+
+def _append_item_note(item: Any, note: str) -> None:
+    """Best-effort note attach (items don't carry notes; the analysis does —
+    this is a no-op hook kept for symmetry / future use)."""
+    return None
 
 
 def requires_cooked_raw_clarification(constraints: Iterable[LockedQuantity]) -> bool:
@@ -828,29 +1644,66 @@ class IdentityConstraint:
 
 
 def identity_constraints_from_texts(texts: Iterable[str]) -> list[IdentityConstraint]:
-    """Parse identity corrections out of the current + locked correction texts.
+    """Parse identity constraints out of the current + locked correction texts.
 
-    This is the deterministic mirror of the prompt rule "the user's text is
-    authoritative": every replacement-form correction ("לא טחינה חציל במיונז",
-    "זה עוף לא הודו", "X במקום Y") becomes a hard constraint that outlives
-    the current AI call — TASK-58's invariant is that a rejected identity
-    cannot reappear in ANY later reanalysis of the same meal lifecycle.
+    The deterministic mirror of the prompt rule "the user's text is
+    authoritative". Texts are processed IN ORDER (the order meal_text
+    appends them to locked_corrections):
+
+    - A replacement form ("לא פלאפל, שניצל", "תוריד פלאפל ותוסיף שניצל")
+      yields rejected→confirmed. A later constraint about the SAME rejected
+      food supersedes the earlier one (the newest decision wins); chains
+      over different foods (פלאפל→שניצל then שניצל→חזה עוף) remain two
+      auditable constraints and resolve transitively during enforcement.
+    - A remove-only form ("תוריד פלאפל") yields a rejected-only constraint
+      (confirmed="") so enforcement DELETES a reintroduced item instead of
+      renaming it (Batch 3: a removed food could previously return via a
+      later AI reanalysis because removal texts produced no constraint).
+    - An add-only form ("תוסיף פלאפל") REVERSES earlier rejections of that
+      food — the user explicitly brought it back (TASK-58's escape hatch:
+      "unless the user later reverses the correction").
     """
     constraints: list[IdentityConstraint] = []
-    seen: set[tuple[str, str]] = set()
+
+    def _same_food(a: str, b: str) -> bool:
+        return _matches_rejected_identity(a, b) or _matches_rejected_identity(b, a)
+
+    def _supersede(rejected: str) -> None:
+        constraints[:] = [
+            existing for existing in constraints
+            if not _same_food(existing.rejected, rejected)
+        ]
+
     for text in texts:
-        for correction in _parse_replacement_corrections(str(text or "")):
-            key = (correction.item_hint.casefold(), correction.value.casefold())
-            if key in seen:
-                continue
-            seen.add(key)
-            constraints.append(
-                IdentityConstraint(
-                    rejected=correction.item_hint,
-                    confirmed=correction.value,
-                    source_text=correction.original_text,
+        raw = str(text or "")
+        replacements = _parse_replacement_corrections(raw)
+        if replacements:
+            for correction in replacements:
+                _supersede(correction.item_hint)
+                constraints.append(
+                    IdentityConstraint(
+                        rejected=correction.item_hint,
+                        confirmed=correction.value,
+                        source_text=correction.original_text,
+                    )
                 )
-            )
+            continue
+        removals = _parse_removal_corrections(raw)
+        if removals:
+            for correction in removals:
+                if not correction.item_hint:
+                    continue
+                _supersede(correction.item_hint)
+                constraints.append(
+                    IdentityConstraint(
+                        rejected=correction.item_hint,
+                        confirmed="",
+                        source_text=correction.original_text,
+                    )
+                )
+            continue
+        for correction in _parse_addition_corrections(raw):
+            _supersede(correction.value)
     return constraints
 
 
@@ -895,6 +1748,20 @@ def enforce_identity_constraints(
     or drop it when the confirmed food already exists as another item.
     Returns the analysis plus a machine-readable list of enforcement actions
     for tracing. Unrelated items are never touched.
+
+    CONTRACT (Batch 3): *constraints* MUST be in chronological order
+    (oldest correction first) — the exact order ``identity_constraints_
+    from_texts`` returns when given texts oldest-to-newest. Enforcement
+    applies constraints via a single forward pass and does not re-scan
+    earlier constraints after a later one fires, so a REVERSED chain
+    (e.g. ["שניצל→חזה עוף", "פלאפל→שניצל"] instead of the chronological
+    ["פלאפל→שניצל", "שניצל→חזה עוף"]) converges to the wrong food: an item
+    still named "פלאפל" is renamed once (→"שניצל") and never re-scanned
+    against the constraint that already ran. The current production caller
+    (``meal_identity.identity_enforced_reanalyze``) always builds its
+    constraint list from ``[*locked_corrections, correction_text]``, which
+    is chronological by construction — do not reorder, dedupe-by-recency,
+    or otherwise permute a constraint list before passing it here.
     """
     enforced: list[dict[str, str]] = []
     for constraint in constraints:
@@ -903,6 +1770,24 @@ def enforce_identity_constraints(
             if _matches_rejected_identity(item.name, constraint.rejected)
         ]
         if not matching:
+            continue
+        if not constraint.confirmed:
+            # Rejected-only constraint (remove-only correction): delete the
+            # reintroduced item — there is no confirmed identity to rename
+            # it to (Batch 3).
+            for item in matching:
+                analysis.items.remove(item)
+                enforced.append(
+                    {
+                        "action": "removed_rejected",
+                        "rejected": constraint.rejected,
+                        "confirmed": "",
+                        "item_was": item.name,
+                    }
+                )
+            note = f"אכיפת זהות: {constraint.rejected} הוסר"
+            if note not in analysis.notes:
+                analysis.notes.append(note)
             continue
         confirmed_exists = any(
             _similarity(constraint.confirmed, item.name) >= 0.6

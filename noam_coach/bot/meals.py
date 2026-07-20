@@ -708,8 +708,19 @@ async def render_meal(target: Any, user_id: int, approval_id: str, refine_count:
         # value. quantity_source is internal and never shown.
         count = getattr(item, "quantity_count", None)
         source = str(getattr(item, "quantity_source", "") or "")
-        if count and source in {"", "visual_count", "estimate"}:
-            unit = str(getattr(item, "quantity_unit", "") or "יחידות")
+        unit = str(getattr(item, "quantity_unit", "") or "יחידות")
+        # Batch 5: a count that was MATERIALIZED to a gram estimate shows both,
+        # so the user sees the count they gave AND the derived weight, clearly
+        # marked approximate ("3 יחידות (~450 גרם)"). This is distinct from a
+        # bare unconverted count and from an exact gram value.
+        if count and source == "count_derived":
+            return f"{count:g} {esc(unit)} (~{item.grams:g} גרם)"
+        # Batch 4: "user_count" is a user-stated count ("3 שניצלים", "חצי
+        # שניצל") not yet converted — render the count the user gave, exactly
+        # like the AI's visual_count evidence. Without this the correction is
+        # recorded (revision bumped, "עדכנתי" shown) but the card re-renders
+        # identical grams, so the user gets no confirmation it was understood.
+        if count and source in {"", "visual_count", "estimate", "user_count"}:
             count_str = f"{count:g}"
             return f"{count_str} {esc(unit)}"
         return f"{item.grams:g} {_quantity_unit(item)}"
@@ -779,6 +790,16 @@ async def render_meal(target: Any, user_id: int, approval_id: str, refine_count:
             "אם הניתוח אינו מדויק — אפשר לבחור מהרשימה, לכתוב לי תיאור נוסף, "
             "או פשוט לאשר אם זה תקין." + restriction_block + refine_hint
         )
+        # Batch 6: a quantity clarification ends with an escape option ("type
+        # grams" / "cancel"). Truncating to a fixed 4 would silently drop it
+        # and trap the user in a question with no way out, so the cap keeps
+        # the LAST options (the exits) rather than only the first ones.
+        _MAX_CLARIFY_BUTTONS = 6
+        visible_options = list(enumerate(analysis.options))
+        if len(visible_options) > _MAX_CLARIFY_BUTTONS:
+            head = visible_options[: _MAX_CLARIFY_BUTTONS - 2]
+            tail = visible_options[-2:]
+            visible_options = head + tail
         option_rows = [
             [
                 button(
@@ -786,7 +807,7 @@ async def render_meal(target: Any, user_id: int, approval_id: str, refine_count:
                     f"clarify:{approval_id}:{index}",
                 )
             ]
-            for index, option in enumerate(analysis.options[:4])
+            for index, option in visible_options
         ]
         # TASK-22: no dedicated "correct by text" button — the user can just
         # write a correction directly while this meal is awaiting approval.

@@ -697,3 +697,152 @@ async def test_fa4_finish_dialog_hides_full_when_incomplete(db: Database) -> Non
     assert not any(cb.endswith(":full") for cb in callbacks)
     # ...and the dialog says it will be marked partial.
     assert any("ייסמן כ" in text and "חלקי" in text for text in query.edits)
+
+
+# ---------------------------------------------------------------------------
+# 2026-07-19 falafel/schnitzel root-cause audit — the exact reanalysis shape
+# from private trace events 1225/1226: the AI turned "3 כדור" into grams=3.0
+# with quantity_source="user", and the deterministic override recalculated
+# calories 15.0 → 8.4 while preserving the impossible weight. Batch 1 pins
+# that this shape is blocked REGARDLESS of quantity_source or calorie stage.
+# ---------------------------------------------------------------------------
+
+
+def _event_1225_item(calories: float, quantity_source: str) -> FoodItem:
+    return FoodItem(
+        name="שניצל", grams=3.0, calories=calories, protein=0.7, carbs=0.3,
+        fat=0.5, confidence=1.0, quantity_count=3.0, quantity_unit="כדור",
+        quantity_source=quantity_source,
+    )
+
+
+@pytest.mark.parametrize("calories", [15.0, 8.4])  # raw AI (1225) / post-override (1226)
+@pytest.mark.parametrize("quantity_source", ["user", "visual_count", "estimate"])
+def test_rc_count_written_as_grams_blocked_for_any_source(
+    calories: float, quantity_source: str
+) -> None:
+    """quantity_count=3 must never imply grams=3 — including when the AI
+    mislabels the count as a user-supplied quantity (the incident's exact
+    'quantity_source="user"' shape must not bypass the gate)."""
+    from noam_coach.services.meal_plausibility import check_item
+
+    issues = check_item(_event_1225_item(calories, quantity_source))
+    assert [i.code for i in issues] == ["count_written_as_grams"]
+    assert issues[0].severity == "block"
+
+
+@pytest.mark.parametrize("quantity_source", ["user", "visual_count"])
+def test_rc_event_1225_meal_cannot_validate(quantity_source: str) -> None:
+    """The full incident meal (schnitzel 3 g + fried eggplant side) is
+    blocked at validation for both source labels — the '3 גרם / 8 קל׳'
+    render can never be approved again."""
+    from noam_coach.services.meal_validation import validate_meal_analysis
+
+    incident = MealAnalysis(
+        meal_name="שניצל + חציל מטוגן",
+        items=[
+            _event_1225_item(8.4, quantity_source),
+            FoodItem(name="חציל מטוגן", grams=100.0, calories=120.0,
+                     protein=1.0, carbs=8.0, fat=9.0, confidence=0.8),
+        ],
+        confidence=0.9,
+    )
+    assert validate_meal_analysis(incident).blocked
+
+
+def test_rc_plausible_schnitzel_count_with_real_weight_passes() -> None:
+    """False-positive guard: three schnitzels at a realistic total weight
+    (count=3, grams=540) must pass — the gate blocks the count-as-grams
+    signature, not counted foods as such."""
+    from noam_coach.services.meal_plausibility import check_item
+
+    plausible = FoodItem(
+        name="שניצל", grams=540.0, calories=1188.0, protein=96.0, carbs=42.0,
+        fat=70.0, confidence=0.9, quantity_count=3.0, quantity_unit="יחידות",
+        quantity_source="visual_count",
+    )
+    assert check_item(plausible) == []
+
+
+# ---------------------------------------------------------------------------
+# Batch 4 verification-gate regression — a user-stated count MUST be visible
+# on the rendered card. Before the fix, "user_count" was absent from
+# render_meal's count allowlist, so a count correction bumped the revision
+# and showed "עדכנתי" while the card re-rendered byte-identical grams — a
+# correction presented as accepted with no visible effect (gate §8).
+# ---------------------------------------------------------------------------
+
+
+async def test_batch4_user_count_is_rendered_on_the_card(db: Database) -> None:
+    payload = {
+        "analysis": MealAnalysis(
+            meal_name="שניצל",
+            items=[
+                FoodItem(name="שניצל", grams=120.0, calories=240.0, protein=12.0,
+                         carbs=24.0, fat=6.0, confidence=0.9,
+                         quantity_count=3.0, quantity_source="user_count"),
+            ],
+            confidence=0.9,
+        ).model_dump(),
+        "eaten_at": utc_now(),
+        "revision": 1,
+    }
+    approval_id = await create_approval(USER_ID, "meal", payload)
+    query = FakeQuery()
+    await meals_bot.render_meal(query, USER_ID, approval_id)
+    rendered = " ".join(query.edits)
+    # The user said "3" — the card shows 3 units, not the silent "120 גרם".
+    assert "3 יחידות" in rendered
+    assert "120 גרם" not in rendered
+
+
+async def test_batch4_user_count_with_unit_is_rendered(db: Database) -> None:
+    payload = {
+        "analysis": MealAnalysis(
+            meal_name="פלאפל",
+            items=[
+                FoodItem(name="פלאפל", grams=100.0, calories=300.0, protein=10.0,
+                         carbs=25.0, fat=18.0, confidence=0.9,
+                         quantity_count=3.0, quantity_unit="כדור",
+                         quantity_source="user_count"),
+            ],
+            confidence=0.9,
+        ).model_dump(),
+        "eaten_at": utc_now(),
+        "revision": 1,
+    }
+    approval_id = await create_approval(USER_ID, "meal", payload)
+    query = FakeQuery()
+    await meals_bot.render_meal(query, USER_ID, approval_id)
+    rendered = " ".join(query.edits)
+    assert "3 כדור" in rendered
+
+
+# ---------------------------------------------------------------------------
+# Batch 5 — a count_derived item shows the count AND the derived grams
+# distinctly ("3 יחידות (~450 גרם)"), never an unmarked exact gram value and
+# never the raw count as grams.
+# ---------------------------------------------------------------------------
+
+
+async def test_batch5_count_derived_renders_count_and_grams(db: Database) -> None:
+    payload = {
+        "analysis": MealAnalysis(
+            meal_name="שניצל",
+            items=[
+                FoodItem(name="שניצל", grams=450.0, calories=1260.0, protein=76.5,
+                         carbs=67.5, fat=76.5, confidence=0.9,
+                         quantity_count=3.0, quantity_source="count_derived"),
+            ],
+            confidence=0.9,
+        ).model_dump(),
+        "eaten_at": utc_now(),
+        "revision": 1,
+    }
+    approval_id = await create_approval(USER_ID, "meal", payload)
+    query = FakeQuery()
+    await meals_bot.render_meal(query, USER_ID, approval_id)
+    rendered = " ".join(query.edits)
+    assert "3 יחידות" in rendered           # the count the user gave
+    assert "450 גרם" in rendered            # the derived weight, shown too
+    assert "~" in rendered                  # marked approximate

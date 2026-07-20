@@ -131,7 +131,13 @@ def install_meal_identity_enforcement() -> None:
     ) -> Any:
         import coach_bot as facade
 
-        texts = [correction_text, *(locked_corrections or [])]
+        # Batch 3: constraints are ORDER-SENSITIVE — a later correction
+        # supersedes/reverses an earlier one about the same food — so the
+        # texts must be chronological: locked history first (oldest→newest),
+        # then the current correction as the newest decision. The previous
+        # newest-first order made a replacement chain enforce its FIRST
+        # correction last (falafel→schnitzel→chicken came out schnitzel).
+        texts = [*(locked_corrections or []), correction_text]
         constraints = identity_constraints_from_texts(texts)
         db = facade.DB
         user_id = _user_id_from_context(nutrition_context)
