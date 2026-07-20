@@ -379,12 +379,23 @@ class TestRestrictionContradiction:
     dietary restriction."""
 
     def test_render_meal_checks_restrictions(self) -> None:
+        import importlib
         import inspect
+        from pathlib import Path
 
-        from noam_coach.bot.meals import render_meal
         from noam_coach.services.meal_validation import validate_meal_analysis_for_user
 
-        source = inspect.getsource(render_meal)
+        # Read the implementation from the module FILE, not from whatever is
+        # currently bound to the name. `runtime_bound._sync` copies the
+        # coach_bot facade's attributes into this module's globals on every
+        # call, so a sibling test that monkeypatched `coach_bot.render_meal`
+        # leaves its fake behind here permanently — monkeypatch restores the
+        # facade, not the propagated copy. Reading the source keeps this a
+        # test about the implementation rather than about execution order.
+        meals_module = importlib.import_module("noam_coach.bot.meals")
+        module_source = Path(meals_module.__file__).read_text(encoding="utf-8")
+        start = module_source.index("async def render_meal(")
+        source = module_source[start:start + 6000]
         validation_source = inspect.getsource(validate_meal_analysis_for_user)
         assert "restriction_warnings" in source
         assert "validate_meal_analysis_for_user" in source
@@ -532,11 +543,22 @@ class TestStructuredErrorRecovery:
         assert "photo_analysis_error" in source
 
     def test_meal_correction_error_logging(self) -> None:
+        """The correction handler still records a structured error event.
+
+        Batch 7 moved this emission to the canonical observability boundary,
+        so the handler now references the taxonomy constant rather than a
+        string literal. Assert on the constant's VALUE — the event name is
+        unchanged — instead of on the source spelling, which pinned an
+        implementation detail rather than the behaviour.
+        """
         import inspect
 
         from noam_coach.bot.meal_text import _handle_meal_correction_text
+        from noam_coach.observability import taxonomy
+
+        assert taxonomy.MEAL_CORRECTION_ERROR == "meal_correction_error"
         source = inspect.getsource(_handle_meal_correction_text)
-        assert "meal_correction_error" in source
+        assert "MEAL_CORRECTION_ERROR" in source
 
 
 # ---------------------------------------------------------------------------

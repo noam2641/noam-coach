@@ -38,7 +38,10 @@ class FoodItem(BaseModel):
     # how the gram weight was derived and is internal (not shown to the user).
     quantity_count: float | None = Field(default=None, ge=0, le=1000)
     quantity_unit: str | None = None  # e.g. "עוגייה" / "יחידה" / "פרוסה"
-    quantity_source: str | None = None  # visual_count | package_label | canonical | user | estimate
+    # visual_count | package_label | canonical | user | estimate | user_count
+    # (a user-stated count, Batch 4) | count_derived (grams derived from a
+    # count via the portion model, Batch 5).
+    quantity_source: str | None = None
 
     @field_validator("grams", "calories", "protein", "carbs", "fat", "confidence")
     @classmethod
@@ -69,6 +72,14 @@ class ClarificationOption(BaseModel):
     protein_delta: float = 0
     carbs_delta: float = 0
     fat_delta: float = 0
+    # Batch 6 — quantity clarification. A macro-delta option leaves these at
+    # their defaults and behaves exactly as before; a quantity option sets
+    # ``apply_kind`` and is routed to the quantity path instead of the deltas.
+    # Optional and defaulted so every previously persisted option still
+    # validates (no migration).
+    apply_kind: str | None = None
+    set_grams: float | None = Field(default=None, ge=0, le=5000)
+    set_size: str | None = None
 
 
 def _title_word_set(text: str) -> set[str]:

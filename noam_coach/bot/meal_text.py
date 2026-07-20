@@ -110,8 +110,224 @@ from noam_coach.services.nutrition_context import (
     build_nutrition_ai_request,
     build_nutrition_context,
 )
+from noam_coach.observability import taxonomy
+from noam_coach.services import meal_observability
 
 RUNTIME_NAMES = ('ContextTypes', 'DB', 'Exception', 'InlineKeyboardMarkup', 'LOGGER', 'MealAnalysis', 'RuntimeError', 'Update', '_CANCEL_WORDS', '_handle_meal_correction_text', 'approval_id', 'button', 'candidate_ids', 'clear_meal_fix', 'conversation', 'corrected_analysis', 'correction_text', 'count', 'decision', 'ensure_user', 'event_log', 'exc', 'fetch_approval', 'flow', 'friendly_error', 'get_meal_fix', 'handle_onboarding_text', 'home_keyboard', 'image_path', 'index', 'int', 'is_allowed', 'json', 'len', 'list', 'original_analysis', 'pc', 'planning', 'prior_locked', 'progress', 'rc', 'reanalyze_meal_with_text_and_image', 'refine_count', 'removal_corrections', 'render_meal', 'route_free_text', 'row', 'selected', 'set_meal_fix', 'str', 'suppress', 'text', 'track_event', 'update', 'user_id', 'write_audit')
+
+
+async def _emit_meal_event(
+    user_id: int,
+    event: str,
+    approval_id: str,
+    *,
+    source: str = "bot",
+    properties: dict[str, Any] | None = None,
+    content: dict[str, Any] | None = None,
+) -> None:
+    """Emit one meal lifecycle event through the canonical boundary.
+
+    Correlation (trace/interaction/span) is supplied by the ambient
+    observability scope inside ``emit_event`` — this never mints identifiers.
+    Emission is best-effort by contract: ``emit_event`` contains its own
+    failures, and the extra guard here covers an import-time problem so a
+    telemetry fault can never break a correction.
+    """
+    try:
+        from noam_coach.observability.emit import emit_event
+
+        await emit_event(
+            DB,
+            user_id,
+            event,
+            entity="approval",
+            entity_id=approval_id,
+            source=source,
+            properties=properties or {},
+            content=content or None,
+        )
+    except Exception:  # noqa: BLE001 — observability must never break coaching
+        LOGGER.debug("meal observability emit failed for %s", event, exc_info=True)
+
+
+async def _emit_meal_lifecycle_evidence(
+    user_id: int,
+    approval_id: str,
+    *,
+    revision: int,
+    original_analysis: Any,
+    corrected_analysis: Any,
+    row: Any,
+) -> None:
+    """Batch 7 evidence chain for one applied correction.
+
+    Emits, in pipeline order: the per-item conversion diagnostic, the
+    plausibility outcome, any clarification raised, and the final rendered
+    quantity mode. Together with ``meal_correction_applied`` these make the
+    correction reconstructable end to end.
+
+    Entirely best-effort — a failure anywhere here leaves the correction and
+    the card untouched.
+    """
+    try:
+        from noam_coach.services.meal_plausibility import check_analysis
+        from noam_coach.services.meal_clarification import PendingClarification
+        from noam_coach.services.meal_quantity_diagnostics import (
+            classify_pre_conversion,
+        )
+
+        # (1) Conversion evidence per item carrying count evidence. The
+        # classifier is PURE and read-only: Batch 7 reports its verdict and
+        # never re-decides it.
+        for index, item in enumerate(getattr(corrected_analysis, "items", []) or []):
+            if not getattr(item, "quantity_count", None):
+                continue
+            diagnostic = classify_pre_conversion(item)
+            await _emit_meal_event(
+                user_id,
+                taxonomy.MEAL_QUANTITY_CONVERSION_EVALUATED,
+                approval_id,
+                source="deterministic",
+                properties={
+                    "revision": revision,
+                    **meal_observability.conversion_properties(
+                        diagnostic,
+                        item_index=index,
+                        item_name=str(getattr(item, "name", "") or ""),
+                    ),
+                },
+            )
+
+        # (2) Plausibility outcome for the corrected draft.
+        issues = check_analysis(getattr(corrected_analysis, "items", []) or [])
+        await _emit_meal_event(
+            user_id,
+            taxonomy.MEAL_PLAUSIBILITY_EVALUATED,
+            approval_id,
+            source="deterministic",
+            properties={
+                "revision": revision,
+                **meal_observability.plausibility_properties(issues),
+            },
+        )
+
+        # (3) A clarification standing on the card after this correction.
+        pending = PendingClarification.from_payload(
+            (row or {}).get("data", {}).get("pending_clarification")
+        )
+        if pending is not None and not pending.is_resolved:
+            await _emit_meal_event(
+                user_id,
+                taxonomy.MEAL_CLARIFICATION_RAISED,
+                approval_id,
+                source="deterministic",
+                properties={
+                    "revision": revision,
+                    **meal_observability.clarification_properties(
+                        pending, status="raised", mutated=False
+                    ),
+                },
+            )
+
+        # (4) What the card will actually show — the last link in the chain.
+        await _emit_meal_event(
+            user_id,
+            taxonomy.MEAL_RENDER_QUANTITY_MODE,
+            approval_id,
+            source="render",
+            properties=meal_observability.render_mode_properties(
+                corrected_analysis, revision=revision
+            ),
+        )
+    except Exception:  # noqa: BLE001 — evidence must never break a correction
+        LOGGER.debug("meal lifecycle evidence failed", exc_info=True)
+
+
+def _apply_quantity_clarification_stage(
+    row: Any,
+    analysis: "MealAnalysis",
+    correction_text: str,
+) -> "MealAnalysis":
+    """Resolve an answered quantity question, then ask the next one if needed.
+
+    Mutates ``row["data"]["pending_clarification"]`` so the approval payload
+    can reconstruct both the pending question and its resolution. Never raises
+    into the correction handler: any failure leaves the analysis untouched and
+    the card renders as it would have before Batch 6.
+    """
+    from noam_coach.services.meal_clarification import (
+        PendingClarification,
+        build_clarification_options,
+        detect_quantity_clarification,
+        resolve_typed_grams,
+    )
+    from models import ClarificationOption
+
+    try:
+        pending = PendingClarification.from_payload(
+            row["data"].get("pending_clarification")
+        )
+
+        # (1) The user typed grams while a question was open. parse_locked_
+        # quantities already applied them to a MATCHED item above; this
+        # closes the question so the same answer can never be applied twice
+        # and the card stops asking.
+        if pending is not None and not pending.is_resolved:
+            locked = meal_intelligence.parse_locked_quantities(correction_text)
+            typed_grams = None
+            for entry in locked or []:
+                grams_value = float(getattr(entry, "grams", 0) or 0)
+                if grams_value > 0:
+                    typed_grams = grams_value
+                    break
+            if typed_grams is not None:
+                resolve_typed_grams(analysis, pending, typed_grams)
+                row["data"]["pending_clarification"] = pending.to_payload()
+                if pending.is_resolved:
+                    analysis.question = None
+                    analysis.options = []
+                    return analysis
+
+        # (2) Ask about unresolved quantity evidence — but never overwrite a
+        # question the analyzer itself is already asking.
+        if analysis.question:
+            return analysis
+
+        next_pending = detect_quantity_clarification(analysis)
+        if next_pending is None:
+            return analysis
+
+        # Do not re-ask a question this payload already answered.
+        if (
+            pending is not None
+            and pending.is_resolved
+            and pending.token == next_pending.token
+        ):
+            return analysis
+
+        # Preserve an in-flight question's resolution state across re-renders
+        # so its token (and idempotency) survives an unrelated correction.
+        if pending is not None and pending.token == next_pending.token:
+            next_pending.resolved_token = pending.resolved_token
+            next_pending.resolution = pending.resolution
+            next_pending.resolved_grams = pending.resolved_grams
+
+        analysis.question = next_pending.question
+        analysis.options = [
+            ClarificationOption(
+                label=str(opt.get("label") or ""),
+                item_index=opt.get("item_index"),
+                item_name=next_pending.item_name,
+                apply_kind=opt.get("apply_kind"),
+                set_grams=opt.get("set_grams"),
+                set_size=opt.get("set_size"),
+            )
+            for opt in build_clarification_options(next_pending)
+        ]
+        row["data"]["pending_clarification"] = next_pending.to_payload()
+    except Exception:  # noqa: BLE001 — clarification must never break a correction
+        LOGGER.exception("quantity clarification stage failed")
+    return analysis
 
 
 @runtime_bound(RUNTIME_NAMES)
@@ -151,6 +367,7 @@ async def _handle_meal_correction_text(
         removal_corrections = [c for c in corrections if c.kind == "remove"]
         prep_corrections = [c for c in corrections if c.kind == "preparation"]
         qty_corrections = [c for c in corrections if c.kind == "quantity"]
+        count_corrections = [c for c in corrections if c.kind == "count"]
         scale_corrections = [c for c in corrections if c.kind == "scale"]
 
         used_deterministic = False
@@ -180,6 +397,16 @@ async def _handle_meal_correction_text(
                     corrected_analysis, locked,
                 )
                 used_deterministic = True
+
+        if count_corrections:
+            # Batch 4: record count/portion evidence ("3 שניצלים", "חצי
+            # שניצל") on the matched item WITHOUT touching grams — a count is
+            # never a weight. Deterministic-to-grams conversion is Batch 5.
+            for cc in count_corrections:
+                corrected_analysis = meal_intelligence.apply_count_correction(
+                    corrected_analysis, cc,
+                )
+            used_deterministic = True
 
         if scale_corrections:
             for sc in scale_corrections:
@@ -245,6 +472,16 @@ async def _handle_meal_correction_text(
             + [f"תיקון: {correction_text}"]
         )[-10:]
 
+        # --- Batch 6: quantity clarification ------------------------------
+        # Two directions, in this order:
+        #   1. the user was ASKED for grams and just typed them → resolve the
+        #      open question through the same gram-locking write a button uses;
+        #   2. the (possibly corrected) analysis still has quantity evidence we
+        #      must not resolve alone → ask, instead of guessing.
+        corrected_analysis = _apply_quantity_clarification_stage(
+            row, corrected_analysis, correction_text
+        )
+
         # Bump revision in payload
         revision = row["data"].get("revision", 0) + 1
         row["data"]["analysis"] = corrected_analysis.model_dump()
@@ -261,18 +498,37 @@ async def _handle_meal_correction_text(
             approval_id,
             correction_text=correction_text,
         )
-        await event_log.append_event(
-            DB,
+        # Batch 7: this event moved to the canonical emit boundary. The NAME
+        # and every non-sensitive property are unchanged, so existing readers
+        # keep working; the raw correction text moved from `properties` into
+        # `content`, where the OFF/METADATA/CONTENT/DEBUG policy, redaction
+        # and digesting already live. `append_event` applies none of those —
+        # it is deliberately a lower layer — so the text was previously
+        # stored verbatim in every mode.
+        await _emit_meal_event(
             user_id,
-            "meal_correction_applied",
-            entity="approval",
-            entity_id=approval_id,
+            taxonomy.MEAL_CORRECTION_APPLIED,
+            approval_id,
             source="deterministic" if used_deterministic else "ai",
             properties={
-                "text": correction_text,
                 "revision": revision,
                 "deterministic": used_deterministic,
+                **meal_observability.correction_parse_properties(
+                    corrections,
+                    used_deterministic=used_deterministic,
+                    revision=revision,
+                    text_length=len(correction_text),
+                ),
             },
+            content={"text": correction_text},
+        )
+        await _emit_meal_lifecycle_evidence(
+            user_id,
+            approval_id,
+            revision=revision,
+            original_analysis=original_analysis,
+            corrected_analysis=corrected_analysis,
+            row=row,
         )
         count = refine_count + 1
         await set_meal_fix(user_id, approval_id, count)
@@ -280,11 +536,20 @@ async def _handle_meal_correction_text(
     except Exception as exc:  # noqa: BLE001
         LOGGER.exception("Meal correction failed")
         with suppress(Exception):
-            await event_log.append_event(
-                DB, user_id, "meal_correction_error",
-                entity="approval", entity_id=approval_id,
+            # Batch 7: never record str(exc) or the correction text here — a
+            # correction failure's message routinely embeds the user's own
+            # words, which is exactly the leak this batch closes. The
+            # exception class plus the pipeline stage is enough to triage,
+            # and the text itself is already on the lifecycle event above as
+            # mode-governed content.
+            await _emit_meal_event(
+                user_id,
+                taxonomy.MEAL_CORRECTION_ERROR,
+                approval_id,
                 source="system",
-                properties={"error": str(exc)[:200], "context": "meal correction", "correction_text": correction_text[:100]},
+                properties=meal_observability.error_properties(
+                    exc, context="meal_correction"
+                ),
             )
         # REC-MEAL-03: keep previous analysis, show recovery options
         await progress.edit_text(
