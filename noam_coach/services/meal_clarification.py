@@ -157,49 +157,74 @@ def clarification_token(item_index: int, item_name: str, count: float, reason: s
 
 
 def _needs_clarification(item: Any) -> str:
-    """The reason this item's quantity cannot be resolved safely, or ""."""
-    from meal_intelligence import (
-        _MAX_REASONABLE_COUNT,
-        _STRONGER_THAN_COUNT,
-        QSOURCE_COUNT_DERIVED,
-        _per_unit_weight,
+    """The reason this item's quantity cannot be resolved safely, or "".
+
+    Batch 6.1: the decline reason now comes from the authoritative diagnostic
+    classifier, which mirrors ``materialize_count_quantity`` branch-for-branch
+    using the converter's own predicates.
+
+    Previously this function re-derived the reason with its own approximation,
+    which disagreed with the converter in BOTH directions: it asked about
+    quantities the converter resolves cleanly (needless friction) and stayed
+    silent on quantities the converter refuses (the audit's root-cause class).
+    Its final ``IMPLAUSIBLE`` fallback also lumped together three distinct
+    converter branches — ceiling, macro-incoherence, and the plausibility
+    trial. Asking now agrees with converting by construction, not by luck.
+    """
+    from noam_coach.services.meal_quantity_diagnostics import (
+        BLOCKED_BY_CEILING,
+        CONVERTED,
+        IDEMPOTENT_NOOP,
+        IMPLAUSIBLE_COUNT,
+        IMPLAUSIBLE_RESULT,
+        MACROS_INCOHERENT,
+        MISSING_OR_INVALID_COUNT,
+        NO_PORTION_MODEL,
+        STRONGER_SOURCE_PRESERVED,
+        classify_pre_conversion,
     )
 
-    count = getattr(item, "quantity_count", None)
-    if not count or float(count) <= 0:
-        return ""
-    count = float(count)
-    source = str(getattr(item, "quantity_source", "") or "")
+    diagnostic = classify_pre_conversion(item)
+    outcome = diagnostic.outcome
 
-    # The user already pinned grams — there is nothing to ask. Mirrors
-    # materialize_count_quantity:1515, which declines for the same reason.
-    if source in _STRONGER_THAN_COUNT:
-        return ""
-
-    # Already converted cleanly by Batch 5 — the card shows real grams.
-    if source == QSOURCE_COUNT_DERIVED:
+    # Nothing to ask when there is no count evidence at all, when the user's
+    # own grams outrank the count, or when a replay is a no-op.
+    if outcome in {
+        MISSING_OR_INVALID_COUNT,
+        STRONGER_SOURCE_PRESERVED,
+        IDEMPOTENT_NOOP,
+    }:
         return ""
 
-    grams = float(getattr(item, "grams", 0) or 0)
-
-    # The incident signature: a multi-unit count sitting next to grams that
-    # equal (or nearly equal) the count itself — "3 שניצלים, 3 גרם".
+    # Batch 6 precedence, preserved exactly: the incident signature is checked
+    # BEFORE deferring to the converter's outcome. Grams that equal the count
+    # are actively wrong on the card, and the audit requires that shape never
+    # pass silently — even when the converter would happily re-derive grams
+    # from the count, because the stored grams prove the two disagree.
+    count = float(diagnostic.count or 0)
+    grams = float(diagnostic.grams_before or 0)
     if count > 1 and grams > 0 and abs(grams - count) < 1.0:
         return REASON_COUNT_GRAMS_CONFLICT
 
-    # An absurd count is not a portion we should price.
-    if count > _MAX_REASONABLE_COUNT:
-        return REASON_IMPLAUSIBLE
+    # A conversion the converter would perform cleanly needs no question.
+    if outcome == CONVERTED:
+        return ""
 
-    # No supported portion model — the most common decline, and until now
-    # entirely silent (materialize_count_quantity:1525).
-    if _per_unit_weight(item) is None:
+    if outcome == NO_PORTION_MODEL:
         return REASON_NO_PORTION_MODEL
 
-    # A portion model exists but conversion still declined and left the item
-    # on raw count evidence: the result failed the plausibility trial
-    # (materialize_count_quantity:1556).
-    return REASON_IMPLAUSIBLE
+    # Every remaining decline is a number we could not stand behind:
+    # an absurd count, a result over the ceiling, incoherent macros, or a
+    # candidate the plausibility trial refused.
+    if outcome in {
+        IMPLAUSIBLE_COUNT,
+        BLOCKED_BY_CEILING,
+        MACROS_INCOHERENT,
+        IMPLAUSIBLE_RESULT,
+    }:
+        return REASON_IMPLAUSIBLE
+
+    return ""
 
 
 def _unit_phrase(count: float, item_name: str, unit_label: str) -> str:
