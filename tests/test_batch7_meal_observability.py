@@ -552,7 +552,6 @@ async def test_repeat_tap_on_a_live_option_is_recorded_as_duplicate(
 ) -> None:
     """The ``duplicate`` branch proper: the option still exists, but the
     question behind it was already answered."""
-    from noam_coach.bot import callback_meals
 
     approval_id = await _seed_clarified_approval()
 

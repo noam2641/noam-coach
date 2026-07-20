@@ -137,12 +137,12 @@ async def _create_approval_with_question(analysis: MealAnalysis) -> str:
     stored question/options are byte-identical to what a real correction
     would have written — only the AI reanalysis step is bypassed.
     """
+    from models import ClarificationOption
     from noam_coach.services import core as core_services
     from noam_coach.services.meal_clarification import (
         build_clarification_options,
         detect_quantity_clarification,
     )
-    from models import ClarificationOption
 
     pending = detect_quantity_clarification(analysis)
     assert pending is not None, "fixture must produce a clarification"
