@@ -135,6 +135,22 @@ _DEBOUNCE_PREFIXES = (
     "nextmeal:plan:",
     "nextmeal:choose:",
     "dailymenu:save:",
+    # workout-selection architecture, Batch 4: Start is the mutation in the
+    # `wk:` graph (it INSERTs a session), so a double delivery must be
+    # debounced. Navigation (`wk:list`, `wk:sel`, `wk:fsel`) is deliberately
+    # NOT debounced -- re-tapping a selector row is a legitimate repeat and
+    # must stay usable. The unique partial index + IntegrityError recovery
+    # remains the real correctness guarantee; debounce only trims the noise.
+    # Batch 5's repeat variants (`wk:start:<id>:<sidx>:again`) are covered by
+    # these same prefixes -- _is_duplicate_tap matches on startswith, and the
+    # marker is a SUFFIX -- so they need no separate entry. Verified by
+    # test_workout_start_provenance.py's debounce-coverage test.
+    "wk:start:",
+    "wk:fstart:",
+    # Batch 6: `wk:par:` is a persisted stepper write (one tap = one stored
+    # override), so a double-tap must not apply the delta twice. `wk:exm:`
+    # and `wk:ex:` are read-only navigation and stay undebounced.
+    "wk:par:",
     # Codex audit round: sensitive single-shot writes that advance a flow —
     # a double-tap must not apply/skip TWO steps (e.g. health:skip_item
     # tapped twice would silently discard the next wizard item too).

@@ -445,6 +445,235 @@ def workout_overview_keyboard(code: str) -> InlineKeyboardMarkup:
     )
 
 
+# ---------------------------------------------------------------------------
+# Workout selector / overview v2 (workout-selection architecture, Batch 4).
+#
+# These builders mint ONLY `wk:` callbacks, every one of which has a handler
+# in callback_plans.py in this same batch (`wk:list`, `wk:sel`, `wk:fsel`,
+# `wk:start`, `wk:fstart`) -- the batch never exposes a dangling button.
+# The legacy builders above are deliberately left byte-identical: old
+# Telegram messages keep working until the Batch 7 adapter retires them.
+# ---------------------------------------------------------------------------
+
+
+def _wk_ref_suffix(ref: Any) -> str:
+    """The `<identity>:<session_index>` tail shared by every `wk:` callback.
+
+    Tier-1 carries the immutable plan_versions id; Tier-2 carries the 8-hex
+    content fingerprint (compute_fact_rev). Both are placed as NON-TERMINAL
+    segments, so neither can occupy the last-two positions the ARCH-04
+    grammar inspects for `^v\\d{1,9}$` / `^ff-\\d+-[0-9a-f]{6,}$`
+    (callback_grammar.py:66-72) -- verified by test_callback_grammar_b2.
+    """
+    identity = ref.plan_id if ref.tier == "plan" else ref.fact_rev
+    return f"{identity}:{ref.session_index}"
+
+
+@runtime_bound(RUNTIME_NAMES)
+def wk_select_callback(ref: Any) -> str:
+    """`wk:sel:<plan_id>:<sidx>` (Tier-1) / `wk:fsel:<fact_rev>:<sidx>` (Tier-2)."""
+    prefix = "wk:sel" if ref.tier == "plan" else "wk:fsel"
+    return f"{prefix}:{_wk_ref_suffix(ref)}"
+
+
+@runtime_bound(RUNTIME_NAMES)
+def wk_start_callback(ref: Any) -> str:
+    """`wk:start:<plan_id>:<sidx>` (Tier-1) / `wk:fstart:<fact_rev>:<sidx>` (Tier-2)."""
+    prefix = "wk:start" if ref.tier == "plan" else "wk:fstart"
+    return f"{prefix}:{_wk_ref_suffix(ref)}"
+
+
+@runtime_bound(RUNTIME_NAMES)
+def workout_selector_keyboard(choices: list[Any]) -> InlineKeyboardMarkup:
+    """One row per selectable session, labelled with its REAL name (not the
+    global template's), ⭐ on the recommended one and ✅ on anything already
+    completed today. Recommendation is a hint, never a forced selection --
+    every session in the plan is tappable (plan section J).
+    """
+    rows = []
+    for choice in choices:
+        label = choice.name
+        if choice.recommended:
+            label = f"⭐ {label}"
+        if choice.done_today:
+            label = f"{label} ✅"
+        rows.append([button(label, wk_select_callback(choice.ref))])
+    rows.append([button("⬅️ תפריט", "menu:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+@runtime_bound(RUNTIME_NAMES)
+def workout_overview_keyboard_v2(ref: Any, *, single_choice: bool = False) -> InlineKeyboardMarkup:
+    """Overview keyboard whose Start button carries the SAME identity the
+    overview was rendered from -- display identity == start identity, the
+    W2 defect this batch closes.
+
+    Batch 6 restored parameter editing here as `wk:exm`, carrying the same
+    identity rather than the ambiguous bare `editparams_menu:<code>` route
+    (which stays live only for old Telegram messages until Batch 7).
+    """
+    rows = [
+        [button("✅ התחל אימון", wk_start_callback(ref))],
+        [button("⚙️ ערוך פרמטרים", wk_exercise_menu_callback(ref))],
+    ]
+    # With only one selectable session there is no selector to go back TO;
+    # Back goes home instead of to a one-row list (plan section J).
+    rows.append([button("⬅️ חזרה", "menu:home" if single_choice else "wk:list")])
+    return InlineKeyboardMarkup(rows)
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def render_workout_overview_v2(query: Any, user_id: int, resolved: Any, *, single_choice: bool = False) -> None:
+    """Overview for a catalog-resolved session (Tier-1 personalized payload
+    or Tier-2 template-seeded content), replacing the template-only
+    render_workout_overview on every `wk:` route."""
+    text = await build_workout_overview_text_v2(user_id, resolved)
+    await safe_edit(query, text, workout_overview_keyboard_v2(resolved.choice.ref, single_choice=single_choice))
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def build_workout_overview_text_v2(user_id: int, resolved: Any) -> str:
+    """Shared overview body for both surfaces (callback overview and the
+    assistant's reply-message overview), so the two can never drift apart.
+    Mirrors render_workout_overview's existing format exactly; the only
+    difference is WHERE the exercises come from (the resolved session, not
+    PLANS[code]).
+    """
+    lines: list[str] = []
+    for index, exercise_data in enumerate(resolved.session.get("exercises", []), start=1):
+        weight, reps, _ = await recommend_load(user_id, exercise_data)
+        muscle = exercise_data.get("muscle")
+        muscle_tag = f" <i>({muscle})</i>" if muscle else ""
+        lines.append(
+            f"{index}. <b>{esc(exercise_data['name'])}</b>{muscle_tag} — "
+            f"{exercise_data['sets']}×{reps} במשקל {weight:g} ק״ג"
+        )
+    banner = await constraint_banner(user_id)
+    banner += await fatigue_banner(user_id)
+    if resolved.choice.done_today:
+        # E2 (plan section F): an honest "already trained" note. Batch 5 adds
+        # the `:again` repeat-confirmation gate; this batch only informs.
+        banner += "כבר ביצעת את האימון הזה היום ✅\n\n"
+    return (
+        f"<b>{esc(resolved.choice.name)}</b>\n\n" + banner + "\n".join(lines) + "\n\nמוכן? לחץ <b>התחל</b>."
+    )
+
+
+@runtime_bound(RUNTIME_NAMES)
+def wk_exercise_menu_callback(ref: Any) -> str:
+    """`wk:exm:<identity>:<sidx>` -- open the exercise picker for a resolved
+    session, carrying that session's identity rather than a bare code."""
+    return f"wk:exm:{_wk_ref_suffix(ref)}"
+
+
+@runtime_bound(RUNTIME_NAMES)
+def wk_exercise_callback(ref: Any, exercise_index: int) -> str:
+    """`wk:ex:<identity>:<sidx>:<exercise_index>`."""
+    return f"wk:ex:{_wk_ref_suffix(ref)}:{exercise_index}"
+
+
+@runtime_bound(RUNTIME_NAMES)
+def wk_param_callback(ref: Any, exercise_index: int, field: str, delta: float) -> str:
+    """`wk:par:<identity>:<sidx>:<exercise_index>:<field>:<delta>` -- the
+    longest callback this architecture mints. Budget checked by
+    tests/test_workout_param_edit_v2.py (worst case 38/64 bytes, plan
+    section N)."""
+    return f"wk:par:{_wk_ref_suffix(ref)}:{exercise_index}:{field}:{delta:g}"
+
+
+@runtime_bound(RUNTIME_NAMES)
+def exercise_picker_keyboard_v2(resolved: Any) -> InlineKeyboardMarkup:
+    """Pick an exercise to edit WITHIN the selected session (Batch 6).
+
+    Rows come from the resolved session's own normalized exercises -- the
+    personalized payload for Tier-1, the template-seeded content for Tier-2 --
+    so what the user edits is exactly what they saw and what Start will use.
+    The legacy builder above (keyed on a bare PLANS code) stays untouched for
+    old Telegram messages until Batch 7.
+    """
+    ref = resolved.choice.ref
+    rows = [
+        [button(exercise.get("name") or exercise.get("id") or f"#{index + 1}",
+                wk_exercise_callback(ref, index))]
+        for index, exercise in enumerate(resolved.session.get("exercises", []))
+    ]
+    rows.append([button("⬅️ חזרה לאימון", wk_select_callback(ref))])
+    return InlineKeyboardMarkup(rows)
+
+
+@runtime_bound(RUNTIME_NAMES)
+def exercise_params_keyboard_v2(ref: Any, exercise_index: int) -> InlineKeyboardMarkup:
+    """Stepper keyboard for one exercise inside one identified session."""
+    return InlineKeyboardMarkup([
+        [
+            button("➖ 2.5 ק״ג", wk_param_callback(ref, exercise_index, "weight", -2.5)),
+            button("➕ 2.5 ק״ג", wk_param_callback(ref, exercise_index, "weight", 2.5)),
+        ],
+        [
+            button("➖ סט", wk_param_callback(ref, exercise_index, "sets", -1)),
+            button("➕ סט", wk_param_callback(ref, exercise_index, "sets", 1)),
+        ],
+        [
+            button("➖ מנוחה", wk_param_callback(ref, exercise_index, "rest", -15)),
+            button("➕ מנוחה", wk_param_callback(ref, exercise_index, "rest", 15)),
+        ],
+        [button("⬅️ חזרה", wk_exercise_menu_callback(ref))],
+        [button("❌ ביטול", "wparamtext:cancel")],
+    ])
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def render_exercise_params_v2(query: Any, user_id: int, resolved: Any, exercise_index: int) -> None:
+    """Parameter editor for one exercise of a resolved session, and the point
+    where the v2 conversation-flow payload is armed.
+
+    The payload carries the FULL identity (tier + plan_id/fact_rev +
+    session_index + exercise_index + exercise_id + code), so a free-text edit
+    applied minutes later still re-validates against the same session instead
+    of falling back to an ambiguous bare code. Legacy code-only payloads keep
+    working -- meal_text reads the new keys defensively.
+    """
+    ref = resolved.choice.ref
+    exercises = resolved.session.get("exercises", [])
+    exercise_data = exercises[exercise_index]
+    muscle = exercise_data.get("muscle")
+    muscle_line = f"שריר מטרה: <b>{esc(muscle)}</b>\n" if muscle else ""
+    text = (
+        f"<b>עריכת פרמטרים</b>\n\n"
+        f"אימון: <b>{esc(resolved.choice.name)}</b>\n"
+        f"תרגיל: <b>{esc(exercise_data['name'])}</b>\n"
+        f"{muscle_line}\n"
+        f"משקל מתוכנן: <b>{exercise_data['weight']:g} ק״ג</b>\n"
+        f"סטים: <b>{exercise_data['sets']}</b>\n"
+        f"טווח חזרות: <b>{exercise_data['rmin']}–{exercise_data['rmax']}</b>\n"
+        f"מנוחה: <b>{exercise_data['rest'] // 60}:{exercise_data['rest'] % 60:02d}</b>\n"
+        f"מדרגת התקדמות: <b>{exercise_data['inc']:g}</b>\n\n"
+        "כתוב את השינוי, למשל:\n"
+        "\"משקל 22.5\"\n"
+        "\"4 סטים\"\n"
+        "\"8-12 חזרות\"\n"
+        "\"מנוחה 1:30\"\n"
+        "\"מנוחה 1:30 לכל התרגילים\""
+    )
+    await conversation.set_active_flow(
+        DB,
+        user_id,
+        conversation.FlowName.workout_parameter_edit,
+        step="awaiting_text",
+        payload={
+            "v": 2,
+            "tier": ref.tier,
+            "plan_id": ref.plan_id,
+            "fact_rev": ref.fact_rev,
+            "session_index": ref.session_index,
+            "exercise_index": exercise_index,
+            "exercise_id": exercise_data.get("id"),
+            "code": resolved.choice.code,
+        },
+    )
+    await safe_edit(query, text, exercise_params_keyboard_v2(ref, exercise_index))
+
+
 @runtime_bound(RUNTIME_NAMES)
 def exercise_picker_keyboard(code: str) -> InlineKeyboardMarkup:
     plan = PLANS[code]
@@ -519,12 +748,23 @@ class TodaysWorkout:
 
 
 async def resolve_todays_workout(user_id: int, *, now: datetime | None = None) -> "TodaysWorkout":
+    """Thin I/O wrapper: reads the active_workout_plan fact mirror and the
+    sessions table, then delegates the cycle/weekday decision to
+    ``workout_catalog.pick_session`` -- the pure core extracted from this
+    function's own former body (workout-selection architecture, Batch 3).
+    Behavior is byte-equivalent to before the extraction (proven by
+    tests/test_workout_catalog.py's parity test); this function's SOURCE
+    (the fact mirror, not planning.get_active_plan) and its exact return
+    shape are both preserved so existing direct callers/tests
+    (e.g. tests/regression/test_audit_2026_07_18.py) keep working unchanged.
+    """
+    from noam_coach.services.workout_catalog import pick_session
+
     current = (now or datetime.now(TZ)).astimezone(TZ)
     plan = await user_model.get_value(DB, user_id, "active_workout_plan")
     if not plan or not plan.get("sessions"):
         return TodaysWorkout(code=None, reason="no_plan")
     sessions = plan["sessions"]
-    cycle = [s["code"] for s in sessions]
 
     # Which codes were already completed today? Don't offer those again.
     start, end = daily_state.local_day_bounds_utc(current)
@@ -536,35 +776,16 @@ async def resolve_todays_workout(user_id: int, *, now: datetime | None = None) -
     done_today = {r["code"] for r in done_today_rows}
     done_tuple = tuple(sorted(done_today))
 
-    # 1) A session scheduled for today's weekday that wasn't done yet.
-    today_wd = current.weekday()
-    for session in sessions:
-        if session.get("weekday") == today_wd and session["code"] not in done_today:
-            return TodaysWorkout(code=session["code"], reason="offer_today", done_today=done_tuple)
-
-    # 2) Otherwise the next code in the cycle after the last performed workout.
     last = await DB.fetch_one(
         "SELECT code FROM sessions WHERE user_id=? "
         "AND status IN ('completed','partial') "
         "ORDER BY ended_at DESC LIMIT 1",
         (user_id,),
     )
-    if last and last["code"] in cycle:
-        nxt = (cycle.index(last["code"]) + 1) % len(cycle)
-        candidate = cycle[nxt]
-        # Skip forward over anything already done today.
-        for _ in range(len(cycle)):
-            if candidate not in done_today:
-                return TodaysWorkout(code=candidate, reason="offer_next", done_today=done_tuple)
-            nxt = (nxt + 1) % len(cycle)
-            candidate = cycle[nxt]
-        # Every code in the cycle was already performed today.
-        return TodaysWorkout(code=None, reason="all_done_today", done_today=done_tuple)
-    # Fall back to the first code not yet done today.
-    for code in cycle:
-        if code not in done_today:
-            return TodaysWorkout(code=code, reason="offer_next", done_today=done_tuple)
-    return TodaysWorkout(code=None, reason="all_done_today", done_today=done_tuple)
+    last_code = last["code"] if last else None
+
+    code, reason = pick_session(sessions, done_today, current.weekday(), last_code)
+    return TodaysWorkout(code=code, reason=reason, done_today=done_tuple)
 
 
 @runtime_bound(RUNTIME_NAMES)

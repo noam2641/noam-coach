@@ -363,6 +363,10 @@ _ROUTER_OWNED_PREFIXES = {
     "reconcile_no", "health", "confirm", "flag",  # handle_menu_callback
     "plan", "planv2", "workout", "startworkout", "wparamtext",
     "editparams_menu", "editparams", "param",  # handle_plan_callback / handle_workout_setup_callback
+    # workout-selection architecture, Batch 4: the `wk:` selector/overview/
+    # start graph -> _handle_workout_v2_actions (+ `wk:list`, which shares
+    # _handle_workout_menu_actions with menu:workout).
+    "wk",
     "goal",  # handle_workout_setup_callback -> _handle_workout_menu_actions (RE10-9 "goal:manual")
     "clarify", "fixmeal", "editqtymenu", "editqty", "qtydelta", "dup",
     "reject_dup", "editmeal", "backmeal", "cancelfix", "force_approve_meal",

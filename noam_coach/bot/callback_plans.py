@@ -401,35 +401,22 @@ async def _handle_workout_menu_actions(
     user_id: int,
     data: str,
 ) -> bool:
-    if data == "menu:workout":
+    if data in ("menu:workout", "wk:list"):
         session = await active_session(user_id)
         if session:
             await show_session(query, user_id, session["id"])
             return True
-        # Audit F-A3: 'כבר הושלם ✅' used to be shown whenever no code was
-        # offered — including when the user simply has no plan and has done
-        # zero workouts. Distinguish the states with provenance from real
-        # session rows (the single completion truth), never a false claim.
-        from noam_coach.bot.ui import resolve_todays_workout
-
-        todays = await resolve_todays_workout(user_id)
-        if todays.code:
-            await render_workout_overview(query, user_id, todays.code)
-        elif todays.reason == "all_done_today":
-            done = ", ".join(todays.done_today)
-            await safe_edit(
-                query,
-                f"כל האימונים של היום כבר בוצעו ({esc(done)}) ✅\n"
-                "רוצה לבחור אימון נוסף בכל זאת?",
-                plans_keyboard(),
-            )
-        else:  # no_plan
-            await safe_edit(
-                query,
-                "עוד אין לך תוכנית אימונים פעילה.\n"
-                "אפשר ליצור אחת דרך \"התוכנית שלי\", או לבחור אימון ידני:",
-                plans_keyboard(),
-            )
+        # Batch 4 (workout-selection architecture): the menu now resolves
+        # through the two-tier catalog instead of resolve_todays_workout +
+        # the template-only render_workout_overview. This is the pin #1 flip
+        # (plan section M.1) -- menu:workout renders the SELECTED active-plan
+        # (or Tier-2) session's content, never PLANS[recommended_code].
+        # Recommendation becomes a hint (⭐), not a forced selection.
+        #
+        # Audit F-A3 is preserved: 'כבר הושלם ✅' is still never claimed for a
+        # user who simply has no plan -- the two states stay distinguished by
+        # provenance from real session rows.
+        await _render_workout_selector(query, user_id)
         return True
 
     if data == "menu:weekly":
@@ -514,6 +501,763 @@ async def _handle_workout_menu_actions(
     return False
 
 
+# ---------------------------------------------------------------------------
+# Workout selector / overview / start v2 (workout-selection architecture,
+# Batch 4). The complete minimal callback graph lands together here --
+# `wk:list`, `wk:sel`, `wk:fsel`, `wk:start`, `wk:fstart` -- so no batch ever
+# ships a user-visible Start button whose handler arrives later (plan §M.3).
+# ---------------------------------------------------------------------------
+
+
+async def _refuse_stale_workout_ref(query: Any, user_id: int, *, ref: Any = None, detail: str = "") -> None:
+    """One intentional refusal for a `wk:` callback whose carried identity no
+    longer matches the live plan/fact, then a FRESH selector so the user is
+    never left staring at a dead screen. Never mutates product state -- a
+    stale reference must refuse, never silently resolve to another workout.
+    """
+    from noam_coach.services.control_refusal import refuse_control
+
+    extra: dict[str, Any] = {"detail": detail} if detail else {}
+    if ref is not None:
+        extra.update({"tier": ref.tier, "plan_id": ref.plan_id, "fact_rev": ref.fact_rev,
+                      "session_index": ref.session_index})
+    await refuse_control(
+        query,
+        user_id,
+        reason="stale_plan_reference",
+        toast="התוכנית התעדכנה",
+        source="workout_selector",
+        extra=extra or None,
+    )
+    await _render_workout_selector(query, user_id)
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def _render_workout_selector(query: Any, user_id: int) -> None:
+    """Render the workout selector for whichever tier the user has.
+
+    0 choices -> the honest no-plan / all-done fallback (F-A3 preserved);
+    1 choice  -> straight to that session's overview (no pointless one-row
+                 list), Back goes home;
+    >=2       -> the selector with real names, ⭐ recommended, ✅ done-today.
+    """
+    from noam_coach.bot.ui import render_workout_overview_v2, workout_selector_keyboard
+    from noam_coach.services import workout_catalog
+
+    choices = await workout_catalog.list_selectable_workouts(DB, user_id)
+    if not choices:
+        # No plan of EITHER tier. Distinguish "never had one" from "all of
+        # today's are done" exactly as the pre-Batch-4 menu did.
+        from noam_coach.bot.ui import resolve_todays_workout
+
+        todays = await resolve_todays_workout(user_id)
+        if todays.reason == "all_done_today":
+            done = ", ".join(todays.done_today)
+            await safe_edit(
+                query,
+                f"כל האימונים של היום כבר בוצעו ({esc(done)}) ✅\n"
+                "רוצה לבחור אימון נוסף בכל זאת?",
+                plans_keyboard(),
+            )
+        else:
+            await safe_edit(
+                query,
+                "עוד אין לך תוכנית אימונים פעילה.\n"
+                "אפשר ליצור אחת דרך \"התוכנית שלי\", או לבחור אימון ידני:",
+                plans_keyboard(),
+            )
+        return
+
+    if len(choices) == 1:
+        try:
+            resolved = await workout_catalog.resolve_selection(DB, user_id, choices[0].ref)
+        except workout_catalog.StalePlanReference as exc:
+            # The plan changed between listing and resolving (a very narrow
+            # window). Refuse rather than render something unverified; do not
+            # recurse into the selector again.
+            from noam_coach.services.control_refusal import refuse_control
+
+            await refuse_control(
+                query, user_id, reason="stale_plan_reference", toast="התוכנית התעדכנה",
+                source="workout_selector", extra={"detail": str(exc)},
+            )
+            return
+        await _apply_overrides_to_resolved(user_id, resolved)
+        await render_workout_overview_v2(query, user_id, resolved, single_choice=True)
+        return
+
+    first = choices[0]
+    # E2 (plan section F, closed in Batch 8): two SEPARATE concepts.
+    #
+    # (a) Per-session ✅ is identity-specific -- `choice.done_today` matches a
+    #     completion to THIS session's code, so only the session actually
+    #     performed is marked.
+    # (b) The user-level banner must be truthful regardless of identity. Before
+    #     this fix the banner was derived from (a), so regenerating into a plan
+    #     with DIFFERENT codes made the selector silently claim the user had not
+    #     trained today -- the system appearing unaware of a real completion.
+    #     It now asks the completion-evidence source directly (real session rows
+    #     / HealthKit), which no plan change can invalidate.
+    #
+    # Valid alternative sessions are never suppressed: the banner informs, and
+    # every session stays selectable. Starting one already completed today
+    # still goes through the Batch-5 `:again` confirmation.
+    from noam_coach.services import daily_state as _daily_state
+
+    banner = ""
+    if await _daily_state.workout_completed_today(DB, user_id):
+        banner = "כבר התאמנת היום ✅\n\n"
+    await safe_edit(
+        query,
+        f"{banner}<b>איזה אימון נעשה?</b>",
+        workout_selector_keyboard(choices),
+    )
+    await track_event(
+        user_id, "workout_selector_rendered",
+        tier=first.ref.tier, session_count=len(choices), reason=first.reason,
+    )
+
+
+def _parse_wk_ref(data: str) -> Any:
+    """Parse `wk:{sel,fsel,start,fstart}:<identity>:<sidx>[:again]` into a
+    WorkoutSelectionRef. Returns None for any malformed payload (a corrupted
+    or hand-crafted callback must refuse, never raise).
+
+    The optional trailing `:again` (Batch 5) is a repeat-confirmation marker
+    on the START forms only; it is stripped here and read separately by
+    _wk_is_again, so identity parsing stays one function with one shape.
+    """
+    from noam_coach.services.workout_catalog import WorkoutSelectionRef
+
+    parts = data.split(":")
+    if len(parts) == 5:
+        # Only the start forms accept the repeat marker; `wk:sel:...:again`
+        # is not a callback this codebase mints and must not be honored.
+        if parts[4] != "again" or parts[1] not in ("start", "fstart"):
+            return None
+        parts = parts[:4]
+    if len(parts) != 4:
+        return None
+    _, action, identity, index_text = parts
+    try:
+        session_index = int(index_text)
+    except (TypeError, ValueError):
+        return None
+    if session_index < 0:
+        return None
+    if action in ("sel", "start"):
+        try:
+            plan_id = int(identity)
+        except (TypeError, ValueError):
+            return None
+        return WorkoutSelectionRef(tier="plan", plan_id=plan_id, fact_rev=None, session_index=session_index)
+    if action in ("fsel", "fstart"):
+        if not identity:
+            return None
+        return WorkoutSelectionRef(tier="fact", plan_id=None, fact_rev=identity, session_index=session_index)
+    return None
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def _apply_overrides_to_resolved(user_id: int, resolved: Any) -> None:
+    """Overlay the user's stored overrides onto a resolved session IN PLACE.
+
+    The catalog resolves plan/template content; overrides are a separate,
+    per-user layer. Every read-side edit screen must show the effective value
+    (what Start would snapshot), so this applies exactly the same
+    collect_overrides result materialize_snapshot would -- code-scoped and
+    id-verified per plan section G, never by bare index.
+    """
+    from noam_coach.services import workout_catalog
+
+    overrides = await workout_catalog.collect_overrides(DB, user_id, resolved.session)
+    if not overrides:
+        return
+    for exercise in resolved.session.get("exercises", []):
+        for override_field, value in overrides.get(exercise.get("id"), {}).items():
+            exercise[override_field] = value
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def _apply_workout_param_delta(
+    user_id: int, resolved: Any, exercise_index: int, field: str, delta: float
+) -> None:
+    """Persist ONE stepper delta against the identified session's exercise.
+
+    Writes are code-scoped and carry the stable ``exercise_id`` (plan section
+    G.6), so a later read verifies identity rather than trusting position.
+    The positional ``exercise_index`` still goes into the row because it is
+    part of the table's primary key -- but note it is the index within THIS
+    session, which for Tier-1 is the personalized payload's ordering. That is
+    exactly why the id is written alongside: collect_overrides matches on the
+    id first and only falls back to a verified template position for legacy
+    NULL-id rows.
+    """
+    exercises = resolved.session.get("exercises", [])
+    current = exercises[exercise_index]
+    code = resolved.choice.code
+    exercise_id = current.get("id")
+
+    new_min, new_max = int(current["rmin"]), int(current["rmax"])
+    if field == "weight":
+        new_value: float = max(0.0, round(float(current["weight"]) + delta, 2))
+    elif field == "sets":
+        new_value = max(1, int(current["sets"] + delta))
+    elif field == "rmin":
+        new_min = max(1, int(current["rmin"] + delta))
+        new_value = new_min
+        if new_min > new_max:
+            new_max = new_min
+            await set_exercise_override(
+                user_id, code, exercise_index, "rmax", new_max, exercise_id=exercise_id
+            )
+    elif field == "rmax":
+        new_max = max(int(current["rmin"]), int(current["rmax"] + delta))
+        new_value = new_max
+    elif field == "rest":
+        new_value = max(30, int(current["rest"] + delta))
+    else:
+        return
+
+    await set_exercise_override(
+        user_id, code, exercise_index, field, new_value, exercise_id=exercise_id
+    )
+
+
+def _wk_back_callback_for_payload(payload: dict[str, Any] | None) -> str | None:
+    """The `wk:sel`/`wk:fsel` callback that returns to the overview a v2 edit
+    flow was started from, or None for a legacy (code-only) payload.
+
+    Kept here rather than in ui.py so both callback_plans and meal_text share
+    one definition of "where does Back go" -- the selection must survive the
+    whole edit loop (plan section M, Batch 6 objective).
+    """
+    payload = payload or {}
+    if int(payload.get("v") or 0) < 2:
+        return None
+    tier = str(payload.get("tier") or "")
+    session_index = payload.get("session_index")
+    if session_index is None:
+        return None
+    if tier == "plan" and payload.get("plan_id") is not None:
+        return f"wk:sel:{payload['plan_id']}:{session_index}"
+    if tier == "fact" and payload.get("fact_rev"):
+        return f"wk:fsel:{payload['fact_rev']}:{session_index}"
+    return None
+
+
+def _wk_edit_callback_for_payload(payload: dict[str, Any] | None) -> str | None:
+    """The `wk:ex:...` callback that reopens the SAME exercise editor, used by
+    the 'write a different correction' button."""
+    payload = payload or {}
+    back = _wk_back_callback_for_payload(payload)
+    if not back:
+        return None
+    exercise_index = payload.get("exercise_index")
+    if exercise_index is None:
+        return None
+    # wk:sel:<identity>:<sidx> -> wk:ex:<identity>:<sidx>:<exercise_index>
+    identity_and_index = back.split(":", 2)[2]
+    return f"wk:ex:{identity_and_index}:{exercise_index}"
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def _apply_workout_param_text_v2(
+    query: Any, user_id: int, payload: dict[str, Any], pending_updates: list[Any]
+) -> bool:
+    """Apply a confirmed free-text parameter edit against a v2 flow payload.
+
+    Re-validates the carried identity immediately before writing (the
+    compose->confirm window is exactly where a regeneration can land), then
+    applies each update with the plan's approved scope rules:
+
+      * scope "current"  -> the one edited exercise, by stable id
+      * scope "all"      -> every exercise in THIS session only
+      * scope "program"  -> every exercise of every session in the user's
+                            current plan, each resolved through the catalog
+                            so writes stay code-scoped and id-verified
+
+    Returns True when the edit was applied (or explicitly refused and
+    rendered); the caller always returns True afterwards.
+    """
+    from noam_coach.services import workout_catalog
+    from noam_coach.services.workout_catalog import WorkoutSelectionRef
+
+    ref = WorkoutSelectionRef(
+        tier=str(payload.get("tier") or "plan"),
+        plan_id=payload.get("plan_id"),
+        fact_rev=payload.get("fact_rev"),
+        session_index=int(payload.get("session_index") or 0),
+    )
+    exercise_index = int(payload.get("exercise_index") or 0)
+    expected_exercise_id = payload.get("exercise_id")
+
+    try:
+        resolved = await workout_catalog.resolve_selection(DB, user_id, ref)
+    except workout_catalog.StalePlanReference as exc:
+        await conversation.clear_active_flow(DB, user_id)
+        await _refuse_stale_workout_ref(query, user_id, ref=ref, detail=str(exc))
+        return True
+
+    exercises = resolved.session.get("exercises", [])
+    if not 0 <= exercise_index < len(exercises):
+        await conversation.clear_active_flow(DB, user_id)
+        await _refuse_stale_workout_ref(query, user_id, ref=ref, detail="exercise_index_out_of_range")
+        return True
+
+    # Identity cross-check: the exercise this edit was composed against must
+    # still be the exercise at that position. Immutable payloads make this
+    # nearly always true, but a Tier-2 template revision could change it --
+    # and applying a "bench" edit to whatever now sits at index 2 is exactly
+    # the class of bug this architecture exists to prevent.
+    actual_exercise_id = exercises[exercise_index].get("id")
+    if expected_exercise_id and actual_exercise_id != expected_exercise_id:
+        await conversation.clear_active_flow(DB, user_id)
+        await _refuse_stale_workout_ref(query, user_id, ref=ref, detail="exercise_identity_changed")
+        return True
+
+    await _apply_overrides_to_resolved(user_id, resolved)
+
+    # Build the target list per scope. "program" walks the user's whole plan
+    # via the catalog (never a bare code list), so every write is scoped to a
+    # real resolved session and carries that session's own exercise ids.
+    async def _targets(scope: str) -> list[tuple[Any, list[int]]]:
+        if scope == "program":
+            out: list[tuple[Any, list[int]]] = []
+            for choice in await workout_catalog.list_selectable_workouts(DB, user_id):
+                try:
+                    other = await workout_catalog.resolve_selection(DB, user_id, choice.ref)
+                except workout_catalog.StalePlanReference:
+                    continue
+                await _apply_overrides_to_resolved(user_id, other)
+                out.append((other, list(range(len(other.session.get("exercises", []))))))
+            return out
+        if scope == "all":
+            return [(resolved, list(range(len(exercises))))]
+        return [(resolved, [exercise_index])]
+
+    applied: list[str] = []
+    affected_count = 0
+    for update_item in pending_updates:
+        if not isinstance(update_item, dict):
+            continue
+        scope = str(update_item.get("scope") or "current")
+        field = str(update_item.get("field") or "")
+        for target_resolved, indices in await _targets(scope):
+            target_exercises = target_resolved.session.get("exercises", [])
+            target_code = target_resolved.choice.code
+            for idx in indices:
+                if not 0 <= idx < len(target_exercises):
+                    continue
+                target_id = target_exercises[idx].get("id")
+                if not target_id:
+                    # Batch 8 (Scope 3): skip exercises with no stable identity
+                    # rather than writing a NULL-id row that would later be
+                    # re-applied by template POSITION to whatever sits at that
+                    # index. Silently skipping one malformed entry is correct
+                    # here -- an "all"/"program" scope edit should still apply
+                    # to every well-formed exercise -- and the count reported
+                    # to the user below reflects only what was really written.
+                    continue
+                if field == "reps":
+                    rmin = int(update_item.get("rmin") or target_exercises[idx]["rmin"])
+                    rmax = int(update_item.get("rmax") or target_exercises[idx]["rmax"])
+                    await set_exercise_override(
+                        user_id, target_code, idx, "rmin", rmin, exercise_id=target_id
+                    )
+                    await set_exercise_override(
+                        user_id, target_code, idx, "rmax", max(rmin, rmax), exercise_id=target_id
+                    )
+                    affected_count += 1
+                elif field in {"weight", "sets", "rest"}:
+                    await set_exercise_override(
+                        user_id, target_code, idx, field, float(update_item["value"]),
+                        exercise_id=target_id,
+                    )
+                    affected_count += 1
+        label = str(update_item.get("label") or field)
+        if label:
+            applied.append(label)
+
+    await conversation.clear_active_flow(DB, user_id)
+    summary = ", ".join(applied) if applied else "השינוי"
+    scope_label = str(payload.get("scope_label") or "")
+    if affected_count:
+        scope_label = f"{scope_label} ({affected_count} תרגילים הושפעו)"
+    from noam_coach.bot.ui import wk_exercise_menu_callback, wk_select_callback
+
+    await safe_edit(
+        query,
+        f"שמרתי: {summary} {scope_label} ✅",
+        InlineKeyboardMarkup([
+            [button("⬅️ חזרה לאימון", wk_select_callback(ref))],
+            [button("✏️ ערוך עוד", wk_exercise_menu_callback(ref))],
+        ]),
+    )
+    return True
+
+
+def _parse_wk_edit_ref(data: str) -> tuple[Any, int, str | None, float | None] | None:
+    """Parse the Batch-6 edit callbacks into
+    (ref, exercise_index, field, delta):
+
+        wk:exm:<identity>:<sidx>                              -> (ref, -1, None, None)
+        wk:ex:<identity>:<sidx>:<exercise_index>              -> (ref, idx, None, None)
+        wk:par:<identity>:<sidx>:<exercise_index>:<field>:<d> -> (ref, idx, field, d)
+
+    Returns None for any malformed payload -- a corrupted or hand-crafted
+    callback must refuse, never raise, and never fall back to a bare code.
+    """
+    from exercise_plans import OVERRIDE_FIELDS
+    from noam_coach.services.workout_catalog import WorkoutSelectionRef
+
+    parts = data.split(":")
+    if len(parts) < 4:
+        return None
+    action, identity, index_text = parts[1], parts[2], parts[3]
+    if action not in ("exm", "ex", "par"):
+        return None
+    try:
+        session_index = int(index_text)
+    except (TypeError, ValueError):
+        return None
+    if session_index < 0:
+        return None
+
+    # `exm` and `par` are minted from the SAME identity segment shape as the
+    # selector: numeric plan_id for Tier-1, 8-hex fingerprint for Tier-2. The
+    # action name alone decides the tier, exactly as with sel/fsel.
+    if identity.lstrip("-").isdigit():
+        ref = WorkoutSelectionRef(tier="plan", plan_id=int(identity), fact_rev=None,
+                                  session_index=session_index)
+    elif identity:
+        ref = WorkoutSelectionRef(tier="fact", plan_id=None, fact_rev=identity,
+                                  session_index=session_index)
+    else:
+        return None
+
+    if action == "exm":
+        return (ref, -1, None, None) if len(parts) == 4 else None
+
+    if len(parts) < 5:
+        return None
+    try:
+        exercise_index = int(parts[4])
+    except (TypeError, ValueError):
+        return None
+    if exercise_index < 0:
+        return None
+
+    if action == "ex":
+        return (ref, exercise_index, None, None) if len(parts) == 5 else None
+
+    if len(parts) != 7:
+        return None
+    field = parts[5]
+    if field not in OVERRIDE_FIELDS:
+        return None
+    try:
+        delta = float(parts[6])
+    except (TypeError, ValueError):
+        return None
+    return ref, exercise_index, field, delta
+
+
+def _wk_is_again(data: str) -> bool:
+    """True when a start callback carries the Batch-5 repeat-confirmation
+    marker. `:again` skips ONLY the done-today interstitial -- identity
+    re-validation and the active-session/unique-index guards all still run."""
+    return data.endswith(":again")
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def _handle_workout_v2_actions(
+    query: Any,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    data: str,
+) -> bool:
+    """`wk:` family: selector, overview (both tiers), and Start (both tiers)."""
+    if not data.startswith("wk:"):
+        return False
+
+    from noam_coach.bot.ui import render_workout_overview_v2
+    from noam_coach.services import workout_catalog
+
+    # `wk:list` is handled by _handle_workout_menu_actions alongside
+    # menu:workout (same screen, same active-session reopen semantics).
+
+    if data.startswith(("wk:sel:", "wk:fsel:")):
+        # Selection is a pure navigation/read action: reopen an active session
+        # if one exists (existing product behavior), else render the overview.
+        session = await active_session(user_id)
+        if session:
+            await show_session(query, user_id, session["id"])
+            return True
+        ref = _parse_wk_ref(data)
+        if ref is None:
+            await _refuse_stale_workout_ref(query, user_id, detail="malformed_ref")
+            return True
+        try:
+            resolved = await workout_catalog.resolve_selection(DB, user_id, ref)
+        except workout_catalog.StalePlanReference as exc:
+            await _refuse_stale_workout_ref(query, user_id, ref=ref, detail=str(exc))
+            return True
+        # Show EFFECTIVE values (Batch 6): the overview must display what
+        # Start will actually snapshot, overrides included, or the user edits
+        # a number and sees the un-edited one on the way back.
+        await _apply_overrides_to_resolved(user_id, resolved)
+        await render_workout_overview_v2(query, user_id, resolved)
+        await track_event(
+            user_id, "workout_selection_activated",
+            tier=ref.tier, session_index=ref.session_index,
+            followed_recommendation=resolved.choice.recommended,
+        )
+        return True
+
+    if data.startswith(("wk:exm:", "wk:ex:", "wk:par:")):
+        # Batch 6: identity-safe parameter editing. Every one of these
+        # re-resolves the carried identity BEFORE doing anything, so an edit
+        # can never be applied to a session other than the one displayed --
+        # and a regenerated plan refuses instead of silently retargeting.
+        from noam_coach.bot.ui import (
+            exercise_picker_keyboard_v2,
+            render_exercise_params_v2,
+        )
+
+        parsed = _parse_wk_edit_ref(data)
+        if parsed is None:
+            await _refuse_stale_workout_ref(query, user_id, detail="malformed_edit_ref")
+            return True
+        ref, exercise_index, field, delta = parsed
+
+        try:
+            resolved = await workout_catalog.resolve_selection(DB, user_id, ref)
+        except workout_catalog.StalePlanReference as exc:
+            await _refuse_stale_workout_ref(query, user_id, ref=ref, detail=str(exc))
+            return True
+
+        await _apply_overrides_to_resolved(user_id, resolved)
+        exercises = resolved.session.get("exercises", [])
+        if data.startswith("wk:exm:"):
+            await safe_edit(
+                query,
+                f"<b>בחר תרגיל לעריכת פרמטרים</b>\n{esc(resolved.choice.name)}",
+                exercise_picker_keyboard_v2(resolved),
+            )
+            return True
+
+        if not 0 <= exercise_index < len(exercises):
+            # The session no longer has that many exercises (a regenerated
+            # plan of the same id is impossible -- payloads are immutable --
+            # but a hand-crafted index must still refuse).
+            await _refuse_stale_workout_ref(query, user_id, ref=ref, detail="exercise_index_out_of_range")
+            return True
+
+        if data.startswith("wk:ex:"):
+            await render_exercise_params_v2(query, user_id, resolved, exercise_index)
+            return True
+
+        # Batch 8 (Scope 3): refuse to write an override against an exercise
+        # with no usable stable identity. A historical/malformed payload can
+        # carry an exercise with no `id` (or an empty one); writing a NULL-id
+        # row for it would later be re-applied BY TEMPLATE POSITION, i.e. to
+        # whatever exercise happens to sit at that index -- the same-index
+        # accidental mutation the approved override model forbids. Rendering
+        # such a session is fine (normalization repairs it for display); only
+        # the WRITE is refused.
+        if not resolved.session["exercises"][exercise_index].get("id"):
+            await safe_answer_callback(
+                query, "לא ניתן לשמור שינוי לתרגיל הזה", show_alert=True
+            )
+            await render_exercise_params_v2(query, user_id, resolved, exercise_index)
+            return True
+
+        # wk:par -- apply one stepper delta, then re-render from freshly
+        # resolved+overridden state so the screen always reflects storage.
+        await _apply_workout_param_delta(
+            user_id, resolved, exercise_index, str(field), float(delta)
+        )
+        refreshed = await workout_catalog.resolve_selection(DB, user_id, ref)
+        await _apply_overrides_to_resolved(user_id, refreshed)
+        await render_exercise_params_v2(query, user_id, refreshed, exercise_index)
+        return True
+
+    if data.startswith(("wk:start:", "wk:fstart:")):
+        # Active-session guard FIRST (unchanged product behavior: one active
+        # session per user; a second start reopens the existing one).
+        current = await active_session(user_id)
+        if current:
+            await show_session(query, user_id, current["id"])
+            return True
+
+        ref = _parse_wk_ref(data)
+        if ref is None:
+            await _refuse_stale_workout_ref(query, user_id, detail="malformed_ref")
+            return True
+
+        # Re-read and RE-VALIDATE immediately before the INSERT. This is the
+        # narrow overview->start TOCTOU window: the plan may have been
+        # regenerated (Tier-1) or the weekly fact replaced (Tier-2, caught by
+        # the recomputed 8-hex fingerprint even when the replacement has the
+        # SAME number of sessions) while the overview sat on screen.
+        try:
+            resolved = await workout_catalog.resolve_selection(DB, user_id, ref)
+        except workout_catalog.StalePlanReference as exc:
+            await _refuse_stale_workout_ref(query, user_id, ref=ref, detail=str(exc))
+            return True
+
+        # Batch 5: repeat-today confirmation. Starting a session already
+        # completed today is legitimate (a second leg day, a redo) but must be
+        # DELIBERATE -- otherwise a stale overview left open from this morning
+        # silently starts a duplicate. The interstitial is shown once; the
+        # `:again` variant of this exact callback skips ONLY this check.
+        # Identity re-validation above and the active-session/unique-index
+        # guards below still run for `:again`, so confirming a repeat can
+        # never bypass staleness or concurrency protection.
+        if resolved.choice.done_today and not _wk_is_again(data):
+            await safe_edit(
+                query,
+                f"כבר ביצעת היום את <b>{esc(resolved.choice.name)}</b> ✅\n\n"
+                "לחזור עליו שוב?",
+                InlineKeyboardMarkup([
+                    [button("🔁 כן, להתחיל שוב", f"{data}:again")],
+                    [button("⬅️ חזרה", "wk:list")],
+                ]),
+            )
+            await track_event(
+                user_id, "workout_repeat_confirm_shown",
+                tier=ref.tier, session_index=ref.session_index,
+            )
+            return True
+
+        overrides = await workout_catalog.collect_overrides(DB, user_id, resolved.session)
+        snapshot = workout_catalog.materialize_snapshot(user_id, resolved, overrides)
+        code = resolved.choice.code
+        try:
+            session_id = await DB.execute(
+                """
+                INSERT INTO sessions(
+                    user_id, code, name, plan, status,
+                    exercise_index, set_number, started_at
+                )
+                VALUES(?, ?, ?, ?, 'active', 0, 1, ?)
+                """,
+                (
+                    user_id,
+                    code,
+                    snapshot["name"],
+                    json.dumps(snapshot, ensure_ascii=False),
+                    utc_now(),
+                ),
+            )
+        except aiosqlite.IntegrityError:
+            # The unique partial index rejected a second concurrent start --
+            # show the session that already opened (same recovery as the
+            # legacy startworkout path, callback_plans.py:534-569).
+            existing = await active_session(user_id)
+            if existing:
+                await show_session(query, user_id, existing["id"])
+            return True
+        await write_audit(user_id, "start", "workout", session_id, code=code)
+        await track_event(
+            user_id, "workout_session_started",
+            session_id=session_id, tier=ref.tier, session_index=ref.session_index,
+            source=snapshot["provenance"]["source"],
+            overrides_applied_count=len(snapshot["provenance"]["overrides_applied"]),
+            defaults_filled_count=len(snapshot["provenance"]["defaults_filled"]),
+            repeat=_wk_is_again(data),
+        )
+        await show_session(query, user_id, session_id)
+        return True
+
+    return False
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def _handle_legacy_workout_callback(
+    query: Any,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    data: str,
+) -> bool:
+    """Route one already-issued legacy workout callback through the Batch-7
+    compatibility adapter.
+
+    Returns True when the adapter fully handled it (mapped to the v2 flow,
+    refused as ambiguous, or refused as stale). Returns False ONLY for
+    `template_fallback` -- the caller then runs the preserved legacy template
+    path. Every outcome emits exactly one workout_legacy_callback event.
+    """
+    from noam_coach.bot import workout_compat
+
+    parsed = workout_compat.parse_legacy_callback(data)
+    if parsed is None:
+        return False  # not a legacy workout callback, or malformed -- caller decides
+
+    action = parsed["action"]
+    code = parsed["code"]
+    resolution = await workout_compat.resolve_legacy_code(DB, user_id, code)
+    outcome = resolution["outcome"]
+    ref = resolution["ref"]
+
+    await workout_compat.emit_legacy_event(
+        DB, user_id, prefix=parsed["prefix"], action=action, code=code,
+        outcome=outcome, ref=ref,
+        source=(
+            "plan_version" if (ref is not None and ref.tier == "plan")
+            else "weekly_fact_template" if (ref is not None and ref.tier == "fact")
+            else "template_fallback" if outcome == workout_compat.OUTCOME_TEMPLATE_FALLBACK
+            else None
+        ),
+    )
+
+    if outcome == workout_compat.OUTCOME_TEMPLATE_FALLBACK:
+        return False  # caller runs the explicit legacy template path
+
+    if outcome == workout_compat.OUTCOME_AMBIGUOUS:
+        # Two or more sessions share this code. A bare code cannot say which,
+        # and picking one would be exactly the silent-wrong-workout defect
+        # this architecture exists to remove. Ask.
+        await safe_answer_callback(query, "בחר את האימון המבוקש")
+        await _render_workout_selector(query, user_id)
+        return True
+
+    if outcome == workout_compat.OUTCOME_STALE or ref is None:
+        await _refuse_stale_workout_ref(
+            query, user_id, ref=ref, detail=f"legacy_{parsed['prefix']}_code_{code}"
+        )
+        return True
+
+    # outcome == mapped: hand off to the v2 handler with the real identity, so
+    # legacy taps inherit every v2 guard (active session, re-validation before
+    # INSERT, done-today `:again` confirmation, id-verified overrides).
+    from noam_coach.bot.ui import (
+        wk_exercise_callback,
+        wk_exercise_menu_callback,
+        wk_param_callback,
+        wk_select_callback,
+        wk_start_callback,
+    )
+
+    if action == workout_compat.ACTION_OVERVIEW:
+        v2 = wk_select_callback(ref)
+    elif action == workout_compat.ACTION_START:
+        v2 = wk_start_callback(ref)
+    elif action == workout_compat.ACTION_EDIT_MENU:
+        v2 = wk_exercise_menu_callback(ref)
+    elif action == workout_compat.ACTION_EDIT_EXERCISE:
+        v2 = wk_exercise_callback(ref, int(parsed["exercise_index"]))
+    elif action == workout_compat.ACTION_EDIT_PARAM:
+        v2 = wk_param_callback(
+            ref, int(parsed["exercise_index"]), str(parsed["field"]), float(parsed["delta"])
+        )
+    else:  # pragma: no cover - parse_legacy_callback yields no other action
+        return False
+
+    return await _handle_workout_v2_actions(query, context, user_id, v2)
+
+
 @runtime_bound(RUNTIME_NAMES)
 async def _handle_workout_start_actions(
     query: Any,
@@ -521,18 +1265,24 @@ async def _handle_workout_start_actions(
     user_id: int,
     data: str,
 ) -> bool:
-    if data.startswith("workout:"):
-        code = data.split(":", 1)[1]
-        current = await active_session(user_id)
-        if current:
-            await show_session(query, user_id, current["id"])
+    if data.startswith(("workout:", "startworkout:")):
+        # Batch 7: already-issued legacy buttons route through the
+        # compatibility adapter so they resolve with the SAME catalog
+        # identity, normalization, override and staleness rules as `wk:`.
+        # A unique code match becomes a real identity and is handled by the
+        # v2 path; ambiguity refuses to the selector rather than guessing;
+        # only a genuinely plan-less user reaches the template path below.
+        handled = await _handle_legacy_workout_callback(query, context, user_id, data)
+        if handled:
             return True
 
-        await render_workout_overview(query, user_id, code)
-        return True
-
-    if data.startswith("startworkout:"):
+        # template_fallback only: no active plan of either tier, known
+        # PLANS code. This is the honest pre-v2 behavior, preserved.
         code = data.split(":", 1)[1]
+        if data.startswith("workout:"):
+            await render_workout_overview(query, user_id, code)
+            return True
+
         current = await active_session(user_id)
         if current:
             await show_session(query, user_id, current["id"])
@@ -582,10 +1332,13 @@ async def _handle_workout_parameter_actions(
         payload = flow.payload if flow.name == conversation.FlowName.workout_parameter_edit else {}
         code = str(payload.get("code") or "A")
         await conversation.clear_active_flow(DB, user_id)
+        # Batch 6: cancel returns to the SAME selected overview when the flow
+        # carried a v2 identity, instead of the ambiguous bare-code screen.
+        back = _wk_back_callback_for_payload(payload) or f"workout:{code}"
         await safe_edit(
             query,
             "ביטלתי את עריכת הפרמטרים. לא שמרתי שינוי.",
-            InlineKeyboardMarkup([[button("⬅️ חזרה לאימון", f"workout:{code}")]]),
+            InlineKeyboardMarkup([[button("⬅️ חזרה לאימון", back)]]),
         )
         return True
 
@@ -610,6 +1363,19 @@ async def _handle_workout_parameter_actions(
                 InlineKeyboardMarkup([[button("🏠 תפריט", "menu:home")]]),
             )
             return True
+        # Batch 6: a v2 payload carries the full session identity, so a
+        # free-text edit confirmed minutes later still applies to the SAME
+        # session -- re-validated here, immediately before the write. A
+        # regenerated plan refuses rather than retargeting the edit. Legacy
+        # code-only payloads (v absent) keep the old positional behavior
+        # untouched until Batch 7 retires them.
+        if int(payload.get("v") or 0) >= 2:
+            applied_v2 = await _apply_workout_param_text_v2(query, user_id, payload, pending_updates)
+            if applied_v2:
+                return True
+            # _apply_workout_param_text_v2 already rendered a refusal.
+            return True
+
         plan = await get_user_plan(user_id, code)
         active_plan = await user_model.get_value(DB, user_id, "active_workout_plan")
         program_codes = []
@@ -656,6 +1422,14 @@ async def _handle_workout_parameter_actions(
             ]),
         )
         return True
+
+    # Batch 7: legacy edit callbacks route through the adapter first, so an
+    # old "edit parameters" button targets the exercise by verified identity
+    # in the user's CURRENT plan instead of a bare (code, index) pair. Only a
+    # plan-less user (template_fallback) reaches the preserved legacy paths.
+    if data.startswith(("editparams_menu:", "editparams:", "param:")):
+        if await _handle_legacy_workout_callback(query, context, user_id, data):
+            return True
 
     if data.startswith("editparams_menu:"):
         code = data.split(":", 1)[1]
@@ -715,6 +1489,12 @@ async def handle_workout_setup_callback(
     """Route workout setup callbacks to menu, start and parameter handlers."""
     handlers = (
         _handle_workout_menu_actions,
+        # Batch 4: the `wk:` graph is tried before the legacy `workout:`/
+        # `startworkout:` handlers. The prefixes are disjoint, so ordering is
+        # a readability choice, not a correctness one -- legacy callbacks
+        # from old Telegram messages keep reaching their existing handler
+        # untouched until the Batch 7 adapter.
+        _handle_workout_v2_actions,
         _handle_workout_start_actions,
         _handle_workout_parameter_actions,
     )

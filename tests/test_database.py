@@ -119,11 +119,11 @@ async def test_database_initialization_is_idempotent(tmp_path: Path) -> None:
     await db.init()
     await db.init()
     rows = await db.fetch_all("SELECT version FROM schema_migrations ORDER BY version")
-    # Migration 13 (observability_correlation, Observability O1: trace/
-    # interaction/span correlation columns on product_events) was added most
-    # recently; bump the expected range whenever a new schema migration is
-    # registered in db.SCHEMA_MIGRATIONS.
-    assert [row["version"] for row in rows] == list(range(1, 14))
+    # Migration 14 (exercise_override_identity, workout-selection
+    # architecture Batch 2: nullable exercise_id column + identity index on
+    # exercise_overrides) was added most recently; bump the expected range
+    # whenever a new schema migration is registered in db.SCHEMA_MIGRATIONS.
+    assert [row["version"] for row in rows] == list(range(1, 15))
 
 
 @pytest.mark.asyncio

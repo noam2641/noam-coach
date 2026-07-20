@@ -622,6 +622,39 @@ def _parse_workout_parameter_text(text: str) -> list[dict[str, Any]]:
     return updates
 
 
+@runtime_bound(RUNTIME_NAMES)
+async def _workout_parameter_exercise_name(
+    user_id: int, payload: dict[str, Any], code: str, exercise_index: int
+) -> str:
+    """Name of the exercise being edited, resolved through the catalog for a
+    v2 payload (so a personalized Tier-1 exercise shows its real name) and
+    through the legacy template path otherwise. Never raises -- a naming
+    failure must not break the edit preview."""
+    if int(payload.get("v") or 0) >= 2:
+        from noam_coach.services import workout_catalog
+        from noam_coach.services.workout_catalog import WorkoutSelectionRef
+
+        try:
+            ref = WorkoutSelectionRef(
+                tier=str(payload.get("tier") or "plan"),
+                plan_id=payload.get("plan_id"),
+                fact_rev=payload.get("fact_rev"),
+                session_index=int(payload.get("session_index") or 0),
+            )
+            resolved = await workout_catalog.resolve_selection(DB, user_id, ref)
+            exercises = resolved.session.get("exercises", [])
+            if 0 <= exercise_index < len(exercises):
+                return str(exercises[exercise_index].get("name") or "התרגיל")
+        except Exception:  # noqa: BLE001 - naming is best-effort, never fatal
+            return "התרגיל"
+        return "התרגיל"
+
+    plan = await get_user_plan(user_id, code)
+    if 0 <= exercise_index < len(plan["exercises"]):
+        return str(plan["exercises"][exercise_index]["name"])
+    return "התרגיל"
+
+
 async def _handle_workout_parameter_text(
     update: Update,
     user_id: int,
@@ -636,19 +669,29 @@ async def _handle_workout_parameter_text(
         await route_free_text(update, user_id)
         return
 
+    # Batch 6 (workout-selection architecture): a v2 payload carries the full
+    # session identity, so every button minted below returns to THAT session
+    # rather than a bare code. Legacy payloads keep the old `workout:<code>`
+    # buttons until the Batch 7 adapter.
+    from noam_coach.bot.callback_plans import (
+        _wk_back_callback_for_payload,
+        _wk_edit_callback_for_payload,
+    )
+
+    back_callback = _wk_back_callback_for_payload(payload) or f"workout:{code}"
+
     updates = _parse_workout_parameter_text(text)
     if not updates:
         await update.effective_message.reply_text(
             "לא זיהיתי שינוי לפרמטרי האימון. אפשר לכתוב למשל: מנוחה 1:30 לכל התרגילים, משקל 22.5, או 4 סטים.",
             reply_markup=InlineKeyboardMarkup([
-                [button("⬅️ חזרה לאימון", f"workout:{code}")],
+                [button("⬅️ חזרה לאימון", back_callback)],
                 [button("❌ ביטול", "wparamtext:cancel")],
             ]),
         )
         return
 
-    plan = await get_user_plan(user_id, code)
-    exercise_name = plan["exercises"][exercise_index]["name"] if 0 <= exercise_index < len(plan["exercises"]) else "התרגיל"
+    exercise_name = await _workout_parameter_exercise_name(user_id, payload, code, exercise_index)
     if any(item.get("scope") == "program" for item in updates):
         scope_label = "לכל התוכנית"
     elif any(item.get("scope") == "all" for item in updates):
@@ -656,24 +699,33 @@ async def _handle_workout_parameter_text(
     else:
         scope_label = f"לתרגיל {exercise_name}"
     summary = ", ".join(str(item["label"]) for item in updates)
+    # Carry the identity keys forward verbatim -- the confirm step re-validates
+    # them before writing, so losing them here would silently downgrade a v2
+    # edit to ambiguous bare-code targeting.
+    preview_payload = {
+        "code": code,
+        "exercise_index": exercise_index,
+        "pending_updates": updates,
+        "summary": summary,
+        "scope_label": scope_label,
+    }
+    for key in ("v", "tier", "plan_id", "fact_rev", "session_index", "exercise_id"):
+        if key in payload:
+            preview_payload[key] = payload[key]
+
     await conversation.set_active_flow(
         DB,
         user_id,
         conversation.FlowName.workout_parameter_edit,
         step="preview",
-        payload={
-            "code": code,
-            "exercise_index": exercise_index,
-            "pending_updates": updates,
-            "summary": summary,
-            "scope_label": scope_label,
-        },
+        payload=preview_payload,
     )
+    rewrite_callback = _wk_edit_callback_for_payload(payload) or f"editparams:{code}:{exercise_index}"
     await update.effective_message.reply_text(
         f"הבנתי: {summary} {scope_label}.\nלא שמרתי עדיין. לאשר את השינוי?",
         reply_markup=InlineKeyboardMarkup([
             [button("✅ אשר ושמור", "wparamtext:apply")],
-            [button("✏️ אכתוב תיקון אחר", f"editparams:{code}:{exercise_index}")],
+            [button("✏️ אכתוב תיקון אחר", rewrite_callback)],
             [button("❌ ביטול", "wparamtext:cancel")],
         ]),
     )

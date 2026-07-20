@@ -295,9 +295,19 @@ CREATE TABLE IF NOT EXISTS exercise_overrides(
     field TEXT NOT NULL,
     value REAL NOT NULL,
     updated_at TEXT NOT NULL,
+    exercise_id TEXT,
     PRIMARY KEY(user_id, code, exercise_index, field),
     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
+
+-- NOTE (migration-order contract, same as idx_product_events_trace/
+-- idx_product_events_interaction above): idx_exercise_overrides_identity is
+-- created by migration 14 (exercise_override_identity), NOT here. This
+-- CREATE TABLE only adds the nullable exercise_id column for FRESH
+-- databases (a no-op on an existing one, since CREATE TABLE IF NOT EXISTS
+-- leaves the old table shape in place) -- an index on this column here
+-- would abort startup with "no such column" on every existing deployment,
+-- before migration 14 ever gets the chance to add the column.
 
 CREATE TABLE IF NOT EXISTS active_flow(
     user_id INTEGER PRIMARY KEY,
@@ -602,6 +612,7 @@ SCHEMA_MIGRATIONS: tuple[tuple[int, str], ...] = (
     (11, "meal_status_column"),
     (12, "daily_flags_revision"),
     (13, "observability_correlation"),
+    (14, "exercise_override_identity"),
 )
 
 FK_MIGRATION_TABLES: tuple[str, ...] = (
@@ -1318,6 +1329,32 @@ async def _migration_observability_correlation(db: Database) -> None:
         await _record_migration(connection, 13, "observability_correlation")
 
 
+async def _migration_exercise_override_identity(db: Database) -> None:
+    """Migration 14 (workout-selection architecture Batch 2): give
+    exercise_overrides a stable exercise identity alongside its existing
+    positional key.
+
+    Storage/write plumbing only -- no production read path applies
+    overrides by exercise_id yet (that starts in a later batch). Adding a
+    nullable exercise_id column is backward compatible by construction:
+    existing rows read back with exercise_id=NULL and continue to be
+    applied exactly as before via the untouched (user_id, code,
+    exercise_index, field) primary key. The index on this column is
+    created HERE, never in the base SCHEMA -- see the migration-order
+    contract note above the exercise_overrides CREATE TABLE.
+    """
+    async with db.transaction() as connection:
+        cursor = await connection.execute("PRAGMA table_info(exercise_overrides)")
+        present = {row["name"] for row in await cursor.fetchall()}
+        if "exercise_id" not in present:
+            await connection.execute("ALTER TABLE exercise_overrides ADD COLUMN exercise_id TEXT")
+        await connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_exercise_overrides_identity "
+            "ON exercise_overrides(user_id, exercise_id)"
+        )
+        await _record_migration(connection, 14, "exercise_override_identity")
+
+
 async def run_migrations(
     db: Database,
     *,
@@ -1362,6 +1399,8 @@ async def run_migrations(
             await _migration_daily_flags_revision(db)
         elif version == 13:
             await _migration_observability_correlation(db)
+        elif version == 14:
+            await _migration_exercise_override_identity(db)
         else:
             raise RuntimeError(f"Unknown schema migration {version}")
         LOGGER.info("Applied schema migration %s: %s", version, name)

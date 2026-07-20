@@ -111,17 +111,33 @@ RUNTIME_NAMES = ('Any', 'DB', 'Exception', 'LOGGER', 'MealAnalysis', 'OPENAI_CLI
 
 @runtime_bound(RUNTIME_NAMES)
 async def set_exercise_override(
-    user_id: int, code: str, exercise_index: int, field: str, value: float
+    user_id: int,
+    code: str,
+    exercise_index: int,
+    field: str,
+    value: float,
+    *,
+    exercise_id: str | None = None,
 ) -> None:
+    """Upsert one positional exercise override.
+
+    ``exercise_id`` (Batch 2, workout-selection architecture: storage/write
+    plumbing only) is optional and backward compatible -- every existing
+    caller keeps calling this positionally with 5 args and keeps getting
+    exercise_id=NULL rows, applied exactly as before by get_user_plan's
+    unchanged (user_id, code, exercise_index) lookup. No production read
+    path applies overrides BY exercise_id yet; that begins in a later batch.
+    """
     await DB.execute(
         """
         INSERT INTO exercise_overrides(
-            user_id, code, exercise_index, field, value, updated_at
-        ) VALUES(?, ?, ?, ?, ?, ?)
+            user_id, code, exercise_index, field, value, updated_at, exercise_id
+        ) VALUES(?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id, code, exercise_index, field) DO UPDATE SET
-            value=excluded.value, updated_at=excluded.updated_at
+            value=excluded.value, updated_at=excluded.updated_at,
+            exercise_id=COALESCE(excluded.exercise_id, exercise_overrides.exercise_id)
         """,
-        (user_id, code, exercise_index, field, float(value), utc_now()),
+        (user_id, code, exercise_index, field, float(value), utc_now(), exercise_id),
     )
 
 
