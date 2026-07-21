@@ -2518,7 +2518,13 @@ def _evening_coach_review_lines(ctx: "DailyContext") -> list[str]:
 
 
 @runtime_bound(RUNTIME_NAMES)
-async def build_morning_menu_text(user_id: int, ctx: "DailyContext | None" = None) -> str:
+async def build_morning_menu_text(
+    user_id: int,
+    ctx: "DailyContext | None" = None,
+    *,
+    persist: bool = True,
+    _sink: dict[str, Any] | None = None,
+) -> str:
     """Return the standalone daily menu message.
 
     TASK-05/06: the morning check-in is already delivered as its own message in
@@ -2526,6 +2532,15 @@ async def build_morning_menu_text(user_id: int, ctx: "DailyContext | None" = Non
     self-contained daily menu — not a long blended morning briefing/status
     message.  Legacy callback name ``menu:morning`` still calls this function,
     but its product meaning is now "תפריט להיום".
+
+    ``persist`` (G2.3B-3) defaults to True, so every existing caller keeps its
+    current behaviour of saving the generated menu as a new revision. The
+    durable refresh orchestrator passes ``persist=False`` because it must
+    allocate the revision itself: the identity is RESERVED at claim time and
+    written by one atomic mutation together with the operation record, and a
+    second self-allocating write here would defeat that. ``_sink`` then
+    receives the generated ``meals``/``strategy`` so that caller can persist
+    them under the reserved identity without generating twice.
     """
     if ctx is None:
         ctx = await build_daily_context(user_id)
@@ -2600,19 +2615,49 @@ async def build_morning_menu_text(user_id: int, ctx: "DailyContext | None" = Non
     if gate.based_on_partial_info and gate.tag():
         text += f"\n\n<i>{esc(gate.tag())}</i>"
     text += _data_quality_disclaimer(ctx)
-    from noam_coach.services.daily_menu_state import remember_active_daily_menu
-
     with suppress(Exception):
         active_plan = await planning.get_active_plan(DB, user_id, "nutrition")
-        await remember_active_daily_menu(
-            DB,
-            user_id,
-            text=text,
-            strategy=(active_plan or {}).get("strategy"),
-            source="build_morning_menu_text",
-            meals=pipeline_result.meal_records,
-        )
+        if persist:
+            from noam_coach.services.daily_menu_state import remember_active_daily_menu
+
+            await remember_active_daily_menu(
+                DB,
+                user_id,
+                text=text,
+                strategy=(active_plan or {}).get("strategy"),
+                source="build_morning_menu_text",
+                meals=pipeline_result.meal_records,
+            )
+        elif _sink is not None:
+            _sink["meals"] = list(pipeline_result.meal_records or [])
+            _sink["strategy"] = (active_plan or {}).get("strategy")
     return text
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def generate_daily_menu_payload(
+    user_id: int,
+    ctx: "DailyContext | None" = None,
+) -> dict[str, Any]:
+    """Generate a daily menu WITHOUT persisting it (G2.3B-3).
+
+    Returns ``{"text", "meals", "strategy"}`` for a caller that owns revision
+    allocation -- the durable refresh orchestrator, which reserved the menu
+    identity before generation and writes it atomically together with the
+    operation record.
+
+    Exactly ONE generation happens: ``build_morning_menu_text`` is called once
+    with ``persist=False``, which skips only its self-allocating save. The
+    structured meals are collected into ``sink`` by that same call, so no
+    second AI request is made and no module-level state is involved.
+    """
+    sink: dict[str, Any] = {}
+    text = await build_morning_menu_text(user_id, ctx, persist=False, _sink=sink)
+    return {
+        "text": text,
+        "meals": list(sink.get("meals") or []),
+        "strategy": sink.get("strategy"),
+    }
 
 
 @runtime_bound(RUNTIME_NAMES)

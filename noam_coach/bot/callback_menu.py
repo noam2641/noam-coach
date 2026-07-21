@@ -247,6 +247,22 @@ async def _render_next_meal_screen(
     await remember_active_recommendation(DB, user_id, recommendation, message_id=message_id)
 
 
+async def _refreshed_menu_text(user_id: int) -> str | None:
+    """Read back the menu the durable refresh just persisted.
+
+    The refresh orchestrator owns persistence, so the handler renders what
+    actually landed under the reserved identity rather than a locally held
+    string that might not match the stored revision.
+    """
+    from noam_coach.services.daily_menu_state import get_active_daily_menu
+
+    with suppress(Exception):
+        active = await get_active_daily_menu(DB, user_id)
+        if isinstance(active, dict):
+            return active.get("text")
+    return None
+
+
 @runtime_bound(RUNTIME_NAMES)
 async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
     """Handle home/menu navigation and inline confirmations.
@@ -1035,7 +1051,33 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
                     active = await get_active_daily_menu(DB, user_id)
                 text = active["text"] if active else await build_morning_menu_text(user_id)
             elif data == "menu:refresh_daily_menu":
-                text = await build_morning_menu_text(user_id)
+                # G2.3B-3: an explicit refresh is a durable operation. The
+                # claim is taken BEFORE generation, so two concurrent taps
+                # produce one AI call, one revision and one delivery; the
+                # reserved identity is written atomically with the operation
+                # record, and a crash after that resumes instead of
+                # regenerating.
+                from noam_coach.services.daily_menu_refresh import (
+                    refresh_daily_menu,
+                    refresh_toast,
+                )
+                from noam_coach.services.health_jobs import (
+                    generate_daily_menu_payload,
+                )
+
+                async def _generate() -> dict[str, Any]:
+                    return await generate_daily_menu_payload(user_id)
+
+                refreshed = await refresh_daily_menu(
+                    DB,
+                    user_id,
+                    generate=_generate,
+                    requested_by="menu:refresh_daily_menu",
+                )
+                if refreshed.suppressed:
+                    await safe_answer_callback(query, refresh_toast(refreshed))
+                    return True
+                text = await _refreshed_menu_text(user_id) or text
             elif data == "menu:nextmeal":
                 await _render_next_meal_screen(query, user_id)
                 return True
