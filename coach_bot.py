@@ -206,6 +206,7 @@ from noam_coach.bot.ui import (
     render_exercise_params,
     safe_answer_callback,
     safe_edit,
+    safe_message_edit,
 )
 
 

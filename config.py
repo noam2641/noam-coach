@@ -46,6 +46,13 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_model: str = "gpt-4.1-mini"
 
+    # Debugging aid: when true, every place that would normally EDIT an
+    # existing Telegram message instead SENDS A NEW MESSAGE with the same
+    # content, leaving prior screens visible so the full conversation
+    # history can be scrolled and inspected. Off by default -- production
+    # behavior (edit-in-place) is unaffected unless explicitly enabled.
+    debug_append_only_messages: bool = False
+
     # Continuous HealthKit/Shortcuts/Watch ingestion is optional and disabled
     # by default.  Retrospective ZIP/XML imports remain available.
     enable_healthkit_api: bool = False

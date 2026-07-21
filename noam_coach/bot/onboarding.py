@@ -105,10 +105,10 @@ from retention import (
 # ---------------------------------------------------------------------------
 
 from noam_coach.runtime_bind import runtime_bound
-from noam_coach.bot.ui import safe_answer_callback
+from noam_coach.bot.ui import safe_answer_callback, safe_message_edit
 from noam_coach.services.weekdays import sunday_first_key, weekday_labels_he
 
-RUNTIME_NAMES = ('Any', 'CONFIRM_PENDING', 'ContextTypes', 'DB', 'Exception', 'InlineKeyboardMarkup', 'LOGGER', 'MAX_FREQUENCY', 'MIN_FREQUENCY', 'PENDING_QUESTION', 'PLANS', 'ParseMode', 'PlanConstraint', 'SETTINGS', 'SPLIT_BY_FREQUENCY', 'TypeError', 'Update', 'ValueError', '_CANCEL_WORDS', '_ENUM_DISPLAY_MAP', '_as_float', '_format_candidate', '_format_fact_value', '_parse_dietary_answer', '_plan_type_label', '_re', '_safe_cb', 'a_parts', 'abs', 'active_constraints', 'affects', 'allergies', 'allowed', 'applied', 'apply_basics_fix', 'ask_deferred_for_plan', 'ask_next_question', 'assumptions', 'at', 'block', 'bool', 'build_profile_text', 'build_weekly_plan', 'button', 'c', 'callback', 'candidate', 'candidates', 'chosen_days', 'clear_flow_state', 'clear_meal_fix', 'clear_pending', 'compute_basics_extras', 'confirm', 'confirm_routine_facts', 'confirmation_text', 'constraint_id', 'constraint_text', 'constraints', 'context_pending_fix', 'conversation', 'ctx', 'current', 'd', 'data', 'dataclass', 'datetime', 'day', 'days', 'days_source', 'default_spread', 'deferred', 'delta', 'detail', 'detected_days', 'dict', 'diet', 'direction', 'discard_unconfirmed_routine_facts', 'display', 'display_val', 'ensure_user', 'enumerate', 'esc', 'event_log', 'exc', 'existing', 'existing_a', 'existing_r', 'exp_labels', 'experience', 'extract_daily_routine', 'extraction', 'extras', 'fact', 'facts', 'finish_onboarding', 'first_item', 'float', 'flow', 'flow_name', 'food_item', 'format_constraints_summary', 'format_routine_confirmation', 'format_weekly_plan', 'freq', 'frequency', 'gap', 'gaps', 'gather_plan_constraints', 'get_flow_state', 'goal', 'goal_labels', 'group', 'handle_safety_answer', 'hard', 'hasattr', 'head', 'home_keyboard', 'hour', 'i', 'icon', 'index', 'index_str', 'int', 'is_allowed', 'isinstance', 'item', 'items', 'json', 'k', 'key', 'keyboard', 'kind', 'kind_label', 'label', 'latest_bf', 'latest_weight', 'len', 'lines', 'list', 'load_routine_profile', 'loc', 'loc_labels', 'location', 'mapping', 'mark', 'match', 'max', 'mc', 'meal', 'medical', 'message', 'min', 'mins', 'missing', 'missing_labels', 'name', 'needs_follow_up', 'new_val', 'note', 'num', 'nutrition', 'onboarding', 'onboarding_frequency_keyboard', 'onboarding_open_keyboard', 'out', 'parsed_items', 'parts', 'payload', 'pct', 'pending', 'plan', 'plan_constraints', 'plan_type', 'planning', 'prefix', 'profile', 'progress', 'prompt', 'pts', 'q', 'qid', 'query', 'question', 'question_names', 'questions', 'r', 'range', 'rationale', 're', 'readable', 'readiness', 'record_medication', 'restriction_type', 'result', 'rng', 'round', 'row', 'rows', 's', 'safe_edit', 'save_medical_constraint', 'save_routine_extraction', 'score', 'session', 'session_min', 'sessions', 'set_flow_state', 'set_pending', 'severity', 'show_onboarding_patterns', 'since', 'sleep', 'snapshot', 'soft', 'sorted', 'source', 'spec', 'split', 'stage', 'start_onboarding', 'str', 'suggestions', 'suppress', 'suspend', 'target', 'text', 'time_text', 'timedelta', 'timezone', 'title', 'track_event', 'tradeoffs', 'tuple', 'type_label', 'type_labels', 'understood', 'unified', 'update', 'user', 'user_id', 'user_model', 'utc_now', 'v', 'value', 'view', 'weekday_he', 'when', 'why', 'wk', 'workout', 'workout_window', 'write_audit')
+RUNTIME_NAMES = ('Any', 'CONFIRM_PENDING', 'ContextTypes', 'DB', 'Exception', 'InlineKeyboardMarkup', 'LOGGER', 'MAX_FREQUENCY', 'MIN_FREQUENCY', 'PENDING_QUESTION', 'PLANS', 'ParseMode', 'PlanConstraint', 'SETTINGS', 'SPLIT_BY_FREQUENCY', 'TypeError', 'Update', 'ValueError', '_CANCEL_WORDS', '_ENUM_DISPLAY_MAP', '_as_float', '_format_candidate', '_format_fact_value', '_parse_dietary_answer', '_plan_type_label', '_re', '_safe_cb', 'a_parts', 'abs', 'active_constraints', 'affects', 'allergies', 'allowed', 'applied', 'apply_basics_fix', 'ask_deferred_for_plan', 'ask_next_question', 'assumptions', 'at', 'block', 'bool', 'build_profile_text', 'build_weekly_plan', 'button', 'c', 'callback', 'candidate', 'candidates', 'chosen_days', 'clear_flow_state', 'clear_meal_fix', 'clear_pending', 'compute_basics_extras', 'confirm', 'confirm_routine_facts', 'confirmation_text', 'constraint_id', 'constraint_text', 'constraints', 'context_pending_fix', 'conversation', 'ctx', 'current', 'd', 'data', 'dataclass', 'datetime', 'day', 'days', 'days_source', 'default_spread', 'deferred', 'delta', 'detail', 'detected_days', 'dict', 'diet', 'direction', 'discard_unconfirmed_routine_facts', 'display', 'display_val', 'ensure_user', 'enumerate', 'esc', 'event_log', 'exc', 'existing', 'existing_a', 'existing_r', 'exp_labels', 'experience', 'extract_daily_routine', 'extraction', 'extras', 'fact', 'facts', 'finish_onboarding', 'first_item', 'float', 'flow', 'flow_name', 'food_item', 'format_constraints_summary', 'format_routine_confirmation', 'format_weekly_plan', 'freq', 'frequency', 'gap', 'gaps', 'gather_plan_constraints', 'get_flow_state', 'goal', 'goal_labels', 'group', 'handle_safety_answer', 'hard', 'hasattr', 'head', 'home_keyboard', 'hour', 'i', 'icon', 'index', 'index_str', 'int', 'is_allowed', 'isinstance', 'item', 'items', 'json', 'k', 'key', 'keyboard', 'kind', 'kind_label', 'label', 'latest_bf', 'latest_weight', 'len', 'lines', 'list', 'load_routine_profile', 'loc', 'loc_labels', 'location', 'mapping', 'mark', 'match', 'max', 'mc', 'meal', 'medical', 'message', 'min', 'mins', 'missing', 'missing_labels', 'name', 'needs_follow_up', 'new_val', 'note', 'num', 'nutrition', 'onboarding', 'onboarding_frequency_keyboard', 'onboarding_open_keyboard', 'out', 'parsed_items', 'parts', 'payload', 'pct', 'pending', 'plan', 'plan_constraints', 'plan_type', 'planning', 'prefix', 'profile', 'progress', 'prompt', 'pts', 'q', 'qid', 'query', 'question', 'question_names', 'questions', 'r', 'range', 'rationale', 're', 'readable', 'readiness', 'record_medication', 'restriction_type', 'result', 'rng', 'round', 'row', 'rows', 's', 'safe_edit', 'safe_message_edit', 'save_medical_constraint', 'save_routine_extraction', 'score', 'session', 'session_min', 'sessions', 'set_flow_state', 'set_pending', 'severity', 'show_onboarding_patterns', 'since', 'sleep', 'snapshot', 'soft', 'sorted', 'source', 'spec', 'split', 'stage', 'start_onboarding', 'str', 'suggestions', 'suppress', 'suspend', 'target', 'text', 'time_text', 'timedelta', 'timezone', 'title', 'track_event', 'tradeoffs', 'tuple', 'type_label', 'type_labels', 'understood', 'unified', 'update', 'user', 'user_id', 'user_model', 'utc_now', 'v', 'value', 'view', 'weekday_he', 'when', 'why', 'wk', 'workout', 'workout_window', 'write_audit')
 
 
 @runtime_bound(RUNTIME_NAMES)
@@ -2954,14 +2954,14 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
         if _q_daily_routine is not None:
             await questions.record_answer(DB, user_id, _q_daily_routine, text)
         confirmation_text = format_routine_confirmation(extraction)
-        await progress.edit_text(
+        await safe_message_edit(
+            progress,
             confirmation_text,
-            reply_markup=InlineKeyboardMarkup([
+            InlineKeyboardMarkup([
                 [button("✅ נכון", "routine:confirm")],
                 [button("✏️ לתקן", "routine:fix")],
                 [button("⏭️ דלג", "routine:skip")],
             ]),
-            parse_mode=ParseMode.HTML,
         )
         await clear_pending(user_id)
         await set_pending(user_id, "__routine_confirm__")
@@ -2974,10 +2974,7 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
         await save_routine_extraction(user_id, extraction)
         await confirm_routine_facts(user_id)
         await clear_pending(user_id)
-        await progress.edit_text(
-            "תודה, התיקון נשמר והפרופיל עודכן ✅",
-            parse_mode=ParseMode.HTML,
-        )
+        await safe_message_edit(progress, "תודה, התיקון נשמר והפרופיל עודכן ✅")
         if await continue_after_plan_completion_answer(message, user_id):
             return True
         if not await ask_next_question(message, user_id):

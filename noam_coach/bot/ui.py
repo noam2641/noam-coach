@@ -108,7 +108,7 @@ from retention import (
 from noam_coach.runtime_bind import runtime_bound
 from noam_coach.services.telegram_errors import is_stale_callback_error, is_stale_edit_error
 
-RUNTIME_NAMES = ('Any', 'BadRequest', 'DB', 'Exception', 'InlineKeyboardButton', 'InlineKeyboardMarkup', 'LOGGER', 'PLANS', 'ParseMode', 'SETTINGS', 'TZ', 'ValueError', '_is_valid_public_url', '_resolve_home_action', 'action', 'active_constraints', 'assignments_sql', 'banner', 'bool', 'button', 'c', 'candidate', 'changed', 'coach_intelligence', 'code', 'constraint_banner', 'constraints', 'consumed_cal', 'consumed_prot', 'cycle', 'data', 'datetime', 'dict', 'done_today', 'done_today_rows', 'end', 'enumerate', 'esc', 'exc', 'exercise_data', 'exercise_index', 'exercise_params_keyboard', 'extra', 'fatigue_banner', 'float', 'frozenset', 'get_user_plan', 'home_keyboard', 'home_keyboard_for_user', 'inc', 'index', 'int', 'keyboard', 'last', 'len', 'lines', 'list', 'muscle', 'muscle_line', 'muscle_tag', 'nxt', 'parameters', 'parts', 'plan', 'position', 'query', 'r', 'range', 'recommend_load', 'reps', 'rows', 's', 'safe_edit', 'session', 'sessions', 'spots', 'start', 'str', 'text', 'today_bounds_utc', 'today_consumed', 'today_wd', 'tuple', 'user_id', 'user_model', 'value', 'weight', 'where', 'workout_overview_keyboard')
+RUNTIME_NAMES = ('Any', 'BadRequest', 'DB', 'Exception', 'InlineKeyboardButton', 'InlineKeyboardMarkup', 'LOGGER', 'PLANS', 'ParseMode', 'SETTINGS', 'TZ', 'ValueError', '_is_valid_public_url', '_resolve_home_action', '_send_new_instead_of_edit', 'action', 'active_constraints', 'assignments_sql', 'banner', 'bool', 'button', 'c', 'candidate', 'changed', 'coach_intelligence', 'code', 'constraint_banner', 'constraints', 'consumed_cal', 'consumed_prot', 'cycle', 'data', 'datetime', 'dict', 'done_today', 'done_today_rows', 'end', 'enumerate', 'esc', 'exc', 'exercise_data', 'exercise_index', 'exercise_params_keyboard', 'extra', 'fatigue_banner', 'float', 'frozenset', 'get_user_plan', 'home_keyboard', 'home_keyboard_for_user', 'inc', 'index', 'int', 'keyboard', 'last', 'len', 'lines', 'list', 'muscle', 'muscle_line', 'muscle_tag', 'nxt', 'parameters', 'parts', 'plan', 'position', 'query', 'r', 'range', 'recommend_load', 'reps', 'rows', 's', 'safe_edit', 'safe_message_edit', 'session', 'sessions', 'spots', 'start', 'str', 'text', 'today_bounds_utc', 'today_consumed', 'today_wd', 'tuple', 'user_id', 'user_model', 'value', 'weight', 'where', 'workout_overview_keyboard')
 
 
 @runtime_bound(RUNTIME_NAMES)
@@ -885,6 +885,18 @@ async def safe_edit(
     text: str,
     keyboard: InlineKeyboardMarkup | None = None,
 ) -> None:
+    """Render *text*/*keyboard* as the next screen for *query*.
+
+    DEBUG_APPEND_ONLY_MESSAGES (config.py): when enabled, every call sends a
+    NEW message instead of editing the current one, leaving the previous
+    screen and its keyboard visible -- purely a debugging/traceability aid so
+    a full conversation flow can be scrolled and inspected. Off by default;
+    production behavior (edit-in-place, including the stale-edit recovery
+    below) is this function's normal path and is unchanged.
+    """
+    if SETTINGS.debug_append_only_messages:
+        await _send_new_instead_of_edit(query, text, keyboard)
+        return
     try:
         await query.edit_message_text(
             text,
@@ -902,6 +914,66 @@ async def safe_edit(
                         parse_mode=ParseMode.HTML,
                     )
             return
+        if "not modified" not in str(exc).lower():
+            raise
+
+
+async def _send_new_instead_of_edit(
+    query: Any,
+    text: str,
+    keyboard: InlineKeyboardMarkup | None,
+) -> None:
+    """DEBUG_APPEND_ONLY_MESSAGES fan-out: send *text*/*keyboard* as a new
+    message via whatever send capability *query* actually exposes, without
+    touching the previous message.
+
+    Handles the two shapes this codebase's edit targets come in: a real
+    Telegram ``CallbackQuery`` (has ``.message.reply_text``), and the
+    ``_MessageEditTarget`` job-context adapter used by the workout rest-timer
+    auto-advance (has its own ``send_new`` -- see workout_runtime.py).
+    """
+    send_new = getattr(query, "send_new", None)
+    if callable(send_new):
+        await send_new(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+        return
+    message = getattr(query, "message", None)
+    if message is not None and hasattr(message, "reply_text"):
+        await message.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+        return
+    if hasattr(query, "reply_text"):
+        # query is itself a Message (the onboarding.py hasattr(target,
+        # "edit_message_text") dispatch pattern always routes a real Message
+        # to the else-branch instead, but stay defensive here too).
+        await query.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def safe_message_edit(
+    message: Any,
+    text: str,
+    keyboard: InlineKeyboardMarkup | None = None,
+) -> None:
+    """Edit-in-place counterpart to ``safe_edit`` for plain ``Message``
+    objects (``.edit_text``, not a callback query's ``.edit_message_text``).
+
+    Used by the "progress placeholder" pattern: a handler sends a temporary
+    "מנתח…"/"⏳" message via ``message.reply_text(...)``, does async work, then
+    calls this to turn that placeholder into the real result in place.
+
+    Respects DEBUG_APPEND_ONLY_MESSAGES the same way ``safe_edit`` does: when
+    enabled, sends a new message instead of editing the placeholder, so the
+    placeholder stays visible in the conversation history.
+
+    Only the harmless "message is not modified" BadRequest is swallowed --
+    every other BadRequest propagates unchanged.
+    """
+    if SETTINGS.debug_append_only_messages:
+        if hasattr(message, "reply_text"):
+            await message.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+        return
+    try:
+        await message.edit_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+    except BadRequest as exc:
         if "not modified" not in str(exc).lower():
             raise
 

@@ -104,6 +104,7 @@ from retention import (
 # They are re-imported above for backward compatibility.
 # ---------------------------------------------------------------------------
 
+from noam_coach.bot.ui import safe_message_edit
 from noam_coach.runtime_bind import runtime_bound
 from noam_coach.services.nutrition_context import (
     build_nutrition_ai_request,
@@ -115,7 +116,7 @@ from noam_coach.services.meal_validation import (
     validate_meal_analysis_for_user,
 )
 
-RUNTIME_NAMES = ('Any', 'ContextTypes', 'DB', 'Exception', 'FoodItem', 'InlineKeyboardButton', 'InlineKeyboardMarkup', 'LOGGER', 'MealAnalysis', 'ParseMode', 'Path', 'SETTINGS', 'Update', 'ValueError', '_AlreadyDecided', '_dt', '_item_line', 'abs', 'allergies_val', 'analysis', 'analyze_meal_image', 'any', 'approval', 'approval_id', 'asyncio', 'auto_save_meal', 'bool', 'button', 'bytes', 'cal', 'caption', 'clear_meal_fix', 'conn', 'conversation', 'count', 'create_approval', 'cur', 'cursor', 'cutoff', 'data_quality', 'datetime', 'decide_approval', 'dict', 'diet_restrictions', 'diff', 'duplicate_approval_id', 'duplicate_id', 'edit_meal_id', 'edited_existing', 'ensure_user', 'enumerate', 'esc', 'event_log', 'exc', 'fetch_approval', 'file_unique_id', 'float', 'folder', 'friendly_error', 'handed_off', 'hasattr', 'high', 'home_keyboard', 'i', 'image_bytes', 'image_path', 'index', 'int', 'is_allowed', 'item', 'item_count', 'item_index', 'item_name_lower', 'items', 'json', 'keyboard', 'line', 'list', 'low', 'macro_cal', 'macro_diff', 'max', 'meal', 'meal_id', 'meal_intelligence', 'message', 'now', 'option', 'option_rows', 'path', 'payload', 'pending_dup', 'persist_meal', 'photo_obj', 'progress', 'query', 'range', 'reanalyze_meal_with_text_and_image', 'recent', 'refine_count', 'refine_hint', 'render_meal', 'report', 'restriction', 'restriction_block', 'restriction_lower', 'restriction_warnings', 'restricted_items', 'row', 'rows', 'safe_edit', 'saved_dup', 'secrets', 'set_meal_fix', 'should_auto_approve', 'str', 'suppress', 'target', 'telegram_file', 'telegram_file_unique_id', 'text', 'timedelta', 'timezone', 'totals', 'update', 'user_id', 'user_model', 'utc_now', 'write_audit')
+RUNTIME_NAMES = ('Any', 'ContextTypes', 'DB', 'Exception', 'FoodItem', 'InlineKeyboardButton', 'InlineKeyboardMarkup', 'LOGGER', 'MealAnalysis', 'ParseMode', 'Path', 'SETTINGS', 'Update', 'ValueError', '_AlreadyDecided', '_dt', '_item_line', 'abs', 'allergies_val', 'analysis', 'analyze_meal_image', 'any', 'approval', 'approval_id', 'asyncio', 'auto_save_meal', 'bool', 'button', 'bytes', 'cal', 'caption', 'clear_meal_fix', 'conn', 'conversation', 'count', 'create_approval', 'cur', 'cursor', 'cutoff', 'data_quality', 'datetime', 'decide_approval', 'dict', 'diet_restrictions', 'diff', 'duplicate_approval_id', 'duplicate_id', 'edit_meal_id', 'edited_existing', 'ensure_user', 'enumerate', 'esc', 'event_log', 'exc', 'fetch_approval', 'file_unique_id', 'float', 'folder', 'friendly_error', 'handed_off', 'hasattr', 'high', 'home_keyboard', 'i', 'image_bytes', 'image_path', 'index', 'int', 'is_allowed', 'item', 'item_count', 'item_index', 'item_name_lower', 'items', 'json', 'keyboard', 'line', 'list', 'low', 'macro_cal', 'macro_diff', 'max', 'meal', 'meal_id', 'meal_intelligence', 'message', 'now', 'option', 'option_rows', 'path', 'payload', 'pending_dup', 'persist_meal', 'photo_obj', 'progress', 'query', 'range', 'reanalyze_meal_with_text_and_image', 'recent', 'refine_count', 'refine_hint', 'render_meal', 'report', 'restricted_items', 'restriction', 'restriction_block', 'restriction_lower', 'restriction_warnings', 'row', 'rows', 'safe_edit', 'safe_message_edit', 'saved_dup', 'secrets', 'set_meal_fix', 'should_auto_approve', 'str', 'suppress', 'target', 'telegram_file', 'telegram_file_unique_id', 'text', 'timedelta', 'timezone', 'totals', 'update', 'user_id', 'user_model', 'utc_now', 'write_audit')
 
 
 async def _meal_analysis_context(user_id: int, purpose: str, request: str) -> dict[str, Any] | None:
@@ -301,10 +302,11 @@ async def handle_photo(
                     [button("❌ לא לשמור", f"reject_dup:{duplicate_id}")],
                 ]
             )
-            await progress.edit_text(
+            await safe_message_edit(
+                progress,
                 "זיהיתי שהתמונה דומה מאוד לארוחה שכבר נשלחה. "
                 "האם זו ארוחה נוספת או שתרצה לעדכן את הקיימת?",
-                reply_markup=InlineKeyboardMarkup(rows),
+                InlineKeyboardMarkup(rows),
             )
             return
 
@@ -326,7 +328,7 @@ async def handle_photo(
         if caption:
             analysis.notes = (analysis.notes + [f"תיאור מהמשתמש: {caption}"])[-10:]
         if not analysis.is_meaningful():
-            await progress.edit_text("לא זוהתה ארוחה (אין מזון או ערכים תזונתיים). נסה תמונה ברורה יותר.")
+            await safe_message_edit(progress, "לא זוהתה ארוחה (אין מזון או ערכים תזונתיים). נסה תמונה ברורה יותר.")
             return
 
         approval_id = await create_approval(
@@ -364,7 +366,7 @@ async def handle_photo(
                 source="system",
                 properties={"error": str(exc)[:200], "context": "photo analysis"},
             )
-        await progress.edit_text(friendly_error(exc, "photo analysis"))
+        await safe_message_edit(progress, friendly_error(exc, "photo analysis"))
     finally:
         if path is not None and not handed_off:
             with suppress(Exception):
@@ -660,16 +662,16 @@ async def auto_save_meal(progress: Any, user_id: int, approval_id: str) -> None:
     meal_id = await persist_meal(user_id, approval_id)
     if meal_id is None:
         return
-    await progress.edit_text(
+    await safe_message_edit(
+        progress,
         f"נרשם ✅ {esc(analysis.meal_name)} — "
         f"{totals['calories']:.0f} קל׳, {totals['protein']:.0f} ג׳ חלבון.\n"
         "<i>(זוהה בביטחון גבוה ונשמר אוטומטית)</i>",
-        reply_markup=InlineKeyboardMarkup(
+        InlineKeyboardMarkup(
             [
                 [button("↩️ בטל", f"undo_meal:{meal_id}")],
             ]
         ),
-        parse_mode=ParseMode.HTML,
     )
 
 
@@ -872,8 +874,4 @@ async def render_meal(target: Any, user_id: int, approval_id: str, refine_count:
     if hasattr(target, "edit_message_text"):
         await safe_edit(target, text, keyboard)
     else:
-        await target.edit_text(
-            text,
-            reply_markup=keyboard,
-            parse_mode=ParseMode.HTML,
-        )
+        await safe_message_edit(target, text, keyboard)

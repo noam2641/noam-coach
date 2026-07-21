@@ -104,6 +104,7 @@ from retention import (
 # They are re-imported above for backward compatibility.
 # ---------------------------------------------------------------------------
 
+from noam_coach.bot.ui import safe_message_edit
 from noam_coach.runtime_bind import runtime_bound
 from noam_coach.services.profile import analyze_meal_text, get_user_plan, set_exercise_override
 from noam_coach.services.nutrition_context import (
@@ -113,7 +114,7 @@ from noam_coach.services.nutrition_context import (
 from noam_coach.observability import taxonomy
 from noam_coach.services import meal_observability
 
-RUNTIME_NAMES = ('ContextTypes', 'DB', 'Exception', 'InlineKeyboardMarkup', 'LOGGER', 'MealAnalysis', 'RuntimeError', 'Update', '_CANCEL_WORDS', '_handle_meal_correction_text', 'approval_id', 'button', 'candidate_ids', 'clear_meal_fix', 'conversation', 'corrected_analysis', 'correction_text', 'count', 'decision', 'ensure_user', 'event_log', 'exc', 'fetch_approval', 'flow', 'friendly_error', 'get_meal_fix', 'handle_onboarding_text', 'home_keyboard', 'image_path', 'index', 'int', 'is_allowed', 'json', 'len', 'list', 'original_analysis', 'pc', 'planning', 'prior_locked', 'progress', 'rc', 'reanalyze_meal_with_text_and_image', 'refine_count', 'removal_corrections', 'render_meal', 'route_free_text', 'row', 'selected', 'set_meal_fix', 'str', 'suppress', 'text', 'track_event', 'update', 'user_id', 'write_audit')
+RUNTIME_NAMES = ('ContextTypes', 'DB', 'Exception', 'InlineKeyboardMarkup', 'LOGGER', 'MealAnalysis', 'RuntimeError', 'Update', '_CANCEL_WORDS', '_handle_meal_correction_text', 'approval_id', 'button', 'candidate_ids', 'clear_meal_fix', 'conversation', 'corrected_analysis', 'correction_text', 'count', 'decision', 'ensure_user', 'event_log', 'exc', 'fetch_approval', 'flow', 'friendly_error', 'get_meal_fix', 'handle_onboarding_text', 'home_keyboard', 'image_path', 'index', 'int', 'is_allowed', 'json', 'len', 'list', 'original_analysis', 'pc', 'planning', 'prior_locked', 'progress', 'rc', 'reanalyze_meal_with_text_and_image', 'refine_count', 'removal_corrections', 'render_meal', 'route_free_text', 'row', 'safe_message_edit', 'selected', 'set_meal_fix', 'str', 'suppress', 'text', 'track_event', 'update', 'user_id', 'write_audit')
 
 
 async def _emit_meal_event(
@@ -431,7 +432,7 @@ async def _handle_meal_correction_text(
             # even when re-analysing from scratch (REC-PLAN-MEAL-03-12).
             prior_locked: list[str] = list(row["data"].get("locked_corrections") or [])
             if image_path:
-                await progress.edit_text("מנתח מחדש את התמונה לפי מה שכתבת…")
+                await safe_message_edit(progress, "מנתח מחדש את התמונה לפי מה שכתבת…")
                 nutrition_payload: dict[str, Any] | None = None
                 with suppress(Exception):
                     nutrition_payload = build_nutrition_ai_request(
@@ -456,7 +457,7 @@ async def _handle_meal_correction_text(
                 # manual logging itself uses (analyze_meal_text), so a
                 # manually-logged meal's correction path is not silently
                 # worse than its logging path.
-                await progress.edit_text("מעדכן לפי מה שכתבת…")
+                await safe_message_edit(progress, "מעדכן לפי מה שכתבת…")
                 current_description = "; ".join(
                     f"{item.name} {item.grams:g} גרם" for item in original_analysis.items
                 )
@@ -552,10 +553,11 @@ async def _handle_meal_correction_text(
                 ),
             )
         # REC-MEAL-03: keep previous analysis, show recovery options
-        await progress.edit_text(
+        await safe_message_edit(
+            progress,
             "לא הצלחתי לעדכן את הארוחה. הניתוח הקודם נשמר.\n"
             "אפשר לנסות שוב או לחזור לארוחה.",
-            reply_markup=InlineKeyboardMarkup([
+            InlineKeyboardMarkup([
                 [button("🔄 נסה שוב", f"backmeal:{approval_id}")],
                 [button("⬅️ חזרה לארוחה", f"backmeal:{approval_id}")],
             ]),
