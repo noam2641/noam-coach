@@ -8,6 +8,7 @@ import pytest
 
 import coach_bot
 import conversation
+from noam_coach.bot import checkins as checkins_bot
 
 
 @pytest.mark.asyncio
@@ -93,6 +94,94 @@ async def test_morning_checkin_is_not_blocked_by_empty_nutrition_day(
 
     assert result is True
     assert sent is True
+
+
+# ---------------------------------------------------------------------------
+# Morning check-in (chk:*) buttons must edit the tapped card in place, not
+# send a new message and leave the original keyboard stale/still-tappable.
+# ---------------------------------------------------------------------------
+
+
+class _FakeCheckinMessage:
+    def __init__(self) -> None:
+        self.reply_text_calls: list[str] = []
+
+    async def reply_text(self, text: str, **_kwargs) -> None:
+        self.reply_text_calls.append(text)
+
+
+class _FakeCheckinQuery:
+    def __init__(self) -> None:
+        self.message = _FakeCheckinMessage()
+        self.edit_calls: list[tuple[str, object]] = []
+
+    async def edit_message_text(self, text: str, reply_markup=None, **_kwargs) -> None:
+        self.edit_calls.append((text, reply_markup))
+
+    async def answer(self, *_a, **_k) -> None:
+        return None
+
+
+async def _checkin_db(tmp_path: Path, monkeypatch) -> coach_bot.Database:
+    db = coach_bot.Database(str(tmp_path / "coach.db"))
+    await db.init()
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(1,'A',NULL,?)",
+        (coach_bot.utc_now(),),
+    )
+    monkeypatch.setattr(coach_bot, "DB", db)
+    return db
+
+
+@pytest.mark.asyncio
+async def test_checkin_sleep_bad_edits_card_not_new_message(tmp_path: Path, monkeypatch) -> None:
+    await _checkin_db(tmp_path, monkeypatch)
+    query = _FakeCheckinQuery()
+
+    await checkins_bot.handle_checkin_callback(query, 1, "chk:sleep:bad")
+
+    assert query.edit_calls, "expected the check-in card to be edited"
+    assert not query.message.reply_text_calls, "must not send a new message for a button tap"
+    text, _keyboard = query.edit_calls[-1]
+    assert "ישנת פחות טוב" in text
+
+
+@pytest.mark.asyncio
+async def test_checkin_energy_edits_card_not_new_message(tmp_path: Path, monkeypatch) -> None:
+    await _checkin_db(tmp_path, monkeypatch)
+    query = _FakeCheckinQuery()
+
+    await checkins_bot.handle_checkin_callback(query, 1, "chk:energy:low")
+
+    assert query.edit_calls
+    assert not query.message.reply_text_calls
+    assert query.edit_calls[-1][1] is not None  # follow-up keyboard offered
+
+
+@pytest.mark.asyncio
+async def test_checkin_pain_report_edits_card_not_new_message(tmp_path: Path, monkeypatch) -> None:
+    await _checkin_db(tmp_path, monkeypatch)
+    query = _FakeCheckinQuery()
+
+    await checkins_bot.handle_checkin_callback(query, 1, "chk:state:pain")
+
+    assert query.edit_calls
+    assert not query.message.reply_text_calls
+    text, _keyboard = query.edit_calls[-1]
+    assert "איפה כואב" in text
+
+
+@pytest.mark.asyncio
+async def test_checkin_normal_state_edits_card_not_new_message(tmp_path: Path, monkeypatch) -> None:
+    await _checkin_db(tmp_path, monkeypatch)
+    query = _FakeCheckinQuery()
+
+    await checkins_bot.handle_checkin_callback(query, 1, "chk:state:normal")
+
+    assert query.edit_calls
+    assert not query.message.reply_text_calls
+    text, _keyboard = query.edit_calls[-1]
+    assert "יום רגיל" in text
 
 
 @pytest.mark.asyncio

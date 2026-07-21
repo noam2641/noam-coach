@@ -105,14 +105,35 @@ from retention import (
 # ---------------------------------------------------------------------------
 
 from noam_coach.runtime_bind import runtime_bound
-from noam_coach.bot.ui import safe_answer_callback
+from noam_coach.bot.ui import button, safe_answer_callback, safe_edit
 
-RUNTIME_NAMES = ('Any', 'DB', 'IndexError', 'ValueError', 'abs', 'action', 'bool', 'build_daily_context', 'coach_intelligence', 'ctx', 'data', 'esc', 'extra', 'flags', 'float', 'get_daily_flags', 'hh', 'hhmm', 'hour', 'int', 'kind', 'known_medications', 'last', 'latest_day', 'len', 'lines', 'med_name', 'meds', 'mini_app_url', 'mm', 'near', 'notes', 'parts', 'query', 'record_medication', 'save_medical_constraint', 'set_daily_flags', 'set_pending', 'str', 'url', 'user_id', 'value', 'when', 'window', 'x')
+RUNTIME_NAMES = ('Any', 'DB', 'IndexError', 'InlineKeyboardMarkup', 'ValueError', '_checkin_more_keyboard', 'abs', 'action', 'bool', 'build_daily_context', 'button', 'coach_intelligence', 'ctx', 'data', 'esc', 'extra', 'flags', 'float', 'get_daily_flags', 'hh', 'hhmm', 'hour', 'int', 'kind', 'known_medications', 'last', 'latest_day', 'len', 'lines', 'med_name', 'meds', 'mini_app_url', 'mm', 'near', 'notes', 'parts', 'query', 'record_medication', 'safe_edit', 'save_medical_constraint', 'set_daily_flags', 'set_pending', 'str', 'url', 'user_id', 'value', 'when', 'window', 'x')
+
+
+# Follow-up keyboard shown after a check-in category is answered, so the
+# same card can keep collecting the other categories (med/sleep/energy/state
+# are independent flags) instead of going dead after one tap.
+def _checkin_more_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [button("😴 שינה טובה", "chk:sleep:good"), button("😐 שינה סבירה", "chk:sleep:ok"), button("😫 שינה גרועה", "chk:sleep:bad")],
+        [button("⚡ אנרגיה גבוהה", "chk:energy:high"), button("🔋 אנרגיה רגילה", "chk:energy:normal"), button("🪫 אנרגיה נמוכה", "chk:energy:low")],
+        [button("💊 לקחתי תרופה", "chk:med_other"), button("🕐 בצום", "chk:state:fasting"), button("🤕 יש כאב", "chk:state:pain")],
+        [button("✅ זהו", "chk:state:normal")],
+    ])
 
 
 @runtime_bound(RUNTIME_NAMES)
 async def handle_checkin_callback(query: Any, user_id: int, data: str) -> None:
-    """Handle the morning check-in taps (the real-time signal source)."""
+    """Handle the morning check-in taps (the real-time signal source).
+
+    Every branch edits the tapped check-in card in place (via ``safe_edit``)
+    instead of sending a new message — tapping several categories updates the
+    same card each time rather than stacking up separate replies below an
+    unchanged, still-fully-tappable original keyboard.
+
+    ``safe_edit`` is the single UI boundary here: DEBUG_APPEND_ONLY_MESSAGES
+    is honoured there, so this module never needs its own debug branch.
+    """
     parts = data.split(":")
     kind = parts[1]
     value = parts[2] if len(parts) > 2 else ""
@@ -133,26 +154,32 @@ async def handle_checkin_callback(query: Any, user_id: int, data: str) -> None:
             if "ריטלין" in med_name or med_name.lower() == "ritalin"
             else ""
         )
-        await query.message.reply_text(f"רשמתי שלקחת {esc(med_name)}.{extra}")
+        await safe_edit(query, f"רשמתי שלקחת {esc(med_name)}. 💊{extra}", _checkin_more_keyboard())
         return
     if kind == "med_other":
         await set_pending(user_id, "__med_name__")
-        await query.message.reply_text('איזו תרופה לקחת? כתוב לי את השם.\n\n(כתוב "ביטול" כדי לדלג.)')
+        await safe_answer_callback(query)
+        await safe_edit(query, 'איזו תרופה לקחת? כתוב לי את השם.\n\n(כתוב "ביטול" כדי לדלג.)', None)
         return
     if kind == "sleep":
         flags["sleep_quality"] = value  # good | ok | bad
         await set_daily_flags(user_id, flags)
         await safe_answer_callback(query, "תודה")
         if value == "bad":
-            await query.message.reply_text(
+            await safe_edit(
+                query,
                 "רשמתי שישנת פחות טוב. לא אעלה משקלים אוטומטית היום, "
-                "ואם תרצה — אפשר גרסת אימון מעט קלה יותר."
+                "ואם תרצה — אפשר גרסת אימון מעט קלה יותר.",
+                _checkin_more_keyboard(),
             )
+        else:
+            await safe_edit(query, "תודה, נרשם.", _checkin_more_keyboard())
         return
     if kind == "energy":
         flags["energy"] = value
         await set_daily_flags(user_id, flags)
         await safe_answer_callback(query, "נרשם")
+        await safe_edit(query, "נרשם, אתאים את ההמלצות בהתאם 👍", _checkin_more_keyboard())
         return
     if kind == "state":
         if value == "pain":
@@ -163,19 +190,27 @@ async def handle_checkin_callback(query: Any, user_id: int, data: str) -> None:
                 note="reported in morning check-in",
                 affects=("exercise_selection",),
             )
-            await query.message.reply_text(
+            await safe_answer_callback(query)
+            await safe_edit(
+                query,
                 'מצטער לשמוע. איפה כואב? (למשל "ברך ימין") אתאים תרגילים '
-                'בהתאם. אם הכאב חד או מתגבר — כדאי בדיקה מקצועית.\n\n(כתוב "ביטול" כדי לדלג.)'
+                'בהתאם. אם הכאב חד או מתגבר — כדאי בדיקה מקצועית.\n\n(כתוב "ביטול" כדי לדלג.)',
+                None,
             )
         elif value == "fasting":
             flags["fasting"] = True
             await set_daily_flags(user_id, flags)
             await safe_answer_callback(query, "נרשם צום")
-            await query.message.reply_text("רשמתי שאתה בצום היום — אתזמן את ההמלצות בהתאם.")
+            await safe_edit(
+                query,
+                "רשמתי שאתה בצום היום — אתזמן את ההמלצות בהתאם. 🕐",
+                _checkin_more_keyboard(),
+            )
         else:  # normal
             flags["state"] = "normal"
             await set_daily_flags(user_id, flags)
             await safe_answer_callback(query, "יום רגיל 👍")
+            await safe_edit(query, "יום רגיל 👍", None)
         return
 
 
