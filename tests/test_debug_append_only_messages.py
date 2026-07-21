@@ -155,7 +155,9 @@ async def test_message_edit_target_adapter_supports_debug_mode(
 
 
 # ---------------------------------------------------------------------------
-# End-to-end: at least one real onboarding flow in append-only mode.
+# Repeated press of a previously-visible state-changing callback must not
+# duplicate persisted data / duplicate a sent message, whether or not debug
+# mode is on (this is the real, storage-level guard, not a UI trick).
 # ---------------------------------------------------------------------------
 
 
@@ -167,6 +169,119 @@ async def _make_db(tmp_path: Path) -> coach_bot.Database:
         (coach_bot.utc_now(),),
     )
     return db
+
+
+@pytest.mark.asyncio
+async def test_repeated_approve_meal_does_not_duplicate_persisted_meal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real meal-flow duplicate-click scenario: approve_meal: tapped twice
+    (e.g. an old, still-visible button re-tapped in debug mode) must not
+    insert the meal twice. persist_meal's compare-and-swap on
+    approvals.status='pending' is the actual guard (not the UI)."""
+    from models import FoodItem, MealAnalysis
+    from noam_coach.bot import meals as meals_bot
+    from noam_coach.services.core import create_approval
+
+    db = await _make_db(tmp_path)
+    monkeypatch.setattr(coach_bot, "DB", db)
+    monkeypatch.setattr(meals_bot, "DB", db)
+
+    analysis = MealAnalysis(
+        meal_name="חביתה",
+        items=[FoodItem(name="ביצים", grams=100, calories=150, protein=12, carbs=1, fat=10, confidence=0.9)],
+        confidence=0.9,
+    )
+    approval_id = await create_approval(
+        1, "meal", {"analysis": analysis.model_dump(), "image": None, "source": "manual_text"},
+    )
+
+    first = await meals_bot.persist_meal(1, approval_id)
+    second = await meals_bot.persist_meal(1, approval_id)
+
+    assert first is not None
+    assert second is None  # already-decided guard rejects the duplicate
+
+    rows = await db.fetch_all("SELECT id FROM meals WHERE user_id=1")
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_repeated_plan_select_does_not_resend_pinnable_menu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """planv2:select: tapped twice for the same (already-active) plan must
+    not send a second standalone pinnable daily-menu message -- the
+    already_active guard added alongside DEBUG_APPEND_ONLY_MESSAGES."""
+    from noam_coach.bot import callback_plans
+
+    db = await _make_db(tmp_path)
+    monkeypatch.setattr(coach_bot, "DB", db)
+    monkeypatch.setattr(callback_plans, "DB", db)
+
+    import json as _json
+
+    plan_id_row = await db.execute(
+        """
+        INSERT INTO plan_versions(user_id, plan_type, title, strategy, payload, fit_score, status, created_at)
+        VALUES(1, 'nutrition', 'Plan A', 'balanced', ?, 0.9, 'candidate', ?)
+        """,
+        (_json.dumps({"days": [{"meals": []}]}), coach_bot.utc_now()),
+    )
+    plan_id = int(plan_id_row)
+
+    # This test targets the callback handler's own duplicate-send guard
+    # (added alongside DEBUG_APPEND_ONLY_MESSAGES), not planning.activate_plan
+    # itself (already covered by its own tests) -- stub it to a plain,
+    # already-idempotent no-op so the plan-readiness prerequisite chain
+    # (unrelated to this fix) doesn't need to be fully reconstructed here.
+    # The stub mirrors the real function's effect on status so the handler's
+    # OWN "was it already active before I called activate_plan" check (read
+    # directly from plan_versions, not from this stub) behaves correctly
+    # across the two calls below.
+    plan_row = {
+        "id": plan_id, "plan_type": "nutrition", "title": "Plan A",
+        "strategy": "balanced", "fit_score": 0.9,
+    }
+
+    async def _fake_activate_plan(db_arg, _user_id, _plan_id):
+        await db_arg.execute(
+            "UPDATE plan_versions SET status='active' WHERE id=?", (plan_id,)
+        )
+        return plan_row
+
+    monkeypatch.setattr(callback_plans.planning, "activate_plan", _fake_activate_plan)
+
+    async def _fake_menu_text(_user_id: int) -> str:
+        return "menu text"
+
+    monkeypatch.setattr(coach_bot, "build_morning_menu_text", _fake_menu_text, raising=False)
+
+    class _Query(_FakeQuery):
+        pass
+
+    query = _Query()
+    handled_first = await callback_plans.handle_plan_callback(query, 1, f"planv2:select:{plan_id}")
+    assert handled_first is True
+    first_pin_sends = len(query.message.reply_calls)
+    assert first_pin_sends >= 1
+
+    query2 = _Query()
+    handled_second = await callback_plans.handle_plan_callback(query2, 1, f"planv2:select:{plan_id}")
+    assert handled_second is True
+    # activate_plan() itself is idempotent (no duplicate plan_versions rows),
+    # and the standalone pinnable menu is NOT re-sent for an already-active plan.
+    assert query2.message.reply_calls == []
+
+    active_rows = await db.fetch_all(
+        "SELECT status FROM plan_versions WHERE id=?", (plan_id,)
+    )
+    assert [r["status"] for r in active_rows] == ["active"]
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: at least one real onboarding flow in append-only mode.
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio

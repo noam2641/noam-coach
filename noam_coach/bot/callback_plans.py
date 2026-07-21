@@ -1644,6 +1644,21 @@ async def handle_plan_callback(query: Any, user_id: int, data: str) -> bool:
         if len(parts_v2) < 3 or not parts_v2[2].isdigit():
             return True
         plan_id = int(parts_v2[2])
+        # Duplicate-tap guard: activate_plan() itself is a safe idempotent
+        # upsert, but the standalone pinnable-menu send below is NOT -- it
+        # fires unconditionally on every call. A stale "select plan" button
+        # re-tapped after the plan is already active (more reachable once
+        # DEBUG_APPEND_ONLY_MESSAGES keeps old keyboards visible) must not
+        # re-send a duplicate menu message / redo the AI generation.
+        #
+        # The condition is the plan's own persisted status, read before
+        # activation -- not elapsed wall-clock time. A genuinely different
+        # plan, or a candidate/draft becoming active for the first time, is
+        # never blocked: it simply has no active row here.
+        already_active = await DB.fetch_one(
+            "SELECT 1 FROM plan_versions WHERE id=? AND user_id=? AND status='active'",
+            (plan_id, user_id),
+        )
         try:
             selected = await planning.activate_plan(DB, user_id, plan_id)
         except planning.PlanningBlockedError as exc:
@@ -1685,7 +1700,11 @@ async def handle_plan_callback(query: Any, user_id: int, data: str) -> bool:
             f"<b>{esc(selected['title'])}</b> נבחרה כתוכנית {_plan_type_label(selected['plan_type'])} הראשית ✅{extra}",
             InlineKeyboardMarkup(rows),
         )
-        if selected["plan_type"] == "nutrition" and getattr(query, "message", None) is not None:
+        if (
+            not already_active
+            and selected["plan_type"] == "nutrition"
+            and getattr(query, "message", None) is not None
+        ):
             with suppress(Exception):
                 from noam_coach.services.daily_menu_state import remember_daily_menu_message
 
