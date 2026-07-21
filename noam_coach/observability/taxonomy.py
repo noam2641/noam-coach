@@ -86,6 +86,23 @@ MEAL_CORRECTION_APPLIED = "meal_correction_applied"
 MEAL_CORRECTION_ERROR = "meal_correction_error"
 MEAL_CLARIFICATION_RESOLVED = "meal_clarification_resolved"
 
+# Daily-menu durable idempotency operations (G2.3B).
+#
+# These describe the LIFECYCLE of a menu operation (claim -> generate ->
+# persist -> deliver), not the menu content itself. Every one of them carries
+# the structured operation identity (operation_kind, semantic_key, attempt_id,
+# menu_id, coaching_day_key, plan_id, status) so a duplicate-suppression or
+# crash-recovery decision can be reconstructed after the fact.
+DAILY_MENU_SEND_CLAIMED = "daily_menu.send.claimed"
+DAILY_MENU_SEND_COMPLETED = "daily_menu.send.completed"
+DAILY_MENU_DUPLICATE_SUPPRESSED = "daily_menu.duplicate.suppressed"
+DAILY_MENU_SEND_FAILED = "daily_menu.send.failed"
+DAILY_MENU_STALE_CLAIM_RECOVERED = "daily_menu.stale_claim.recovered"
+DAILY_MENU_COMPLETION_PERSIST_FAILED = "daily_menu.completion.persist_failed"
+DAILY_MENU_EXPLICIT_REFRESH = "daily_menu.explicit_refresh"
+DAILY_MENU_LEASE_RENEWED = "daily_menu.lease.renewed"
+DAILY_MENU_IDENTITY_CHANGED = "daily_menu.identity.changed"
+
 # Envelope version for events emitted by the canonical emit boundary.
 EVENT_VERSIONS: dict[str, int] = {}
 
