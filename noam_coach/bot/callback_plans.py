@@ -1706,23 +1706,32 @@ async def handle_plan_callback(query: Any, user_id: int, data: str) -> bool:
             and getattr(query, "message", None) is not None
         ):
             with suppress(Exception):
-                from noam_coach.services.daily_menu_state import remember_daily_menu_message
+                # G2.3B-2: only the DELIVERY step is wrapped by the durable
+                # boundary here. Menu generation on this path stays exactly as
+                # it was -- claiming generation is refresh work and belongs to
+                # B-3.
+                from noam_coach.services.daily_menu_delivery import (
+                    deliver_standalone_menu,
+                )
 
                 menu_text = await build_morning_menu_text(user_id)
                 menu_keyboard = InlineKeyboardMarkup([
                     [button("🔄 רענן תפריט", "menu:refresh_daily_menu"), button("🍽 מה לאכול עכשיו", "menu:nextmeal")],
                     [button("✏️ החלף ארוחה", "menu:replace_daily_meal"), button("📊 מצב היום", "menu:status")],
                 ])
-                sent = await query.message.reply_text(
-                    menu_text,
-                    reply_markup=menu_keyboard,
-                    parse_mode=ParseMode.HTML,
-                )
-                await remember_daily_menu_message(
+
+                async def _send_plan_menu() -> Any:
+                    return await query.message.reply_text(
+                        menu_text,
+                        reply_markup=menu_keyboard,
+                        parse_mode=ParseMode.HTML,
+                    )
+
+                await deliver_standalone_menu(
                     DB,
                     user_id,
-                    chat_id=getattr(getattr(sent, "chat", None), "id", user_id),
-                    message_id=getattr(sent, "message_id", None),
+                    send=_send_plan_menu,
+                    requested_by="planv2:select",
                     source="nutrition_strategy_selected",
                 )
         return True

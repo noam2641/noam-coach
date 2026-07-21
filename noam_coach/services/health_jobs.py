@@ -2210,21 +2210,27 @@ async def job_morning(context: CallbackContext) -> None:
     async def send_menu() -> None:
         # TASK-05: send the daily menu as a separate pin-friendly message and
         # remember its Telegram id for refresh/replace flows.
-        from noam_coach.services.daily_menu_state import remember_daily_menu_message
+        #
+        # G2.3B-2: routed through the durable delivery boundary so the morning
+        # job cannot re-deliver a menu the user already received today (e.g.
+        # after a retry or a restart). A background suppression is silent --
+        # the user is never told that a duplicate was avoided.
+        from noam_coach.services.daily_menu_delivery import deliver_standalone_menu
 
-        sent = await send_to_user(
-            context,
-            await build_morning_menu_text(user_id),
-            reply_markup=InlineKeyboardMarkup([
-                [button("🔄 רענן תפריט", "menu:refresh_daily_menu"), button("🍽 מה לאכול עכשיו", "menu:nextmeal")],
-                [button("✏️ החלף ארוחה", "menu:replace_daily_meal"), button("📊 מצב היום", "menu:status")],
-            ]),
-        )
-        await remember_daily_menu_message(
+        menu_text = await build_morning_menu_text(user_id)
+        menu_keyboard = InlineKeyboardMarkup([
+            [button("🔄 רענן תפריט", "menu:refresh_daily_menu"), button("🍽 מה לאכול עכשיו", "menu:nextmeal")],
+            [button("✏️ החלף ארוחה", "menu:replace_daily_meal"), button("📊 מצב היום", "menu:status")],
+        ])
+
+        async def _send_morning_menu() -> Any:
+            return await send_to_user(context, menu_text, reply_markup=menu_keyboard)
+
+        await deliver_standalone_menu(
             DB,
             user_id,
-            chat_id=getattr(getattr(sent, "chat", None), "id", user_id),
-            message_id=getattr(sent, "message_id", None),
+            send=_send_morning_menu,
+            requested_by="job_morning",
             source="morning_job",
         )
 

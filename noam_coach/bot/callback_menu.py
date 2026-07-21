@@ -1052,16 +1052,34 @@ async def handle_menu_callback(query: Any, user_id: int, data: str) -> bool:
             if data == "menu:daily_menu" and getattr(query, "message", None) is not None:
                 # TASK-05: explicit daily-menu tap creates a standalone message
                 # the user can pin.  The current menu screen is only acknowledged.
-                from noam_coach.services.daily_menu_state import remember_daily_menu_message
+                #
+                # G2.3B-2: the send goes through the one durable delivery
+                # boundary, so re-tapping a still-visible button (or reaching
+                # the same menu from another path) cannot deliver it twice.
+                # Suppression is keyed on the menu's semantic identity, never
+                # on elapsed time.
+                from noam_coach.services.daily_menu_delivery import (
+                    deliver_standalone_menu,
+                    suppression_toast,
+                )
 
-                sent = await query.message.reply_text(text, reply_markup=keyboard, parse_mode="HTML")
-                await remember_daily_menu_message(
+                async def _send_standalone_menu() -> Any:
+                    return await query.message.reply_text(
+                        text, reply_markup=keyboard, parse_mode="HTML",
+                    )
+
+                delivery = await deliver_standalone_menu(
                     DB,
                     user_id,
-                    chat_id=getattr(getattr(sent, "chat", None), "id", user_id),
-                    message_id=getattr(sent, "message_id", None),
+                    send=_send_standalone_menu,
+                    requested_by="menu:daily_menu",
                     source="menu_callback",
                 )
+                if delivery.suppressed:
+                    # A duplicate is answered with a toast only -- never with a
+                    # second ordinary message.
+                    await safe_answer_callback(query, suppression_toast(delivery))
+                    return True
                 await safe_edit(
                     query,
                     "שלחתי לך את תפריט היום כהודעה עצמאית שאפשר לנעוץ ✅",
