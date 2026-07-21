@@ -42,6 +42,7 @@ from typing import Any
 from config import TZ
 from noam_coach.services.daily_menu_state import (
     ACTIVE_DAILY_MENU_KEY,
+    DAILY_MENU_MESSAGE_KEY,
     DAILY_MENU_SCHEMA_VERSION,
 )
 
@@ -430,6 +431,79 @@ async def complete_operation(
         if chat_id is not None:
             done["chat_id"] = int(chat_id)
         current[key] = done
+        outcome.update(status=ACQUIRED, record=done, reason=None)
+        return current
+
+    try:
+        await _patch(db, user_id, day, _mutate, key)
+    except Exception as exc:  # noqa: BLE001
+        return OperationOutcome(status=CONFLICT, reason=f"cas_conflict:{exc.__class__.__name__}")
+    return OperationOutcome(**outcome)
+
+
+async def complete_delivery_atomically(
+    db: Any,
+    user_id: int,
+    day: str,
+    *,
+    identity: dict[str, str],
+    attempt_id: str,
+    message_id: int | None,
+    chat_id: int | None,
+    source: str,
+    now: datetime | None = None,
+) -> OperationOutcome:
+    """Record a completed delivery AND its message identity in ONE mutation.
+
+    Completion status, completion timestamp, the archived last-completed
+    record and ``DAILY_MENU_MESSAGE_KEY`` all land in the same CAS ``UPDATE``,
+    so a crash can never leave a delivery marked completed while the message
+    metadata that names it is missing -- the two facts are one write.
+
+    Ownership is validated inside the mutator: if ``attempt_id`` no longer owns
+    the record, NOTHING is mutated (neither the operation nor the message
+    metadata) and ``ownership_lost`` is returned.
+    """
+    key = _KIND_TO_KEY[KIND_DELIVERY]
+    moment = _now(now)
+    outcome: dict[str, Any] = {"status": OWNERSHIP_LOST, "record": None,
+                               "reason": "ownership_lost"}
+
+    def _mutate(current: dict[str, Any]) -> dict[str, Any]:
+        existing = current.get(key)
+        if not _record_is_supported(existing):
+            return current
+        if existing.get("attempt_id") != attempt_id or not identities_match(
+            existing.get("identity"), identity
+        ):
+            return current
+        if existing.get("status") != IN_FLIGHT:
+            outcome.update(status=CONFLICT, record=existing, reason="not_in_flight")
+            return current
+
+        stamp = _iso(moment)
+        done = dict(existing)
+        done["status"] = "completed"
+        done["completed_at"] = stamp
+        done["updated_at"] = stamp
+        if message_id is not None:
+            done["message_id"] = int(message_id)
+        if chat_id is not None:
+            done["chat_id"] = int(chat_id)
+
+        current[key] = done
+        # Archived alongside, so a late tap of this menu is still recognised
+        # even after a later identity rotation.
+        current[DAILY_MENU_LAST_COMPLETED_KEY] = done
+        # The message identity the rest of the codebase reads. Written by the
+        # SAME mutator, never as a follow-up call.
+        if message_id is not None:
+            current[DAILY_MENU_MESSAGE_KEY] = {
+                "chat_id": chat_id if chat_id is not None else user_id,
+                "message_id": int(message_id),
+                "source": source,
+                "saved_at": stamp,
+            }
         outcome.update(status=ACQUIRED, record=done, reason=None)
         return current
 

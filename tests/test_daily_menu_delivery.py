@@ -452,7 +452,7 @@ async def test_completion_cas_failure_does_not_falsely_complete(
     async def _refuse(*_a, **_k):
         return ops.OperationOutcome(status=ops.CONFLICT, reason="injected")
 
-    monkeypatch.setattr(ops, "complete_operation", _refuse)
+    monkeypatch.setattr(ops, "complete_delivery_atomically", _refuse)
     result = await _deliver(db, sender)
     monkeypatch.undo()
 
@@ -482,7 +482,7 @@ async def test_crash_after_send_before_completion_permits_at_least_once_retry(
     async def _crash(*_a, **_k):
         return ops.OperationOutcome(status=ops.CONFLICT, reason="simulated_crash")
 
-    monkeypatch.setattr(ops, "complete_operation", _crash)
+    monkeypatch.setattr(ops, "complete_delivery_atomically", _crash)
     await _deliver(db, sender)              # sent, but never completed
     monkeypatch.undo()
 
@@ -578,6 +578,142 @@ async def test_missing_active_menu_still_yields_a_wellformed_identity(
     _day, identity = await delivery.resolve_delivery_identity(db, 1, now=T0)
     assert identity["menu_id"] == ops.NONE_SENTINEL
     assert identity["plan_id"] == ops.NONE_SENTINEL
+
+
+# --- atomic completion: status + archive + message identity in ONE write ----
+
+
+@pytest.mark.asyncio
+async def test_completion_stores_all_fields_in_one_mutation(tmp_path: Path) -> None:
+    db = await _make_db(tmp_path)
+    day = await _seed_menu(db)
+    sender = _FakeSender()
+
+    result = await _deliver(db, sender)
+
+    flags = await _read_flags(db, day)
+    record = flags[ops.DAILY_MENU_SEND_OP_KEY]
+    assert record["status"] == "completed"
+    assert record["completed_at"]
+    assert record["message_id"] == result.message_id
+    # Archived alongside, in the same write.
+    assert flags[ops.DAILY_MENU_LAST_COMPLETED_KEY]["message_id"] == result.message_id
+    # Message identity, in the same write.
+    assert flags[DAILY_MENU_MESSAGE_KEY]["message_id"] == result.message_id
+    assert flags[DAILY_MENU_MESSAGE_KEY]["source"] == "test"
+
+
+@pytest.mark.asyncio
+async def test_crash_cannot_produce_completed_without_message_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The B-2 atomicity fix: the old two-write sequence could leave
+    status=completed with DAILY_MENU_MESSAGE_KEY absent. Sabotaging the legacy
+    follow-up writer must now change nothing, because completion no longer
+    depends on it."""
+    import noam_coach.services.daily_menu_state as state
+
+    async def _would_have_crashed(*_a, **_k):
+        raise RuntimeError("process died before metadata write")
+
+    monkeypatch.setattr(state, "remember_daily_menu_message", _would_have_crashed)
+
+    db = await _make_db(tmp_path)
+    day = await _seed_menu(db)
+    result = await _deliver(db, _FakeSender())
+    monkeypatch.undo()
+
+    flags = await _read_flags(db, day)
+    assert flags[ops.DAILY_MENU_SEND_OP_KEY]["status"] == "completed"
+    assert flags[DAILY_MENU_MESSAGE_KEY]["message_id"] == result.message_id
+
+
+@pytest.mark.asyncio
+async def test_injected_completion_cas_failure_stores_no_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = await _make_db(tmp_path)
+    day = await _seed_menu(db)
+
+    from noam_coach.services import daily_flags_cas
+
+    real_patch = daily_flags_cas.patch_daily_flags
+    calls = {"n": 0}
+
+    async def _fail_second(*a, **k):
+        calls["n"] += 1
+        if calls["n"] > 1:          # let the claim land, break the completion
+            raise RuntimeError("injected CAS failure")
+        return await real_patch(*a, **k)
+
+    monkeypatch.setattr(daily_flags_cas, "patch_daily_flags", _fail_second)
+    result = await _deliver(db, _FakeSender())
+    monkeypatch.undo()
+
+    assert result.status == delivery.SENT      # the message really was sent
+    flags = await _read_flags(db, day)
+    record = flags[ops.DAILY_MENU_SEND_OP_KEY]
+    assert record["status"] != "completed"
+    assert record["message_id"] is None
+    assert DAILY_MENU_MESSAGE_KEY not in flags
+    assert ops.DAILY_MENU_LAST_COMPLETED_KEY not in flags
+
+
+@pytest.mark.asyncio
+async def test_stale_owner_atomic_completion_stores_no_field(tmp_path: Path) -> None:
+    db = await _make_db(tmp_path)
+    day = await _seed_menu(db)
+    _day, identity = await delivery.resolve_delivery_identity(db, 1, now=T0)
+
+    await ops.claim_operation(db, 1, day, kind=ops.KIND_DELIVERY,
+                              identity=identity, attempt_id="OLD", now=T0)
+    later = T0 + timedelta(seconds=ops.MENU_SEND_LEASE_SECONDS + 1)
+    await ops.claim_operation(db, 1, day, kind=ops.KIND_DELIVERY,
+                              identity=identity, attempt_id="NEW", now=later)
+
+    refused = await ops.complete_delivery_atomically(
+        db, 1, day, identity=identity, attempt_id="OLD",
+        message_id=999, chat_id=1, source="stale", now=later,
+    )
+
+    assert refused.status == ops.OWNERSHIP_LOST
+    flags = await _read_flags(db, day)
+    assert flags[ops.DAILY_MENU_SEND_OP_KEY]["attempt_id"] == "NEW"
+    assert flags[ops.DAILY_MENU_SEND_OP_KEY]["status"] == ops.IN_FLIGHT
+    assert DAILY_MENU_MESSAGE_KEY not in flags
+    assert ops.DAILY_MENU_LAST_COMPLETED_KEY not in flags
+
+
+@pytest.mark.asyncio
+async def test_atomic_completion_preserves_unrelated_flags(tmp_path: Path) -> None:
+    db = await _make_db(tmp_path)
+    day = await _seed_menu(db)
+    from noam_coach.services.daily_flags_cas import patch_daily_flags
+
+    def _other(current):
+        current["sleep_quality"] = "good"
+        return current
+
+    await patch_daily_flags(db, 1, day, _other, owner="checkins")
+    await _deliver(db, _FakeSender())
+
+    flags = await _read_flags(db, day)
+    assert flags["sleep_quality"] == "good"
+    assert flags[ACTIVE_DAILY_MENU_KEY]["menu_id"] == "menu-A"
+
+
+@pytest.mark.asyncio
+async def test_atomically_completed_delivery_remains_suppressed(
+    tmp_path: Path,
+) -> None:
+    db = await _make_db(tmp_path)
+    await _seed_menu(db)
+    sender = _FakeSender()
+    await _deliver(db, sender)
+    second = await _deliver(db, sender, now=T0 + timedelta(seconds=5))
+
+    assert second.status == delivery.SUPPRESSED_ALREADY_COMPLETED
+    assert sender.calls == 1, "no Telegram resend may be introduced"
 
 
 def test_no_database_file_is_created_in_the_repository_root() -> None:

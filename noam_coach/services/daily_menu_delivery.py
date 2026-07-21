@@ -240,16 +240,21 @@ async def deliver_standalone_menu(
 
     # Completion happens only now, after Telegram actually returned a message,
     # and only for the attempt that still owns the claim.
-    completion = await ops.complete_operation(
+    #
+    # Completion status, the archived last-completed record and the message
+    # identity are ONE CAS mutation: a crash can never leave a delivery marked
+    # completed while DAILY_MENU_MESSAGE_KEY is missing, because the two facts
+    # are written together or not at all.
+    completion = await ops.complete_delivery_atomically(
         db, user_id, day,
-        kind=ops.KIND_DELIVERY, identity=identity, attempt_id=attempt_id,
-        now=now, message_id=message_id, chat_id=chat_id,
+        identity=identity, attempt_id=attempt_id,
+        message_id=message_id, chat_id=chat_id, source=source, now=now,
     )
 
     if completion.status != ops.ACQUIRED:
         # The message exists but the durable record does not name it. Emit the
         # high-severity reconciliation signal carrying the message id, and do
-        # NOT touch the newer owner's message metadata.
+        # NOT touch the newer owner's completion or message metadata.
         await _emit(
             db, user_id, taxonomy.DAILY_MENU_COMPLETION_PERSIST_FAILED,
             identity=identity, attempt_id=attempt_id, status="inconsistent",
@@ -260,20 +265,6 @@ async def deliver_standalone_menu(
             status=SENT, identity=identity, attempt_id=attempt_id,
             message_id=message_id, reason=completion.reason or completion.status,
         )
-
-    # Message metadata is only recorded by the attempt that owns the completion.
-    try:
-        from noam_coach.services.daily_menu_state import remember_daily_menu_message
-
-        await remember_daily_menu_message(
-            db, user_id,
-            chat_id=chat_id if chat_id is not None else user_id,
-            message_id=message_id,
-            now=now,
-            source=source,
-        )
-    except Exception:  # noqa: BLE001
-        LOGGER.debug("daily-menu message metadata not recorded", exc_info=True)
 
     await _emit(
         db, user_id, taxonomy.DAILY_MENU_SEND_COMPLETED,
