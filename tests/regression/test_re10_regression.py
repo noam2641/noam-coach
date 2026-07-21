@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 import coach_bot
+import conversation
 import planning
 import user_model
 from noam_coach.bot import onboarding as bot_onboarding
@@ -64,6 +65,36 @@ async def test_routine_confirm_reaches_onboarding_handler_not_session_fallback()
     # The router-level fix means these never reach that fallback at all —
     # verified structurally above; this asserts the fallback would indeed
     # have rejected them, proving the router fix is load-bearing.
+
+
+@pytest.mark.asyncio
+async def test_routine_confirm_free_text_reaches_question_flow_not_fallback(
+    tmp_path: Path,
+) -> None:
+    """Sibling bug to RE10-1: a plain-text correction to the "describe your
+    day" summary card (pending == "__routine_confirm__") must route through
+    ConversationRouter to "question_flow" -- the only path that reaches
+    handle_onboarding_text's dedicated __routine_confirm__ correction branch
+    (onboarding.py:2910). Before this fix, FlowName.routine_confirm was
+    mapped from the pending key (PENDING_KEY_TO_FLOW) but missing from
+    QUESTION_FLOWS, so flow.is_question was False and the router fell through
+    to the generic "free_text" fallback -- silently dropping the correction.
+    """
+    db = await _make_db(tmp_path)
+    coach_bot.DB.path = db.path
+
+    await conversation.set_active_flow(
+        db, 1, conversation.FlowName.routine_confirm, step="__routine_confirm__",
+    )
+    flow = await conversation.get_active_flow(db, 1)
+    assert flow.name == conversation.FlowName.routine_confirm
+
+    # This is the exact assertion that was false before the fix.
+    assert flow.is_question is True
+
+    decision = await conversation.ConversationRouter.route(db, 1, "text")
+    assert decision.handler == "question_flow"
+    assert decision.action == "consume"
 
 
 # ---------------------------------------------------------------------------

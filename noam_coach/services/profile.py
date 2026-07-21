@@ -645,6 +645,20 @@ async def save_routine_extraction(user_id: int, extraction: RoutineExtraction) -
             kind=user_model.KIND_ESTIMATE, source=user_model.SOURCE_DERIVED,
             confidence=0.7, affects=("workout_timing", "workout_schedule"),
         )
+    if extraction.available_workout_minutes:
+        # Confirmed-user-knowledge fix: this must be its own fact, not only
+        # nested inside workout_window.minutes above. Every downstream reader
+        # (user_model.compute_readiness's workout profile, availability.
+        # resolve_availability, planning.py's strategy scoring) reads the
+        # canonical "session_minutes" key directly and never looks inside
+        # workout_window -- so a value that only lived there was invisible to
+        # both the plan-completion prerequisite check and the planner itself,
+        # even after the user explicitly confirmed the routine summary.
+        await user_model.set_fact(
+            DB, user_id, "session_minutes", extraction.available_workout_minutes,
+            kind=user_model.KIND_ESTIMATE, source=user_model.SOURCE_DERIVED,
+            confidence=0.7, affects=("workout_volume",),
+        )
     if extraction.cooking_willingness:
         await user_model.set_fact(
             DB, user_id, "cooking_capacity", extraction.cooking_willingness,
@@ -672,6 +686,7 @@ ROUTINE_ESTIMATE_KEYS = (
     "commute_minutes",
     "meal_break_info",
     "workout_window",
+    "session_minutes",
     "cooking_capacity",
     "sleep_schedule",
     "daily_routine_summary",

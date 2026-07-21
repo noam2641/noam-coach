@@ -206,7 +206,16 @@ class RoutineExtraction(BaseModel):
     has_fridge_at_work: bool | None = None
     has_microwave_at_work: bool | None = None
     preferred_workout_time: str | None = Field(default=None, description="e.g. '19:00'")
-    available_workout_minutes: int | None = Field(default=None, ge=0, le=300)
+    available_workout_minutes: int | None = Field(
+        default=None, ge=0, le=300,
+        description=(
+            "Minutes available per workout session. If the user states a "
+            "range (e.g. '45-60 minutes'), use the LOWER bound -- this is a "
+            "conservative, adherence-safe choice: a plan sized to what the "
+            "user can reliably sustain, not the best case they might "
+            "occasionally have."
+        ),
+    )
     cooking_willingness: str | None = Field(default=None, description="none/basic/moderate/enjoys")
     typical_meals_per_day: int | None = Field(default=None, ge=1, le=10)
     medication_appetite_note: str | None = Field(

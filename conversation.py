@@ -60,6 +60,13 @@ QUESTION_FLOWS = frozenset(
         FlowName.equipment_detail,
         FlowName.med_name,
         FlowName.basics_fix,
+        # Free-text corrections to the "describe your day" summary card
+        # (pending key "__routine_confirm__") must route the same way any
+        # other pending question does -- otherwise ConversationRouter.route()
+        # sends the correction to the generic free-text/assistant fallback
+        # instead of onboarding.handle_onboarding_text's dedicated
+        # __routine_confirm__ branch, and the correction is silently lost.
+        FlowName.routine_confirm,
     }
 )
 
