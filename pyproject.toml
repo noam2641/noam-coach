@@ -7,7 +7,6 @@ exclude = ["data", "storage", "backups", ".venv", "dist", ".claude"]
 select = ["E4", "E7", "E9", "F", "I"]
 ignore = ["E501"]
 
-[tool.pytest.ini_options]
-asyncio_mode = "auto"
-testpaths = ["tests"]
-addopts = "-q --disable-warnings --maxfail=1"
+# Pytest configuration lives in pytest.ini, which takes precedence over this
+# section. Duplicating it here meant edits to one file had no effect -- the
+# --maxfail=1 that hid eight of nine suite failures was present in both.

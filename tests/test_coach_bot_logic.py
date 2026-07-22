@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import pytest
+import pytest_asyncio
 
 import coach_bot
 
@@ -145,10 +146,39 @@ def test_home_keyboard_is_focused_primary_menu() -> None:
     assert "menu:home" in settings  # back to the primary menu
 
 
+@pytest_asyncio.fixture
+async def isolated_global_db(tmp_path: Any, monkeypatch: Any):
+    """Point the module-level ``DB`` at a temporary file for one test.
+
+    ``home_keyboard_for_user`` reads production state through the global ``DB``
+    binding, whose configured path is the RELATIVE default ``./noam_coach.db``.
+    Calling it without isolation therefore creates a stray database in whatever
+    directory pytest happens to run from -- the repository root -- which the
+    repo-hygiene contracts in the daily-menu suites then correctly flag.
+
+    Binding the global to ``tmp_path`` keeps the test's writes inside pytest's
+    own temporary directory. ``monkeypatch`` restores the original binding
+    afterwards, so no other test observes the substitution, and the working
+    directory is never changed.
+
+    This is test-side isolation only. The underlying production default (a
+    relative path that silently creates a fresh database) is a runtime concern
+    tracked for the startup guard, not something this fixture papers over.
+    """
+    import coach_bot
+
+    isolated = coach_bot.Database(str(tmp_path / "isolated_global.db"))
+    await isolated.init()
+    monkeypatch.setattr(coach_bot, "DB", isolated)
+    monkeypatch.setattr("noam_coach.bot.ui.DB", isolated, raising=False)
+    return isolated
+
+
 @pytest.mark.asyncio
 async def test_home_keyboard_for_user_includes_next_action_button(
     tmp_path: Any,
     monkeypatch: Any,
+    isolated_global_db: Any,
 ) -> None:
     """When required planning data is missing, home shows the focused plan CTA
     instead of the full daily coach keyboard."""
@@ -165,6 +195,7 @@ async def test_home_keyboard_for_user_includes_next_action_button(
 @pytest.mark.asyncio
 async def test_home_keyboard_for_user_falls_back_when_no_callback(
     monkeypatch: Any,
+    isolated_global_db: Any,
 ) -> None:
     """When profile data is incomplete, missing-data focus wins even if a
     mocked next action has no callback."""

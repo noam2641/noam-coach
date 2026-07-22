@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -11,6 +13,19 @@ from noam_coach.app import runtime
 from noam_coach.bot import callback_router
 from noam_coach.bot.ui import safe_answer_callback, safe_edit
 from noam_coach.services import telegram_errors
+
+
+def _isolate_global_db(monkeypatch: pytest.MonkeyPatch, label: str) -> None:
+    """Redirect the module-level ``DB`` at a temp file for one test.
+
+    ``SETTINGS.database_path`` defaults to the RELATIVE ``./noam_coach.db``, so
+    any production call that touches the global binding creates a database in
+    whatever directory pytest was started from -- the repository root. Tests
+    that exercise such code must isolate the binding; ``monkeypatch`` restores
+    it afterwards, and the working directory is never changed.
+    """
+    temp_db = Path(tempfile.gettempdir()) / f"noam_coach_test_{label}.db"
+    monkeypatch.setattr(coach_bot.DB, "path", str(temp_db), raising=False)
 
 
 class FakeLogger:
@@ -90,6 +105,12 @@ async def test_user_error_message_does_not_expose_error_id(
     monkeypatch.setattr(coach_bot, "Update", FakeUpdate)
     monkeypatch.setattr(coach_bot, "LOGGER", FakeLogger())
     monkeypatch.setattr(coach_bot, "notify_admin", notify_admin)
+    # on_error records the failure through the global DB, whose configured
+    # path is the RELATIVE default ``./noam_coach.db`` -- so without this the
+    # test materialises a stray database in whatever directory pytest runs
+    # from (the repository root). Point the binding at a temp file; monkeypatch
+    # restores it afterwards and the working directory is never changed.
+    _isolate_global_db(monkeypatch, "on_error")
 
     await callback_router.on_error(update, FakeContext(RuntimeError("boom")))  # type: ignore[arg-type]
 

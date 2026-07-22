@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -88,12 +90,93 @@ def test_task05_task06_daily_menu_has_one_canonical_route_and_standalone_text() 
     assert "menu:daily_menu" in ui
     assert "menu:morning" in ui  # ☀️ עדכון בוקר — short briefing button
     runtime = src("noam_coach/app/runtime.py")
-    health_jobs = src("noam_coach/services/health_jobs.py")
     daily_menu_state = src("noam_coach/services/daily_menu_state.py")
     assert "job_morning" in runtime
-    assert "remember_daily_menu_message" in health_jobs
     assert "daily_menu_message" in daily_menu_state
     assert "שלחתי לך את תפריט היום כהודעה עצמאית" in menu
+    # The TASK-05/06 guarantee that the delivered menu's Telegram message
+    # identity is recorded is asserted BEHAVIOURALLY in
+    # test_task05_delivered_menu_message_identity_is_recorded_durably below.
+    # It used to be a source-text check for `remember_daily_menu_message` in
+    # health_jobs.py; that call was deliberately replaced by the durable
+    # delivery boundary, which records the identity atomically instead. A
+    # source-text assertion would only have moved the brittleness to a new
+    # symbol name, so the requirement is now proven by exercising it.
+
+
+@pytest.mark.asyncio
+async def test_task05_delivered_menu_message_identity_is_recorded_durably(
+    tmp_path: Path,
+) -> None:
+    """TASK-05/06: sending the standalone daily menu must record the delivered
+    Telegram message identity in durable day state, and re-requesting the same
+    semantic menu must not create a second identity.
+
+    This replaces the former source-text assertion that
+    ``remember_daily_menu_message`` appears in ``health_jobs.py``. That call was
+    routed through the durable delivery boundary, which now writes the message
+    identity in the same atomic mutation that marks the delivery completed.
+    """
+    import coach_bot
+    from noam_coach.services import daily_menu_delivery as delivery
+    from noam_coach.services.daily_flags_cas import (
+        get_daily_flags_with_revision,
+        patch_daily_flags,
+    )
+    from noam_coach.services.daily_menu_state import (
+        ACTIVE_DAILY_MENU_KEY,
+        DAILY_MENU_MESSAGE_KEY,
+        _nutrition_day,
+    )
+
+    db = coach_bot.Database(str(tmp_path / "contract.db"))
+    await db.init()
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(1,'A',NULL,?)",
+        (coach_bot.utc_now(),),
+    )
+    day = await _nutrition_day(db, 1)
+
+    def _seed(current: dict) -> dict:
+        current[ACTIVE_DAILY_MENU_KEY] = {
+            "text": "menu", "revision": 1, "menu_id": "menu-contract-1",
+        }
+        return current
+
+    await patch_daily_flags(db, 1, day, _seed, owner="test")
+
+    sends: list[int] = []
+
+    class _Sent:
+        def __init__(self, message_id: int) -> None:
+            self.message_id = message_id
+            self.chat = type("_Chat", (), {"id": 1})()
+
+    async def _send() -> "_Sent":
+        sends.append(len(sends) + 1)
+        return _Sent(500 + len(sends))
+
+    first = await delivery.deliver_standalone_menu(
+        db, 1, send=_send, requested_by="menu:daily_menu", source="menu_callback",
+    )
+    assert first.was_sent
+
+    flags, _rev = await get_daily_flags_with_revision(db, 1, day)
+    recorded = flags[DAILY_MENU_MESSAGE_KEY]
+    assert recorded["message_id"] == first.message_id, (
+        "the delivered menu's Telegram message identity must be recorded"
+    )
+    assert recorded["source"] == "menu_callback"
+
+    # Re-requesting the SAME semantic menu must not create a second identity.
+    second = await delivery.deliver_standalone_menu(
+        db, 1, send=_send, requested_by="menu:daily_menu", source="menu_callback",
+    )
+    assert second.suppressed
+    assert len(sends) == 1, "a duplicate request must not send another menu"
+
+    flags_after, _rev2 = await get_daily_flags_with_revision(db, 1, day)
+    assert flags_after[DAILY_MENU_MESSAGE_KEY]["message_id"] == first.message_id
 
 
 def test_task07_task08_workout_plans_keep_requested_days_and_have_catalog_support() -> None:

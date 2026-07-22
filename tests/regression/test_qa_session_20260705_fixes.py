@@ -34,6 +34,25 @@ from noam_coach.bot import callback_session as callback_session_bot
 from noam_coach.services.availability import parse_hebrew_availability_answer
 from noam_coach.services.weekdays import WEEKDAY_SCHEMA_VERSION
 
+
+@pytest.fixture
+def isolated_global_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Redirect the module-level ``DB`` at a temp file for one test.
+
+    The ``menu:*`` handlers below read production state through the global
+    ``DB`` binding, whose configured path is the RELATIVE default
+    ``./noam_coach.db``. Without isolation they materialise a database in
+    whatever directory pytest runs from -- the repository root -- which the
+    repo-hygiene contracts then correctly flag.
+
+    ``monkeypatch`` restores the original path afterwards; the working
+    directory is never changed.
+    """
+    monkeypatch.setattr(
+        coach_bot.DB, "path", str(tmp_path / "isolated_global.db"), raising=False,
+    )
+
+
 # ---------------------------------------------------------------------------
 # F9 — "menu:today" dead-button fix
 # ---------------------------------------------------------------------------
@@ -73,6 +92,7 @@ def test_free_text_help_keyboard_uses_daily_menu_not_menu_today() -> None:
 @pytest.mark.asyncio
 async def test_menu_morning_renders_short_briefing_not_full_menu(
     monkeypatch: pytest.MonkeyPatch,
+    isolated_global_db: None,
 ) -> None:
     """TASK-16: "menu:morning" (☀️ עדכון בוקר) must render the dedicated short
     briefing (build_morning_briefing_text) and must NOT call the full daily
@@ -103,6 +123,7 @@ async def test_menu_morning_renders_short_briefing_not_full_menu(
 @pytest.mark.asyncio
 async def test_menu_today_is_legacy_alias_for_full_daily_menu(
     monkeypatch: pytest.MonkeyPatch,
+    isolated_global_db: None,
 ) -> None:
     """A stale keyboard already on-screen may still send "menu:today". It must
     render the full daily menu (same as menu:daily_menu), not the briefing and
@@ -120,6 +141,7 @@ async def test_menu_today_is_legacy_alias_for_full_daily_menu(
 @pytest.mark.asyncio
 async def test_menu_today_never_falls_through_to_session_fallback(
     monkeypatch: pytest.MonkeyPatch,
+    isolated_global_db: None,
 ) -> None:
     """Reproduces the exact silent no-op from the recording: before the fix,
     "menu:today" reached handle_session_action_callback, which only handles
