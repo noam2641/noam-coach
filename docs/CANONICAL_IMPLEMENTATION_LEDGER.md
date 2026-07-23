@@ -222,6 +222,30 @@ Repository evidence justified changing the prior plan. Each deviation:
 - **D-G — New live bug found via the local audit (F-02), verified empirically.**
   See R-2b. Recorded as a candidate fix for the DayPlan phase because it corrupts
   `coaching_date`/`wake_time`/`sleep_time` — the very fields DayPlan owns.
+- **D-H — Meal-count semantics (product decision, approved + refined).** The stated
+  `typical_meals_per_day` (models.py:220) is extracted at onboarding but **never
+  persisted** to a readable fact, and `next_meal._meals_remaining` hard-caps at 3.
+  Approved resolution:
+  - **Persist** the explicitly stated preference as a **canonical *confirmed* user
+    preference**, represented as a **range** when the user says e.g. "5–6"
+    (fact `preferred_meal_count` = `{min, max}`).
+  - **Precedence** for the preferred full-day count: explicit confirmed preference
+    **>** learned meal-pattern inference **>** default. Explicit is a **soft
+    planning band**, never an invariant. Learned `typical_meal_hours` informs
+    **slot timing** and selecting a **feasible count within** the preferred range;
+    it must **not override** an explicit preference.
+  - DayPlan models **four distinct quantities**: `preferred_meal_count` (full-day
+    band) · `selected_planned_meals` (this specific day) · `consumed_meals`
+    (completed) · `remaining_meals` (slots left). The remaining count may
+    legitimately fall below the preferred minimum late in the day or after meals
+    are consumed — **any deviation from the band is stated explicitly in
+    `DayPlan.assumptions`/provenance, never a silent fallback to 3.**
+  - Legacy `_meals_remaining` cap is wrapped (compat), not deleted; it becomes a
+    "remaining within band" adapter.
+  - **Regression coverage:** explicit single value; explicit range (5–6); learned
+    pattern with no explicit preference; default when neither exists; late-day
+    feasibility; completed meals reducing remaining slots; explicit preference
+    surviving restart and readable by DayPlan.
 
 ---
 
