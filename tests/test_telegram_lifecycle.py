@@ -426,6 +426,10 @@ def _install_fake_runtime(
     monkeypatch.setattr(coach_bot, "verify_bot_identity", noop)
     # SETTINGS is a pydantic model; patch validate_runtime on the class.
     monkeypatch.setattr(type(coach_bot.SETTINGS), "validate_runtime", lambda self: None, raising=False)
+    # The startup DB-path guard is not in RUNTIME_NAMES, so it resolves to the
+    # runtime module global (not the facade); no-op it there. These tests cross
+    # the startup boundary but never touch a real DB (DB.init is a no-op below).
+    monkeypatch.setattr(runtime, "assert_safe_database_path", lambda _path: None, raising=False)
     monkeypatch.setattr(coach_bot.DB, "init", noop, raising=False)
     monkeypatch.setattr(coach_bot, "ensure_user_record", noop)
     monkeypatch.setattr(coach_bot, "load_pending_state", noop)

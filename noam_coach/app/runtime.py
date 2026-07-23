@@ -77,6 +77,7 @@ from config import (  # noqa: F401
     TZ,
     RuntimeState,
     Settings,
+    assert_safe_database_path,
 )
 from db import DB, Database  # noqa: F401
 from helpers import _safe_html_block, esc, friendly_error, today_bounds_utc, utc_now  # noqa: F401
@@ -397,6 +398,10 @@ async def _cancel_task(task: asyncio.Task[Any] | None) -> None:
 @runtime_bound(RUNTIME_NAMES)
 async def run() -> None:
     SETTINGS.validate_runtime()
+    # Startup-boundary guard: refuse to run against an empty/relative/unresolved
+    # DATABASE_PATH so a stray noam_coach.db can never be created in the repo
+    # root or an ambiguous location. Fires before DB.init() opens/creates a file.
+    assert_safe_database_path(SETTINGS.database_path)
     Path(SETTINGS.storage_dir).mkdir(parents=True, exist_ok=True)
     try:
         await DB.init()

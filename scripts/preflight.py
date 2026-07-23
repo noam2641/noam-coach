@@ -121,14 +121,22 @@ def main() -> None:
                 coach_bot.SETTINGS.validate_runtime()
             except Exception as exc:
                 failures.append(f"runtime settings: {exc}")
-        db_path = Path(coach_bot.SETTINGS.database_path).expanduser()
+        # Startup-boundary guard: an empty/relative/unresolved DATABASE_PATH must
+        # fail here rather than silently create dirs (and later a DB) under the
+        # repository root. On failure, skip the directory/DB probes below.
+        db_path: Path | None = None
+        try:
+            db_path = coach_bot.assert_safe_database_path(
+                coach_bot.SETTINGS.database_path
+            )
+        except Exception as exc:
+            failures.append(f"database path: {exc}")
         storage = Path(coach_bot.SETTINGS.storage_dir).expanduser()
         backup_dir = Path(os.getenv("BACKUP_DIR", "./backups")).expanduser()
-        for label, folder in (
-            ("database parent", db_path.parent),
-            ("storage", storage),
-            ("backup directory", backup_dir),
-        ):
+        folders = [("storage", storage), ("backup directory", backup_dir)]
+        if db_path is not None:
+            folders.insert(0, ("database parent", db_path.parent))
+        for label, folder in folders:
             try:
                 folder.mkdir(parents=True, exist_ok=True)
                 probe = folder / ".preflight_write"
@@ -140,10 +148,11 @@ def main() -> None:
             domain = os.getenv("DOMAIN", "").strip()
             if not domain:
                 failures.append("DOMAIN is required for the bundled Caddy deployment")
-        try:
-            warnings.extend(check_database(db_path))
-        except Exception as exc:
-            failures.append(f"database: {exc}")
+        if db_path is not None:
+            try:
+                warnings.extend(check_database(db_path))
+            except Exception as exc:
+                failures.append(f"database: {exc}")
         if args.migrate and not failures:
             asyncio.run(migrate_if_requested(db_path))
 

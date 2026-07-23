@@ -196,6 +196,51 @@ class Settings(BaseSettings):
             raise RuntimeError("כל secret/token חייב להיות ייחודי")
 
 
+def assert_safe_database_path(path: str | None) -> Path:
+    """Startup-boundary guard for the runtime database location.
+
+    Called explicitly by the real runtime entrypoint (before the DB is opened)
+    and by the preflight command — never on plain import or generic Settings
+    construction, so unit tests that don't cross the startup boundary keep
+    working, and importing a module never creates a directory or touches disk.
+
+    Rejects the dangerous defaults that let a stray ``noam_coach.db`` appear in
+    the repository root or an unresolved location:
+
+    * empty / missing path  -> fail (no silent fallback to ``./noam_coach.db``)
+    * relative path         -> fail (must be explicitly absolute)
+    * ``.`` / ``..`` segments left in the path -> fail (must be fully resolved)
+
+    An absolute, normalized path is accepted regardless of *where* it points, so
+    temporary absolute DB paths used by tests remain valid — the canonical
+    ``data/noam_coach.db`` is not hard-coded as the only permissible location.
+    Returns the resolved :class:`Path`. Does **not** create anything.
+    """
+    if path is None or not str(path).strip():
+        raise RuntimeError(
+            "DATABASE_PATH חסר: יש להגדיר נתיב מסד נתונים מוחלט ומפורש "
+            "(לדוגמה C:\\coach_bot\\noam-coach\\data\\noam_coach.db). "
+            "אין fallback ל-./noam_coach.db."
+        )
+    raw = str(path).strip()
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        raise RuntimeError(
+            f"DATABASE_PATH חייב להיות נתיב מוחלט, לא יחסי: {raw!r}. "
+            "נתיב יחסי עלול ליצור noam_coach.db בשורש הריפוזיטורי."
+        )
+    # Reject un-normalized paths (stray '.'/'..' segments) so the resolved
+    # runtime location is unambiguous. resolve(strict=False) does not touch disk
+    # for a non-existent file and does not create the parent directory.
+    resolved = candidate.resolve(strict=False)
+    if any(part in (".", "..") for part in candidate.parts):
+        raise RuntimeError(
+            f"DATABASE_PATH חייב להיות מפורש ומנורמל (ללא '.'/'..'): {raw!r} "
+            f"→ {resolved}"
+        )
+    return resolved
+
+
 try:
     APP_VERSION = (Path(__file__).with_name("VERSION").read_text(encoding="utf-8").strip() or "0.0.0")
 except FileNotFoundError:

@@ -78,6 +78,7 @@ from config import (  # noqa: F401
     TZ,
     RuntimeState,
     Settings,
+    assert_safe_database_path,
 )
 from db import DB, Database  # noqa: F401
 from helpers import _safe_html_block, esc, friendly_error, today_bounds_utc, utc_now  # noqa: F401
