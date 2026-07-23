@@ -317,3 +317,24 @@ def test_cli_requires_exactly_one_selection(tmp_path: Path) -> None:
 
     with pytest.raises(SystemExit, match="exactly one selection"):
         main(["build", "--reviews-dir", str(tmp_path)])
+
+
+def test_cli_selection_validated_before_database_is_opened(tmp_path: Path) -> None:
+    """Argument-shape validation must not depend on a database existing.
+
+    Missing selection => "exactly one selection", even when --db points at a
+    non-existent file. Conversely, a well-formed single selection with a missing
+    --db surfaces the "database not found" error — proving the DB is still opened
+    once the request shape is valid.
+    """
+    from scripts.review_session import main
+
+    missing_db = str(tmp_path / "nope.db")
+    # No selection + explicitly missing DB: the selection error must win.
+    with pytest.raises(SystemExit, match="exactly one selection"):
+        main(["build", "--db", missing_db, "--reviews-dir", str(tmp_path)])
+
+    # Valid single selection + missing DB: the DB error must now surface.
+    with pytest.raises(SystemExit, match="database not found"):
+        main(["build", "--db", missing_db, "--after-id", "0",
+              "--reviews-dir", str(tmp_path)])

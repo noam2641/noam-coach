@@ -112,10 +112,10 @@ async def _cmd_build(args: argparse.Namespace) -> int:
         resolve_selection,
     )
 
-    db = _open_db(args.db)
-    user_id = int(args.user) if args.user else _default_user()
-    if user_id is None:
-        raise SystemExit("error: no user id (pass --user)")
+    # Validate the review-request shape (selection / --rebuild) BEFORE touching
+    # the database: argument-shape errors must not depend on runtime data
+    # existing, so a bad `build` invocation reports the selection error rather
+    # than a spurious "database not found". Nothing below needs `db`.
     reviews_dir = Path(args.reviews_dir)
 
     rebuilt_from = None
@@ -134,6 +134,11 @@ async def _cmd_build(args: argparse.Namespace) -> int:
         rebuilt_from = args.rebuild
     else:
         requested = _requested_selection(args)
+
+    db = _open_db(args.db)
+    user_id = int(args.user) if args.user else _default_user()
+    if user_id is None:
+        raise SystemExit("error: no user id (pass --user)")
 
     try:
         resolved = await resolve_selection(db, user_id, requested, reviews_dir=reviews_dir)
