@@ -50,12 +50,32 @@ class CoachingDay:
     anchor_hour: int  # local hour (0-23) at which the day actually rolls over
 
 
+# A ``sleep_schedule`` fact is written in two shapes by two writers:
+#   - Health import (health_service.py) writes ``bedtime`` / ``wake_time``.
+#   - Onboarding text-edit (onboarding._parse_sleep_window_text) writes
+#     ``typical_bedtime`` / ``typical_wake_time``.
+# The resolver reads bedtime from EITHER (R-2b). Precedence: the canonical
+# ``bedtime`` key wins when both are present (a fact mid-normalization), so the
+# newer/normalized shape is authoritative.
+_BEDTIME_KEYS = ("bedtime", "typical_bedtime")
+
+
 def _parse_bedtime(value: Any) -> dtime | None:
-    """Parse a ``sleep_schedule`` fact's bedtime string ("HH:MM") into a time."""
+    """Parse a ``sleep_schedule`` fact's bedtime string ("HH:MM") into a time.
+
+    Accepts both the canonical ``bedtime`` key and the legacy ``typical_bedtime``
+    key (R-2b) so onboarding-written and Health-imported sleep schedules produce
+    identical coaching-day semantics. ``bedtime`` takes precedence if both exist.
+    """
     if not isinstance(value, dict):
         return None
-    raw = value.get("bedtime")
-    if not isinstance(raw, str) or ":" not in raw:
+    raw: Any = None
+    for key in _BEDTIME_KEYS:
+        candidate = value.get(key)
+        if isinstance(candidate, str) and ":" in candidate:
+            raw = candidate
+            break
+    if not isinstance(raw, str):
         return None
     try:
         hour_str, minute_str = raw.split(":")[:2]
