@@ -89,6 +89,26 @@ async def _make_db(tmp_path: Path, name: str) -> Database:
     return db
 
 
+def _freeze_clock(monkeypatch: pytest.MonkeyPatch, moment: datetime) -> None:
+    """Pin the production session clock to ``moment`` for one test.
+
+    The session start/complete paths stamp ``started_at``/``ended_at`` with
+    ``utc_now()`` -- the real wall clock, which takes no injectable argument.
+    These scenarios build their assertion windows from a fixed fixture date, so
+    without pinning the clock the rows land outside the window being queried and
+    every "did this happen today / in this range" read comes back empty. That is
+    what made this suite start failing once the calendar moved past the fixture
+    date, with no code change.
+
+    ``@runtime_bound`` refreshes referenced globals from the ``coach_bot``
+    facade immediately before each call, so patching the facade is what actually
+    reaches the production write path -- patching a test-local import would not.
+    ``monkeypatch`` restores it afterwards.
+    """
+    frozen = moment.astimezone(timezone.utc).isoformat()
+    monkeypatch.setattr(coach_bot, "utc_now", lambda: frozen)
+
+
 def _bind(monkeypatch: pytest.MonkeyPatch, db: Database) -> None:
     monkeypatch.setattr(coach_bot, "DB", db)
     monkeypatch.setattr(ui_bot, "DB", db)
@@ -699,6 +719,7 @@ async def test_full_lifecycle_start_regenerate_complete_history_adherence(
     _bind(monkeypatch, db)
     monkeypatch.setattr(mini_api, "DB", db)
     now = datetime(2026, 7, 20, 9, 0, tzinfo=TZ)
+    _freeze_clock(monkeypatch, now)
     plan_id = await _seed_tier1(db, now, codes=["A"], exercises_by_code={
         "A": [_ex("leg_press", "לחיצת רגליים", sets=1)]})
 

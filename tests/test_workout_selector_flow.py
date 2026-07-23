@@ -163,7 +163,19 @@ async def _seed_tier2(db: Database, now: datetime, *, codes: list[str]) -> dict[
 
 
 async def _mark_completed_today(db: Database, code: str, now: datetime) -> None:
-    iso = now.astimezone(timezone.utc).isoformat()
+    """Seed a session completed *today*, as the helper's name promises.
+
+    ``resolve_todays_workout`` computes its done-today window from
+    ``datetime.now(TZ)`` -- its caller passes no ``now`` -- so a row stamped
+    with the fixture date falls outside that window and the ✅ marker never
+    appears. Anchoring to the real current day keeps the scenario honest
+    without pinning production behaviour: ``now``'s clock time is preserved so
+    the seeded session still sits at the fixture's hour of day.
+    """
+    today = datetime.now(TZ).replace(
+        hour=now.hour, minute=now.minute, second=0, microsecond=0,
+    )
+    iso = today.astimezone(timezone.utc).isoformat()
     await db.execute(
         "INSERT INTO sessions(user_id, code, name, plan, status, exercise_index, set_number, started_at, ended_at) "
         "VALUES(1, ?, ?, '{}', 'completed', 0, 1, ?, ?)",

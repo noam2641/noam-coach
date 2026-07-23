@@ -173,7 +173,19 @@ async def _all_sessions(db: Database) -> list[Any]:
 
 
 async def _mark_completed_today(db: Database, code: str, now: datetime) -> None:
-    iso = now.astimezone(timezone.utc).isoformat()
+    """Seed a session completed *today*, as the helper's name promises.
+
+    The repeat-today gate compares against ``datetime.now(TZ)`` -- its caller
+    passes no ``now`` -- so a row stamped with the fixture date is not "today",
+    the gate never engages, and the interstitial these tests assert on never
+    appears. Anchoring to the real current day keeps the scenario honest
+    without pinning production behaviour; ``now``'s time of day is preserved so
+    the seeded session still sits at the fixture's hour.
+    """
+    today = datetime.now(TZ).replace(
+        hour=now.hour, minute=now.minute, second=0, microsecond=0,
+    )
+    iso = today.astimezone(timezone.utc).isoformat()
     await db.execute(
         "INSERT INTO sessions(user_id, code, name, plan, status, exercise_index, set_number, started_at, ended_at) "
         "VALUES(1, ?, ?, '{}', 'completed', 0, 1, ?, ?)",

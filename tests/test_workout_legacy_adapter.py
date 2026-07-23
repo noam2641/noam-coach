@@ -90,6 +90,35 @@ def _bind(monkeypatch: pytest.MonkeyPatch, db: Database) -> None:
     monkeypatch.setattr(ui_bot, "DB", db)
 
 
+def _freeze_clock(monkeypatch: pytest.MonkeyPatch, moment: datetime) -> None:
+    """Pin the production session clock to ``moment`` for one test.
+
+    Session start/complete stamp ``started_at``/``ended_at`` with ``utc_now()``
+    -- the real wall clock, which takes no injectable argument. Scenarios that
+    assert over a fixed fixture window need the written rows to land inside it;
+    otherwise the reads come back empty purely because the calendar moved on.
+
+    ``@runtime_bound`` refreshes referenced globals from the ``coach_bot``
+    facade before each call, so patching the facade is what actually reaches the
+    production write path. ``monkeypatch`` restores it afterwards.
+    """
+    frozen = moment.astimezone(timezone.utc).isoformat()
+    monkeypatch.setattr(coach_bot, "utc_now", lambda: frozen)
+
+
+def _today_at(moment: datetime) -> str:
+    """UTC ISO stamp for *today* at ``moment``'s time of day.
+
+    The repeat-today gate compares against ``datetime.now(TZ)`` (its caller
+    passes no ``now``), so a row seeded at the fixture date is not "today" and
+    the gate never engages.
+    """
+    today = datetime.now(TZ).replace(
+        hour=moment.hour, minute=moment.minute, second=0, microsecond=0,
+    )
+    return today.astimezone(timezone.utc).isoformat()
+
+
 def _ex(exercise_id: str, name: str, **over: Any) -> dict[str, Any]:
     base = {
         "id": exercise_id, "name": name, "sets": 2, "rmin": 8, "rmax": 12,
@@ -317,7 +346,7 @@ async def test_legacy_start_cannot_bypass_again_confirmation(
     _bind(monkeypatch, db)
     now = datetime(2026, 7, 20, 9, 0, tzinfo=TZ)
     plan_id = await _seed_tier1(db, now, codes=["A"])
-    iso = now.astimezone(timezone.utc).isoformat()
+    iso = _today_at(now)
     await db.execute(
         "INSERT INTO sessions(user_id, code, name, plan, status, exercise_index, set_number, started_at, ended_at) "
         "VALUES(1, 'A', 'A', '{}', 'completed', 0, 1, ?, ?)", (iso, iso),
@@ -790,6 +819,7 @@ async def test_legacy_start_then_regenerate_then_complete_reaches_history(
     _bind(monkeypatch, db)
     monkeypatch.setattr(workout_bot, "DB", db)
     now = datetime(2026, 7, 20, 9, 0, tzinfo=TZ)
+    _freeze_clock(monkeypatch, now)
     await _seed_tier1(db, now, codes=["A"], exercises_by_code={
         "A": [_ex("leg_press", "לחיצת רגליים", sets=1)]})
 
