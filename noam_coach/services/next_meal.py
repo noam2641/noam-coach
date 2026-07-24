@@ -621,6 +621,31 @@ async def build_workout_nutrition_context(
     if workout["source"] == "routine_pattern":
         assumptions.append("דפוס אימונים היסטורי אינו הוכחה שאימון מתקיים היום.")
 
+    # Meal-count carrier (ledger P1.1): keep the legacy estimate as the baseline,
+    # but let an explicit confirmed preferred_meal_count own it via the DayPlan
+    # bridge so "I eat 5-6 meals" reaches Today's Status and Today's Menu (both
+    # read meals_remaining_estimate). Users without an explicit preference keep
+    # the exact legacy value.
+    legacy_estimate = _meals_remaining(hours_until_bedtime, recent_minutes, flags)
+    try:
+        from noam_coach.services.day_plan import resolve_remaining_meals_estimate
+        from noam_coach.services.nutrition_context import _routine_profile
+
+        _profile = await _routine_profile(db, user_id)
+        _learned_hours = list(
+            ((_profile.get("eating") or {}).get("typical_meal_hours") or [])
+        )
+        meals_remaining_estimate = await resolve_remaining_meals_estimate(
+            db,
+            user_id,
+            consumed_meals=int(getattr(nutrition, "meals_logged_count", 0) or 0),
+            hours_until_sleep=hours_until_bedtime,
+            learned_meal_hours=_learned_hours,
+            legacy_estimate=legacy_estimate,
+        )
+    except Exception:  # noqa: BLE001 — never let the bridge break the context
+        meals_remaining_estimate = legacy_estimate
+
     return WorkoutNutritionContext(
         user_id=user_id,
         local_now=local_now.isoformat(),
@@ -637,7 +662,7 @@ async def build_workout_nutrition_context(
         minutes_since_workout=workout.get("minutes_since"),
         hours_until_bedtime=hours_until_bedtime,
         sleep_reference=sleep_reference,
-        meals_remaining_estimate=_meals_remaining(hours_until_bedtime, recent_minutes, flags),
+        meals_remaining_estimate=meals_remaining_estimate,
         recent_meal_minutes_ago=recent_minutes,
         recent_meal_name=recent_name,
         fasting=bool(flags.get("fasting")),

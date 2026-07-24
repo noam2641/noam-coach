@@ -679,6 +679,22 @@ async def save_routine_extraction(user_id: int, extraction: RoutineExtraction) -
         confidence=0.7,
         affects=("meal_timing", "workout_timing", "menu_planning"),
     )
+    if extraction.typical_meals_per_day:
+        # Ledger D-H / P1.1: persist the user's stated meal-count as the canonical
+        # confirmed preference so DayPlan (and every surface it feeds) honors
+        # "I eat N meals a day" instead of the legacy cap-of-3. A single stated
+        # value is stored as an equal-bounds band {min:n, max:n}; a range (e.g.
+        # 5-6) is stored as {min, max}. This is the SINGLE writer of the
+        # preferred_meal_count fact (keep it the one canonical owner).
+        from noam_coach.services.day_plan import persist_preferred_meal_count
+
+        _max = getattr(extraction, "typical_meals_per_day_max", None)
+        await persist_preferred_meal_count(
+            DB,
+            user_id,
+            minimum=int(extraction.typical_meals_per_day),
+            maximum=int(_max) if _max else None,
+        )
 
 
 ROUTINE_ESTIMATE_KEYS = (

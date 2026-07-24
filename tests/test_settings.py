@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 
 import coach_bot
@@ -91,7 +93,13 @@ def test_guard_rejects_unnormalized_absolute_path(tmp_path) -> None:
         coach_bot.assert_safe_database_path(messy)
 
 
-def test_guard_accepts_canonical_absolute_path() -> None:
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="A drive-letter path (C:\\...) is only an absolute path on Windows; "
+    "the cross-platform acceptance case is covered by "
+    "test_guard_accepts_temporary_absolute_path via tmp_path.",
+)
+def test_guard_accepts_canonical_windows_path() -> None:
     from pathlib import Path
 
     canonical = r"C:\coach_bot\noam-coach\data\noam_coach.db"
