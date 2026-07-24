@@ -218,6 +218,16 @@ class RoutineExtraction(BaseModel):
     )
     cooking_willingness: str | None = Field(default=None, description="none/basic/moderate/enjoys")
     typical_meals_per_day: int | None = Field(default=None, ge=1, le=10)
+    typical_meals_per_day_max: int | None = Field(
+        default=None,
+        ge=1,
+        le=10,
+        description=(
+            "Upper bound when the user states a RANGE of meals per day (e.g. "
+            "'5-6' -> typical_meals_per_day=5, typical_meals_per_day_max=6). "
+            "Leave null for a single value."
+        ),
+    )
     medication_appetite_note: str | None = Field(
         default=None,
         description="Appetite constraint related to medication, e.g. 'reduced appetite on Ritalin days'. Do NOT infer diagnosis or dosage.",

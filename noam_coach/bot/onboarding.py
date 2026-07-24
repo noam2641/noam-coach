@@ -2384,11 +2384,48 @@ async def render_profile_snapshot(target: Any, user_id: int) -> None:
 
 
 @runtime_bound(RUNTIME_NAMES)
+async def _weekly_today_projection_line(user_id: int) -> str | None:
+    """Live DayPlan projection for TODAY's row of the weekly plan (P1.1).
+
+    Re-projects ONLY today's meal count through the same canonical DayPlan that
+    Today's Menu/Status use, so all three agree. The stored weekly payload is
+    NOT mutated — this is a render-time overlay. Returns None on any failure so
+    the caller falls back to the stored row rather than presenting a stale count
+    as authoritative.
+    """
+    try:
+        from noam_coach.services.day_plan import build_day_plan
+
+        plan = await build_day_plan(DB, user_id, as_of=datetime.now(TZ))
+        band = plan.preferred_meal_count
+        if band.source == "explicit_preference":
+            band_text = (
+                f"{band.minimum}–{band.maximum}" if band.maximum > band.minimum
+                else str(band.maximum)
+            )
+            return (
+                f"📌 היום (מעודכן): {plan.remaining_meals} ארוחות שנותרו "
+                f"מתוך העדפה של {band_text} ביום."
+            )
+        return f"📌 היום (מעודכן): {plan.remaining_meals} ארוחות שנותרו היום."
+    except Exception:  # noqa: BLE001 — never let the overlay break the screen
+        return None
+
+
 async def render_unified_plan(target: Any, user_id: int) -> None:
     plan = await planning.get_active_plan(DB, user_id, "unified")
     if not plan:
         await safe_edit(target, "עוד אין תוכנית שבועית מאוחדת.", InlineKeyboardMarkup([[button("⬅️ לתוכניות", "menu:smartplan")]]))
         return
+
+    # Which stored day is TODAY? Match the canonical Hebrew weekday name. Only
+    # today's row gets the live DayPlan overlay; past/future rows render from the
+    # stored payload unchanged (Phase 1 — no stored-plan regeneration).
+    from noam_coach.services.weekdays import local_weekday, weekday_he
+
+    today_name = weekday_he(local_weekday(datetime.now(TZ)))
+    today_line = await _weekly_today_projection_line(user_id)
+
     lines = ["<b>התוכנית השבועית שלי</b>", ""]
     for day in plan["payload"].get("days", []):
         lines.append(f"<b>{esc(day['weekday_name'])}</b>")
@@ -2405,6 +2442,8 @@ async def render_unified_plan(target: Any, user_id: int) -> None:
             icon = "🏋️" if item.get("type") == "workout" else "🍽️"
             default_name = "אימון" if item.get("type") == "workout" else "ארוחה"
             lines.append(f"{icon} {esc(time_text + item.get('name', default_name))}")
+        if day.get("weekday_name") == today_name and today_line:
+            lines.append(today_line)
         lines.append("")
     await safe_edit(target, "\n".join(lines), InlineKeyboardMarkup([[button("⬅️ לתוכניות", "menu:smartplan")]]))
 

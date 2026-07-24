@@ -297,6 +297,47 @@ def _band_text(band: MealCountBand) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Compatibility bridge (ledger P1.1): the legacy meal-count carrier is
+# ``WorkoutNutritionContext.meals_remaining_estimate``, read by BOTH Today's
+# Status and Today's Menu. This bridge lets that single carrier become
+# DayPlan-owned when the user has an explicit confirmed preference, while
+# preserving the exact legacy value for everyone who never stated one — so the
+# legacy ``_meals_remaining`` path is wrapped, not deleted, and no behavior
+# changes for existing users until a preference exists.
+# ---------------------------------------------------------------------------
+
+async def resolve_remaining_meals_estimate(
+    db: Any,
+    user_id: int,
+    *,
+    consumed_meals: int,
+    hours_until_sleep: float | None,
+    learned_meal_hours: list[str] | None,
+    legacy_estimate: int,
+) -> int:
+    """Return the canonical remaining-meal count for the shared carrier.
+
+    * With an explicit confirmed ``preferred_meal_count``: the DayPlan-resolved
+      remaining (within the stated band, honoring consumed + late-day
+      feasibility). This is what makes "I eat 5–6" reach every surface.
+    * Otherwise: the caller's ``legacy_estimate`` verbatim (the historical
+      ``_meals_remaining`` value), so existing users are unaffected.
+    """
+    explicit = await read_preferred_meal_count_fact(db, user_id)
+    if explicit is None:
+        return legacy_estimate
+    band = resolve_preferred_band(
+        explicit_fact_value=explicit, learned_meal_hours=learned_meal_hours
+    )
+    if band.source != "explicit_preference":
+        return legacy_estimate
+    counts = resolve_meal_counts(
+        band=band, consumed_meals=consumed_meals, hours_until_sleep=hours_until_sleep
+    )
+    return counts.remaining
+
+
+# ---------------------------------------------------------------------------
 # Preference persistence (ledger D-H): store an explicit stated preference as a
 # confirmed user fact. Non-destructive; readable by the builder after restart.
 # ---------------------------------------------------------------------------

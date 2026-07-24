@@ -160,6 +160,44 @@ program consolidates decision logic onto canonical owners.
 | **P1.10** | Compute-once Cache (per-request, event-invalidated) | perf | P1.1, P1.3 | PLANNED | DayPlan built once per turn; `MealLogged` invalidates | cache unit | (in DecisionEngine) | informal `DailyContext` passing | — |
 | **P1.11** | Weight display `per_side` + regional food vocab | F10, F11 | — | PLANNED | dumbbell shows "each hand (total)"; Argaliot not→Alfajores; high-conf clarify for confusables | unit | `exercise_plans.py`, `meal_prompts.py` | — | — |
 
+### P1.1 DayPlan — implementation progress (this branch)
+
+| Piece | Commit | Status |
+|---|---|---|
+| R-2b coaching-day sleep-schema fix + 8 tests | `10ac87a` | DONE |
+| DayPlan contract + meal-count owner + 13 tests | `7e9ebc6` | DONE |
+| `build_day_plan` builder + 5 read-only-verified tests | `90d7c07` | DONE |
+| CI cross-platform fix (separate) | `8259c60` | DONE |
+| Consumer migration + onboarding writer + 9 parity tests | (pending commit) | IN PROGRESS |
+
+**Migration approach (consolidation, not rewrite):** the single legacy count
+carrier is `WorkoutNutritionContext.meals_remaining_estimate`, read by BOTH
+Today's Status and Today's Menu. A compat bridge
+`day_plan.resolve_remaining_meals_estimate` makes that carrier DayPlan-owned
+**only when an explicit confirmed `preferred_meal_count` exists** (honors "5–6"),
+and returns the exact legacy `_meals_remaining` value otherwise — so existing
+users are unchanged and the legacy path is **wrapped, not deleted**.
+
+**Consumers migrated:**
+- **Today's Status** (`workout.build_daily_status`) — via the shared carrier. ✓
+- **Today's Menu** (`morning_menu_pipeline` → `build_meal_intents`) — via the same
+  carrier. ✓
+- **Weekly Plan → today** (`onboarding.render_unified_plan`) — live DayPlan
+  overlay on today's row only; stored payload NOT mutated; controlled fallback to
+  the stored row on any projection failure. ✓
+
+**Writer:** `profile.save_routine_extraction` now persists the stated
+`typical_meals_per_day` (+ new `typical_meals_per_day_max` for ranges) as a
+confirmed `preferred_meal_count` fact — the **single writer** of that key.
+
+**Remaining legacy callers of `_meals_remaining` (kept, wrapped — retire in a
+later batch once all count consumers read the carrier/DayPlan):**
+`next_meal._meals_remaining` is still the fallback inside
+`build_workout_nutrition_context`; `planning._meal_slots` (weekly-plan STORED
+count) is unchanged in Phase 1 (only today's row is re-projected — stored-plan
+regeneration is Phase 2, ledger U-2). `meal_intent._slot_plan` still shapes slot
+*roles/timing* but its count now flows from the carrier.
+
 ---
 
 ## Part C — Local-only artifacts (workspace audit)
