@@ -98,6 +98,28 @@ def test_parse_bedtime_still_uses_accessor() -> None:
     assert cd._parse_bedtime(ONBOARD) == dtime(23, 0)
 
 
+def test_onboarding_writer_emits_canonical_shape() -> None:
+    """P1.1b step 2: onboarding sleep-window writer now emits bedtime/wake_time."""
+    from noam_coach.bot.onboarding import _parse_sleep_window_text
+
+    out = _parse_sleep_window_text("23:00-07:00")
+    assert out == {"bedtime": "23:00", "wake_time": "07:00"}
+    assert "typical_bedtime" not in out
+    # readable through the shared accessor
+    assert cd.sleep_bedtime(out) == "23:00" and cd.sleep_wake_time(out) == "07:00"
+
+
+def test_multi_fact_writer_emits_canonical_shape() -> None:
+    """P1.1b step 2: multi_fact sleep writer now emits bedtime/wake_time."""
+    from noam_coach.services.multi_fact import parse_multi_fact_update
+
+    result = parse_multi_fact_update("שינה 22:30-06:30")
+    sleep = result.recognized["sleep_schedule"]
+    assert sleep == {"bedtime": "22:30", "wake_time": "06:30"}
+    assert "typical_bedtime" not in sleep
+    assert cd.sleep_bedtime(sleep) == "22:30"
+
+
 def test_hours_left_until_sleep_reads_both_shapes() -> None:
     """proactive.hours_left_until_sleep was a legacy-only reader; after migration
     it must honor the canonical bedtime shape too."""
@@ -105,7 +127,7 @@ def test_hours_left_until_sleep_reads_both_shapes() -> None:
 
     legacy = hours_left_until_sleep({"sleep": {"typical_bedtime": "23:00"}})
     canonical = hours_left_until_sleep({"sleep": {"bedtime": "23:00"}})
-    # both shapes resolve to a real bedtime, so both give the SAME hours-left
-    # (not the 23:00 default fallback path) — they must be equal.
-    assert legacy == canonical
+    # Both shapes resolve to the same bedtime, so hours-left must match — within a
+    # small tolerance, since the function samples datetime.now() once per call.
+    assert abs(legacy - canonical) < 0.01
     assert isinstance(canonical, float)

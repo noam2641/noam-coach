@@ -98,8 +98,9 @@ def test_labels_bind_by_proximity_not_position() -> None:
 
 def test_sleep_window_and_height_together() -> None:
     result = parse_multi_fact_update("שינה 00:20-06:50 וגובה 174")
+    # P1.1b: multi_fact now writes the CANONICAL sleep_schedule shape.
     assert result.recognized["sleep_schedule"] == {
-        "typical_bedtime": "00:20", "typical_wake_time": "06:50",
+        "bedtime": "00:20", "wake_time": "06:50",
     }
     assert result.recognized["height_cm"] == 174
 

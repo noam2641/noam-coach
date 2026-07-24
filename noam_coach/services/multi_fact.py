@@ -42,6 +42,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from noam_coach.services import coaching_day
+
 # Pendings whose free text is prose, not fact corrections — never hijack.
 _EXCLUDED_PENDINGS = (
     "__manual_meal__", "__routine_confirm__", "q_daily_routine",
@@ -94,9 +96,12 @@ def parse_multi_fact_update(text: str) -> MultiFactResult:
             int(part) for part in sleep_match.groups()
         )
         if 0 <= start_hour <= 23 and 0 <= end_hour <= 23:
+            # P1.1b: write the CANONICAL sleep_schedule shape only. All readers
+            # go through coaching_day.sleep_bedtime/sleep_wake_time, which still
+            # tolerate historical legacy-shaped facts.
             result.recognized["sleep_schedule"] = {
-                "typical_bedtime": f"{start_hour:02d}:{start_minute:02d}",
-                "typical_wake_time": f"{end_hour:02d}:{end_minute:02d}",
+                "bedtime": f"{start_hour:02d}:{start_minute:02d}",
+                "wake_time": f"{end_hour:02d}:{end_minute:02d}",
             }
         working = working.replace(sleep_match.group(0), " ")
 
@@ -177,7 +182,8 @@ async def apply_multi_fact_update(
                 confirmed=True,
             )
             saved.append(
-                f"שינה {value['typical_bedtime']}–{value['typical_wake_time']}"
+                f"שינה {coaching_day.sleep_bedtime(value)}–"
+                f"{coaching_day.sleep_wake_time(value)}"
             )
             continue
         if fact_key == "allergies":

@@ -2706,9 +2706,12 @@ def _parse_sleep_window_text(text: str) -> dict[str, str] | None:
     start_hour, start_minute, end_hour, end_minute = (int(part) for part in match.groups())
     if not (0 <= start_hour <= 23 and 0 <= end_hour <= 23 and 0 <= start_minute <= 59 and 0 <= end_minute <= 59):
         return None
+    # P1.1b: write the CANONICAL sleep_schedule shape only (bedtime/wake_time).
+    # Readers go through coaching_day.sleep_bedtime/sleep_wake_time, which still
+    # tolerate historical legacy-shaped facts — so no data migration is needed.
     return {
-        "typical_bedtime": f"{start_hour:02d}:{start_minute:02d}",
-        "typical_wake_time": f"{end_hour:02d}:{end_minute:02d}",
+        "bedtime": f"{start_hour:02d}:{start_minute:02d}",
+        "wake_time": f"{end_hour:02d}:{end_minute:02d}",
     }
 
 
