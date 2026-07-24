@@ -50,32 +50,68 @@ class CoachingDay:
     anchor_hour: int  # local hour (0-23) at which the day actually rolls over
 
 
-# A ``sleep_schedule`` fact is written in two shapes by two writers:
+# A ``sleep_schedule`` fact (or a profile ``sleep`` block) is written in two
+# shapes by two writers:
 #   - Health import (health_service.py) writes ``bedtime`` / ``wake_time``.
-#   - Onboarding text-edit (onboarding._parse_sleep_window_text) writes
-#     ``typical_bedtime`` / ``typical_wake_time``.
-# The resolver reads bedtime from EITHER (R-2b). Precedence: the canonical
-# ``bedtime`` key wins when both are present (a fact mid-normalization), so the
-# newer/normalized shape is authoritative.
+#   - Onboarding text-edit (onboarding._parse_sleep_window_text) and multi_fact
+#     write ``typical_bedtime`` / ``typical_wake_time``.
+# Every reader must go through the shared accessors below rather than reimplement
+# ``bedtime or typical_bedtime`` — with DETERMINISTIC canonical precedence: the
+# canonical ``bedtime`` / ``wake_time`` keys win when both shapes are present, so
+# the normalized shape is authoritative during the reader-first migration.
 _BEDTIME_KEYS = ("bedtime", "typical_bedtime")
+_WAKE_KEYS = ("wake_time", "typical_wake_time")
 
 
-def _parse_bedtime(value: Any) -> dtime | None:
-    """Parse a ``sleep_schedule`` fact's bedtime string ("HH:MM") into a time.
+def _first_present_key(value: dict, keys: tuple[str, ...]) -> str | None:
+    """Return the first non-empty string value among ``keys``, in order."""
+    for key in keys:
+        candidate = value.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
 
-    Accepts both the canonical ``bedtime`` key and the legacy ``typical_bedtime``
-    key (R-2b) so onboarding-written and Health-imported sleep schedules produce
-    identical coaching-day semantics. ``bedtime`` takes precedence if both exist.
+
+def sleep_bedtime(value: Any) -> str | None:
+    """Canonical bedtime string ("HH:MM") from either sleep shape, or None.
+
+    THE shared accessor — do not reimplement ``bedtime or typical_bedtime`` in
+    callers. Canonical ``bedtime`` takes precedence over legacy ``typical_bedtime``.
     """
     if not isinstance(value, dict):
         return None
-    raw: Any = None
-    for key in _BEDTIME_KEYS:
-        candidate = value.get(key)
-        if isinstance(candidate, str) and ":" in candidate:
-            raw = candidate
-            break
-    if not isinstance(raw, str):
+    return _first_present_key(value, _BEDTIME_KEYS)
+
+
+def sleep_wake_time(value: Any) -> str | None:
+    """Canonical wake-time string ("HH:MM") from either sleep shape, or None.
+    Canonical ``wake_time`` takes precedence over legacy ``typical_wake_time``."""
+    if not isinstance(value, dict):
+        return None
+    return _first_present_key(value, _WAKE_KEYS)
+
+
+def normalize_sleep_schedule(value: Any) -> dict[str, str]:
+    """Return a canonical ``{"bedtime", "wake_time"}`` dict from either shape.
+
+    Only present fields are included. Historical legacy-shaped facts stay
+    readable through this accessor — no data migration is performed.
+    """
+    result: dict[str, str] = {}
+    bedtime = sleep_bedtime(value)
+    if bedtime is not None:
+        result["bedtime"] = bedtime
+    wake = sleep_wake_time(value)
+    if wake is not None:
+        result["wake_time"] = wake
+    return result
+
+
+def _parse_bedtime(value: Any) -> dtime | None:
+    """Parse a sleep value's bedtime into a ``time`` via the shared accessor
+    (R-2b): both shapes, canonical precedence."""
+    raw = sleep_bedtime(value)
+    if raw is None or ":" not in raw:
         return None
     try:
         hour_str, minute_str = raw.split(":")[:2]

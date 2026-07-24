@@ -498,15 +498,17 @@ async def _bedtime_hours(db: Any, user_id: int, now: datetime) -> tuple[float | 
     sleep_fact = sleep_row.get("value") if sleep_row else None
     bedtime = None
     source = "unknown"
+    from noam_coach.services import coaching_day
+
     if isinstance(sleep_fact, dict):
-        bedtime = sleep_fact.get("bedtime") or sleep_fact.get("typical_bedtime")
+        bedtime = coaching_day.sleep_bedtime(sleep_fact)
         source = "confirmed_fact" if sleep_row and sleep_row.get("confirmed") else "unconfirmed_fact"
     if not bedtime:
         row = await db.fetch_one("SELECT profile FROM routine_profile WHERE user_id=?", (user_id,))
         if row:
             try:
                 profile = json.loads(row["profile"] or "{}")
-                bedtime = (profile.get("sleep") or {}).get("typical_bedtime")
+                bedtime = coaching_day.sleep_bedtime(profile.get("sleep") or {})
                 source = "routine_profile" if bedtime else source
             except (TypeError, json.JSONDecodeError):
                 bedtime = None

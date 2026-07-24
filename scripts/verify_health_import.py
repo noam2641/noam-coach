@@ -143,8 +143,11 @@ async def run(zip_path: Path, window_days: int) -> None:
             value = await user_model.get_value(db, USER_ID, key)
             print(f"[latest] {key}={value}")
         sleep = profile.get("sleep") or {}
+        from noam_coach.services import coaching_day
+
         print(
-            f"[sleep] {sleep.get('typical_bedtime')}-{sleep.get('typical_wake_time')} "
+            f"[sleep] {coaching_day.sleep_bedtime(sleep)}-"
+            f"{coaching_day.sleep_wake_time(sleep)} "
             f"nights={sleep.get('nights_sampled')}"
         )
 

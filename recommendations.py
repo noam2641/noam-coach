@@ -155,10 +155,12 @@ def _profile_block(profile: dict[str, Any]) -> str:
     sleep = profile.get("sleep", {})
     workout = profile.get("workout", {})
     eating = profile.get("eating", {})
+    from noam_coach.services import coaching_day
+
     return (
         "שגרה שנלמדה (ממוצעים נעים, חריגים הוסרו):\n"
-        f"- שינה: הולך לישון ~{sleep.get('typical_bedtime')}, "
-        f"מתעורר ~{sleep.get('typical_wake_time')}, "
+        f"- שינה: הולך לישון ~{coaching_day.sleep_bedtime(sleep)}, "
+        f"מתעורר ~{coaching_day.sleep_wake_time(sleep)}, "
         f"משך ~{sleep.get('avg_duration_minutes')} דק'.\n"
         f"- אימונים: ~{workout.get('weekly_frequency')} בשבוע, "
         f"בדרך כלל בשעה ~{workout.get('typical_hour')}, "
