@@ -338,3 +338,205 @@ async def read_preferred_meal_count_fact(db: Any, user_id: int) -> Any:
     if not fact or not fact.get("confirmed"):
         return None
     return fact.get("value")
+
+
+# ---------------------------------------------------------------------------
+# The builder — composes ONE DayPlan from the already-canonical sources.
+# Reads remaining/consumed from nutrition_context (ledger D-F: those are already
+# consolidated), the coaching day from coaching_day (R-2b-safe), and workout
+# timing read-only from the workout-nutrition context. It OWNS only the
+# meal-count decision + slot/timeline assembly.
+# ---------------------------------------------------------------------------
+
+def _hhmm(value: Any) -> str | None:
+    """Best-effort HH:MM from an ISO timestamp or an already-HH:MM string."""
+    if not value or not isinstance(value, str):
+        return None
+    if "T" in value:
+        try:
+            from datetime import datetime as _dt
+
+            return _dt.fromisoformat(value).strftime("%H:%M")
+        except ValueError:
+            return None
+    return value[:5] if len(value) >= 5 and ":" in value else None
+
+
+def _workout_window_from_context(workout_context: Any) -> WorkoutWindow:
+    if workout_context is None:
+        return WorkoutWindow.empty()
+    phase = getattr(getattr(workout_context, "workout_phase", None), "value", None)
+    planned = getattr(workout_context, "planned_workout_start", None)
+    if planned is None and phase in (None, "rest_day"):
+        return WorkoutWindow.empty()
+    return WorkoutWindow(
+        planned_start=planned,
+        minutes_until=getattr(workout_context, "minutes_until_workout", None),
+        minutes_since=getattr(workout_context, "minutes_since_workout", None),
+        status=phase or "none",
+        completed=bool(
+            getattr(workout_context, "minutes_since_workout", None) is not None
+        ),
+    )
+
+
+def _sleep_wake_from_profile(profile: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Read wake/bedtime for display, tolerating both fact shapes (R-2b)."""
+    sleep = (profile or {}).get("sleep") or {}
+    bedtime = sleep.get("bedtime") or sleep.get("typical_bedtime")
+    wake = sleep.get("wake_time") or sleep.get("typical_wake_time")
+    return _hhmm(wake), _hhmm(bedtime)
+
+
+async def build_day_plan(
+    db: Any,
+    user_id: int,
+    *,
+    as_of: "Any" = None,
+    nutrition_context: Any | None = None,
+    workout_context: Any | None = None,
+) -> DayPlan:
+    """Resolve the canonical DayPlan for ``user_id`` at ``as_of``.
+
+    ``as_of`` (a tz-aware datetime) pins the effective instant for deterministic
+    tests and the Weekly-Plan today-projection. Callers that already built a
+    ``NutritionContext`` / ``WorkoutNutritionContext`` for this request may pass
+    them to avoid duplicate DB reads; otherwise the builder resolves them.
+    """
+    from noam_coach.services.coaching_day import resolve_coaching_day
+
+    if nutrition_context is None:
+        from noam_coach.services.nutrition_context import build_nutrition_context
+
+        nutrition_context = await build_nutrition_context(
+            db, user_id, "day_plan", now=as_of, local_now=as_of
+        )
+    if workout_context is None:
+        from noam_coach.services.next_meal import build_workout_nutrition_context
+
+        workout_context = await build_workout_nutrition_context(db, user_id, now=as_of)
+
+    coaching = await resolve_coaching_day(db, user_id, local_now=as_of)
+
+    # meal-count: explicit-confirmed preference > learned pattern > default
+    explicit = await read_preferred_meal_count_fact(db, user_id)
+    learned_hours = list(getattr(nutrition_context, "usual_meal_times", []) or [])
+    band = resolve_preferred_band(
+        explicit_fact_value=explicit, learned_meal_hours=learned_hours
+    )
+    # consumed count = today's reported meals already resolved on the context
+    # (canonical: nutrition_context._reported_meals) — no extra DB read.
+    consumed = len(getattr(nutrition_context, "reported_meals", []) or [])
+    hours_until_sleep = getattr(nutrition_context, "hours_until_sleep", None)
+    counts = resolve_meal_counts(
+        band=band, consumed_meals=consumed, hours_until_sleep=hours_until_sleep
+    )
+
+    from noam_coach.services.nutrition_context import _routine_profile
+
+    profile = await _routine_profile(db, user_id)
+    wake_time, sleep_time = _sleep_wake_from_profile(profile)
+
+    workout_window = _workout_window_from_context(workout_context)
+
+    # slots + timeline from the remaining count, anchored on learned hours.
+    slots = _build_slots(counts, nutrition_context, learned_hours)
+    timeline = _build_timeline(slots, workout_window, sleep_time)
+
+    assumptions = list(counts.assumptions)
+    missing: list[str] = []
+    if band.source == "default":
+        missing.append("preferred_meal_count")
+    if coaching.rollover_reason == "calendar_midnight":
+        missing.append("sleep_schedule")
+
+    return DayPlan(
+        user_id=user_id,
+        coaching_date=coaching.day_key,
+        as_of=(as_of.isoformat() if as_of is not None else coaching.day_key),
+        timezone=getattr(nutrition_context, "timezone", coaching.day_key),
+        wake_time=wake_time,
+        sleep_time=sleep_time,
+        workout_window=workout_window,
+        preferred_meal_count=band,
+        selected_planned_meals=counts.selected_planned,
+        consumed_meals=counts.consumed,
+        remaining_meals=counts.remaining,
+        remaining_calories=getattr(nutrition_context, "remaining_calories", None),
+        remaining_protein=getattr(nutrition_context, "remaining_protein", None),
+        remaining_time_until_sleep=hours_until_sleep,
+        meal_slots=slots,
+        daily_timeline=timeline,
+        assumptions=assumptions,
+        missing_information=missing,
+        requires_confirmation=band.source == "default",
+        confidence=_confidence_for(band, coaching.rollover_reason),
+    )
+
+
+def _confidence_for(band: MealCountBand, rollover_reason: str) -> float:
+    c = 1.0
+    if band.source == "learned_pattern":
+        c -= 0.15
+    elif band.source == "default":
+        c -= 0.35
+    if rollover_reason == "calendar_midnight":
+        c -= 0.1
+    return round(max(0.0, c), 2)
+
+
+def _build_slots(
+    counts: MealCountResolution,
+    nutrition_context: Any,
+    learned_hours: list[str],
+) -> list[MealSlot]:
+    """Build ``remaining`` slots, distributing remaining budget evenly and
+    anchoring times on learned meal hours when available."""
+    n = counts.remaining
+    if n <= 0:
+        return []
+    rem_cal = getattr(nutrition_context, "remaining_calories", None)
+    rem_prot = getattr(nutrition_context, "remaining_protein", None)
+    per_cal = int(rem_cal / n) if isinstance(rem_cal, (int, float)) and rem_cal > 0 else None
+    per_prot = int(rem_prot / n) if isinstance(rem_prot, (int, float)) and rem_prot > 0 else None
+
+    # anchor the LAST n learned hours (the remaining part of the day)
+    hint_hours = [_hhmm(h) for h in learned_hours][-n:] if learned_hours else []
+    slots: list[MealSlot] = []
+    for i in range(n):
+        slots.append(
+            MealSlot(
+                index=i,
+                time_hint=hint_hours[i] if i < len(hint_hours) else None,
+                role=None,
+                target_calories=per_cal,
+                target_protein=per_prot,
+            )
+        )
+    return slots
+
+
+def _build_timeline(
+    slots: list[MealSlot],
+    workout_window: WorkoutWindow,
+    sleep_time: str | None,
+) -> list[TimelineEvent]:
+    """Chronological rest-of-day events: meals, the upcoming workout, sleep."""
+    events: list[TimelineEvent] = []
+    for slot in slots:
+        events.append(TimelineEvent(time_hint=slot.time_hint, kind="meal", label="ארוחה"))
+    if workout_window.planned_start and not workout_window.completed:
+        events.append(
+            TimelineEvent(
+                time_hint=_hhmm(workout_window.planned_start),
+                kind="workout",
+                label="אימון",
+            )
+        )
+    if sleep_time:
+        events.append(TimelineEvent(time_hint=sleep_time, kind="sleep", label="שינה"))
+
+    def _key(ev: TimelineEvent) -> str:
+        return ev.time_hint or "99:99"
+
+    return sorted(events, key=_key)
