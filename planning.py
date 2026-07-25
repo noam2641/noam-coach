@@ -268,21 +268,10 @@ async def activate_goal(db: Any, user_id: int, goal_id: int) -> bool:
             "UPDATE goal_versions SET status='active', decided_at=? WHERE id=? AND user_id=?",
             (now, goal_id, user_id),
         )
-        cursor = await conn.execute(
-            "SELECT calories, protein, steps, phase FROM goal_versions WHERE id=?",
-            (goal_id,),
-        )
-        row = await cursor.fetchone()
-        await conn.execute(
-            """
-            INSERT INTO goals(user_id, calories, protein, steps, phase, updated_at)
-            VALUES(?, ?, ?, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                calories=excluded.calories, protein=excluded.protein,
-                steps=excluded.steps, phase=excluded.phase, updated_at=excluded.updated_at
-            """,
-            (user_id, row["calories"], row["protein"], row["steps"], row["phase"], now),
-        )
+        # LOG-016: the legacy `goals` table is frozen by derivation — it is no
+        # longer mirrored on activation. `goal_versions` is the sole authoritative
+        # read path. The prior target read (calories/protein/steps/phase) existed
+        # only to feed that mirror and is removed with it.
     return True
 
 

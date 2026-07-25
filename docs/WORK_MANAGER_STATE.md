@@ -103,7 +103,38 @@ Remaining steps (all outside this task's completed scope):
 - Delete the empty `noam-coach.wt-lease-fix` directory once its OS lock clears.
 - Product backlog stays gated: LOG-014 → LOG-015/Task 66 → LOG-016 → LOG-012 remain **PROPOSED and unstarted**.
 
-## Log-audit intake (PROPOSED — not approved, not started)
+## Authorized product queue + owner decisions (standing autonomy)
+
+Under the standing Work Manager autonomy directive (2026-07-25), the queue
+`LOG-014 → LOG-015/Task 66 → LOG-016 → LOG-012` is **AUTHORIZED for autonomous
+execution** (planning → implementation → review/correction loops → CI → merge →
+cleanup). Owner Hebrew interview resolved these durable Category-C product
+decisions (apply in each task's implementation + acceptance tests):
+
+- **LOG-014 — ambiguous identity correction:** when a free-text correction names a
+  food absent from the current items (or targets an unclear/low-confidence item),
+  **route automatically to AI reanalysis with identity enforcement** — do NOT ask a
+  clarification question, and do NOT apply a deterministic scale/quantity change.
+  Scale/quantity must also be **idempotent** (dedup against `locked_corrections`).
+- **LOG-015 / Task 66 — interrupted mandatory safety question:** **block-and-auto-
+  restore.** (1) Enforce the safety gate (`pending_safety_questions` /
+  `check_plan_readiness`) on **every** plan-build/activation path, not only the
+  assistant path; AND (2) **automatically restore** the suspended
+  `training_limitations` question immediately when the health-import microflow +
+  confirm wizard completes (deterministic parent-resume by flow identity).
+- **LOG-012 — medication name in `audit`:** **code to a category** (`kind_code`),
+  do NOT store the raw medication free-text (and do not keep it even redacted);
+  free-text `explanation`/`correction_text`/daily-flag `text` dropped in favor of
+  bounded structured fields; `write_audit` also routed through `redact` as a backstop.
+- **LOG-016 — legacy `goals`:** freeze (drop the two writers + repoint the DSAR
+  export to `goal_versions`); **no schema drop, no remove-on-write** (brief-settled).
+
+Engineering (Category-B) decisions resolved autonomously and recorded per task
+spec at implementation time (e.g. reuse of existing confidence thresholds, the
+resume-unwind mechanism, the audit allowlist shape, LOG-012-before-LOG-016
+serialization on `core.py`/`export_user_data.py`).
+
+## Log-audit intake (PROPOSED — superseded by the authorized queue above for LOG-014/015/016/012)
 
 Recorded 2026-07-25 by the read-only log-audit + 4-agent intake turn. All items
 revalidated at HEAD `ad1da97` against live code + read-only DB. **State = PROPOSED.**

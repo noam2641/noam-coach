@@ -329,8 +329,13 @@ async def resume_suspended(db: Any, user_id: int) -> ActiveFlow | None:
     if not suspended:
         return None
     name = _safe_flow(str(suspended.get("name") or suspended.get("flow") or "idle"))
+    # Restore the suspended flow's payload verbatim — including any deeper
+    # ``suspended`` snapshot nested inside it. Previously this popped the inner
+    # snapshot, which silently discarded the original parent whenever a
+    # microflow suspended a second flow (parent -> health_import -> wizard
+    # question). Keeping it lets ``resume_all_suspended`` unwind the full chain
+    # back to the safety-critical parent question.
     payload = dict(suspended.get("payload") or {})
-    payload.pop("suspended", None)
     await set_active_flow(
         db,
         user_id,
@@ -340,6 +345,38 @@ async def resume_suspended(db: Any, user_id: int) -> ActiveFlow | None:
         flow_id=str(suspended.get("flow_id") or _new_flow_id(user_id)),
     )
     return await get_active_flow(db, user_id)
+
+
+async def resume_all_suspended(db: Any, user_id: int) -> ActiveFlow | None:
+    """Fully unwind a nested suspension chain back to the original parent.
+
+    ``resume_suspended`` pops exactly one level and, by design, drops any
+    ``suspended`` snapshot nested inside the level it restores.  When a short
+    microflow itself suspends a second flow (for example the health-import
+    microflow whose confirm wizard sets its own pending question, nesting
+    parent -> health_import -> wizard onboarding_question two levels deep), a
+    single pop would restore an intermediate flow and silently discard the
+    original parent question underneath it.
+
+    This helper walks the whole chain: it keeps resuming while the newly
+    restored flow still carries a suspended snapshot, so the *deepest* (oldest)
+    parent — the safety-critical onboarding question that was interrupted — is
+    the flow left active.  Returns the final restored flow, or ``None`` if
+    nothing was suspended.
+    """
+    resumed = await resume_suspended(db, user_id)
+    if resumed is None:
+        return None
+    # Peel remaining levels. ``resume_suspended`` re-reads state each call, so
+    # a bounded guard is enough to avoid any pathological loop on corrupt data.
+    for _ in range(16):
+        if resumed.suspended is None:
+            break
+        deeper = await resume_suspended(db, user_id)
+        if deeper is None:
+            break
+        resumed = deeper
+    return resumed
 
 
 async def clear_all_flows(db: Any, user_id: int) -> int:

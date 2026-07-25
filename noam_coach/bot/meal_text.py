@@ -244,6 +244,61 @@ async def _emit_meal_lifecycle_evidence(
         LOGGER.debug("meal lifecycle evidence failed", exc_info=True)
 
 
+def _scale_hint_is_foreign_or_unclear(
+    item_hint: str,
+    analysis: "MealAnalysis",
+) -> bool:
+    """LOG-014 dispatch guard: True when a scale correction's item hint does
+    not clearly target a CURRENT meal item and must therefore be routed to AI
+    reanalysis (identity enforcement) instead of a deterministic scale.
+
+    Two owner-decision cases collapse to True:
+      * FOREIGN token — the hint introduces a food word absent from every
+        current item name (the item-IDENTITY correction misrouted as a scale,
+        e.g. "חצי מהסלמון" on a chicken meal).
+      * UNCLEAR / low-confidence target — the hint's best match is too weak to
+        act on deterministically, matching apply_scale_correction's own
+        similarity floor.
+
+    Uses meal_intelligence's existing _tokens / _similarity helpers so the guard
+    and the applier agree on what "matches". A hint with no comparable tokens is
+    treated as unclear (safer to reanalyze than to scale the whole meal).
+    """
+    hint_tokens = meal_intelligence._tokens(item_hint)
+    if not hint_tokens:
+        return True
+
+    items = list(getattr(analysis, "items", []) or [])
+    if not items:
+        return True
+
+    # Union of every token across current item names.
+    item_tokens: set[str] = set()
+    for item in items:
+        item_tokens |= meal_intelligence._tokens(getattr(item, "name", "") or "")
+
+    # FOREIGN: no hint token appears in ANY current item name.
+    if not (hint_tokens & item_tokens):
+        return True
+
+    # UNCLEAR: best similarity below the applier's action floor and no direct
+    # token containment — mirror apply_scale_correction's own guard (0.15).
+    best_sim = max(
+        (meal_intelligence._similarity(item_hint, getattr(item, "name", "") or "")
+         for item in items),
+        default=0.0,
+    )
+    name_contains_hint = any(
+        t in meal_intelligence._tokens(getattr(item, "name", "") or "")
+        for item in items
+        for t in hint_tokens
+    )
+    if best_sim < 0.15 and not name_contains_hint:
+        return True
+
+    return False
+
+
 def _apply_quantity_clarification_stage(
     row: Any,
     analysis: "MealAnalysis",
@@ -374,6 +429,14 @@ async def _handle_meal_correction_text(
         used_deterministic = False
         corrected_analysis = original_analysis
 
+        # LOG-014: previously-locked corrections must be readable BEFORE the
+        # deterministic scale block so scale application can be made idempotent
+        # (a repeated identical scale must not compound grams/kcal) — mirror how
+        # identity corrections dedup. Previously this was read only inside the
+        # ``if not used_deterministic`` branch below.
+        prior_locked: list[str] = list(row["data"].get("locked_corrections") or [])
+        _locked_normalized = {t.strip().casefold() for t in prior_locked if t.strip()}
+
         if removal_corrections:
             # Apply item-removal deterministically (e.g. "בלי שמן")
             for rc in removal_corrections:
@@ -410,11 +473,42 @@ async def _handle_meal_correction_text(
             used_deterministic = True
 
         if scale_corrections:
+            # LOG-014 (P1 nutrition correctness): a free-text scale correction
+            # must not misroute an item-IDENTITY correction to a quantity/scale
+            # op, and a repeated identical scale must not compound.
+            #
+            # Owner decision: when a scale correction names a food ABSENT from
+            # the current meal items (a foreign token) or targets an unclear /
+            # low-confidence item, DROP it from the deterministic scale bucket so
+            # ``used_deterministic`` stays False and control falls through to the
+            # AI reanalysis / identity-enforcement path below — no clarification
+            # prompt, no deterministic scale. Idempotency: skip a scale whose
+            # normalized original_text was already locked on this meal.
+            applied_scale = False
+            skipped_idempotent = False
             for sc in scale_corrections:
+                if sc.original_text.strip().casefold() in _locked_normalized:
+                    # Already applied to this meal — skip as an idempotent
+                    # NO-OP (do not re-halve). Covers the bare whole-meal 'חצי'
+                    # repeat as well as item scales. This is still a
+                    # deterministic outcome, so it must NOT fall through to a
+                    # fresh AI reanalysis.
+                    skipped_idempotent = True
+                    continue
+                if sc.item_hint and _scale_hint_is_foreign_or_unclear(
+                    sc.item_hint, original_analysis
+                ):
+                    # Foreign / unclear target → let it fall through to
+                    # reanalysis with identity enforcement (used_deterministic
+                    # stays False). Owner decision: no clarification prompt, no
+                    # deterministic scale.
+                    continue
                 corrected_analysis = meal_intelligence.apply_scale_correction(
                     corrected_analysis, sc,
                 )
-            used_deterministic = True
+                applied_scale = True
+            if applied_scale or skipped_idempotent:
+                used_deterministic = True
 
         replace_corrections = [c for c in corrections if c.kind == "replace"]
 
@@ -427,10 +521,12 @@ async def _handle_meal_correction_text(
 
         if not used_deterministic:
             # Fall back to AI reanalysis only when deterministic parser
-            # did not recognize the correction.
+            # did not recognize the correction (or, per LOG-014, when a scale
+            # correction was dropped for naming a foreign / unclear item).
             # Pass all previously locked corrections so the AI respects them
             # even when re-analysing from scratch (REC-PLAN-MEAL-03-12).
-            prior_locked: list[str] = list(row["data"].get("locked_corrections") or [])
+            # ``prior_locked`` is read once above so the scale block can consult
+            # it for idempotency.
             if image_path:
                 await safe_message_edit(progress, "מנתח מחדש את התמונה לפי מה שכתבת…")
                 nutrition_payload: dict[str, Any] | None = None
@@ -492,12 +588,15 @@ async def _handle_meal_correction_text(
             "UPDATE approvals SET payload=? WHERE id=? AND user_id=? AND status='pending'",
             (json.dumps(row["data"], ensure_ascii=False), approval_id, user_id),
         )
+        # LOG-012: record only the bounded revision counter — the raw
+        # `correction_text` free-text is never stored in the audit trail (it
+        # also lives in the redacted emit boundary below).
         await write_audit(
             user_id,
             "meal_text_correction",
             "approval",
             approval_id,
-            correction_text=correction_text,
+            revision=revision,
         )
         # Batch 7: this event moved to the canonical emit boundary. The NAME
         # and every non-sensitive property are unchanged, so existing readers
