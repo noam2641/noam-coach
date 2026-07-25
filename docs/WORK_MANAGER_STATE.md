@@ -5,10 +5,10 @@ phase changes and before every pause.
 
 | Field | Value |
 |---|---|
-| Last updated | 2026-07-25 (PR #6 + #7 merged; develop `fc628d9`; filesystem-cleanup task recorded) |
-| Last verified `origin/develop` | `fc628d90b89e5f60181fbf5671880a19c3d6119a` (merge of PR #6 — repository consolidation audit + Work Manager governance) |
+| Last updated | 2026-07-25 (LOG batch #9–#13 merged; inventory PR #14 finalizing; develop `25101d0`) |
+| Last verified `origin/develop` | `25101d0` (merge of PR #10 — LOG-015; final pre-inventory head) |
 | GitHub default branch | `develop` (verified — the old `codex/*` default is corrected) |
-| Active phase | PHASE 5 — **Repository-cleanup track COMPLETE.** PR #7 (`3ec5296`) and PR #6 (`fc628d9`) merged; Batch C done (origin/HEAD→develop; 3 merged 0-unique branches pruned). Canonical `develop` @ `fc628d9`, clean, synced. **Active operational task: physical filesystem cleanup of `C:\coach_bot` (FS-CLEANUP-1)** — inventory-and-prove-then-remove; see the dedicated section below. No product implementation started; LOG-014/015/016/012 remain PROPOSED. |
+| Active phase | PHASE 6 — **LOG batch COMPLETE & MERGED.** All 4 LOG tasks + governance merged to develop: PR #13 governance (`6d2e841`), #11 LOG-012 (`c317a4b`), #12 LOG-016 (`c517dbe`), #9 LOG-014 (`b38d467`), #10 LOG-015 (`25101d0`). Inventory PR #14 is the final merge (this commit). Beyond the LOG batch there are **no remaining approved tasks** (rest is merged/blocked/exploratory/superseded). Then: verified worktree cleanup. |
 | Baseline @ approval | head `1dbd6c6`; push CI `30154848488` success; PR CI `30154850042` success; PR #6 open, `+591/−0` |
 | Batch A result | **PII in all six docs** (real user id + meal-image refs) → external backup only at `…\cleanup_20260725\local_docs_PII\`; **NOT added to Git** (A2 skipped). No tracked change. |
 | Batch A CI | `b6db987`: push run `30155534787` success; pull_request run `30155536081` **success on re-run attempt 2** (attempt 1 flaked on `test_daily_menu_refresh::test_lease_loss_during_generation_fences_persistence`). Flake-record commit `52d6a10` CI: push `30156817298` success + pull_request `30156817976` success. **The deferred CI-hardening is now DONE** — PR #7 / commit `4697298` (event-driven deterministic synchronization; 150/150 local stress), merged to develop as `3ec5296`. |
@@ -192,8 +192,22 @@ CANONICAL_IMPLEMENTATION_LEDGER A.2; Task 61's "PARTIAL/U-3" label is stale, it
 is merged at `a4eec07`); FIX 38–57 (B-series, 20 modules/tests); ARCH 1–13 except
 ARCH-07B; Observability O1–O10 + Review R1–R6; DayPlan P1.1/P1.1b (PR #4/#5).
 
-**Current LOG batch (this session) — implemented, independently verified, pushed,
-NOT yet merged (status: verified-not-merged):**
+**Current LOG batch (this session) — implemented, independently verified, and
+MERGED to develop (status: verified-complete-merged). PRs #9–#13 all merged with
+both CI contexts green (LOG-015's earlier push-context stray-db flake did NOT
+recur on the PR run):**
+
+| Task | PR | Merge commit | Branch CI |
+|---|---|---|---|
+| Governance (autonomy + owner decisions) | #13 | `6d2e841` | both green |
+| LOG-012 (audit allowlist/redaction; medication→kind_code) | #11 | `c317a4b` | both green |
+| LOG-016 (freeze legacy goals; DSAR→goal_versions) | #12 | `c517dbe` | both green |
+| LOG-014 (meal-correction routing/idempotency) | #9 | `b38d467` | both green |
+| LOG-015 / Task 66 (safety-question resume + universal gate) | #10 | `25101d0` | both green (flake cleared on rerun) |
+
+Inventory: PR #14 (this doc) — final merge. develop after the 5 merges: `25101d0`.
+
+**Original per-branch verification record (pre-merge):**
 | Task | Branch | Commit | Local verify | Branch CI |
 |---|---|---|---|---|
 | LOG-014 (P1 meal-correction routing/idempotency) | `fix/log-014-meal-correction-routing` | `100cf71` | 177+~470+447 green | push **success** |
@@ -227,15 +241,19 @@ code" — a doc line ≠ approved task); addendum "batches A–I" (audit recomme
 only); the deleted root PII audit `.md` plans (FS-CLEANUP-1).
 
 ### Corrected progress (explicit denominators)
-- **Current LOG batch:** 4/4 implemented + independently verified; **0/4 merged**
-  (all await operator PR-open, then WM merge). Governance branch also awaits PR.
-- **Complete approved work plan:** the entire *approved* scope = the already-merged
-  historical tasks + this LOG batch. Verified-and-merged historical set is
-  complete; the only unmerged approved work is these 4 LOG tasks (+ governance).
-  **Remaining approved-and-unstarted beyond this batch: 0.**
+- **Current LOG batch:** 4/4 implemented + independently verified + **MERGED**
+  (PRs #9/#10/#11/#12 + governance #13). Inventory PR #14 finalizing.
+- **Complete approved work plan:** the entire *approved* scope = already-merged
+  historical tasks + this LOG batch — now **all merged**. **Remaining
+  approved-and-unstarted beyond this batch: 0.**
 - **Blocked by owner decision / external access:** the BLOCKED list above (AI
   Gateway, Phase-2, sleep migration, multi-user, live Apple Health, P2.x
   scheduling, external-credential items) — not counted as "remaining approved".
+- **Worktree cleanup:** performed after the inventory merge — the 6 merged task
+  worktrees (`wt-log012/014/015/016`, `wt-config`, `wt-inventory`) are removed via
+  `git worktree remove` + `prune` once each is proven to hold no unique/uncommitted
+  work; `wt-lease-fix` (empty, OS-locked) retained. Final accounting in the
+  session report.
 
 ## Links
 - Canonical implementation ledger: `docs/CANONICAL_IMPLEMENTATION_LEDGER.md`
