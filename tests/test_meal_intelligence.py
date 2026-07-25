@@ -205,6 +205,35 @@ def test_whole_meal_double_and_x3_are_parsed_and_scaled() -> None:
     assert corrected.items[0].calories == 468
 
 
+def test_scale_correction_naming_absent_food_is_dropped_from_deterministic_scale() -> None:
+    """LOG-014: a scale correction that names a food ABSENT from the current
+    meal items must NOT be applied as a deterministic scale — the dispatch guard
+    flags its item hint as foreign so control falls through to AI reanalysis
+    (identity enforcement). A present-item scale is left untouched.
+
+    The parser is item-agnostic, so the routing decision is the dispatch-level
+    guard ``_scale_hint_is_foreign_or_unclear``; this pins that a foreign-food
+    scale hint is dropped while a legitimate present-item scale is kept.
+    """
+    from noam_coach.bot.meal_text import _scale_hint_is_foreign_or_unclear
+
+    analysis = _analysis_with_rice_chicken_oil()  # rice + chicken + olive oil
+
+    # "חצי מהסלמון" — salmon is not in the meal → parsed as a scale whose hint
+    # is FOREIGN, so it is dropped from the deterministic scale bucket.
+    absent = meal_intelligence.parse_meal_correction("חצי מהסלמון")
+    scale_absent = [c for c in absent if c.kind == "scale"]
+    assert scale_absent, "expected a scale parse for the foreign-food phrasing"
+    assert _scale_hint_is_foreign_or_unclear(scale_absent[0].item_hint, analysis) is True
+
+    # "חצי מהאורז" — rice IS present → the scale survives the guard and would be
+    # applied deterministically (behavior preserved).
+    present = meal_intelligence.parse_meal_correction("חצי מהאורז")
+    scale_present = [c for c in present if c.kind == "scale"]
+    assert scale_present
+    assert _scale_hint_is_foreign_or_unclear(scale_present[0].item_hint, analysis) is False
+
+
 def test_removal_takes_priority_over_preparation_in_parser() -> None:
     """parse_meal_correction must return only removal when the text is 'בלי שמן',
     not a preparation correction."""

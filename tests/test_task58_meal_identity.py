@@ -593,6 +593,119 @@ async def test_same_removal_twice_is_idempotent(
     assert payload["locked_corrections"] == ["תוריד פלאפל", "תוריד פלאפל"]
 
 
+async def _make_scale_meal_approval() -> str:
+    """A rice + chicken text-logged draft (image=None) for scale routing tests."""
+    from noam_coach.services import core as core_services
+
+    analysis = MealAnalysis(
+        meal_name="צלחת",
+        confidence=0.82,
+        items=[
+            FoodItem(name="אורז לבן מבושל", grams=200, calories=260,
+                     protein=5, carbs=56, fat=1, confidence=0.85),
+            FoodItem(name="חזה עוף", grams=180, calories=300,
+                     protein=55, carbs=0, fat=7, confidence=0.86),
+        ],
+    )
+    return await core_services.create_approval(
+        USER_ID, "meal",
+        {"analysis": analysis.model_dump(), "image": None, "revision": 0},
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeated_scale_correction_does_not_compound(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """LOG-014: applying the SAME present-item scale correction 2× and 3× must
+    not compound — grams/kcal halve exactly once and then stay stable, because
+    a scale whose normalized text is already locked is skipped (idempotent),
+    mirroring identity-correction dedup."""
+    _fail_ai(monkeypatch)
+    approval_id = await _make_scale_meal_approval()
+
+    await _send_correction(monkeypatch, approval_id, "חצי מהאורז")
+    saved1, payload1 = await _saved_analysis(approval_id)
+    rice1 = next(i for i in saved1.items if "אורז" in i.name)
+    assert rice1.grams == 100  # 200 → 100 (scaled once)
+    assert rice1.calories == 130
+
+    # Second and third identical submissions must NOT re-halve.
+    await _send_correction(monkeypatch, approval_id, "חצי מהאורז")
+    await _send_correction(monkeypatch, approval_id, "חצי מהאורז")
+    saved3, payload3 = await _saved_analysis(approval_id)
+    rice3 = next(i for i in saved3.items if "אורז" in i.name)
+    assert rice3.grams == 100  # STILL 100 — not 50, not 25
+    assert rice3.calories == 130
+    # Chicken never targeted by this correction.
+    chicken = next(i for i in saved3.items if "עוף" in i.name)
+    assert chicken.grams == 180
+    # Every submission is still audited honestly.
+    assert payload3["revision"] == 3
+    assert payload3["locked_corrections"].count("חצי מהאורז") == 3
+
+
+@pytest.mark.asyncio
+async def test_foreign_food_scale_reaches_reanalysis_path(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """LOG-014 owner decision: a scale correction naming a food ABSENT from the
+    current items (identity correction misrouted as a scale) is DROPPED from the
+    deterministic scale bucket, so ``used_deterministic`` stays False and the
+    handler falls through to AI reanalysis with identity enforcement — no
+    deterministic scale, no clarification prompt."""
+    from noam_coach.bot import meal_text as meal_text_bot
+
+    approval_id = await _make_scale_meal_approval()
+
+    reanalyze_calls: list[str] = []
+
+    async def spy_analyze_meal_text(description: str, **k: Any) -> MealAnalysis:
+        # image=None → the manual-text reanalysis branch runs this analyzer.
+        reanalyze_calls.append(description)
+        return MealAnalysis(
+            meal_name="סלמון",
+            confidence=0.7,
+            items=[FoodItem(name="סלמון", grams=100, calories=200,
+                            protein=20, carbs=0, fat=13, confidence=0.7)],
+        )
+
+    async def fail_image(*a: Any, **k: Any) -> None:
+        raise AssertionError("text-logged meal must not hit image reanalysis")
+
+    # The handler resolves these names from meal_text's own module globals
+    # (imported directly), so patch them there — not only on the facade.
+    monkeypatch.setattr(meal_text_bot, "analyze_meal_text", spy_analyze_meal_text)
+    monkeypatch.setattr(coach_bot, "analyze_meal_text", spy_analyze_meal_text, raising=False)
+    monkeypatch.setattr(
+        meal_text_bot, "reanalyze_meal_with_text_and_image", fail_image, raising=False
+    )
+    monkeypatch.setattr(
+        coach_bot, "reanalyze_meal_with_text_and_image", fail_image, raising=False
+    )
+
+    rendered: list[str] = []
+
+    async def fake_render(target: Any, user_id: int, approval_id_: str, **k: Any) -> None:
+        rendered.append(approval_id_)
+
+    monkeypatch.setattr(coach_bot, "render_meal", fake_render, raising=False)
+
+    message = _FakeMessage("חצי מהסלמון")  # salmon absent from rice+chicken meal
+    update = SimpleNamespace(
+        effective_message=message,
+        effective_user=SimpleNamespace(id=USER_ID),
+        effective_chat=SimpleNamespace(id=USER_ID),
+    )
+    await meal_text_bot._handle_meal_correction_text(update, USER_ID, approval_id, 0)
+
+    # The foreign-food scale fell through to reanalysis (used_deterministic False).
+    assert reanalyze_calls, "foreign-food scale must reach the AI reanalysis path"
+    events = await event_log.list_events(db, USER_ID)
+    applied = [e for e in events if e.event == "meal_correction_applied"]
+    assert applied and applied[-1].properties["deterministic"] is False
+
+
 @pytest.mark.asyncio
 async def test_replacement_chain_through_real_handler(
     db: Database, monkeypatch: pytest.MonkeyPatch
