@@ -167,14 +167,18 @@ async def test_parity_restart_persistence(tmp_path: Path) -> None:
 
 # --- onboarding writer: stated preference reaches DayPlan (single + range) ---
 
-async def test_onboarding_extraction_persists_single_value(tmp_path: Path) -> None:
+async def test_onboarding_extraction_persists_single_value(
+    tmp_path: Path, monkeypatch
+) -> None:
     import coach_bot
     from models import RoutineExtraction
     from noam_coach.services import profile as profile_svc
 
     db = await _db(tmp_path)
-    coach_bot.DB = db  # save_routine_extraction writes via the module-level DB
-    profile_svc.DB = db
+    # monkeypatch restores the module-level DB after the test, so the closed tmp
+    # DB never leaks into later tests in the same process (suite is order-safe).
+    monkeypatch.setattr(coach_bot, "DB", db, raising=False)
+    monkeypatch.setattr(profile_svc, "DB", db, raising=False)
 
     await profile_svc.save_routine_extraction(
         USER_ID, RoutineExtraction(typical_meals_per_day=4)
@@ -189,14 +193,16 @@ async def test_onboarding_extraction_persists_single_value(tmp_path: Path) -> No
     assert plan.selected_planned_meals == 4
 
 
-async def test_onboarding_extraction_persists_range(tmp_path: Path) -> None:
+async def test_onboarding_extraction_persists_range(
+    tmp_path: Path, monkeypatch
+) -> None:
     import coach_bot
     from models import RoutineExtraction
     from noam_coach.services import profile as profile_svc
 
     db = await _db(tmp_path)
-    coach_bot.DB = db
-    profile_svc.DB = db
+    monkeypatch.setattr(coach_bot, "DB", db, raising=False)
+    monkeypatch.setattr(profile_svc, "DB", db, raising=False)
 
     await profile_svc.save_routine_extraction(
         USER_ID,
