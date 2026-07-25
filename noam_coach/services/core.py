@@ -293,22 +293,11 @@ async def ensure_user_record(
             """,
             (user_id, first_name, username, now),
         )
-        await connection.execute(
-            """
-            INSERT INTO goals(
-                user_id, calories, protein, steps, phase, updated_at
-            ) VALUES(?, ?, ?, ?, ?, ?)
-            ON CONFLICT(user_id) DO NOTHING
-            """,
-            (
-                user_id,
-                SETTINGS.default_calories,
-                SETTINGS.default_protein,
-                SETTINGS.default_steps,
-                "fat_loss_muscle_retention",
-                now,
-            ),
-        )
+        # LOG-016: the legacy `goals` table is frozen by derivation. Its sole
+        # live read path is `goal_versions`; `goals` has no product readers.
+        # We no longer default-insert a goals row here (it would only produce a
+        # stale value that leaks into the DSAR export). No row is required —
+        # `goals` is a child of `users` and parent of nothing.
 
 
 @runtime_bound(RUNTIME_NAMES)

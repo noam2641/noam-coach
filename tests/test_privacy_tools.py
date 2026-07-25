@@ -51,6 +51,53 @@ def test_export_and_delete_user_data(tmp_path: Path) -> None:
     assert not image.exists()
 
 
+def test_export_uses_goal_versions_not_stale_legacy_goals(tmp_path: Path) -> None:
+    """LOG-016: DSAR export must source goals from `goal_versions`, not the
+    frozen legacy `goals` table (which can hold a stale number for
+    active_provisional users).
+    """
+    db_path = tmp_path / "coach.db"
+    import asyncio
+
+    db = coach_bot.Database(str(db_path))
+    asyncio.run(db.init())
+    connection = sqlite3.connect(db_path)
+    connection.execute("PRAGMA foreign_keys=ON")
+    connection.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(1,'Noam',NULL,?)",
+        (coach_bot.utc_now(),),
+    )
+    # Live goal (goal_versions) is the authoritative value.
+    connection.execute(
+        """
+        INSERT INTO goal_versions(user_id, calories, protein, steps, phase, status, source, created_at)
+        VALUES(1, 1750, 165, 9000, 'fat_loss_muscle_retention', 'active_provisional', 'computed', ?)
+        """,
+        (coach_bot.utc_now(),),
+    )
+    # A STALE legacy goals row that disagrees — must NOT leak into the export.
+    connection.execute(
+        "INSERT INTO goals(user_id, calories, protein, steps, phase, updated_at) "
+        "VALUES(1, 9999, 10, 1, 'stale', ?)",
+        (coach_bot.utc_now(),),
+    )
+    connection.commit()
+    connection.close()
+
+    archive = export_user(db_path, 1, tmp_path / "export.zip")
+    with zipfile.ZipFile(archive) as exported:
+        payload = json.loads(exported.read("data.json"))
+    tables = payload["tables"]
+
+    # The export now carries the live goal source.
+    assert "goal_versions" in tables
+    assert tables["goal_versions"][0]["calories"] == 1750
+    # The stale legacy value is not exposed as the goal source.
+    assert "goals" not in tables
+    dumped = json.dumps(payload)
+    assert "9999" not in dumped
+
+
 def test_privacy_audit_flags_sensitive_files_without_touching_them(tmp_path: Path) -> None:
     (tmp_path / ".env").write_text("TOKEN=x", encoding="utf-8")
     (tmp_path / "coach.db").write_bytes(b"sqlite")
