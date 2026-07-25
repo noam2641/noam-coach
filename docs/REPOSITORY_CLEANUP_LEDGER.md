@@ -230,6 +230,16 @@ git commit -m "revert(archive): remove Batch A archival copies"
 
 ### Batch B — Remove ONLY the verified 0-byte / malformed / empty strays
 
+> **STATUS 2026-07-25: EXECUTED @ `52d6a10`** (both CI contexts green first). The
+> stray backups (deferred in Batch A when the PII guard tripped) were created and
+> hash-verified — `noam_coach.db` sha `e3b0c442…b855` (canonical empty-file hash),
+> `.git/info/exclude` sha `584f2cca…06ef`. All three targets revalidated inline
+> (0-byte db · `.git` = exactly `info/exclude`, no HEAD/objects/refs · empty
+> `.agents`), then removed via the fail-closed procedure below (rm exclude → rmdir
+> info → rmdir .git; no `rm -rf`). Verified absent; canonical repo still resolves
+> `52d6a10`; protected worktree/DB, PII, runtime data untouched. **No git diff**
+> (all outside the repo). Rollback available from the recorded backups.
+
 **Only after Batch A backups exist and are byte-verified.** These live OUTSIDE the
 repo → no git diff. The `.git` removal is **fail-closed** (aborts on any surprise).
 ```bash
