@@ -8,7 +8,7 @@ phase changes and before every pause.
 | Last updated | 2026-07-25 (audit-gaps corrected) |
 | Last verified `origin/develop` | `fbff6f106e4b923bcbd016d652c2c121e55ecec0` (merge of PR #5) |
 | GitHub default branch | `develop` (verified — the old `codex/*` default is corrected) |
-| Active phase | PHASE 4 execution — **Batch A + B DONE**; Batch C (branch prune) next |
+| Active phase | PHASE 4 — **Batch A + B DONE; Batch C BLOCKED.** The lease/CAS flake RECURRED on Batch B commit `69a4450` (push run `30157487932` failure on pytest; pull_request success). Per the constraint, STOPPED for root-cause + deterministic-fix proposal before Batch C. Local stress: 40/40 pass (CI-contention-only). |
 | Baseline @ approval | head `1dbd6c6`; push CI `30154848488` success; PR CI `30154850042` success; PR #6 open, `+591/−0` |
 | Batch A result | **PII in all six docs** (real user id + meal-image refs) → external backup only at `…\cleanup_20260725\local_docs_PII\`; **NOT added to Git** (A2 skipped). No tracked change. |
 | Batch A CI | `b6db987`: push run `30155534787` success; pull_request run `30155536081` **success on re-run attempt 2** (attempt 1 flaked on `test_daily_menu_refresh::test_lease_loss_during_generation_fences_persistence` — deferred CI-hardening, not fixed here). Both green. Flake record commit `52d6a10` CI: push `30156817298` success + pull_request `30156817976` success. |
