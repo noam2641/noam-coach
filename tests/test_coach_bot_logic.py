@@ -1150,6 +1150,12 @@ async def test_known_medications(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_write_audit(tmp_path) -> None:
+    # LOG-012 (INTENTIONAL BEHAVIOR CHANGE): the audit trail is exported in the
+    # user's DSAR ZIP, so write_audit no longer stores arbitrary free-text
+    # kwargs. It applies a per-(action, entity) allowlist + redaction backstop.
+    # The OLD test asserted an arbitrary `detail_a="hello"` survived; under the
+    # new contract an unknown (action, entity) keeps ONLY bounded scalars and a
+    # long free-text value is DROPPED. This is the new contract, not a bug.
     db = coach_bot.Database(str(tmp_path / "coach.db"))
     await db.init()
     await db.execute("INSERT INTO users(id, updated_at) VALUES(1, ?)", (coach_bot.utc_now(),))
@@ -1158,12 +1164,27 @@ async def test_write_audit(tmp_path) -> None:
     orig_db = cb.DB
     cb.DB = db
     try:
-        await cb.write_audit(1, "test_action", "test_entity", "123", detail_a="hello")
+        await cb.write_audit(
+            1,
+            "test_action",
+            "test_entity",
+            "123",
+            count=5,
+            free_text=(
+                "this is a long free-text note that must never be stored in the "
+                "audit trail because it would be exported in the user's DSAR ZIP"
+            ),
+        )
         rows = await db.fetch_all("SELECT * FROM audit WHERE user_id=1")
         assert len(rows) == 1
         assert rows[0]["action"] == "test_action"
+        assert rows[0]["entity_id"] == "123"
         details = json.loads(rows[0]["details"])
-        assert details["detail_a"] == "hello"
+        # Bounded scalar survives; the free-text key is dropped for an unknown
+        # (action, entity) pair (fail-safe default).
+        assert details["count"] == 5
+        assert "free_text" not in details
+        assert "long free-text note" not in json.dumps(details, ensure_ascii=False)
     finally:
         cb.DB = orig_db
 

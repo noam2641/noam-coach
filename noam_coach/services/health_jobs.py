@@ -1906,7 +1906,16 @@ async def command_flags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if "צום" in text:
         flags["fasting"] = not fasting_negated
     await set_daily_flags(user_id, flags)
-    await write_audit(user_id, "daily_flags", "flags", None, text=text)
+    # LOG-012: store derived booleans only — never the raw note free-text.
+    await write_audit(
+        user_id,
+        "daily_flags",
+        "flags",
+        None,
+        ritalin=bool(flags.get("ritalin")),
+        fasting=bool(flags.get("fasting")),
+        has_note=bool(text),
+    )
     await update.effective_message.reply_text("נרשם להיום. אתאים את ההמלצות בהתאם 👍")
 
 

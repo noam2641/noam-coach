@@ -492,12 +492,15 @@ async def _handle_meal_correction_text(
             "UPDATE approvals SET payload=? WHERE id=? AND user_id=? AND status='pending'",
             (json.dumps(row["data"], ensure_ascii=False), approval_id, user_id),
         )
+        # LOG-012: record only the bounded revision counter — the raw
+        # `correction_text` free-text is never stored in the audit trail (it
+        # also lives in the redacted emit boundary below).
         await write_audit(
             user_id,
             "meal_text_correction",
             "approval",
             approval_id,
-            correction_text=correction_text,
+            revision=revision,
         )
         # Batch 7: this event moved to the canonical emit boundary. The NAME
         # and every non-sensitive property are unchanged, so existing readers

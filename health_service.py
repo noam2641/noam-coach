@@ -366,7 +366,14 @@ async def record_medication(
         if "ריטלין" in name or name.lower() == "ritalin":
             flags["ritalin"] = True
         await set_daily_flags(user_id, flags)
-    await coach_bot.write_audit(user_id, "medication", "med_event", event_id, name=name)
+    # LOG-012 / OWNER DECISION: the audit trail codes the medication to a
+    # coarse category — the raw drug name is never stored (it also lives in
+    # the medication_events table, governed by retention/DSAR separately).
+    from noam_coach.services.core import _medication_kind_code
+
+    await coach_bot.write_audit(
+        user_id, "medication", "med_event", event_id, kind_code=_medication_kind_code(name)
+    )
     return event_id
 
 
