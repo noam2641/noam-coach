@@ -15,7 +15,10 @@ from dotenv import load_dotenv
 
 DIRECT_TABLES = (
     "users",
-    "goals",
+    # LOG-016: DSAR export reads the live goal source. The legacy `goals` table
+    # is frozen by derivation and can hold a stale value for active_provisional
+    # users, so we export `goal_versions` (the sole authoritative read path).
+    "goal_versions",
     "approvals",
     "meals",
     "sessions",

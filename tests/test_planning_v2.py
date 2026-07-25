@@ -495,6 +495,74 @@ async def test_fetch_goal_prefers_goal_versions_over_legacy_goals(
 
 
 @pytest.mark.asyncio
+async def test_reads_work_with_no_legacy_goals_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LOG-016: freezing legacy `goals` must not break live reads.
+
+    With ZERO rows in the legacy `goals` table, active_goal and fetch_goal must
+    still return the correct values sourced from `goal_versions`.
+    """
+    db = Database(str(tmp_path / "no_legacy_goals.db"))
+    await db.init()
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(1,'T',NULL,?)",
+        (utc_now(),),
+    )
+    await db.execute(
+        """
+        INSERT INTO goal_versions(user_id, calories, protein, steps, phase, status, source, created_at)
+        VALUES(1, 1850, 160, 9500, 'fat_loss_muscle_retention', 'active', 'computed', ?)
+        """,
+        (utc_now(),),
+    )
+    # No legacy goals row is inserted at all.
+    assert await db.fetch_one("SELECT COUNT(*) AS c FROM goals") == {"c": 0}
+
+    active = await planning.active_goal(db, 1)
+    assert active is not None
+    assert int(active["calories"]) == 1850
+    assert int(active["protein"]) == 160
+    assert int(active["steps"]) == 9500
+
+    monkeypatch.setattr(coach_bot, "DB", db)
+    goal = await coach_bot.fetch_goal(1)
+    assert goal["calories"] == 1850
+    assert goal["protein"] == 160
+    assert goal["steps"] == 9500
+    assert goal["phase"] == "fat_loss_muscle_retention"
+
+
+@pytest.mark.asyncio
+async def test_activate_goal_does_not_write_legacy_goals(tmp_path: Path) -> None:
+    """LOG-016: the goals mirror is removed — activation must not touch `goals`.
+
+    New contract: `goal_versions` is authoritative; the legacy `goals` table is
+    frozen by derivation and is NOT written on activation.
+    """
+    db = Database(str(tmp_path / "no_mirror.db"))
+    await db.init()
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(1,'T',NULL,?)",
+        (utc_now(),),
+    )
+    goal_id = await db.execute(
+        "INSERT INTO goal_versions(user_id, calories, protein, steps, phase, status, source, "
+        "explanation, created_at) VALUES(1, 2000, 150, 8000, 'maintain', 'proposed', 'manual', '', ?)",
+        (utc_now(),),
+    )
+
+    assert await planning.activate_goal(db, 1, int(goal_id)) is True
+
+    # goal_versions is authoritative and now active.
+    new = await db.fetch_one("SELECT status FROM goal_versions WHERE id=?", (goal_id,))
+    assert new and new["status"] == "active"
+    # The legacy goals table was NOT mirrored — it stays empty.
+    assert await db.fetch_one("SELECT COUNT(*) AS c FROM goals") == {"c": 0}
+
+
+@pytest.mark.asyncio
 async def test_gap_blocks_workout_readiness(tmp_path: Path) -> None:
     db = await _ready_db(tmp_path)
     await user_model.record_gap(db, 1, "equipment", why_matters="required")
