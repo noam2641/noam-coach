@@ -62,13 +62,14 @@ AI Gateway · stored weekly-plan regeneration (`planning._meal_slots` Phase 2) �
 destructive sleep-fact migration · any protected-data mutation · any deletion
 before approval.
 
-## FS-CLEANUP-1 — Physical filesystem cleanup of `C:\coach_bot` (operational task)
+## FS-CLEANUP-1 — Physical filesystem cleanup of `C:\coach_bot` (**COMPLETE**)
 
-Started 2026-07-25 after the repository-cleanup track completed. **Prove-then-remove**;
-read-only inventory first, deletion only when every guard passes. This task does NOT
-change any log-audit finding from PROPOSED. Protected-DB baseline hashes recorded:
+Executed 2026-07-25 after the repository-cleanup track completed. **Prove-then-remove**;
+read-only inventory first, deletion only when every guard passed. **Status: COMPLETE.**
+This task did NOT change any log-audit finding from PROPOSED. Protected-DB baseline
+hashes recorded and re-verified unchanged after the task:
 `noam-coach/data/noam_coach.db` sha256 `9077e35d…`; `noam_coach_complete_release/noam_coach.db`
-sha256 `5bd8ac1b…` (must remain unchanged).
+sha256 `5bd8ac1b…`.
 
 Top-level classification (C:\coach_bot):
 - `noam-coach` — **CANONICAL repo** (develop @ `fc628d9`, clean). KEEP. Do not touch.
@@ -82,14 +83,25 @@ Top-level classification (C:\coach_bot):
 - `.claude` — operator config (`settings.local.json`). KEEP (never tracked/deleted for tidiness).
 - 6 root `.md` files (`FINAL_MEAL_INTERACTION_IMPLEMENTATION_PLAN.md`, `MEAL_INTERACTION_ENGINEERING_ROOT_CAUSE_AUDIT.md`,
   `MEAL_INTERACTION_LOG_AND_IMAGE_AUDIT.md`, `SYSTEM_DATA_SOURCE_OF_TRUTH_AND_OBSERVABILITY_AUDIT.md`,
-  `UNIFIED_NOAM_COACH_AUDIT_CHECKPOINT.md`, `UNIFIED_NOAM_COACH_CONSOLIDATION_PLAN.md`) — unique audit/planning docs,
-  **contain PII** (ledger §Batch-A), byte-identical external backup verified at
-  `…\cleanup_20260725\local_docs_PII\`. Cannot move into repo without an approved redaction pass. **DELETION IS A HUMAN DECISION** (personal data) — deferred to human.
-- `noam-coach.wt-lease-fix` — empty, git-deregistered lease-fix worktree remnant. Safe to remove EXCEPT an OS
-  filesystem lock (`Device or resource busy`) persists with no attributable user process; left in place per guard A.
+  `UNIFIED_NOAM_COACH_AUDIT_CHECKPOINT.md`, `UNIFIED_NOAM_COACH_CONSOLIDATION_PLAN.md`) — unique audit/planning docs
+  that **contain PII** (ledger §Batch-A). **DELETED** — human-approved for deletion; each file was verified
+  **SHA-256 byte-identical to its external backup copy immediately before deletion** (all six OK at delete time),
+  then all six were removed from the `C:\coach_bot` root. The external backup remains **intact (6/6)** in the
+  designated cleanup backup location. Not moved into the repo (would require an approved redaction pass).
+- `noam-coach.wt-lease-fix` — empty, git-deregistered lease-fix worktree remnant. **RETAINED** only because a
+  persistent OS filesystem lock (`Device or resource busy`) blocks removal, with no attributable user process;
+  not force-removed per guard A. Delete the empty directory once the lock clears.
 
-Actions taken this task: none deleted (see report). Generated caches: none at root level (all live inside
-canonical/protected repos → out of scope). No protected data touched; DB hashes unchanged.
+Actions taken this task: **the 6 root PII `.md` files were deleted** (delete-time SHA-256 backup re-verification;
+backup intact 6/6). No other item deleted. Generated caches: none at root level (all live inside
+canonical/protected repos → out of scope). No protected data touched; protected-DB hashes/mtimes unchanged
+before and after.
+
+Remaining steps (all outside this task's completed scope):
+- **Human-gated merge of PR #8** (`docs/filesystem-cleanup-record` → `develop`) — do NOT auto-merge.
+- After PR #8 merges: remove the `noam-coach.wt-fscleanup-doc` worktree.
+- Delete the empty `noam-coach.wt-lease-fix` directory once its OS lock clears.
+- Product backlog stays gated: LOG-014 → LOG-015/Task 66 → LOG-016 → LOG-012 remain **PROPOSED and unstarted**.
 
 ## Log-audit intake (PROPOSED — not approved, not started)
 
