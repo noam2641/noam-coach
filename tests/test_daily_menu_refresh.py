@@ -288,26 +288,85 @@ async def test_heartbeat_renews_only_for_owning_attempt(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_lease_loss_during_generation_fences_persistence(tmp_path: Path) -> None:
-    """A stale AI result must not persist, deliver or change the menu."""
+async def test_lease_loss_during_generation_fences_persistence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale AI result must not persist, deliver or change the menu.
+
+    Fully deterministic synchronization (no wall-clock). The heartbeat loop is
+    ``while True: await asyncio.sleep(interval); renew()``. We drive it by
+    hand instead of trusting a timer under arbitrary CI scheduling:
+
+    * The heartbeat module's ``asyncio.sleep`` is patched so each heartbeat
+      iteration PARKS on a test-controlled event and ANNOUNCES (via
+      ``renew_armed``) that it is about to renew. This removes the wall-clock
+      dependency that made the old fixed ``sleep(0.02)`` + 1 ms heartbeat race
+      flaky in CI.
+    * The heartbeat's ``renew_operation`` is wrapped to SIGNAL ``loss_observed``
+      the first time it sees ownership loss.
+
+    Ordering enforced: (1) generation starts and the heartbeat parks before its
+    first renew; (2) a NEWER owner claims past the lease — a deterministic
+    takeover; (3) exactly one heartbeat renewal is released, which observes the
+    loss; (4) only then is generation released. This proves the takeover
+    completed AND was observed by the losing worker before it could persist.
+    The behavioural invariant is unchanged: a worker that lost the lease is
+    fenced from persistence and delivery.
+    """
     db = await _make_db(tmp_path)
     day = await _seed_menu(db, menu_id="menu-1-2026-07-21-1", revision=1)
     gate = asyncio.Event()
     gen = _FakeGenerator(gate=gate)
     deliver = _FakeDelivery()
 
+    # Drive the heartbeat by hand: it parks on ``release_renew`` each iteration
+    # and announces (``renew_armed``) that it is about to renew. No wall-clock.
+    release_renew = asyncio.Event()
+    renew_armed = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    async def _controlled_sleep(delay, *args, **kwargs):
+        # Only intercept the heartbeat's own interval sleep; leave the
+        # cooperative ``sleep(0)`` yields used elsewhere untouched.
+        if delay and delay > 0:
+            renew_armed.set()
+            await release_renew.wait()
+            return None
+        return await real_sleep(delay, *args, **kwargs)
+
+    monkeypatch.setattr(refresh.asyncio, "sleep", _controlled_sleep)
+
+    # Signal the exact moment the losing worker's heartbeat observes the loss.
+    loss_observed = asyncio.Event()
+    real_renew = ops.renew_operation
+
+    async def _observed_renew(*args, **kwargs):
+        outcome = await real_renew(*args, **kwargs)
+        if outcome.status != ops.ACQUIRED:
+            loss_observed.set()
+        return outcome
+
+    # Patch on the refresh module (it calls ops.renew_operation via that name).
+    monkeypatch.setattr(refresh.ops, "renew_operation", _observed_renew)
+
     task = asyncio.create_task(
         _refresh(db, gen, deliver=deliver, renew_every=0.001)
     )
     while gen.calls == 0:
-        await asyncio.sleep(0)
+        await real_sleep(0)
+    # The heartbeat is now parked before its first renew.
+    await asyncio.wait_for(renew_armed.wait(), timeout=5)
 
-    # A newer owner takes the claim while generation is in flight.
+    # A newer owner takes the claim while generation is in flight. ``later`` is
+    # past the lease, so the takeover is deterministic (not timing-dependent).
     _d, identity, _m, _r = await refresh.resolve_refresh_identity(db, 1, now=T0)
     later = T0 + timedelta(seconds=ops.MENU_SEND_LEASE_SECONDS + 1)
     await ops.claim_operation(db, 1, day, kind=ops.KIND_REFRESH_REQUEST,
                               identity=identity, attempt_id="NEWER", now=later)
-    await asyncio.sleep(0.02)      # let the heartbeat observe the loss
+    # Release exactly one heartbeat renewal now that the takeover has landed;
+    # it must observe the loss. This is fully ordered — no timer race.
+    release_renew.set()
+    await asyncio.wait_for(loss_observed.wait(), timeout=5)
     gate.set()
     result = await task
 
