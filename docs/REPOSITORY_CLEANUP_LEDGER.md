@@ -37,7 +37,7 @@ Classifications: `CANONICAL_ACTIVE` · `HISTORICAL_REFERENCE` · `PROTECTED` ·
 | `docs/FINAL_TASKS_58_65_IMPLEMENTATION_REPORT.md` | HISTORICAL_REFERENCE / SUPERSEDED | Ledger: "historical partial report" |
 | `docs/MASTER_CORRECTION_BACKLOG_ADDENDUM_38_57.md` | HISTORICAL_REFERENCE / SUPERSEDED | Ledger supersedes the FIX 38–57 addendum |
 | `docs/archive/*`, `docs/audits/*`, `docs/reports/*` | HISTORICAL_REFERENCE | point-in-time reports; correctly filed |
-| **Local-only (untracked, outside repo)** at `C:\coach_bot\`: `FINAL_MEAL_INTERACTION_IMPLEMENTATION_PLAN.md`, `MEAL_INTERACTION_ENGINEERING_ROOT_CAUSE_AUDIT.md`, `MEAL_INTERACTION_LOG_AND_IMAGE_AUDIT.md`, `SYSTEM_DATA_SOURCE_OF_TRUTH_AND_OBSERVABILITY_AUDIT.md`, `UNIFIED_NOAM_COACH_CONSOLIDATION_PLAN.md`, `UNIFIED_NOAM_COACH_AUDIT_CHECKPOINT.md` | ARCHIVE_CANDIDATE (untracked, **only copies**) | No git history — **backup before any move**. Proposed: copy into `docs/archive/` (redacted) or the backup store. Risk if deleted: permanent loss. |
+| **Local-only (untracked, outside repo)** at `C:\coach_bot\`: `FINAL_MEAL_INTERACTION_IMPLEMENTATION_PLAN.md`, `MEAL_INTERACTION_ENGINEERING_ROOT_CAUSE_AUDIT.md`, `MEAL_INTERACTION_LOG_AND_IMAGE_AUDIT.md`, `SYSTEM_DATA_SOURCE_OF_TRUTH_AND_OBSERVABILITY_AUDIT.md`, `UNIFIED_NOAM_COACH_CONSOLIDATION_PLAN.md`, `UNIFIED_NOAM_COACH_AUDIT_CHECKPOINT.md` | ARCHIVE_CANDIDATE (untracked, **only copies**) | No git history — **backup before any move**. Proposed: **copy verbatim** into `docs/archive/` — only after the §G secret/PII scan passes (all six scanned = 0 hits 2026-07-25, so no redaction). Risk if deleted: permanent loss. |
 | `C:\coach_bot_BACKUP_20260721_150908\` (3.4 MB, SHA256 manifest) | ARCHIVE (evidence store) | deliberate dated backup — retain as-is |
 
 ## C. Delete candidates (each with evidence; backup first)
@@ -63,7 +63,8 @@ Classifications: `CANONICAL_ACTIVE` · `HISTORICAL_REFERENCE` · `PROTECTED` ·
 
 ## E. Branch & worktree cleanup (reachability evidence)
 
-Reachability tested with `git merge-base --is-ancestor <ref> origin/develop`.
+Reachability tested with, e.g., `git merge-base --is-ancestor origin/consolidation/unified-noam-coach origin/develop`
+(one such check per branch; the exact guarded loop is in §G Batch C).
 
 | Branch | Reachable? | Unique commits | Class | Proposed action |
 |---|---|---|---|---|
@@ -110,96 +111,177 @@ Fixed inputs (verified 2026-07-25, sha256 truncated to 16):
 | UNIFIED_NOAM_COACH_CONSOLIDATION_PLAN.md | 82977 | `855e35756439afff` |
 | UNIFIED_NOAM_COACH_AUDIT_CHECKPOINT.md | 81762 | `6a74ea4ec7206310` |
 
-Secret scan of all six: **0 hits** → archived verbatim (no redaction). Strays:
+**Secret/PII scan** (exact command, run again immediately before Batch A):
+```bash
+cd /c/coach_bot
+for f in FINAL_MEAL_INTERACTION_IMPLEMENTATION_PLAN.md MEAL_INTERACTION_ENGINEERING_ROOT_CAUSE_AUDIT.md \
+         MEAL_INTERACTION_LOG_AND_IMAGE_AUDIT.md SYSTEM_DATA_SOURCE_OF_TRUTH_AND_OBSERVABILITY_AUDIT.md \
+         UNIFIED_NOAM_COACH_CONSOLIDATION_PLAN.md UNIFIED_NOAM_COACH_AUDIT_CHECKPOINT.md; do
+  hits=$(grep -icE "sk-[a-z0-9]{20}|bearer [a-z0-9]{20}|[0-9]{9,10}:[A-Za-z0-9_-]{35}|password *=|token *= *['\"][A-Za-z0-9]{20}" "$f")
+  echo "$f: $hits"
+done
+```
+Result 2026-07-25: **all six = 0 hits** → archive **verbatim** (no redaction). If ANY
+file scans > 0, **STOP** and do not place that document in Git. Strays:
 `C:\coach_bot\noam_coach.db` = 0 bytes; `C:\coach_bot\.git\` = only `info\exclude`
-(301 B); `C:\coach_bot\.agents\` = empty.
+(301 B, sha256 `584f2cca6096463716b1370b772a34dbbc10e2743d0039a6848eea9b98ad06ef`);
+`C:\coach_bot\.agents\` = empty.
 
-Ordering: **A → B → C.** Each is a separate reviewed commit/PR; verify after each.
+Ordering: **A → B → C.** Each is a **separate logical commit on PR #6**; after each
+batch update the ledgers + `WORK_MANAGER_STATE.md`, push, and wait for CI; pause on
+any failed guard. Do not create or merge another PR unless explicitly instructed.
+`BK` is redefined at the start of every batch (never relied on across sessions).
 
 ---
 
 ### Batch A — Backups + archival copies ONLY (non-destructive, reversible)
 
-**A1. Back up the three stray/local items** (copy, never move):
+**A0. Re-run the secret/PII scan above; abort if any file > 0 hits.**
+
+**A1. Back up the local docs + strays** (copy, never move):
 ```bash
-BK="/c/coach_bot_BACKUP_20260721_150908/cleanup_20260725"
+BK="/c/coach_bot_BACKUP_20260721_150908/cleanup_20260725"   # (re)defined here
 mkdir -p "$BK/local_docs" "$BK/stray_root_git" "$BK/stray_root_db"
-# six local-only audit docs
-for f in FINAL_MEAL_INTERACTION_IMPLEMENTATION_PLAN MEAL_INTERACTION_ENGINEERING_ROOT_CAUSE_AUDIT \
-         MEAL_INTERACTION_LOG_AND_IMAGE_AUDIT SYSTEM_DATA_SOURCE_OF_TRUTH_AND_OBSERVABILITY_AUDIT \
-         UNIFIED_NOAM_COACH_CONSOLIDATION_PLAN UNIFIED_NOAM_COACH_AUDIT_CHECKPOINT; do
-  cp -p "/c/coach_bot/$f.md" "$BK/local_docs/$f.md"
+for f in FINAL_MEAL_INTERACTION_IMPLEMENTATION_PLAN.md MEAL_INTERACTION_ENGINEERING_ROOT_CAUSE_AUDIT.md \
+         MEAL_INTERACTION_LOG_AND_IMAGE_AUDIT.md SYSTEM_DATA_SOURCE_OF_TRUTH_AND_OBSERVABILITY_AUDIT.md \
+         UNIFIED_NOAM_COACH_CONSOLIDATION_PLAN.md UNIFIED_NOAM_COACH_AUDIT_CHECKPOINT.md; do
+  cp -p "/c/coach_bot/$f" "$BK/local_docs/$f"
 done
-cp -p "/c/coach_bot/.git/info/exclude" "$BK/stray_root_git/exclude"   # the only file in the stray .git
-cp -p "/c/coach_bot/noam_coach.db"      "$BK/stray_root_db/noam_coach.db"  # 0-byte
+cp -p "/c/coach_bot/.git/info/exclude" "$BK/stray_root_git/exclude"
+cp -p "/c/coach_bot/noam_coach.db"      "$BK/stray_root_db/noam_coach.db"
 ```
 **A2. Archive the six docs INTO the repo (copy; originals untouched):**
 ```bash
-for f in FINAL_MEAL_INTERACTION_IMPLEMENTATION_PLAN MEAL_INTERACTION_ENGINEERING_ROOT_CAUSE_AUDIT \
-         MEAL_INTERACTION_LOG_AND_IMAGE_AUDIT SYSTEM_DATA_SOURCE_OF_TRUTH_AND_OBSERVABILITY_AUDIT \
-         UNIFIED_NOAM_COACH_CONSOLIDATION_PLAN UNIFIED_NOAM_COACH_AUDIT_CHECKPOINT; do
-  cp -p "/c/coach_bot/$f.md" "/c/coach_bot/noam-coach/docs/archive/$f.md"
+for f in FINAL_MEAL_INTERACTION_IMPLEMENTATION_PLAN.md MEAL_INTERACTION_ENGINEERING_ROOT_CAUSE_AUDIT.md \
+         MEAL_INTERACTION_LOG_AND_IMAGE_AUDIT.md SYSTEM_DATA_SOURCE_OF_TRUTH_AND_OBSERVABILITY_AUDIT.md \
+         UNIFIED_NOAM_COACH_CONSOLIDATION_PLAN.md UNIFIED_NOAM_COACH_AUDIT_CHECKPOINT.md; do
+  cp -p "/c/coach_bot/$f" "/c/coach_bot/noam-coach/docs/archive/$f"
 done
 ```
-- **Preconditions:** the six sha256 above still match; `docs/archive/<name>.md` free (verified — no collision); backup store writable.
-- **Verify (byte-equality, both copies):**
+- **Preconditions:** secret scan = 0; the six sha256 (§G table) still match; each
+  each of the six `docs/archive/<basename>.md` targets free (verified 2026-07-25,
+  no collision); backup store writable.
+- **Verify (byte-equality, all three copies):**
 ```bash
-for f in <the six basenames>; do
-  a=$(sha256sum "/c/coach_bot/$f.md" | cut -d' ' -f1)
-  b=$(sha256sum "$BK/local_docs/$f.md" | cut -d' ' -f1)
-  c=$(sha256sum "/c/coach_bot/noam-coach/docs/archive/$f.md" | cut -d' ' -f1)
-  [ "$a" = "$b" ] && [ "$a" = "$c" ] && echo "OK $f" || echo "MISMATCH $f"
+BK="/c/coach_bot_BACKUP_20260721_150908/cleanup_20260725"
+for f in FINAL_MEAL_INTERACTION_IMPLEMENTATION_PLAN.md MEAL_INTERACTION_ENGINEERING_ROOT_CAUSE_AUDIT.md \
+         MEAL_INTERACTION_LOG_AND_IMAGE_AUDIT.md SYSTEM_DATA_SOURCE_OF_TRUTH_AND_OBSERVABILITY_AUDIT.md \
+         UNIFIED_NOAM_COACH_CONSOLIDATION_PLAN.md UNIFIED_NOAM_COACH_AUDIT_CHECKPOINT.md; do
+  a=$(sha256sum "/c/coach_bot/$f" | cut -d' ' -f1)
+  b=$(sha256sum "$BK/local_docs/$f" | cut -d' ' -f1)
+  c=$(sha256sum "/c/coach_bot/noam-coach/docs/archive/$f" | cut -d' ' -f1)
+  { [ "$a" = "$b" ] && [ "$a" = "$c" ]; } && echo "OK $f" || echo "MISMATCH $f"
 done
 ```
-- **Expected git diff:** 6 new tracked files under `docs/archive/` (no other change).
-  Confirm CI forbidden-files gate stays clean (`git ls-files | grep -E '\.env$|\.db$|/\.claude/'` empty).
-- **Rollback:** `git rm docs/archive/<the six>.md && git commit` (originals + backups remain). Backups are copies; deleting them is harmless.
-- **Guards/tests:** run `ruff check .` (docs-only, no code) + the forbidden-files grep; open a PR to develop; CI must be green.
+- **Expected git diff:** exactly 6 new tracked files under `docs/archive/`:
+  `FINAL_MEAL_INTERACTION_IMPLEMENTATION_PLAN.md`, `MEAL_INTERACTION_ENGINEERING_ROOT_CAUSE_AUDIT.md`,
+  `MEAL_INTERACTION_LOG_AND_IMAGE_AUDIT.md`, `SYSTEM_DATA_SOURCE_OF_TRUTH_AND_OBSERVABILITY_AUDIT.md`,
+  `UNIFIED_NOAM_COACH_CONSOLIDATION_PLAN.md`, `UNIFIED_NOAM_COACH_AUDIT_CHECKPOINT.md`. No other change.
+  Forbidden-files gate stays clean: `git ls-files | grep -E '\.env$|\.db$|/\.claude/'` → empty.
+- **Rollback:**
+```bash
+cd /c/coach_bot/noam-coach
+git rm docs/archive/FINAL_MEAL_INTERACTION_IMPLEMENTATION_PLAN.md \
+       docs/archive/MEAL_INTERACTION_ENGINEERING_ROOT_CAUSE_AUDIT.md \
+       docs/archive/MEAL_INTERACTION_LOG_AND_IMAGE_AUDIT.md \
+       docs/archive/SYSTEM_DATA_SOURCE_OF_TRUTH_AND_OBSERVABILITY_AUDIT.md \
+       docs/archive/UNIFIED_NOAM_COACH_CONSOLIDATION_PLAN.md \
+       docs/archive/UNIFIED_NOAM_COACH_AUDIT_CHECKPOINT.md
+git commit -m "revert(archive): remove Batch A archival copies"
+```
+  (originals at `C:\coach_bot\` and the `$BK` backups remain.)
+- **Guards/tests:** `ruff check .` (docs-only) + forbidden-files grep. Commit on PR #6, push, wait for BOTH CI contexts green.
 - **Planned commit:** `docs(archive): preserve six local-only audit documents (Batch A)`.
-- **Untouched confirmation:** originals at `C:\coach_bot\` remain (copy only); protected worktree, historical DB, PII, runtime data, unmerged branches — untouched.
+- **Untouched:** originals (copy only); protected worktree, historical DB, PII, runtime data, unmerged branches.
 
-### Batch B — Remove ONLY verified 0-byte / malformed / empty strays
+### Batch B — Remove ONLY the verified 0-byte / malformed / empty strays
 
-**Only after Batch A backups exist and are byte-verified.** These live OUTSIDE
-the repo, so there is no git diff.
+**Only after Batch A backups exist and are byte-verified.** These live OUTSIDE the
+repo → no git diff. The `.git` removal is **fail-closed** (aborts on any surprise).
 ```bash
-# preconditions: backups exist under $BK; re-verify emptiness right before removal
-[ ! -s /c/coach_bot/noam_coach.db ] && echo "confirmed 0-byte" || { echo "ABORT: not empty"; exit 1; }
-git -C /c/coach_bot rev-parse 2>/dev/null && { echo "ABORT: real repo"; exit 1; } || echo "confirmed .git not a repo"
-[ -z "$(ls -A /c/coach_bot/.agents 2>/dev/null)" ] && echo "confirmed .agents empty" || { echo "ABORT: .agents not empty"; exit 1; }
-# removals
-rm -f  /c/coach_bot/noam_coach.db
-rm -rf /c/coach_bot/.git            # only ./info/exclude, backed up in A1
-rmdir  /c/coach_bot/.agents
+BK="/c/coach_bot_BACKUP_20260721_150908/cleanup_20260725"   # (re)defined here
+# --- B1: 0-byte stray DB ---
+[ -f /c/coach_bot/noam_coach.db ] && [ ! -s /c/coach_bot/noam_coach.db ] \
+  && echo "confirmed 0-byte db" || { echo "ABORT: db missing or not empty"; exit 1; }
+[ -f "$BK/stray_root_db/noam_coach.db" ] || { echo "ABORT: backup missing"; exit 1; }
+rm -f /c/coach_bot/noam_coach.db
+
+# --- B2: malformed .git — FAIL-CLOSED ---
+GITDIR=/c/coach_bot/.git
+[ -d "$GITDIR" ] || { echo "ABORT: $GITDIR missing"; exit 1; }
+git -C /c/coach_bot rev-parse 2>/dev/null && { echo "ABORT: real repo"; exit 1; } || true
+# complete inventory must be EXACTLY: info/ (dir) and info/exclude (file), nothing else
+INV=$(cd "$GITDIR" && find . -mindepth 1 -printf '%y %p\n' | sort)
+EXPECTED=$'d ./info\nf ./info/exclude'
+[ "$INV" = "$EXPECTED" ] || { echo "ABORT: unexpected .git contents:"; echo "$INV"; exit 1; }
+# exclude must match its recorded full sha256
+EXPECT_SHA=584f2cca6096463716b1370b772a34dbbc10e2743d0039a6848eea9b98ad06ef
+GOT_SHA=$(sha256sum "$GITDIR/info/exclude" | cut -d' ' -f1)
+[ "$GOT_SHA" = "$EXPECT_SHA" ] || { echo "ABORT: exclude sha mismatch ($GOT_SHA)"; exit 1; }
+[ -f "$BK/stray_root_git/exclude" ] || { echo "ABORT: exclude backup missing"; exit 1; }
+# remove ONLY info/exclude, then rmdir info, then rmdir .git (no rm -rf)
+rm -f "$GITDIR/info/exclude"
+rmdir "$GITDIR/info"
+rmdir "$GITDIR"
+
+# --- B3: empty .agents ---
+[ -d /c/coach_bot/.agents ] && [ -z "$(ls -A /c/coach_bot/.agents)" ] \
+  && rmdir /c/coach_bot/.agents || { echo "ABORT: .agents missing or not empty"; exit 1; }
 ```
-- **Verify:** `ls /c/coach_bot/noam_coach.db /c/coach_bot/.agents 2>&1` → "No such file"; `ls /c/coach_bot/.git 2>&1` → absent. The canonical repo still resolves: `git -C /c/coach_bot/noam-coach rev-parse HEAD`.
-- **Expected git diff:** NONE (all three are outside the repo).
-- **Rollback:** `touch /c/coach_bot/noam_coach.db`; `mkdir -p /c/coach_bot/.git/info && cp "$BK/stray_root_git/exclude" /c/coach_bot/.git/info/exclude`; `mkdir /c/coach_bot/.agents`.
-- **Guards:** re-run PHASE-0 verification (`git -C noam-coach status`, protected-DB hash unchanged).
-- **Planned commit:** none (no tracked change) — record the action in `WORK_MANAGER_STATE.md`.
-- **Untouched:** the canonical `noam-coach` repo, protected repo/worktrees/DB, PII, runtime data — all untouched.
+- **Verify:** `ls /c/coach_bot/noam_coach.db /c/coach_bot/.git /c/coach_bot/.agents 2>&1` → all "No such file"; canonical repo still resolves `git -C /c/coach_bot/noam-coach rev-parse HEAD`; protected-DB hash unchanged (`sha256sum .../noam_coach_complete_release/noam_coach.db` = `5bd8ac1b…`).
+- **Expected git diff:** NONE (all outside the repo).
+- **Rollback:**
+```bash
+BK="/c/coach_bot_BACKUP_20260721_150908/cleanup_20260725"
+: > /c/coach_bot/noam_coach.db
+mkdir -p /c/coach_bot/.git/info && cp -p "$BK/stray_root_git/exclude" /c/coach_bot/.git/info/exclude
+mkdir -p /c/coach_bot/.agents
+```
+- **Planned commit:** none (no tracked change) — record the action in `WORK_MANAGER_STATE.md`, push that doc update, wait for CI.
+- **Untouched:** the canonical repo, protected repo/worktrees/DB, PII, runtime data.
 
 ### Batch C — Reassign `origin/HEAD` + prune ONLY merged branches with 0 unique commits
 
-**Only after re-verifying reachability at execution time.**
+Directly-executable guarded loop; a branch is deleted **only inside** the condition
+proving it is an ancestor of `origin/develop` with zero unique commits. Uses
+`git branch -d` (safe) and skips local deletion when the branch is absent or
+checked out.
 ```bash
 cd /c/coach_bot/noam-coach
 git fetch --prune origin
 # C1: fix the stale local remote-HEAD symref (GitHub default is already develop)
 git remote set-head origin develop
-# C2: precondition re-check — prune ONLY branches proven merged with 0 unique commits
+git symbolic-ref refs/remotes/origin/HEAD   # expect refs/remotes/origin/develop
+
+# C2: guarded prune — remote delete + safe local delete, only when proven merged & 0-ahead
+CURRENT=$(git rev-parse --abbrev-ref HEAD)
 for b in consolidation/unified-noam-coach review/meal-observability-batch7 review/workout-selection-architecture; do
-  git merge-base --is-ancestor "origin/$b" origin/develop && [ "$(git rev-list --count origin/develop..origin/$b)" = "0" ] \
-    && echo "PRUNE-OK origin/$b" || echo "SKIP origin/$b (unique commits or unreachable)"
+  if git merge-base --is-ancestor "origin/$b" origin/develop \
+     && [ "$(git rev-list --count origin/develop..origin/$b)" = "0" ]; then
+    echo "PRUNE $b"
+    git push origin --delete "$b"
+    # local delete only if it exists AND is not the checked-out branch; -d refuses unmerged
+    if git show-ref --verify --quiet "refs/heads/$b" && [ "$b" != "$CURRENT" ]; then
+      git branch -d "$b" || echo "  (kept local $b: git -d refused / unmerged)"
+    else
+      echo "  (no local $b or it is checked out — skipped local delete)"
+    fi
+  else
+    echo "SKIP $b (unique commits or unreachable) — NOT deleted"
+  fi
 done
 ```
-- **Scope note:** `feature/dayplan-phase1` and `feature/dayplan-residuals` are merged but **intentionally retained** (prior instruction) — NOT pruned. `review/2026-07-18_1` is the protected-repo's branch and origin/HEAD's old target — retained. The three `codex/*` + `audit/latest-manual-session` branches have **unique unmerged commits** — **excluded** (must not delete; if ever retiring `audit/…`, first preserve its unique doc `2cf3de5` into `docs/archive/`).
-- **Actual deletion command (run ONLY for refs that printed PRUNE-OK):**
-  `git push origin --delete <branch>` (remote) and `git branch -D <local-if-any>`.
-- **Verify:** `git ls-remote origin | grep -E '<pruned branch>'` → empty; `git symbolic-ref refs/remotes/origin/HEAD` → `refs/remotes/origin/develop`.
-- **Rollback:** branch tips are recorded here (`consolidation/unified-noam-coach`=`608f60d`; `review/meal-observability-batch7`=`f31f047`; `review/workout-selection-architecture`=`7d256fa`) — recreate with `git push origin <sha>:refs/heads/<branch>`. `origin/HEAD` rollback: `git remote set-head origin <old>` (cosmetic).
-- **Guards:** each pruned branch's content is proven reachable from develop (0 unique commits) → no work is lost.
-- **Planned commit:** none (ref-only changes) — record in `WORK_MANAGER_STATE.md`.
+- **Scope note:** `feature/dayplan-phase1`, `feature/dayplan-residuals` = merged but **intentionally retained** (NOT in the loop). `review/2026-07-18_1` = protected-repo branch / old origin/HEAD target — retained. `origin/codex/complete-rec-program-04`, `origin/codex/post-observability-architecture`, `origin/audit/latest-manual-session-2026-07-18` = **unique unmerged commits → excluded** (not in the loop; if ever retiring `audit/…`, first preserve its unique doc `2cf3de5` into `docs/archive/`).
+- **Verify:** `git ls-remote origin | grep -E 'consolidation/unified-noam-coach|review/meal-observability-batch7|review/workout-selection-architecture'` → empty; `git symbolic-ref refs/remotes/origin/HEAD` → `refs/remotes/origin/develop`.
+- **Rollback (full SHAs):**
+```bash
+git push origin 608f60db2a7d796fec65141533c389ed78b9c36b:refs/heads/consolidation/unified-noam-coach
+git push origin f31f047d74dd68daf8368639dca3fb1ab9a17283:refs/heads/review/meal-observability-batch7
+git push origin 7d256fa8c440a08743d2b6282ce515e7f6d8266e:refs/heads/review/workout-selection-architecture
+# origin/HEAD (cosmetic): git remote set-head origin review/2026-07-18_1
+```
+- **Guards:** each pruned branch is proven reachable from develop (0 unique commits) → no work lost.
+- **Planned commit:** none (ref-only) — record in `WORK_MANAGER_STATE.md`, push that doc update, wait for CI.
 - **Untouched:** all file content, protected assets, PII, unmerged branches.
 
 ---

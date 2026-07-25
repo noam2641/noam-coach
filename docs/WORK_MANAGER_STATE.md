@@ -9,8 +9,10 @@ phase changes and before every pause.
 | Last verified `origin/develop` | `fbff6f106e4b923bcbd016d652c2c121e55ecec0` (merge of PR #5) |
 | GitHub default branch | `develop` (verified — the old `codex/*` default is corrected) |
 | Active phase | PHASE 2/3 complete → audit PR #6 open; awaiting `APPROVE REPOSITORY CLEANUP EXECUTION` |
-| Active branch | `chore/repository-consolidation-audit` @ `c122341` (+ this docs update) |
-| Audit PR | **#6** → base `develop` @ `fbff6f1`; CI push=success, PR-context pending |
+| Active branch | `chore/repository-consolidation-audit` (head advances with each audit-correction commit; latest pushed head recorded in the CI table below) |
+| Audit PR | **#6** (open, not merged) → base `develop` @ `fbff6f1`; head `chore/repository-consolidation-audit` |
+| CI on head `e9ebeac` | push run `30154114434` **success**; pull_request run `30154115680` **success** (this correction commit re-runs both; see PR checks) |
+| PR statistics | **+445 / −0** at `e9ebeac` (this correction commit adds doc lines; final counts per PR #6 after CI) |
 | Active worktree | `C:\coach_bot\noam-coach` (single writer) |
 | Protected worktree | `C:\coach_bot\noam_coach_complete_release` @ `6d57c04` — do not touch |
 | Protected/PII data | `noam_coach_complete_release\noam_coach.db` (sha `5bd8ac1b…`); `C:\coach_bot\noam-coach-private-audit\` (session trace + meal images) |
@@ -60,4 +62,4 @@ before approval.
 - Canonical implementation ledger: `docs/CANONICAL_IMPLEMENTATION_LEDGER.md`
 - Cleanup ledger: `docs/REPOSITORY_CLEANUP_LEDGER.md`
 - Agent roster & contracts (durable): `docs/WORK_MANAGER_AGENTS.md`
-- Active PRs: PR #4 (merged), PR #5 (merged). Next: consolidation-audit PR (pending).
+- Active PRs: PR #4 (merged), PR #5 (merged), **PR #6 (open — this audit)**.
