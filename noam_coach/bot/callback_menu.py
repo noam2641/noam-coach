@@ -141,7 +141,19 @@ async def handle_goal_callback(query: Any, user_id: int, data: str) -> bool:
             await activate_goal_version_provisional(user_id, gv_id)
             missing = await planning.missing_goal_inputs(DB, user_id)
             await decide_approval(approval_id, "approved")
-            await write_audit(user_id, "approve_provisional", "goal", gv_id, **payload)
+            # LOG-012: pass only bounded goal targets — never the free-text
+            # `explanation` (the audit choke point drops it, this is defense
+            # in depth so the raw text never leaves this call).
+            await write_audit(
+                user_id,
+                "approve_provisional",
+                "goal",
+                gv_id,
+                calories=payload.get("calories"),
+                protein=payload.get("protein"),
+                steps=payload.get("steps"),
+                phase=payload.get("phase"),
+            )
             # A provisional goal is a real active goal for planning purposes
             # (planning.active_goal includes 'active_provisional'), so a request
             # that was blocked on "no active goal" can continue automatically.
@@ -184,7 +196,18 @@ async def handle_goal_callback(query: Any, user_id: int, data: str) -> bool:
             affects=("calorie_target", "protein_target"),
         )
         await decide_approval(approval_id, "approved")
-        await write_audit(user_id, "approve", "goal", gv_id, **payload)
+        # LOG-012: bounded goal targets only — the free-text `explanation` is
+        # deliberately not passed (also dropped at the audit choke point).
+        await write_audit(
+            user_id,
+            "approve",
+            "goal",
+            gv_id,
+            calories=payload.get("calories"),
+            protein=payload.get("protein"),
+            steps=payload.get("steps"),
+            phase=payload.get("phase"),
+        )
         await event_log.append_event(
             DB,
             user_id,

@@ -249,6 +249,155 @@ async def notify_admin(bot: Any, text: str) -> None:
         await bot.send_message(chat_id=admin_chat_id(), text=text)
 
 
+# LOG-012 (P4 privacy): the audit trail is exported verbatim in the user's
+# DSAR ZIP, so `details` must never carry raw free-text (medical notes, goal
+# explanations, meal-correction prose, medication names). write_audit is the
+# single choke point for every audit INSERT, so the redaction/allowlist policy
+# lives here rather than being duplicated (and forgotten) at each call site.
+#
+# The allowlist is keyed by (action, entity) and names ONLY the bounded,
+# structured keys that may survive — codes, ids, numeric metadata, booleans.
+# Every other supplied key is DROPPED before storage. Unknown (action, entity)
+# pairs fall through to a conservative default that keeps only scalar
+# ints/bools/short ids, so a NEW call site that forgets to be careful still
+# fails safe. Whatever survives the allowlist is additionally passed through
+# the canonical `redact` backstop (defense in depth) before the INSERT.
+_AUDIT_MAX_SCALAR_STR = 64
+
+# Free-text medication names must be coded to a coarse category (OWNER
+# DECISION): store the CATEGORY, never the raw drug name. We keep the taxonomy
+# deliberately tiny — a stimulant bucket the coaching logic already special
+# cases, plus a generic fallback — rather than inventing a medical ontology.
+_STIMULANT_HINTS = ("ritalin", "ריטלין", "concerta", "adderall", "vyvanse", "elvanse")
+
+
+def _medication_kind_code(name: Any) -> str:
+    text = str(name or "").strip().lower()
+    for hint in _STIMULANT_HINTS:
+        if hint in text:
+            return "stimulant"
+    return "medication"
+
+
+def _location_code(value: Any) -> str | None:
+    """Coerce a free-text body-location note to a bounded code."""
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    buckets = {
+        "knee": ("knee", "ברך", "ברכיים"),
+        "back": ("back", "lower back", "גב", "גב תחתון"),
+        "shoulder": ("shoulder", "כתף", "כתפיים"),
+        "wrist": ("wrist", "hand", "שורש", "יד", "כף יד"),
+        "ankle": ("ankle", "foot", "קרסול", "כף רגל"),
+        "hip": ("hip", "ירך", "אגן"),
+        "neck": ("neck", "צוואר"),
+    }
+    for code, hints in buckets.items():
+        if any(hint in text for hint in hints):
+            return code
+    return "other"
+
+
+def _scalar_only(value: Any) -> bool:
+    """A conservative 'is this a bounded, non-free-text value' test."""
+    if isinstance(value, bool) or value is None:
+        return True
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, str):
+        return len(value) <= _AUDIT_MAX_SCALAR_STR
+    return False
+
+
+# Per (action, entity): a mapping of stored_key -> extractor(details) -> value.
+# Any key NOT produced here is dropped. `None` results are omitted from output.
+def _pass(key: str):
+    return lambda d: d.get(key)
+
+
+_AUDIT_ALLOWLIST: dict[tuple[str, str], dict[str, Any]] = {
+    # Goal approvals: keep the bounded targets; DROP the `explanation` prose.
+    ("approve", "goal"): {
+        "calories": _pass("calories"),
+        "protein": _pass("protein"),
+        "steps": _pass("steps"),
+        "phase": _pass("phase"),
+        "gv_id": _pass("gv_id"),
+    },
+    ("approve_provisional", "goal"): {
+        "calories": _pass("calories"),
+        "protein": _pass("protein"),
+        "steps": _pass("steps"),
+        "phase": _pass("phase"),
+        "gv_id": _pass("gv_id"),
+    },
+    # Meal-text correction: keep revision + optional bounded code; DROP prose.
+    ("meal_text_correction", "approval"): {
+        "revision": _pass("revision"),
+        "correction_kind_code": _pass("correction_kind_code"),
+    },
+    # Meal approve/edit: already bounded numbers + ids.
+    ("approve", "meal"): {
+        "approval_id": _pass("approval_id"),
+        "calories": _pass("calories"),
+        "protein": _pass("protein"),
+        "carbs": _pass("carbs"),
+        "fat": _pass("fat"),
+    },
+    ("edit", "meal"): {
+        "approval_id": _pass("approval_id"),
+        "calories": _pass("calories"),
+        "protein": _pass("protein"),
+        "carbs": _pass("carbs"),
+        "fat": _pass("fat"),
+    },
+    # Safety alert: preserve investigation value as CODES; coerce location.
+    ("safety_alert", "constraint"): {
+        "constraint_id": _pass("constraint_id"),
+        # accept either an already-coded kind or a raw `kind` short token
+        "kind_code": lambda d: d.get("kind_code") or d.get("kind"),
+        "location_code": lambda d: _location_code(
+            d.get("location_code") if d.get("location_code") is not None else d.get("location")
+        ),
+    },
+    # Daily flags: keep ONLY derived booleans; DROP the raw `text` note.
+    ("daily_flags", "flags"): {
+        "ritalin": _pass("ritalin"),
+        "fasting": _pass("fasting"),
+        "has_note": _pass("has_note"),
+    },
+    # Health import counts (numeric only).
+    ("health_import", "health"): {
+        "inserted": _pass("inserted"),
+        "duplicates": _pass("duplicates"),
+    },
+    ("health_facts_activated", "health"): {
+        "count": _pass("count"),
+    },
+    # Medication: store the CATEGORY code, never the raw drug name.
+    ("medication", "med_event"): {
+        "kind_code": lambda d: d.get("kind_code") or _medication_kind_code(d.get("name")),
+    },
+}
+
+
+def _allowlist_audit_details(action: str, entity: str, details: dict[str, Any]) -> dict[str, Any]:
+    spec = _AUDIT_ALLOWLIST.get((action, entity))
+    if spec is not None:
+        out: dict[str, Any] = {}
+        for stored_key, extractor in spec.items():
+            value = extractor(details)
+            if value is not None:
+                out[stored_key] = value
+        return out
+    # Unknown (action, entity): fail safe — keep only bounded scalars, drop
+    # anything that looks like free text or a nested structure.
+    return {key: value for key, value in details.items() if _scalar_only(value)}
+
+
 @runtime_bound(RUNTIME_NAMES)
 async def write_audit(
     user_id: int,
@@ -257,6 +406,14 @@ async def write_audit(
     entity_id: Any = None,
     **details: Any,
 ) -> None:
+    # Local import guards against an import cycle: observability may import
+    # from services during startup wiring.
+    from noam_coach.observability.redaction import redact
+
+    safe_details = _allowlist_audit_details(action, entity, details)
+    # Defense in depth: even allowlisted values pass through the canonical
+    # redactor (bounds strings, strips known secret shapes, rejects binary).
+    safe_details = redact(safe_details)
     await DB.execute(
         """
         INSERT INTO audit(user_id, action, entity, entity_id, details, created_at)
@@ -267,7 +424,7 @@ async def write_audit(
             action,
             entity,
             str(entity_id) if entity_id is not None else None,
-            json.dumps(details, ensure_ascii=False),
+            json.dumps(safe_details, ensure_ascii=False),
             utc_now(),
         ),
     )

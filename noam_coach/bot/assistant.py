@@ -644,7 +644,16 @@ async def _handle_daily_health_text_action(ctx: FreeTextContext) -> bool:
         elif flag == "fasting":
             flags["fasting"] = True
         await set_daily_flags(ctx.user_id, flags)
-        await write_audit(ctx.user_id, "daily_flags", "flags", None, text=note)
+        # LOG-012: store derived booleans only — never the raw note free-text.
+        await write_audit(
+            ctx.user_id,
+            "daily_flags",
+            "flags",
+            None,
+            ritalin=bool(flags.get("ritalin")),
+            fasting=bool(flags.get("fasting")),
+            has_note=bool(note),
+        )
         await ctx.send("נרשם להיום, אתאים את ההמלצות בהתאם 👍")
         return True
 
