@@ -144,6 +144,34 @@ def _slot_plan(
     return slots
 
 
+def _reconcile_slots_to_count(
+    role_slots: list[tuple[str, str, int]], count: int
+) -> list[tuple[str, str, int]]:
+    """Return exactly ``count`` slots, preserving _slot_plan's roles/timing.
+
+    The COUNT is owned by the canonical carrier (DayPlan). _slot_plan supplies
+    the role/timing intelligence for as many slots as it defined:
+      * count == len(role_slots): use them as-is;
+      * count <  len(role_slots): keep the earliest ``count`` (chronological);
+      * count >  len(role_slots): keep all, then append generic evenly-spaced
+        "meal N" slots between the last role slot and a nominal day end, so the
+        extra meals the user prefers still appear (with neutral roles).
+    """
+    role_slots = sorted(role_slots, key=lambda item: item[2])
+    if count <= len(role_slots):
+        return role_slots[:count]
+    slots = list(role_slots)
+    last_hour = role_slots[-1][2] if role_slots else 12
+    extra = count - len(slots)
+    # spread the extra meals from just after the last role slot toward ~22:00
+    span_end = 22
+    step = max(1, (span_end - last_hour) // (extra + 1)) if span_end > last_hour else 1
+    for i in range(extra):
+        hour = min(23, last_hour + step * (i + 1))
+        slots.append(("meal", f"ארוחה {len(slots) + 1}", hour))
+    return sorted(slots, key=lambda item: item[2])
+
+
 def _familiar_for_slot(profile: NutritionPreferenceProfile, slot: str) -> list[LearnedFood]:
     candidates = [
         food for food in profile.learned_foods
@@ -181,8 +209,15 @@ async def build_meal_intents(
     """
     local_now = (now or datetime.now(TZ)).astimezone(TZ)
     workout_context = await build_workout_nutrition_context(db, user_id, now=local_now)
-    slots = _slot_plan(workout_context, profile, now=local_now)
-    n_slots = max(1, len(slots))
+    # _slot_plan owns slot ROLES/TIMING; the COUNT is the canonical carrier value
+    # (workout_context.meals_remaining_estimate — DayPlan-owned when the user has
+    # an explicit preference; the legacy estimate otherwise). P1.1b: this keeps
+    # Today's Menu's meal count in lock-step with Today's Status/DayPlan instead
+    # of independently deciding it from the default slot-role list.
+    role_slots = _slot_plan(workout_context, profile, now=local_now)
+    canonical_count = max(1, int(workout_context.meals_remaining_estimate or 1))
+    slots = _reconcile_slots_to_count(role_slots, canonical_count)
+    n_slots = len(slots)
 
     allocations = build_remaining_slot_allocations(workout_context, slot_count=n_slots)
     # build_remaining_slot_allocations always returns >=1 allocation (it never
