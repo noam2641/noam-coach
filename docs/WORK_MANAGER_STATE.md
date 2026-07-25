@@ -11,6 +11,7 @@ phase changes and before every pause.
 | Active phase | PHASE 4 execution — **Batch A DONE (external-backup-only; PII guard tripped)**; Batch B/C pending |
 | Baseline @ approval | head `1dbd6c6`; push CI `30154848488` success; PR CI `30154850042` success; PR #6 open, `+591/−0` |
 | Batch A result | **PII in all six docs** (real user id + meal-image refs) → external backup only at `…\cleanup_20260725\local_docs_PII\`; **NOT added to Git** (A2 skipped). No tracked change. |
+| Batch A CI | `b6db987`: push run `30155534787` success; pull_request run `30155536081` **success on re-run attempt 2** (attempt 1 flaked on `test_daily_menu_refresh::test_lease_loss_during_generation_fences_persistence` — deferred CI-hardening, not fixed here). Both green. |
 | Active branch | `chore/repository-consolidation-audit` (head advances with each audit-correction commit; latest pushed head recorded in the CI table below) |
 | Audit PR | **#6** (open, not merged) → base `develop` @ `fbff6f1`; head `chore/repository-consolidation-audit` |
 | CI on head `e9ebeac` | push run `30154114434` **success**; pull_request run `30154115680` **success** (this correction commit re-runs both; see PR checks) |

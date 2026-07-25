@@ -13,6 +13,18 @@ Classifications: `CANONICAL_ACTIVE` · `HISTORICAL_REFERENCE` · `PROTECTED` ·
 `GENERATED` · `RUNTIME_DATA` · `PII_SENSITIVE` · `DUPLICATE` · `SUPERSEDED` ·
 `ARCHIVE_CANDIDATE` · `SAFE_DELETE_CANDIDATE` · `UNKNOWN`.
 
+### Deferred: observed CI flake (separate hardening task — NOT fixed in cleanup)
+During Batch A CI, the **pull_request** context on `b6db987` failed once, then
+**passed on re-run (attempt 2, same commit, no changes)** — flaky, not a
+regression. Failing test:
+`tests/test_daily_menu_refresh.py::test_lease_loss_during_generation_fences_persistence`
+— a concurrency/timing case (0.001 s renewal interval + fixed `asyncio.sleep(0.02)`)
+around heartbeat/lease-takeover/CAS fencing; scheduling contention is a plausible
+non-determinism source. Observed once (CI summary: 1 failed, 2425 passed, 2
+skipped). **Deferred as CI-hardening work (make the lease/CAS test deterministic);
+NOT addressed during this cleanup** — no production code or test was modified to
+obtain green CI. If it recurs, stop and root-cause before continuing.
+
 ---
 
 ## A. Keep / Canonical (no action)
