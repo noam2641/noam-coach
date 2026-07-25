@@ -613,7 +613,9 @@ async def today_has_workout(user_id: int) -> bool:
 
 @runtime_bound(RUNTIME_NAMES)
 def hours_left_until_sleep(profile: dict[str, Any]) -> float:
-    bedtime = (profile.get("sleep", {}) or {}).get("typical_bedtime")
+    from noam_coach.services import coaching_day
+
+    bedtime = coaching_day.sleep_bedtime(profile.get("sleep", {}) or {})
     now = datetime.now(TZ)
     if not bedtime:
         end = now.replace(hour=23, minute=0, second=0, microsecond=0)

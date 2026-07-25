@@ -168,7 +168,7 @@ program consolidates decision logic onto canonical owners.
 | DayPlan contract + meal-count owner + 13 tests | `7e9ebc6` | DONE |
 | `build_day_plan` builder + 5 read-only-verified tests | `90d7c07` | DONE |
 | CI cross-platform fix (separate) | `8259c60` | DONE |
-| Consumer migration + onboarding writer + 9 parity tests | (pending commit) | IN PROGRESS |
+| Consumer migration + onboarding writer + 9 parity tests | `e61b267` | DONE (merged PR #4) |
 
 **Migration approach (consolidation, not rewrite):** the single legacy count
 carrier is `WorkoutNutritionContext.meals_remaining_estimate`, read by BOTH
@@ -197,6 +197,55 @@ later batch once all count consumers read the carrier/DayPlan):**
 count) is unchanged in Phase 1 (only today's row is re-projected — stored-plan
 regeneration is Phase 2, ledger U-2). `meal_intent._slot_plan` still shapes slot
 *roles/timing* but its count now flows from the carrier.
+
+### P1.1b DayPlan residuals & data-contract closure (branch `feature/dayplan-residuals`)
+
+| Piece | Commit | Status |
+|---|---|---|
+| Shared tolerant sleep accessor + migrate ALL 5 legacy-only readers | `3a4f09e` | DONE |
+| Writers emit canonical `sleep_schedule` shape only (no dual-write) | `bda89a6` | DONE |
+| Legacy-caller reclassification + architecture guard + Menu count-parity fix + ledger | (this commit) | DONE |
+
+**Scope 1 — sleep-schema normalization (reader-first, no dual-write).** One
+shared accessor `coaching_day.sleep_bedtime / sleep_wake_time /
+normalize_sleep_schedule` (canonical `bedtime`/`wake_time` > legacy
+`typical_*`). All readers migrated to it (onboarding, recommendations,
+verify_health_import, proactive.`hours_left_until_sleep`,
+next_meal.`_bedtime_hours`); then both fact writers (`onboarding.
+_parse_sleep_window_text`, `multi_fact`) flipped to canonical-only. **No
+dual-write** (no external consumer requires the legacy key on write) and **no
+data migration** — historical legacy facts stay readable via the accessor.
+*Residual (documented, out of scope):* `routine.py` still builds the learned
+`profile["sleep"]` block with `typical_*` keys — that is the learned-routine
+schema, not a `sleep_schedule` FACT writer; all readers tolerate it.
+
+**Scope 2 — legacy-caller reclassification:**
+- **`next_meal._meals_remaining` — INTENTIONAL COMPATIBILITY FALLBACK** (not a
+  second decision owner). Reachable from exactly ONE sanctioned call site
+  (`build_workout_nutrition_context`), enforced by an architecture-guard test.
+  It is the no-explicit-preference default only; DayPlan remains canonical.
+- **`planning._meal_slots` — DEFERRED to Phase 2.** It sets the STORED weekly
+  plan's per-day meal count at generation time; regenerating stored plans is
+  explicitly out of this batch (ledger U-2). Boundary: Phase 1 re-projects only
+  *today's* weekly row live; past/future rows keep the stored count.
+- **`meal_intent._slot_plan` — KEPT & NARROWED to roles/timing.** Its COUNT is
+  now imposed by the canonical carrier via `_reconcile_slots_to_count`.
+
+**Finding fixed in this batch — Today's Menu count was still 3, not the
+preferred 6.** The Phase-1 migration made the *carrier* preference-aware (Today's
+Status/DayPlan honored 5–6), but `build_meal_intents` derived its slot count from
+`len(_slot_plan(...))` (the default role list, ~3), **independent of the
+carrier** — so Today's Menu still showed 3. Now `build_meal_intents` takes the
+count from `workout_context.meals_remaining_estimate` and `_reconcile_slots_to_count`
+maps `_slot_plan`'s roles/timing onto that count. **Verified: Today's Menu ==
+Today's Status == DayPlan == 6** (end-to-end parity test).
+
+**Scope 3 — architecture guard (allowlist, not text-search).** AST-based guard
+proving: `_meals_remaining` is called from exactly the one sanctioned site; the
+carrier is produced only through the DayPlan bridge
+(`resolve_remaining_meals_estimate`); `_slot_plan` has one role/timing call site;
+and the end-to-end Menu/Status/DayPlan count parity. The compat carrier only
+*exposes* the DayPlan result — it holds no independent decision logic.
 
 ---
 

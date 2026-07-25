@@ -319,9 +319,10 @@ async def test_health_sleep_edit_stores_structured_schedule(
 
     assert handled is True
     fact = await user_model.get_fact(db, 1, "sleep_schedule")
+    # P1.1b: the onboarding sleep-edit writer now stores the CANONICAL shape.
     assert fact["value"] == {
-        "typical_bedtime": "00:20",
-        "typical_wake_time": "06:50",
+        "bedtime": "00:20",
+        "wake_time": "06:50",
     }
     assert fact["source"] == user_model.SOURCE_USER
     assert fact["confirmed"] is True

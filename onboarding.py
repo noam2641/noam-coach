@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 import user_model
+from noam_coach.services import coaching_day
 
 STAGE_KEY = "onboarding_stage"
 
@@ -135,13 +136,14 @@ def patterns_text(profile: dict[str, Any]) -> tuple[str, list[dict[str, str]]]:
                 ),
             }
         )
-    if sleep.get("typical_bedtime"):
+    _sleep_bedtime = coaching_day.sleep_bedtime(sleep)
+    if _sleep_bedtime:
         items.append(
             {
                 "id": "sleep_schedule",
                 "display_label": user_model.display_label("sleep_schedule"),
                 "text": (
-                    f"שינה טיפוסית ~{sleep['typical_bedtime']}–{sleep.get('typical_wake_time')}."
+                    f"שינה טיפוסית ~{_sleep_bedtime}–{coaching_day.sleep_wake_time(sleep)}."
                 ),
             }
         )
