@@ -247,6 +247,31 @@ carrier is produced only through the DayPlan bridge
 and the end-to-end Menu/Status/DayPlan count parity. The compat carrier only
 *exposes* the DayPlan result — it holds no independent decision logic.
 
+### P2 — Consolidation-audit backlog (revalidated vs `develop` @ `fbff6f1`, 2026-07-25)
+
+Read-only architecture revalidation confirmed 8 actionable findings with
+file:line evidence (a 9th — multi-user / live Health / AI Gateway — is correctly
+NOT started and stays a product decision). These are NOT duplicates of P1.2–P1.11
+(AI Gateway/Event Bus/etc. remain planned & BLOCKED). Dependency order noted;
+each is a small, separately-gated batch.
+
+| ID | Finding | Verdict / severity | Evidence (file:line) | Existing test gap | Acceptance | Dep order |
+|---|---|---|---|---|---|---|
+| **P2.1** | GitHub default branch + stale local `origin/HEAD` | CONFIRMED · Low | `.github/workflows/ci.yml:3-5` (no branch filter); local `origin/HEAD`→`review/2026-07-18_1` | none | default=develop (done, server-side); `git remote set-head origin develop`; optionally pin CI branch triggers | 1 (unblocks) |
+| **P2.2** | Version strings disagree | CONFIRMED · Medium | `VERSION:1` rc7 vs `compose.yaml:5` rc4 vs `README.md:1`/`docs/{ARCHITECTURE,MANIFEST,CONTINUATION_STATE}.md` rc5 | no consistency test | all strings reconciled to `VERSION`; add a version-consistency check | 2 (docs) |
+| **P2.3** | Docs recommend **relative** DB/STORAGE paths the G5 guard rejects | CONFIRMED · Medium | guard `config.py:227-231`; `ENVIRONMENT_VARIABLES.md:13,15`; defaults `config.py:22-23`; compose absolute `compose.yaml:12-15` | `test_settings.py:63-115` (guard OK; docs wrong) | docs show absolute example (`/data/noam_coach.db`, `/storage`) matching compose; optional docs-lint | 2 (docs) |
+| **P2.4** | **Mini App `/meals/today` uses calendar-day, `/dashboard` uses coaching-day** — two Mini screens disagree at the boundary | CONFIRMED · **High** | `mini_api.py:608-610` + `helpers.py:44-56` (calendar) vs `mini_api.py:250`→`proactive.today_consumed`→`coaching_day_bounds_utc` | `test_mini_profile_api.py:141` (no midnight case) | `mini_today_meals` derives bounds via `daily_state.coaching_day_bounds_utc(DB,user_id)`; add a 00:30/post-bedtime parity test | 3 (foundational) |
+| **P2.5** | DayPlan governs Telegram only, **not the Mini App** | CONFIRMED · **High** | only `build_day_plan` consumer = `onboarding.py:2397`; no `mini_api.py` route imports `day_plan` | guard is Telegram-only (`test_day_plan_architecture_guard.py:102`) | Mini `/dashboard`,`/next-meal`,`/meals/today` read count/day from `build_day_plan`; cross-surface parity test | 4 (needs P2.4) |
+| **P2.6** | Body-limit middleware **buffers the whole upload in memory** (≤300 MB) before the streaming handler | CONFIRMED (code) · Med-High | `security.py:51-74` (in-memory `deque` replay); limit `security.py:28-32` + `config.py:78` (300) | `test_bugfix_regression.py:50`, `test_api_guard.py:37` (neither checks buffering) | middleware enforces size incrementally without retaining full body (or exempts `/mini/upload` to the handler's streamed cap); memory-bounded chunked-upload test | 5 (independent) |
+| **P2.7** | No ratchet guard prevents NEW `coach_bot`/`runtime_bound` coupling | CONFIRMED · Medium | `test_architecture.py:17-62` + `test_day_plan_architecture_guard.py:21-64` (neither caps coupling) | — | AST ratchet test: ≤25 files `import coach_bot`, ≤25 files `@runtime_bound`, fail on increase | 6 (before P2.8) |
+| **P2.8** | Incremental `coach_bot`/`runtime_bound` decoupling (baseline: **25 modules import coach_bot; 25 modules / 308 `@runtime_bound`**; facade `runtime_bind.py:18-42`) | CONFIRMED baseline · Medium | 25+25 modules; `RUNTIME_NAMES` e.g. `app/runtime.py:110` | — | extract one module/step (direct imports replace facade); P2.7 ratchet enforces monotonic decrease; behavior tests green | 7 (gated by P2.7) |
+
+**Dependency summary:** P2.1 → then docs (P2.2, P2.3) → **P2.4 → P2.5** (coaching-day
+must be canonical before DayPlan governs the Mini App) → P2.6 (independent) →
+**P2.7 → P2.8** (ratchet before extraction). AI Gateway (P1.2) remains BLOCKED
+until explicitly authorized; stored weekly-plan regeneration (`planning._meal_slots`)
+remains separate Phase-2 scope.
+
 ---
 
 ## Part C — Local-only artifacts (workspace audit)
