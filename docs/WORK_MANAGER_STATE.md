@@ -150,8 +150,65 @@ LOG-013 (analytics dup), LOG-009 (AI latency baseline). No action: LOG-001 alrea
 "daily-menu idempotency unverified" note). Full specs + regression matrices: intake report + the
 scratchpad draft `WORK_MANAGER_STATE_INTAKE_DRAFT.md`.
 
+## Complete work-plan inventory + progress (reconciled 2026-07-25, git-verified)
+
+Reconciliation of the FULL canonical work plan against git reality (not document
+claims). Verified by `git log` / merge-base / test-file presence.
+
+**Verified-and-merged (in `develop @ d3da771`):** Tasks 1–22; Tasks 58–65 (the
+MASTER_TASKS "Open Backlog 58–65" label is **STALE** — all merged per
+CANONICAL_IMPLEMENTATION_LEDGER A.2; Task 61's "PARTIAL/U-3" label is stale, it
+is merged at `a4eec07`); FIX 38–57 (B-series, 20 modules/tests); ARCH 1–13 except
+ARCH-07B; Observability O1–O10 + Review R1–R6; DayPlan P1.1/P1.1b (PR #4/#5).
+
+**Current LOG batch (this session) — implemented, independently verified, pushed,
+NOT yet merged (status: verified-not-merged):**
+| Task | Branch | Commit | Local verify | Branch CI |
+|---|---|---|---|---|
+| LOG-014 (P1 meal-correction routing/idempotency) | `fix/log-014-meal-correction-routing` | `100cf71` | 177+~470+447 green | push **success** |
+| LOG-015 / Task 66 (P2 safety-question resume + universal gate) | `fix/log-015-safety-question-resume` | `c803d8a` | full split + CI-exact 951 green | push red = **stray-db flake** (rerun clears) |
+| LOG-012 (P4 audit allowlist/redaction; medication→kind_code) | `fix/log-012-audit-redaction` | `3466be9` | 23+~380 + full split green | (running) |
+| LOG-016 (P3 freeze legacy goals; DSAR→goal_versions) | `fix/log-016-goals-canonical` | `066e81e` | 42+~135 green | (running) |
+| Governance (autonomy model + owner decisions) | `chore/work-manager-autonomy-config` | `9971e67` | docs-only | push **success** |
+
+Owner Category-C decisions (resolved, Hebrew interview): LOG-014 auto-reanalysis
+on ambiguous/foreign-token identity corrections (no clarification), idempotent
+scale; LOG-015 block-and-auto-restore (gate every plan-build path + auto-restore
+after wizard); LOG-012 medication→`kind_code` (no raw free-text); LOG-016 freeze
+(no schema drop).
+
+**Genuinely-remaining APPROVED tasks beyond the LOG batch: NONE.** Everything
+else is complete-merged, BLOCKED scope, exploratory-direction-only, or superseded.
+
+**BLOCKED / owner-decision (NOT in the autonomous queue):** AI Gateway (P1.2);
+stored weekly-plan regen / `planning._meal_slots` Phase 2 (U-2); destructive
+sleep-fact migration; multi-user support; live Apple Health integration;
+external-resource items (Telegram token, live OpenAI, Google Calendar OAuth,
+Sentry, prod infra, PostgreSQL/queue/object-store, live E2E Telegram). P2.1–P2.8
+consolidation-audit backlog is revalidated-with-evidence but **not scheduled** —
+requires owner approval to enter the queue (P2.4/P2.5 Mini-App governance are the
+most material, both High).
+
+**Superseded / exploratory — DO NOT implement:** FIX 1–37 (→ Tasks 1–22 + 58–65);
+B-2 (→ incorporated in LOG-014); archived requirements (MASTER_TASKS:104-116, "do
+not reopen"); P1.3–P1.11 forward program ("target direction only, no production
+code" — a doc line ≠ approved task); addendum "batches A–I" (audit recommendation
+only); the deleted root PII audit `.md` plans (FS-CLEANUP-1).
+
+### Corrected progress (explicit denominators)
+- **Current LOG batch:** 4/4 implemented + independently verified; **0/4 merged**
+  (all await operator PR-open, then WM merge). Governance branch also awaits PR.
+- **Complete approved work plan:** the entire *approved* scope = the already-merged
+  historical tasks + this LOG batch. Verified-and-merged historical set is
+  complete; the only unmerged approved work is these 4 LOG tasks (+ governance).
+  **Remaining approved-and-unstarted beyond this batch: 0.**
+- **Blocked by owner decision / external access:** the BLOCKED list above (AI
+  Gateway, Phase-2, sleep migration, multi-user, live Apple Health, P2.x
+  scheduling, external-credential items) — not counted as "remaining approved".
+
 ## Links
 - Canonical implementation ledger: `docs/CANONICAL_IMPLEMENTATION_LEDGER.md`
 - Cleanup ledger: `docs/REPOSITORY_CLEANUP_LEDGER.md`
 - Agent roster & contracts (durable): `docs/WORK_MANAGER_AGENTS.md`
-- Active PRs: PR #4 (merged), PR #5 (merged), PR #7 (merged), **PR #6 (open — this audit)**.
+- Active PRs: PR #4/#5/#7 (merged), PR #6/#8 (merged). Open task branches await PRs:
+  `fix/log-012/014/015/016-*`, `chore/work-manager-autonomy-config`.
