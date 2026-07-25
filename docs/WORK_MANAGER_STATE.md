@@ -5,11 +5,12 @@ phase changes and before every pause.
 
 | Field | Value |
 |---|---|
-| Last updated | 2026-07-25 |
+| Last updated | 2026-07-25 (audit-gaps corrected) |
 | Last verified `origin/develop` | `fbff6f106e4b923bcbd016d652c2c121e55ecec0` (merge of PR #5) |
 | GitHub default branch | `develop` (verified — the old `codex/*` default is corrected) |
-| Active phase | PHASE 2 — repository & filesystem consolidation audit (read-only) |
-| Active branch | `chore/repository-consolidation-audit` (off `develop` @ `fbff6f1`) |
+| Active phase | PHASE 2/3 complete → audit PR #6 open; awaiting `APPROVE REPOSITORY CLEANUP EXECUTION` |
+| Active branch | `chore/repository-consolidation-audit` @ `c122341` (+ this docs update) |
+| Audit PR | **#6** → base `develop` @ `fbff6f1`; CI push=success, PR-context pending |
 | Active worktree | `C:\coach_bot\noam-coach` (single writer) |
 | Protected worktree | `C:\coach_bot\noam_coach_complete_release` @ `6d57c04` — do not touch |
 | Protected/PII data | `noam_coach_complete_release\noam_coach.db` (sha `5bd8ac1b…`); `C:\coach_bot\noam-coach-private-audit\` (session trace + meal images) |
@@ -42,9 +43,13 @@ P1.1b head `4f9c664`: local full suite **2428 passed, 0 failed, 1 skipped**;
 CI (push + pull_request contexts) **green**. Verified in the PR #5 pre-merge review.
 
 ## Next exact action
-PHASE 2: enumerate & classify every repo/worktree/local artifact into
-`docs/REPOSITORY_CLEANUP_LEDGER.md` (read-only), then PHASE 3 revalidation, then
-produce the 14-part audit output and open the PR.
+Audit is complete and PR #6 is open with the corrected 14-part output + the
+three-batch (A/B/C) execution plan in `REPOSITORY_CLEANUP_LEDGER.md` §G.
+**PAUSED — awaiting the human token `APPROVE REPOSITORY CLEANUP EXECUTION`.**
+On approval, execute Batch A (backups + archival copies) → verify → Batch B
+(remove verified strays) → verify → Batch C (origin/HEAD + prune 0-unique merged
+branches). Backup destination: `C:\coach_bot_BACKUP_20260721_150908\cleanup_20260725\`.
+No source retirement (P2.7/P2.8 stay future work).
 
 ## Prohibited scopes (this session)
 AI Gateway · stored weekly-plan regeneration (`planning._meal_slots` Phase 2) ·
