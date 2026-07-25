@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 import coach_bot
+import conversation
 import planning
 import questions
 import training_intelligence
@@ -310,3 +311,165 @@ async def test_final_health_planning_summary_displays_one_limitation_concept(
     assert "מרפק טניס" in text
     assert "כאב/פציעה פעילה" not in text
     assert "הימנעות לפי רופא" not in text
+
+
+async def _build_nested_health_suspension(db: Database) -> str:
+    """Reproduce the runtime nesting: a parent onboarding question (the
+    safety-critical training_limitations) suspended by the health_import
+    microflow, which is itself suspended by the confirm wizard's own pending
+    __health_edit_*__ onboarding_question. Returns the parent flow_id."""
+    # 1) Parent onboarding question interrupted by the import.
+    await conversation.set_active_flow(
+        db,
+        1,
+        conversation.FlowName.onboarding_question,
+        step="training_limitations",
+    )
+    parent = await conversation.get_active_flow(db, 1)
+    # 2) Health import microflow suspends the parent (as _begin_health_import_flow).
+    await conversation.set_active_flow(
+        db,
+        1,
+        conversation.FlowName.health_import,
+        step="processing",
+        payload={"source": "document"},
+        suspend_current=True,
+    )
+    # 3) The confirm wizard sets its own pending question, suspending the
+    #    health_import (as set_pending("__health_edit_*__") does).
+    await conversation.set_active_flow(
+        db,
+        1,
+        conversation.FlowName.onboarding_question,
+        step="__health_edit_workout_frequency__",
+        suspend_current=True,
+    )
+    return parent.flow_id
+
+
+@pytest.mark.asyncio
+async def test_suspended_safety_question_auto_restored_after_wizard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """LOG-015: the safety-critical training_limitations question suspended by
+    the import + confirm wizard is AUTO-RESTORED when the wizard finishes."""
+    db = await _make_db(tmp_path)
+    _patch_db(monkeypatch, db)
+
+    async def no_reconciliation(message: Any, user_id: int) -> None:
+        del message, user_id
+
+    monkeypatch.setattr(health_jobs, "run_post_import_reconciliation", no_reconciliation)
+
+    parent_flow_id = await _build_nested_health_suspension(db)
+    # The wizard's post-continuation marker, as start_health_confirm_wizard sets it.
+    await core_services.set_flow_state(
+        1,
+        health_jobs.HEALTH_POST_WIZARD_FLOW,
+        "reconciliation",
+        {"summary_text": "<b>ייבוא Apple Health הושלם ✅</b>"},
+    )
+
+    target = FakeTarget()
+    await health_jobs.finish_health_confirm_wizard(target, 1)
+
+    restored = await conversation.get_active_flow(db, 1)
+    assert restored.name == conversation.FlowName.onboarding_question
+    assert restored.step == "training_limitations"
+    assert restored.flow_id == parent_flow_id
+    # The whole chain is fully unwound — no leftover suspension.
+    assert restored.suspended is None
+
+
+async def _seed_deferred_ready_no_safety(db: Database) -> None:
+    """All plan/deferred inputs present EXCEPT the safety training_limitations,
+    so a build path reaches the safety gate rather than stalling on a deferred
+    question."""
+    await _set_fact(db, "primary_goal", "fat_loss")
+    await _set_fact(db, "session_minutes", 50)
+    await _set_fact(db, "training_location", "gym")
+    await _set_fact(db, "equipment", "full_gym")
+    await _set_fact(db, "strength_experience", "intermediate")
+    await _set_fact(db, "diet_restrictions", "none")
+    await _set_fact(db, "allergies", "none")
+    # training_limitations intentionally left unanswered.
+
+
+class _TextMessage:
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.texts: list[str] = []
+        self.markups: list[Any] = []
+
+    async def reply_text(self, text: str, reply_markup: Any = None, parse_mode: str | None = None) -> None:
+        del parse_mode
+        self.texts.append(text)
+        self.markups.append(reply_markup)
+
+
+@pytest.mark.asyncio
+async def test_plan_frequency_text_build_blocked_by_pending_safety(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """LOG-015: the __plan_frequency__ free-text build path (onboarding ~2857)
+    is BLOCKED while training_limitations is unanswered."""
+    db = await _make_db(tmp_path)
+    _patch_db(monkeypatch, db)
+    await _seed_deferred_ready_no_safety(db)
+
+    built: list[Any] = []
+
+    async def spy_build(user_id: int, frequency: int) -> dict[str, Any]:
+        built.append(frequency)
+        return {}
+
+    monkeypatch.setattr(onboarding_bot, "build_weekly_plan", spy_build)
+
+    await onboarding_bot.set_pending(1, "__plan_frequency__")
+
+    message = _TextMessage("4")
+
+    class FakeUpdate:
+        pass
+
+    update = FakeUpdate()
+    update.effective_message = message  # type: ignore[attr-defined]
+
+    handled = await onboarding_bot.handle_onboarding_text(update, 1)
+
+    assert handled is True
+    assert built == []  # plan build was blocked
+    # The safety question was re-surfaced.
+    assert any("שאלת בטיחות" in t for t in message.texts)
+    assert await questions.pending_safety_questions(db, 1)  # still pending
+
+
+@pytest.mark.asyncio
+async def test_deferred_plan_continuation_blocked_by_pending_safety(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """LOG-015: the deferred-plan continuation build path (onboarding ~692,
+    advance_after_answer) is BLOCKED while training_limitations is unanswered."""
+    db = await _make_db(tmp_path)
+    _patch_db(monkeypatch, db)
+    await _seed_deferred_ready_no_safety(db)
+
+    built: list[Any] = []
+
+    async def spy_build(user_id: int, frequency: int) -> dict[str, Any]:
+        built.append(frequency)
+        return {}
+
+    monkeypatch.setattr(onboarding_bot, "build_weekly_plan", spy_build)
+
+    # A deferred-plan flow whose deferred questions are all answered, so
+    # advance_after_answer proceeds to the safety gate + build.
+    await onboarding_bot.set_flow_state(1, "deferred_plan", "4", {"remaining_key": "equipment"})
+
+    target = _TextMessage("")
+
+    await onboarding_bot.advance_after_answer(target, 1)
+
+    assert built == []  # blocked before build
+    assert any("שאלת בטיחות" in t for t in target.texts)
+    assert await questions.pending_safety_questions(db, 1)

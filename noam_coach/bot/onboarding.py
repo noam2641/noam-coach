@@ -689,6 +689,12 @@ async def advance_after_answer(target: Any, user_id: int) -> None:
         message = target.message if hasattr(target, "message") else target
         if await ask_deferred_for_plan(message, user_id, freq):
             return
+        # LOG-015: enforce the safety gate on this build path too — not only in
+        # assistant._handle_plan_text_action. A safety-critical question (e.g.
+        # training_limitations) that was suspended by a health import must be
+        # answered before a plan is built here.
+        if await _block_plan_for_pending_safety(message, user_id):
+            return
         plan = await build_weekly_plan(user_id, freq)
         await message.reply_text(
             format_weekly_plan(plan),
@@ -2546,6 +2552,42 @@ async def ask_deferred_for_plan(target: Any, user_id: int, frequency: int) -> bo
 
 
 @runtime_bound(RUNTIME_NAMES)
+async def _block_plan_for_pending_safety(target: Any, user_id: int) -> bool:
+    """Safety gate for the onboarding build paths.
+
+    LOG-015: a safety-critical question (any member of
+    ``questions.SAFETY_QUESTIONS`` — currently ``training_limitations``) that
+    is still unanswered must block plan building on EVERY build/activation
+    path, not only ``assistant._handle_plan_text_action``. When one is
+    pending, re-surface it (set it pending + ask it) and return ``True`` so the
+    caller aborts the build. Returns ``False`` when no safety question is
+    pending and the build may proceed.
+    """
+    pending = await questions.pending_safety_questions(DB, user_id)
+    if not pending:
+        return False
+    q = pending[0]
+    await set_pending(user_id, q.id)
+    rows: list[list[Any]] = []
+    if q.options:
+        rows = [
+            [button(label, f"qa:{q.id}:{index}")]
+            for index, (label, _value) in enumerate(q.options)
+        ]
+    keyboard = InlineKeyboardMarkup(rows) if rows else None
+    text = (
+        "לפני שאבנה תוכנית, יש שאלת בטיחות חשובה שצריך לענות עליה קודם:\n\n"
+        + q.text
+    )
+    await target.reply_text(
+        text,
+        reply_markup=keyboard,
+        parse_mode=ParseMode.HTML,
+    )
+    return True
+
+
+@runtime_bound(RUNTIME_NAMES)
 async def check_plan_readiness(user_id: int) -> list[str]:
     """Return a list of missing requirements that block plan activation.
 
@@ -2853,6 +2895,11 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
         await clear_pending(user_id)
         # Ask deferred questions before building the plan.
         if await ask_deferred_for_plan(message, user_id, frequency):
+            return True
+        # LOG-015: mirror the assistant safety gate — block the build while any
+        # safety-critical question is still unanswered (e.g. a training
+        # limitation suspended by a health import + confirm wizard).
+        if await _block_plan_for_pending_safety(message, user_id):
             return True
         plan = await build_weekly_plan(user_id, frequency)
         await message.reply_text(

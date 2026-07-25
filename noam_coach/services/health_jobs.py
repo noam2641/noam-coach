@@ -1514,6 +1514,16 @@ async def finish_health_confirm_wizard(
     summary_text = (payload.get("payload") or {}).get("summary_text", "")
     await clear_flow_state(user_id, HEALTH_POST_WIZARD_FLOW)
 
+    # LOG-015: the confirm wizard sets its own pending question
+    # (__health_edit_*__), which suspends the active health_import microflow,
+    # which in turn had already suspended the parent onboarding question that
+    # was interrupted by the import (a safety-critical training_limitations
+    # question included). Now that the wizard is finished, deterministically
+    # unwind that whole nested chain by flow identity so the original parent
+    # question is auto-restored — otherwise a suspended safety question is
+    # silently orphaned and never re-asked.
+    await _restore_parent_after_health_flow(user_id)
+
     planning_summary = await _health_confirmed_planning_summary_text(user_id)
     text = (
         (summary_text + "\n\n" + planning_summary)
@@ -1817,13 +1827,59 @@ async def import_health_export_file(
                 shutil.rmtree(extract_dir, ignore_errors=True)
 
 
+def _chain_has_health_import(flow: Any) -> bool:
+    """True if ``flow`` is the health-import microflow or has it anywhere in
+    its suspended chain — i.e. a health import is the reason this flow (or an
+    ancestor of it) exists and still owes a parent-resume."""
+    if flow.name == conversation.FlowName.health_import:
+        return True
+    snapshot = flow.suspended
+    depth = 0
+    while isinstance(snapshot, dict) and depth < 16:
+        name = snapshot.get("name") or snapshot.get("flow")
+        if name == conversation.FlowName.health_import.value:
+            return True
+        snapshot = (snapshot.get("payload") or {}).get("suspended")
+        depth += 1
+    return False
+
+
+async def _restore_parent_after_health_flow(user_id: int) -> None:
+    """Unwind the full nested suspension chain created by the health-import
+    microflow (and its confirm wizard) back to the original parent question.
+
+    Runs after the wizard finishes, or when the import ends without a wizard.
+    Uses ``resume_all_suspended`` so a 2-deep nest (parent question ->
+    health_import -> wizard __health_edit_*__) is fully restored to the parent,
+    never left one level short.  When nothing was suspended (import started
+    from idle), the active flow is simply cleared.
+    """
+    with suppress(Exception):
+        resumed = await conversation.resume_all_suspended(DB, user_id)
+        if resumed is None:
+            await conversation.clear_active_flow(DB, user_id)
+
+
 async def _finish_health_import_flow(user_id: int) -> None:
     with suppress(Exception):
         current_flow = await conversation.get_active_flow(DB, user_id)
-        if current_flow.name == conversation.FlowName.health_import:
-            resumed = await conversation.resume_suspended(DB, user_id)
-            if resumed is None:
-                await conversation.clear_active_flow(DB, user_id)
+        # LOG-015: the guard used to require the active flow to still literally
+        # be ``health_import``. Once the confirm wizard runs, the active flow is
+        # the wizard's own onboarding_question (__health_edit_*__) with
+        # health_import suspended one level below — so the old guard was already
+        # false here and the parent question was never restored. Key off flow
+        # identity (the health_import anywhere in the chain) instead. But while
+        # the confirm wizard is still pending it OWNS the resume (it will call
+        # _restore_parent_after_health_flow on finish); tearing it down here
+        # would destroy an in-progress safety question. Detect that via the
+        # persisted post-wizard marker and defer to the wizard in that case.
+        from noam_coach.bot.onboarding import get_flow_state
+
+        wizard_pending = await get_flow_state(user_id, HEALTH_POST_WIZARD_FLOW)
+        if wizard_pending:
+            return
+        if _chain_has_health_import(current_flow):
+            await _restore_parent_after_health_flow(user_id)
 
 
 @runtime_bound(RUNTIME_NAMES)
