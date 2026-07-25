@@ -5,10 +5,10 @@ phase changes and before every pause.
 
 | Field | Value |
 |---|---|
-| Last updated | 2026-07-25 (PR #7 merged; PR #6 synced to develop; log-audit intake recorded) |
-| Last verified `origin/develop` | `3ec5296c5d4e9af67f2605ad2258e9b516087910` (merge of PR #7 — deterministic lease-loss test fix) |
+| Last updated | 2026-07-25 (PR #6 + #7 merged; develop `fc628d9`; filesystem-cleanup task recorded) |
+| Last verified `origin/develop` | `fc628d90b89e5f60181fbf5671880a19c3d6119a` (merge of PR #6 — repository consolidation audit + Work Manager governance) |
 | GitHub default branch | `develop` (verified — the old `codex/*` default is corrected) |
-| Active phase | PHASE 4 — **Batch A + B DONE; PR #6 synced to develop; Batch C pending CI verification on the synced head.** The lease/CAS flake was root-caused as **test-only** wall-clock nondeterminism and fixed deterministically on `fix/deterministic-lease-loss-test` (`4697298`, +64/−5, test-only; 150/150 local stress). **PR #7 merged** into develop (`3ec5296`). PR #6 branch merged origin/develop via a normal no-ff merge (conflict-free; only `tests/test_daily_menu_refresh.py` came in). Batch C runs only after both CI contexts are green on the new PR #6 head. |
+| Active phase | PHASE 5 — **Repository-cleanup track COMPLETE.** PR #7 (`3ec5296`) and PR #6 (`fc628d9`) merged; Batch C done (origin/HEAD→develop; 3 merged 0-unique branches pruned). Canonical `develop` @ `fc628d9`, clean, synced. **Active operational task: physical filesystem cleanup of `C:\coach_bot` (FS-CLEANUP-1)** — inventory-and-prove-then-remove; see the dedicated section below. No product implementation started; LOG-014/015/016/012 remain PROPOSED. |
 | Baseline @ approval | head `1dbd6c6`; push CI `30154848488` success; PR CI `30154850042` success; PR #6 open, `+591/−0` |
 | Batch A result | **PII in all six docs** (real user id + meal-image refs) → external backup only at `…\cleanup_20260725\local_docs_PII\`; **NOT added to Git** (A2 skipped). No tracked change. |
 | Batch A CI | `b6db987`: push run `30155534787` success; pull_request run `30155536081` **success on re-run attempt 2** (attempt 1 flaked on `test_daily_menu_refresh::test_lease_loss_during_generation_fences_persistence`). Flake-record commit `52d6a10` CI: push `30156817298` success + pull_request `30156817976` success. **The deferred CI-hardening is now DONE** — PR #7 / commit `4697298` (event-driven deterministic synchronization; 150/150 local stress), merged to develop as `3ec5296`. |
@@ -61,6 +61,47 @@ No source retirement (P2.7/P2.8 stay future work).
 AI Gateway · stored weekly-plan regeneration (`planning._meal_slots` Phase 2) ·
 destructive sleep-fact migration · any protected-data mutation · any deletion
 before approval.
+
+## FS-CLEANUP-1 — Physical filesystem cleanup of `C:\coach_bot` (**COMPLETE**)
+
+Executed 2026-07-25 after the repository-cleanup track completed. **Prove-then-remove**;
+read-only inventory first, deletion only when every guard passed. **Status: COMPLETE.**
+This task did NOT change any log-audit finding from PROPOSED. Protected-DB baseline
+hashes recorded and re-verified unchanged after the task:
+`noam-coach/data/noam_coach.db` sha256 `9077e35d…`; `noam_coach_complete_release/noam_coach.db`
+sha256 `5bd8ac1b…`.
+
+Top-level classification (C:\coach_bot):
+- `noam-coach` — **CANONICAL repo** (develop @ `fc628d9`, clean). KEEP. Do not touch.
+- `noam_coach_complete_release` — **PROTECTED** separate clone (branch `review/2026-07-18_1` @ `6d57c04`;
+  HEAD NOT ancestor of develop; **18 uncommitted changes** incl. 2 untracked tests; contains `.env`,
+  protected `noam_coach.db`, `HealthKit.zip`, session recordings). KEEP (unique uncommitted work + protected data).
+- `noam_coach_complete_release.worktrees/{meal-clarification-batch6, workout-selection-architecture}` —
+  **PROTECTED** registered linked worktrees (`f31f047`, `7d256fa`). KEEP.
+- `noam-coach-private-audit` — **PROTECTED** captured session (zip + session dir; meal images/PII). KEEP.
+- `.conda` — root Python environment (~32MB). KEEP (guard F: not conclusively unused; not the canonical `.venv` interpreter but may be an IDE/conda env).
+- `.claude` — operator config (`settings.local.json`). KEEP (never tracked/deleted for tidiness).
+- 6 root `.md` files (`FINAL_MEAL_INTERACTION_IMPLEMENTATION_PLAN.md`, `MEAL_INTERACTION_ENGINEERING_ROOT_CAUSE_AUDIT.md`,
+  `MEAL_INTERACTION_LOG_AND_IMAGE_AUDIT.md`, `SYSTEM_DATA_SOURCE_OF_TRUTH_AND_OBSERVABILITY_AUDIT.md`,
+  `UNIFIED_NOAM_COACH_AUDIT_CHECKPOINT.md`, `UNIFIED_NOAM_COACH_CONSOLIDATION_PLAN.md`) — unique audit/planning docs
+  that **contain PII** (ledger §Batch-A). **DELETED** — human-approved for deletion; each file was verified
+  **SHA-256 byte-identical to its external backup copy immediately before deletion** (all six OK at delete time),
+  then all six were removed from the `C:\coach_bot` root. The external backup remains **intact (6/6)** in the
+  designated cleanup backup location. Not moved into the repo (would require an approved redaction pass).
+- `noam-coach.wt-lease-fix` — empty, git-deregistered lease-fix worktree remnant. **RETAINED** only because a
+  persistent OS filesystem lock (`Device or resource busy`) blocks removal, with no attributable user process;
+  not force-removed per guard A. Delete the empty directory once the lock clears.
+
+Actions taken this task: **the 6 root PII `.md` files were deleted** (delete-time SHA-256 backup re-verification;
+backup intact 6/6). No other item deleted. Generated caches: none at root level (all live inside
+canonical/protected repos → out of scope). No protected data touched; protected-DB hashes/mtimes unchanged
+before and after.
+
+Remaining steps (all outside this task's completed scope):
+- **Human-gated merge of PR #8** (`docs/filesystem-cleanup-record` → `develop`) — do NOT auto-merge.
+- After PR #8 merges: remove the `noam-coach.wt-fscleanup-doc` worktree.
+- Delete the empty `noam-coach.wt-lease-fix` directory once its OS lock clears.
+- Product backlog stays gated: LOG-014 → LOG-015/Task 66 → LOG-016 → LOG-012 remain **PROPOSED and unstarted**.
 
 ## Log-audit intake (PROPOSED — not approved, not started)
 
