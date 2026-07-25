@@ -8,7 +8,9 @@ phase changes and before every pause.
 | Last updated | 2026-07-25 (audit-gaps corrected) |
 | Last verified `origin/develop` | `fbff6f106e4b923bcbd016d652c2c121e55ecec0` (merge of PR #5) |
 | GitHub default branch | `develop` (verified — the old `codex/*` default is corrected) |
-| Active phase | PHASE 2/3 complete → audit PR #6 open; awaiting `APPROVE REPOSITORY CLEANUP EXECUTION` |
+| Active phase | PHASE 4 execution — **Batch A DONE (external-backup-only; PII guard tripped)**; Batch B/C pending |
+| Baseline @ approval | head `1dbd6c6`; push CI `30154848488` success; PR CI `30154850042` success; PR #6 open, `+591/−0` |
+| Batch A result | **PII in all six docs** (real user id + meal-image refs) → external backup only at `…\cleanup_20260725\local_docs_PII\`; **NOT added to Git** (A2 skipped). No tracked change. |
 | Active branch | `chore/repository-consolidation-audit` (head advances with each audit-correction commit; latest pushed head recorded in the CI table below) |
 | Audit PR | **#6** (open, not merged) → base `develop` @ `fbff6f1`; head `chore/repository-consolidation-audit` |
 | CI on head `e9ebeac` | push run `30154114434` **success**; pull_request run `30154115680` **success** (this correction commit re-runs both; see PR checks) |

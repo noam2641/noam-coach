@@ -29,8 +29,10 @@ Base: `develop` · Head: `chore/repository-consolidation-audit`.
 
 ## Planned cleanup — three reversible batches (NOT executed)
 Backup destination: `C:\coach_bot_BACKUP_20260721_150908\cleanup_20260725\`.
-- **Batch A** (non-destructive): back up + **copy** the six local-only audit docs
-  into `docs/archive/` verbatim (secret/PII scan = 0 hits); originals untouched.
+- **Batch A** (non-destructive): back up the six local-only audit docs. The
+  extended PII scan found the real production user id + meal-image references in
+  **all six**, so per the guard they were backed up **externally only and NOT
+  added to Git** (the in-repo `docs/archive/` copy was skipped). Originals untouched.
 - **Batch B**: remove ONLY the verified strays outside the repo — the 0-byte
   `noam_coach.db`, the malformed `.git\` (fail-closed: exact inventory +
   recorded sha256), the empty `.agents\`.

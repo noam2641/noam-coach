@@ -37,7 +37,7 @@ Classifications: `CANONICAL_ACTIVE` · `HISTORICAL_REFERENCE` · `PROTECTED` ·
 | `docs/FINAL_TASKS_58_65_IMPLEMENTATION_REPORT.md` | HISTORICAL_REFERENCE / SUPERSEDED | Ledger: "historical partial report" |
 | `docs/MASTER_CORRECTION_BACKLOG_ADDENDUM_38_57.md` | HISTORICAL_REFERENCE / SUPERSEDED | Ledger supersedes the FIX 38–57 addendum |
 | `docs/archive/*`, `docs/audits/*`, `docs/reports/*` | HISTORICAL_REFERENCE | point-in-time reports; correctly filed |
-| **Local-only (untracked, outside repo)** at `C:\coach_bot\`: `FINAL_MEAL_INTERACTION_IMPLEMENTATION_PLAN.md`, `MEAL_INTERACTION_ENGINEERING_ROOT_CAUSE_AUDIT.md`, `MEAL_INTERACTION_LOG_AND_IMAGE_AUDIT.md`, `SYSTEM_DATA_SOURCE_OF_TRUTH_AND_OBSERVABILITY_AUDIT.md`, `UNIFIED_NOAM_COACH_CONSOLIDATION_PLAN.md`, `UNIFIED_NOAM_COACH_AUDIT_CHECKPOINT.md` | ARCHIVE_CANDIDATE (untracked, **only copies**) | No git history — **backup before any move**. Proposed: **copy verbatim** into `docs/archive/` — only after the §G secret/PII scan passes (all six scanned = 0 hits 2026-07-25, so no redaction). Risk if deleted: permanent loss. |
+| **Local-only (untracked, outside repo)** at `C:\coach_bot\`: `FINAL_MEAL_INTERACTION_IMPLEMENTATION_PLAN.md`, `MEAL_INTERACTION_ENGINEERING_ROOT_CAUSE_AUDIT.md`, `MEAL_INTERACTION_LOG_AND_IMAGE_AUDIT.md`, `SYSTEM_DATA_SOURCE_OF_TRUTH_AND_OBSERVABILITY_AUDIT.md`, `UNIFIED_NOAM_COACH_CONSOLIDATION_PLAN.md`, `UNIFIED_NOAM_COACH_AUDIT_CHECKPOINT.md` | ARCHIVE_CANDIDATE (untracked, **only copies**) | No git history — external backup only. **The extended PII scan (§G) found real user id + meal-image refs in ALL SIX → they are NOT added to Git; backed up externally at `…\cleanup_20260725\local_docs_PII\`.** In-repo archival would need a separately-approved redaction pass. Risk if deleted: permanent loss. |
 | `C:\coach_bot_BACKUP_20260721_150908\` (3.4 MB, SHA256 manifest) | ARCHIVE (evidence store) | deliberate dated backup — retain as-is |
 
 ## C. Delete candidates (each with evidence; backup first)
@@ -90,7 +90,8 @@ Canonical hierarchy (tracked): **1)** `CANONICAL_IMPLEMENTATION_LEDGER.md`
 (source/gap accounting) · **3)** `MASTER_TASKS.md` (task register; status deferred to
 the Ledger). Superseded-but-kept: `FINAL_TASKS_58_65…`, `MASTER_CORRECTION_BACKLOG_ADDENDUM_38_57`,
 `docs/archive|audits|reports/*`. Local-only `C:\coach_bot` audit docs = the
-"local-only audit documents" the Ledger supersedes (archive candidates, only copies).
+"local-only audit documents" the Ledger supersedes — **contain PII (real user id +
+meal-image refs); kept external-backup-only, NOT in Git** (see §G Batch A status).
 
 ---
 
@@ -121,8 +122,23 @@ for f in FINAL_MEAL_INTERACTION_IMPLEMENTATION_PLAN.md MEAL_INTERACTION_ENGINEER
   echo "$f: $hits"
 done
 ```
-Result 2026-07-25: **all six = 0 hits** → archive **verbatim** (no redaction). If ANY
-file scans > 0, **STOP** and do not place that document in Git. Strays:
+Result (narrow tokens-only scan, 2026-07-25): all six = 0 token/secret hits.
+
+**⚠️ EXTENDED PII scan at execution time (constraint 2 — tokens, PII, real user/
+Health data, production logs, meal-image refs, usernames, emails, phones,
+user-specific paths): ALL SIX DOCUMENTS CONTAIN PII.** Verified without printing
+content: a real production Telegram **user id (`<REDACTED_USER_ID>`)**, real **meal-image /
+approval-id references** (`storage/food/<id>_*.jpg`, `<id>_in_<hash>`,
+`<REDACTED_APPROVAL_ID>`), and/or private-audit paths (`noam-coach-private-audit`,
+`private_trace`, `C:\Users\user`) appear across all six. (The one "email" flag is
+a benign `@users.noreply.github.com`.)
+
+**Batch A revised per constraint 2 → executed as EXTERNAL-BACKUP-ONLY:** the six
+docs were copied to `C:\coach_bot_BACKUP_20260721_150908\cleanup_20260725\
+local_docs_PII\` (byte-verified) and **NOT added to Git.** No `docs/archive/`
+copies were created. This closes the forbidden-content guard: the only copies are
+preserved externally, out of version control. Any future in-repo archival would
+require a separately-approved redaction pass. Strays:
 `C:\coach_bot\noam_coach.db` = 0 bytes; `C:\coach_bot\.git\` = only `info\exclude`
 (301 B, sha256 `584f2cca6096463716b1370b772a34dbbc10e2743d0039a6848eea9b98ad06ef`);
 `C:\coach_bot\.agents\` = empty.
@@ -135,6 +151,12 @@ any failed guard. Do not create or merge another PR unless explicitly instructed
 ---
 
 ### Batch A — Backups + archival copies ONLY (non-destructive, reversible)
+
+> **STATUS 2026-07-25: EXECUTED as EXTERNAL-BACKUP-ONLY (A2 archival SKIPPED).**
+> The extended PII scan (constraint 2) found the real production user id +
+> meal-image/approval references in **all six** docs. Per constraint 2, they were
+> backed up externally (byte-verified) and **NOT added to Git**. A2 (copy into
+> `docs/archive/`) was correctly **not performed**. See the PII note above.
 
 **A0. Re-run the secret/PII scan above; abort if any file > 0 hits.**
 
