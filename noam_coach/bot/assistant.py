@@ -798,7 +798,12 @@ async def route_free_text(update: Update, user_id: int) -> None:
         text=text,
         intent=intent,
         action=intent.action,
-        slots=intent.slots or {},
+        # Slots is a closed Pydantic model (strict-mode requirement -- see
+        # assistant.Slots). Every downstream consumer reads ctx.slots with
+        # .get(), so it is flattened to a plain dict exactly once, here.
+        # exclude_none drops unfilled slots so .get() returns None for them,
+        # matching the previous free-form-dict behaviour.
+        slots=intent.slots.model_dump(exclude_none=True) if intent.slots else {},
         follow=InlineKeyboardMarkup([[button("⬅️ תפריט", "menu:home")]]),
     )
     handlers = (

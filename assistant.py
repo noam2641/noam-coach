@@ -18,7 +18,7 @@ import re
 from contextvars import ContextVar
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 # B9/ARCH-16: bounded unresolved-reference candidates for the CURRENT turn,
 # set by the turn-context pipeline (noam_coach.services.turn_context) before
@@ -51,11 +51,68 @@ Action = Literal[
 ]
 
 
+class Slots(BaseModel):
+    """Extracted parameters, as a CLOSED set of keys.
+
+    This must never become a free-form ``dict[str, Any]``. The OpenAI
+    Responses API runs structured outputs in strict mode, which requires every
+    object to declare ``additionalProperties: false`` with all keys listed in
+    ``required``. A free-form mapping cannot satisfy that, so the request is
+    rejected before a single token is generated -- which is exactly what
+    happened here: intent classification failed 100% of the time (9/9
+    BadRequestError in the 2026-07-26 session) while every other AI purpose
+    succeeded, and it had never worked since the field was introduced.
+
+    Adding a slot means adding it HERE and to the prompt -- both, or the model
+    has no way to return it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    body_fat_pct: float | None = None
+    calories: int | None = None
+    equipment_occupied: bool | None = None
+    flag: str | None = None
+    frequency: int | None = None
+    goal_weight: float | None = None
+    height_cm: float | None = None
+    item: str | None = None
+    kind: str | None = None
+    location: str | None = None
+    note: str | None = None
+    polarity: str | None = None
+    status: str | None = None
+    text: str | None = None
+    weight_kg: float | None = None
+
+    # Mapping-style reads, so this stays a drop-in replacement for the
+    # free-form dict it used to be. Call sites across the bot -- and the
+    # dynamic ``slots.get(key)`` lookup in the measurement handler -- keep
+    # working unchanged, and an unfilled slot reads as absent exactly as
+    # before.
+    def get(self, key: str, default: Any = None) -> Any:
+        value = getattr(self, key, None)
+        return default if value is None else value
+
+    def __getitem__(self, key: str) -> Any:
+        if key not in type(self).model_fields:
+            raise KeyError(key)
+        value = getattr(self, key)
+        if value is None:
+            raise KeyError(key)
+        return value
+
+    def __contains__(self, key: str) -> bool:
+        return getattr(self, key, None) is not None
+
+
 class Intent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     action: Action
-    # Free-form extracted parameters, e.g. {"frequency": 4}, {"weight_kg": 89},
+    # Extracted parameters, e.g. {"frequency": 4}, {"weight_kg": 89},
     # {"flag": "ritalin"}, {"location": "ברך ימין"}, {"goal_weight": 85}.
-    slots: dict[str, Any] = Field(default_factory=dict)
+    slots: Slots = Field(default_factory=Slots)
     confidence: float = Field(ge=0, le=1, default=0.5)
 
 
