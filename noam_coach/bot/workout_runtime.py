@@ -106,7 +106,7 @@ from retention import (
 
 from noam_coach.runtime_bind import runtime_bound
 
-RUNTIME_NAMES = ('Any', 'BadRequest', 'CallbackContext', 'ContextTypes', 'DB', 'Exception', 'InlineKeyboardMarkup', 'LOGGER', 'NetworkError', 'ParseMode', 'RetryAfter', 'RuntimeError', 'TimedOut', '_MessageEditTarget', '_StaleSetStep', '_rir_known', '_split_flow', 'advance_sql', 'base_weight', 'bool', 'bot', 'button', 'buttons', 'cancel_rest_timer', 'candidate', 'center', 'chat_id', 'choices', 'clear_flow_state', 'completed', 'completed_blocks', 'conn', 'context', 'cur', 'current', 'delta', 'dict', 'divmod', 'exc', 'finished', 'first_reps', 'first_weight', 'float', 'get_flow_state', 'home_keyboard', 'idx', 'increment', 'index', 'int', 'isinstance', 'job', 'jobs', 'json', 'kwargs', 'len', 'list', 'math', 'max', 'message_id', 'min', 'minutes', 'now', 'params', 'part', 'plan', 'progress', 'progress_bar', 'query', 'range', 'refreshed', 'remaining', 'reps', 'rest_job_name', 'rest_keyboard', 'rest_seconds', 'rest_text', 'rest_timer_tick', 'rir', 'rir_label', 'round', 'rows', 'safe_edit', 'second_reps', 'second_weight', 'seconds', 'self', 'session', 'session_action_data', 'session_id', 'session_step', 'set_flow_state', 'set_line', 'set_no', 'should_update', 'show_session', 'split_state', 'state', 'step', 'str', 'summary_line', 'suppress', 'target', 'text', 'time', 'timer_data', 'total', 'total_reps', 'total_seconds', 'tuple', 'update_rest_message', 'user_id', 'utc_now', 'value', 'values', 'weight', 'workout_summary')
+RUNTIME_NAMES = ('Any', 'BadRequest', 'CallbackContext', 'ContextTypes', 'DB', 'Exception', 'InlineKeyboardMarkup', 'LOGGER', 'NetworkError', 'ParseMode', 'RetryAfter', 'RuntimeError', 'TimedOut', '_MessageEditTarget', '_StaleSetStep', '_rest_next_action_block', '_rir_known', '_show_rest_completion', '_split_flow', 'action', 'advance_sql', 'base_weight', 'block', 'bool', 'bot', 'button', 'buttons', 'cancel_rest_timer', 'candidate', 'center', 'chat_id', 'choices', 'clear_flow_state', 'completed', 'completed_blocks', 'conn', 'context', 'cur', 'current', 'delta', 'dict', 'divmod', 'esc', 'exc', 'finished', 'first_reps', 'first_weight', 'float', 'fresh', 'get_flow_state', 'head', 'home_keyboard', 'idx', 'increment', 'index', 'int', 'isinstance', 'job', 'jobs', 'json', 'kwargs', 'len', 'list', 'math', 'max', 'message_id', 'min', 'minutes', 'next_action', 'next_block', 'now', 'params', 'part', 'plan', 'progress', 'progress_bar', 'query', 'range', 'refreshed', 'remaining', 'rendered', 'reps', 'resolve_rest_next_action', 'resolved', 'rest_job_name', 'rest_keyboard', 'rest_seconds', 'rest_text', 'rest_timer_tick', 'rir', 'rir_label', 'round', 'rows', 'safe_edit', 'second_reps', 'second_weight', 'seconds', 'self', 'session', 'session_action_data', 'session_id', 'session_step', 'set_flow_state', 'set_line', 'set_no', 'should_update', 'show_session', 'split_state', 'state', 'step', 'str', 'summary_line', 'suppress', 'tail', 'target', 'text', 'time', 'timer_data', 'total', 'total_reps', 'total_seconds', 'tuple', 'update_rest_message', 'user_id', 'utc_now', 'value', 'values', 'weight', 'workout_next_action', 'workout_summary')
 
 
 @runtime_bound(RUNTIME_NAMES)
@@ -340,6 +340,54 @@ def rest_keyboard(
 
 
 @runtime_bound(RUNTIME_NAMES)
+async def resolve_rest_next_action(
+    session_id: int,
+    *,
+    previous_weight: float | None = None,
+) -> Any:
+    """The rest card's next action, read from the CANONICAL persisted state.
+
+    TASK-WORKOUT-REST-NEXT-ACTION. This is the one place the rest flow turns
+    the durable ``sessions`` row into "what happens when this ends". It is
+    re-run on every card edit rather than captured once, so an alternative
+    chosen, a set undone, a skip or a finish that happens WHILE the timer runs
+    is reflected on the next edit instead of leaving a stale instruction.
+
+    Deliberately reads the session row and NOT ``rest_timers`` (whose
+    denormalised weight/reps/rir describe the set already performed) and NOT
+    the last rendered message.
+
+    Returns ``None`` only when the row cannot be read at all; the renderer then
+    keeps the card's existing shape rather than asserting a next step it does
+    not know.
+    """
+    from noam_coach.services import workout_next_action
+
+    session = await DB.fetch_one(
+        "SELECT plan, exercise_index, set_number, status FROM sessions WHERE id=?",
+        (session_id,),
+    )
+    if not session:
+        return None
+    # The exercise the JUST-COMPLETED set belonged to. The session pointer has
+    # already advanced, so "still inside exercise N" cannot by itself tell a
+    # further set apart from the first set of the NEXT movement: after the last
+    # set of bench the pointer reads (row, set 1). rest_timers already records
+    # the origin exercise, so comparing the two makes the transition explicit —
+    # no schema change needed.
+    timer_row = await DB.fetch_one(
+        "SELECT exercise_index FROM rest_timers WHERE session_id=?",
+        (session_id,),
+    )
+    origin_index = timer_row["exercise_index"] if timer_row else None
+    return workout_next_action.resolve_from_session(
+        session,
+        from_exercise_index=origin_index,
+        previous_weight=previous_weight
+    )
+
+
+@runtime_bound(RUNTIME_NAMES)
 def rest_text(
     weight: float,
     reps: int,
@@ -347,23 +395,59 @@ def rest_text(
     remaining: int,
     total_seconds: int,
     summary_line: str | None = None,
+    next_action: Any = None,
 ) -> str:
+    """The rest-timer card.
+
+    ``next_action`` is a ``workout_next_action.NextAction`` (or ``None`` when
+    it could not be resolved). It is rendered INSIDE this same card — never as
+    an extra chat message — and it is passed on every render, including each
+    throttled countdown edit and the final zero edit, so the instruction is
+    never dropped by an update.
+    """
     minutes, seconds = divmod(max(0, remaining), 60)
     progress = 1 - (remaining / max(1, total_seconds))
     completed_blocks = min(10, max(0, round(progress * 10)))
     progress_bar = "█" * completed_blocks + "░" * (10 - completed_blocks)
     rir_label = "לא דווח" if not _rir_known(rir) else ("0 / כשל" if rir == 0 else str(rir))
     set_line = summary_line or f"{weight:g} ק״ג × {reps} | RIR {rir_label}"
+    next_block = _rest_next_action_block(next_action)
 
     if remaining <= 0:
-        return f"<b>המנוחה הסתיימה 🔔</b>\n\n{set_line}\n\nמוכן לסט הבא."
+        # At zero the next action is repeated prominently rather than dropped:
+        # this is the moment the user acts on it.
+        tail = next_block or "מוכן לסט הבא."
+        return f"<b>המנוחה הסתיימה 🔔</b>\n\n{set_line}\n\n{tail}"
 
     return (
         "<b>הסט נשמר ✅</b>\n\n"
         f"{set_line}\n\n"
         f"⏱ מנוחה: <b>{minutes:02d}:{seconds:02d}</b>\n"
         f"<code>{progress_bar}</code>"
+        + (f"\n\n{next_block}" if next_block else "")
     )
+
+
+def _rest_next_action_block(next_action: Any) -> str:
+    """Render + HTML-escape the next-action block for the rest card.
+
+    The resolver stays a pure string builder; escaping happens here because
+    exercise names come from the plan JSON and this is the boundary where the
+    text becomes HTML. The first line (the heading) is bolded for scanability
+    on a phone.
+    """
+    if next_action is None:
+        return ""
+    from noam_coach.services import workout_next_action
+
+    rendered = workout_next_action.render_next_action(next_action)
+    if not rendered:
+        return ""
+    head, _, rest = rendered.partition("\n")
+    block = f"<b>{esc(head)}</b>"
+    if rest:
+        block += "\n" + esc(rest)
+    return block
 
 
 @runtime_bound(RUNTIME_NAMES)
@@ -485,6 +569,12 @@ async def restore_rest_timers_on_startup(job_queue: Any) -> int:
                 "last_remaining": None,
                 "cancelled": False,
                 "summary_line": row.get("summary_line"),
+                # Resumed after an interruption: the next action is derived
+                # from the persisted session row, not from whatever the frozen
+                # card happened to be showing before the restart.
+                "next_action": await resolve_rest_next_action(
+                    session_id, previous_weight=float(row["weight"])
+                ),
             }
             job_queue.run_repeating(
                 rest_timer_tick,
@@ -504,11 +594,15 @@ async def restore_rest_timers_on_startup(job_queue: Any) -> int:
         else:
             # Rest already ended while the process was down -- resolve the
             # stale card into the resume state instead of leaving it frozen.
+            resolved = await resolve_rest_next_action(
+                session_id, previous_weight=float(row["weight"])
+            )
             with suppress(Exception):
                 await target.edit_message_text(
                     rest_text(
                         float(row["weight"]), int(row["reps"]), int(row["rir"]),
                         0, int(row["total_seconds"]), row.get("summary_line"),
+                        resolved,
                     ),
                     reply_markup=rest_keyboard(session_step, finished=True),
                     parse_mode=ParseMode.HTML,
@@ -565,6 +659,22 @@ async def update_rest_message(
 
     timer_data["last_remaining"] = remaining
 
+    # Re-resolve the next action from the canonical session row on each edit
+    # this throttle actually lets through. That is at most a handful of edits
+    # per rest (start, halfway, the last 10s, zero) — the existing anti-flood
+    # gate above is untouched, so this adds no messages and no extra edits,
+    # it only keeps the instruction on those edits truthful. A read failure
+    # falls back to the last known action rather than blanking the card.
+    next_action = timer_data.get("next_action")
+    with suppress(Exception):
+        resolved = await resolve_rest_next_action(
+            int(timer_data["session_id"]),
+            previous_weight=timer_data.get("weight"),
+        )
+        if resolved is not None:
+            next_action = resolved
+            timer_data["next_action"] = resolved
+
     # Observability O3 exemption: countdown ticks are high-frequency,
     # zero-decision-value edits of the same card — recording each one would
     # flood the trace. The rest lifecycle itself (started/restored/finished)
@@ -583,6 +693,7 @@ async def update_rest_message(
                     remaining,
                     timer_data["total_seconds"],
                     timer_data.get("summary_line"),
+                    next_action,
                 ),
                 reply_markup=rest_keyboard(
                     timer_data["session_step"],
@@ -640,6 +751,33 @@ async def _emit_rest_event(user_id: int, session_id: int, action: str, **props: 
 
 
 @runtime_bound(RUNTIME_NAMES)
+async def _show_rest_completion(
+    target: Any,
+    timer_data: dict[str, Any],
+    action: Any,
+) -> None:
+    """Final rest: nothing left to perform, so show the completion step.
+
+    Reuses the EXISTING end-of-workout screen (``workout_summary`` +
+    ``home_keyboard``) — the completion action the resolver names is the real
+    one the product already has, not a new terminal state invented here. If
+    the summary cannot be built, the card still states the completion action
+    rather than naming an exercise that does not exist.
+    """
+    from noam_coach.services import workout_next_action
+
+    try:
+        text = await workout_summary(
+            int(timer_data["user_id"]), int(timer_data["session_id"])
+        )
+    except Exception:  # noqa: BLE001 - never leave the card pointing nowhere
+        text = esc(workout_next_action.render_next_action(action))
+    await target.edit_message_text(
+        text, reply_markup=home_keyboard(), parse_mode=ParseMode.HTML
+    )
+
+
+@runtime_bound(RUNTIME_NAMES)
 async def rest_timer_tick(context: CallbackContext) -> None:
     job = context.job
     if job is None:
@@ -662,11 +800,31 @@ async def rest_timer_tick(context: CallbackContext) -> None:
             await clear_persisted_rest_timer(timer_data["session_id"])
         # Auto-advance: when rest ends, show the next set in the same card —
         # no need to tap "הצג סט הבא". Skip if a pain stop cancelled the flow.
+        #
+        # The transition consults the SAME resolver the card just rendered
+        # from (resolve_rest_next_action over the canonical session row), so
+        # the instruction the user read and the state they land on are one
+        # decision. When the resolver says nothing is left to perform,
+        # show_session's own inactive-session branch renders the completion
+        # screen rather than an exercise card — we must not force an exercise
+        # card in that state, so the resolved action is checked first.
         with suppress(Exception):
             target = _MessageEditTarget(
                 context.bot, timer_data["chat_id"], timer_data["message_id"]
             )
-            await show_session(target, timer_data["user_id"], timer_data["session_id"])
+            resolved = timer_data.get("next_action")
+            with suppress(Exception):
+                fresh = await resolve_rest_next_action(
+                    int(timer_data["session_id"]),
+                    previous_weight=timer_data.get("weight"),
+                )
+                if fresh is not None:
+                    resolved = fresh
+                    timer_data["next_action"] = fresh
+            if resolved is None or not resolved.is_complete:
+                await show_session(target, timer_data["user_id"], timer_data["session_id"])
+            else:
+                await _show_rest_completion(target, timer_data, resolved)
 
 
 @runtime_bound(RUNTIME_NAMES)
@@ -685,7 +843,7 @@ async def start_rest_timer(
 
     refreshed = await DB.fetch_one(
         """
-        SELECT id, exercise_index, set_number
+        SELECT id, exercise_index, set_number, status, plan
         FROM sessions
         WHERE id=? AND user_id=? AND status='active'
         """,
@@ -704,6 +862,15 @@ async def start_rest_timer(
         "exercise_index": int(refreshed["exercise_index"]),
         "set_number": int(refreshed["set_number"]),
     }
+    # Resolved from the SAME freshly-read session row that defines
+    # session_step, so the instruction on the card and the step the timer
+    # will hand to show_session are one decision, not two.
+    from noam_coach.services import workout_next_action
+
+    next_action = workout_next_action.resolve_from_session(
+        refreshed, previous_weight=weight
+    )
+
     timer_data = {
         "user_id": user_id,
         "session_id": session_id,
@@ -718,6 +885,7 @@ async def start_rest_timer(
         "last_remaining": None,
         "cancelled": False,
         "summary_line": summary_line,
+        "next_action": next_action,
     }
     with suppress(Exception):
         await persist_rest_timer(timer_data)
@@ -731,6 +899,7 @@ async def start_rest_timer(
             rest_seconds,
             rest_seconds,
             summary_line,
+            next_action,
         ),
         rest_keyboard(session_step),
     )
