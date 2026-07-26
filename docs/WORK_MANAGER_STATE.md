@@ -5,10 +5,13 @@ phase changes and before every pause.
 
 | Field | Value |
 |---|---|
-| Last updated | 2026-07-25 (LOG batch #9–#13 merged; inventory PR #14 finalizing; develop `25101d0`) |
-| Last verified `origin/develop` | `25101d0` (merge of PR #10 — LOG-015; final pre-inventory head) |
+| Last updated | 2026-07-26 (WAVE-1 complete: PRs #15/#16/#18/#19 merged; develop `a5bfc01`) |
+| Last verified `origin/develop` | `a5bfc01` (merge of PR #19 — TASK-UX01; final WAVE-1 head) |
 | GitHub default branch | `develop` (verified — the old `codex/*` default is corrected) |
-| Active phase | PHASE 6 — **LOG batch COMPLETE & MERGED.** All 4 LOG tasks + governance merged to develop: PR #13 governance (`6d2e841`), #11 LOG-012 (`c317a4b`), #12 LOG-016 (`c517dbe`), #9 LOG-014 (`b38d467`), #10 LOG-015 (`25101d0`). Inventory PR #14 is the final merge (this commit). Beyond the LOG batch there are **no remaining approved tasks** (rest is merged/blocked/exploratory/superseded). Then: verified worktree cleanup. |
+| Active phase | **PHASE 7 — WAVE-1 CLOSEOUT.** All four WAVE-1 tasks merged: TASK-R1 #15 (`0cfb062`), TASK-B1 #16 (`2674c98`), TASK-LOG004 #18 (`95119bf`), TASK-UX01 #19 (`a5bfc01`); queue/follow-up doc #17 (`91eeac1`). Cumulative full regression run on the combined state. **Next: WAVE-2 (owner-approved workout UX), serialized — TASK-WORKOUT-WEIGHT-TEXT then TASK-WORKOUT-REST-NEXT-ACTION.** |
+| Active task | WAVE-1 closeout (regression + traceability + wave-only worktree cleanup), then WAVE-2 start. |
+| Approved work outstanding | **YES — WAVE-2 is owner-approved and queued** (see the execution-queue section). This supersedes the earlier "no remaining approved tasks" statement, which was true only of the LOG batch on 2026-07-25 and is **no longer current**. |
+| *(rows below are HISTORICAL)* | *The following rows record the completed 2026-07-21…25 repository-cleanup and LOG-batch work. They are kept for traceability and are **not** current operational state — the current state is the four rows above.* |
 | Baseline @ approval | head `1dbd6c6`; push CI `30154848488` success; PR CI `30154850042` success; PR #6 open, `+591/−0` |
 | Batch A result | **PII in all six docs** (real user id + meal-image refs) → external backup only at `…\cleanup_20260725\local_docs_PII\`; **NOT added to Git** (A2 skipped). No tracked change. |
 | Batch A CI | `b6db987`: push run `30155534787` success; pull_request run `30155536081` **success on re-run attempt 2** (attempt 1 flaked on `test_daily_menu_refresh::test_lease_loss_during_generation_fences_persistence`). Flake-record commit `52d6a10` CI: push `30156817298` success + pull_request `30156817976` success. **The deferred CI-hardening is now DONE** — PR #7 / commit `4697298` (event-driven deterministic synchronization; 150/150 local stress), merged to develop as `3ec5296`. |
@@ -262,12 +265,14 @@ only); the deleted root PII audit `.md` plans (FS-CLEANUP-1).
 |---|---|---|---|
 | TASK-R1 — recursive fail-closed DSAR redaction of `analytics_events` | `fix/wave1-dsar-analytics-redaction` | #15 | **MERGED** (`0cfb062`) |
 | TASK-B1 — fit the main session to `session_minutes` | `fix/wave1-planning-duration-fitting` | #16 | **MERGED** (`2674c98`) |
-| TASK-LOG004 — fully opaque `flow_id` (no user-derived component) | `fix/wave1-opaque-flow-id` | — | in progress |
-| TASK-UX01 — duplicate-correction notice (idempotent skip) | `fix/wave1-duplicate-correction-notice` | — | in progress |
+| TASK-LOG004 — fully opaque `flow_id` (no user-derived component) | `fix/wave1-opaque-flow-id` | #18 | **MERGED** (`95119bf`) |
+| TASK-UX01 — duplicate-correction notice (idempotent skip) | `fix/wave1-duplicate-correction-notice` | #19 | **MERGED** (`a5bfc01`) |
 
-Closeout after all four merge: sync `develop` → cumulative full-regression on the
-combined state → update this document + traceability → remove ONLY this wave's
-worktrees/branches → consolidated report.
+**WAVE-1 is COMPLETE.** All four tasks merged with both CI contexts green on each
+PR; every merge commit is contained in `develop @ a5bfc01`. Cumulative
+full-regression gate on the combined state: **both halves EXIT 0, zero failures**
+(~2,487 tests). Wave-only worktrees/branches removed after proving each held no
+unique or uncommitted work.
 
 ### WAVE-2 — Workout UX (owner-approved P1; queued, starts after WAVE-1 closeout)
 
@@ -318,6 +323,7 @@ copy; bodyweight → `0`. No schema change, no historical-data modification.
 | FU-01 | `session_N_missing_time` quality issue when `resolved_preferred_time` is omitted and no availability fact exists | surfaced while building TASK-B1 tests; verified **pre-existing** against a stashed baseline (`_workout_candidate` emits sessions with no time on that path) | **DEFERRED** — real but pre-existing; out of TASK-B1 scope. Candidate for a future small planner-quality task. Not scheduled. |
 | FU-02 | Empty equipment facts can leave a session with zero exercises (equipment adaptation strips to bodyweight) | surfaced while building TASK-B1 tests; **pre-existing** in `adapt_exercises`, not in the new fitting code | **DEFERRED** — pre-existing adaptation behavior, outside TASK-B1 scope. Not scheduled. |
 | FU-03 | Remaining `DIRECT_TABLES` in the DSAR export (e.g. `conversation_state`, `user_facts`, `medical_constraints`) may carry comparable free-text exposure; only `audit` (LOG-012) and `analytics_events` (TASK-R1) are redacted today | `scripts/export_user_data.py` generic `SELECT *` loop | **DEFERRED** — follow-up DSAR audit candidate. Deliberately not expanded into WAVE-1 (scope discipline). Not scheduled. |
+| FU-04 | `test_plan_completion_flow.py::test_complete_missing_callback_starts_continuous_completion_flow` fails with a `TypeError` in `noam_coach/observability/telegram_egress.py` **only inside a broad `-k` slice** (`conversation or flow or callback or resume or suspend or observability or grammar or trace`); it passes alone, as a whole file, and in CI | Reproduced on **clean `develop`** with the identical slice, i.e. **pre-existing test-ordering pollution**, not caused by TASK-LOG004 | **DEFERRED** — test-isolation hygiene, same family as the known stray-root-db ordering artifact. Does not affect CI (which passes) or product behavior. Not scheduled. |
 
 These remain visible in the accounting and must not disappear silently; none is
 authorized for implementation without an explicit owner decision.
