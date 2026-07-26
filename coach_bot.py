@@ -285,6 +285,20 @@ from noam_coach.bot.workout import (
     _StaleSetStep,
     try_save_set,
     workout_summary,
+    WEIGHT_TEXT_STEP,
+    await_weight_text,
+    clear_weight_text_flow,
+    previous_weight_context,
+    record_load_type_hint,
+    reps_prompt_keyboard,
+    stored_load_type,
+    handle_weight_text,
+)
+from noam_coach.services.weight_text import (
+    parse_weight_text,
+    format_weight_confirmation,
+    weight_prompt_text,
+    INVALID_WEIGHT_TEXT,
 )
 
 

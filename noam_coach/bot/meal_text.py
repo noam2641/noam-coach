@@ -114,7 +114,7 @@ from noam_coach.services.nutrition_context import (
 from noam_coach.observability import taxonomy
 from noam_coach.services import meal_observability
 
-RUNTIME_NAMES = ('ContextTypes', 'DB', 'Exception', 'InlineKeyboardMarkup', 'LOGGER', 'MealAnalysis', 'RuntimeError', 'Update', '_CANCEL_WORDS', '_handle_meal_correction_text', 'approval_id', 'button', 'candidate_ids', 'clear_meal_fix', 'conversation', 'corrected_analysis', 'correction_text', 'count', 'decision', 'ensure_user', 'event_log', 'exc', 'fetch_approval', 'flow', 'friendly_error', 'get_meal_fix', 'handle_onboarding_text', 'home_keyboard', 'image_path', 'index', 'int', 'is_allowed', 'json', 'len', 'list', 'original_analysis', 'pc', 'planning', 'prior_locked', 'progress', 'rc', 'reanalyze_meal_with_text_and_image', 'refine_count', 'removal_corrections', 'render_meal', 'route_free_text', 'row', 'safe_message_edit', 'selected', 'set_meal_fix', 'str', 'suppress', 'text', 'track_event', 'update', 'user_id', 'write_audit')
+RUNTIME_NAMES = ('ContextTypes', 'DB', 'Exception', 'InlineKeyboardMarkup', 'LOGGER', 'MealAnalysis', 'RuntimeError', 'Update', 'WEIGHT_TEXT_STEP', '_CANCEL_WORDS', '_handle_meal_correction_text', 'approval_id', 'button', 'candidate_ids', 'clear_meal_fix', 'conversation', 'corrected_analysis', 'correction_text', 'count', 'decision', 'ensure_user', 'event_log', 'exc', 'fetch_approval', 'flow', 'friendly_error', 'get_meal_fix', 'handle_onboarding_text', 'handle_weight_text', 'home_keyboard', 'image_path', 'index', 'int', 'is_allowed', 'json', 'len', 'list', 'original_analysis', 'pc', 'planning', 'prior_locked', 'progress', 'rc', 'reanalyze_meal_with_text_and_image', 'refine_count', 'removal_corrections', 'render_meal', 'route_free_text', 'row', 'safe_message_edit', 'selected', 'set_meal_fix', 'str', 'suppress', 'text', 'track_event', 'update', 'user_id', 'write_audit')
 
 
 async def _emit_meal_event(
@@ -976,6 +976,20 @@ async def handle_text_message(
             entity="plan_selection", source="router",
             properties={"text_preview": text[:60]},
         )
+
+    # TASK-WORKOUT-WEIGHT-TEXT: an ACTIVE workout that is explicitly awaiting a
+    # weight owns this message. Placed AFTER meal/photo and selection handling
+    # and BEFORE the question flows, matching ConversationRouter's own order, so
+    # meal logging and onboarding text can never be captured here. The flow is
+    # armed only while the weight question is on screen and cleared on save,
+    # cancel or a stale payload — hence a stale payload falls through to normal
+    # routing rather than trapping the user (mirrors the branches above).
+    if decision.handler == "workout_flow":
+        flow = await conversation.get_active_flow(DB, user_id)
+        if flow.name == conversation.FlowName.workout_session and flow.step == WEIGHT_TEXT_STEP:
+            if await handle_weight_text(update, user_id, flow, text):
+                return
+        await conversation.clear_active_flow(DB, user_id)
 
     if decision.handler == "workout_parameter_flow":
         flow = await conversation.get_active_flow(DB, user_id)
