@@ -738,6 +738,16 @@ _STRATEGY_SET_DELTA: dict[str, int] = {
 _MIN_SETS_PER_EXERCISE = 2
 _MAX_SETS_PER_EXERCISE = 5
 
+# TASK-B1: tolerance for the session duration fit, in minutes.
+#
+# Zero: the estimator in ``training_intelligence`` is deterministic and the
+# trim ladder can always reach a fitting plan, so a fitted session's estimated
+# duration must land at or under the requested minutes with nothing to spare.
+# The estimator is already slightly conservative (it charges rest after the
+# final set of every exercise), which absorbs real-world transition time
+# without needing a slack allowance here.
+_DURATION_FIT_TOLERANCE_MINUTES = 0.0
+
 
 def _apply_strategy_volume(sessions: list[dict[str, Any]], strategy: str) -> None:
     """Adjust sets-per-exercise by strategy (E4), bounded to a safe range."""
@@ -750,6 +760,60 @@ def _apply_strategy_volume(sessions: list[dict[str, Any]], strategy: str) -> Non
             exercise_entry["sets"] = max(
                 _MIN_SETS_PER_EXERCISE, min(_MAX_SETS_PER_EXERCISE, current + delta)
             )
+
+
+def _duration_fit_rationale(
+    minutes: int,
+    sessions: list[dict[str, Any]],
+    duration_fit_audit: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Explain, in the plan rationale, how the plan was fitted to the time budget.
+
+    TASK-B1: states the REQUESTED duration and HOW the plan was adapted to it —
+    including the explicit "nothing was cut, it already fits" case, so a user
+    with a long slot can see their volume was not silently reduced.
+    """
+    estimated = [
+        float(session.get("estimated_minutes") or 0.0)
+        for session in sessions
+        if session.get("estimated_minutes") is not None
+    ]
+    trimmed_names = [str(item.get("session") or "") for item in duration_fit_audit]
+    reductions = sum(
+        1
+        for item in duration_fit_audit
+        for change in item.get("changes") or []
+        if change.get("action") == "reduced_sets"
+    )
+    removals = sum(
+        1
+        for item in duration_fit_audit
+        for change in item.get("changes") or []
+        if change.get("action") == "removed"
+    )
+    if trimmed_names:
+        summary = (
+            f"התוכנית הותאמה לחלון של {minutes} דקות לאימון: "
+            f"הוסרו {removals} תרגילים והופחתו סטים ב-{reductions} תרגילים "
+            f"({', '.join(trimmed_names)}), תוך שמירה על תרגילי הבסיס."
+        )
+    else:
+        summary = (
+            f"התוכנית המלאה נכנסת בחלון של {minutes} דקות לאימון — "
+            "לא הוסר ולא הופחת דבר."
+        )
+    return {
+        "requested_minutes": minutes,
+        "estimated_minutes_per_session": estimated,
+        "max_estimated_minutes": round(max(estimated), 1) if estimated else 0.0,
+        "tolerance_minutes": _DURATION_FIT_TOLERANCE_MINUTES,
+        "fitted": bool(trimmed_names),
+        "sessions_trimmed": trimmed_names,
+        "exercises_removed": removals,
+        "set_reductions": reductions,
+        "method": "trim_only_accessory_first",
+        "summary": summary,
+    }
 
 
 def workout_quality_issues(payload: dict[str, Any]) -> list[str]:
@@ -959,6 +1023,7 @@ def _workout_candidate(
     if equipment_value is None:
         assumptions.append("הונח ציוד בסיסי בלבד עד לאישור ציוד")
     adaptation_audit: list[dict[str, Any]] = []
+    duration_fit_audit: list[dict[str, Any]] = []
     pain_backfilled = False
     for session in sessions:
         adapted, changes = training_intelligence.adapt_exercises(
@@ -973,6 +1038,30 @@ def _workout_candidate(
             pain_detail=pain_detail,
         )
         session["exercises"] = adapted
+        # TASK-B1: fit the MAIN prescribed session to the user's resolved time
+        # budget. Previously the session copied the full template verbatim and
+        # only `_apply_strategy_volume` touched it, so a 30-minute user and a
+        # 90-minute user received identical volume. Fitting is trim-only: a
+        # session that already fits is left untouched. It runs AFTER adaptation
+        # so the exercises being priced are the ones actually prescribed.
+        fitted, fit_changes = training_intelligence.fit_session_to_minutes(
+            session,
+            int(session["minutes"]),
+            tolerance_minutes=_DURATION_FIT_TOLERANCE_MINUTES,
+        )
+        session["exercises"] = fitted["exercises"]
+        session["estimated_minutes"] = round(
+            training_intelligence.estimate_session_minutes(session), 1
+        )
+        if fit_changes:
+            duration_fit_audit.append(
+                {
+                    "session": session["name"],
+                    "requested_minutes": int(session["minutes"]),
+                    "estimated_minutes": session["estimated_minutes"],
+                    "changes": fit_changes,
+                }
+            )
         for exercise in session["exercises"]:
             exercise["warmup_sets"] = training_intelligence.warmup_sets(exercise)
         if changes:
@@ -991,6 +1080,11 @@ def _workout_candidate(
         ]
     if adaptation_audit:
         assumptions.append("התוכנית הותאמה לציוד, לניסיון ולמגבלות שדווחו")
+    if duration_fit_audit:
+        assumptions.append(
+            f"נפח האימון קוצר כדי להיכנס ל-{minutes} דקות לאימון "
+            "(הופחתו קודם תרגילי עזר, תרגילי הבסיס נשמרו)"
+        )
     # Pain-driven adaptation happened (replacement, load reduction or
     # backfill): name the reported limitation so the user understands why the
     # plan looks different from a textbook split.
@@ -1015,12 +1109,18 @@ def _workout_candidate(
         },
         "days_source": "default" if assumed else "confirmed_availability",
         "adaptation_audit": adaptation_audit,
+        "duration_fit_audit": duration_fit_audit,
         "plan_rationale": {
             "split_type": strategy,
             "frequency": frequency,
             "why_this_split": list(rationale),
             "tradeoffs": list(tradeoffs),
             "days_source": "default" if assumed else "confirmed_availability",
+            # TASK-B1: the rationale must state the REQUESTED duration and how
+            # the plan was adapted to it, so the user can see why their plan is
+            # shorter than a textbook split (or why nothing was cut).
+            "requested_session_minutes": minutes,
+            "duration_fit": _duration_fit_rationale(minutes, sessions, duration_fit_audit),
             "equipment_considered": list(training_profile.available_equipment),
             "pain_areas_considered": list(training_profile.pain_areas),
             "progression_rule": "double_progression_rir_with_pain_hold",

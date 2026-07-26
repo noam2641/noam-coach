@@ -1164,6 +1164,225 @@ def warmup_sets(exercise: dict[str, Any], working_weight: float | None = None) -
     return sets
 
 
+# ---------------------------------------------------------------------------
+# TASK-B1: session duration model + trim-only time fitting for the MAIN plan.
+# ---------------------------------------------------------------------------
+#
+# DURATION MODEL (deterministic, no per-user calibration available).
+#
+# There was no estimator for a *prescribed* session anywhere in the codebase
+# (``routine.py``/``health_jobs.py`` only average *observed* workouts), so this
+# is a new, explicitly documented one. Cost of one working set is:
+#
+#     work_seconds(reps) + rest_seconds
+#
+# with ``work_seconds = reps * _SECONDS_PER_REP`` at a controlled ~3 s/rep
+# tempo (roughly 1 s concentric + 2 s eccentric, the tempo the plan cues
+# prescribe), and ``rest`` taken from the exercise's own prescription — the
+# templates already carry per-exercise ``rest`` in seconds, so rest is real
+# data, not an assumption. Reps use the midpoint of the ``rmin``/``rmax``
+# range. The last set of an exercise still charges rest, which stands in for
+# the setup/transition to the next station; that keeps the model simple and
+# slightly conservative (it never under-estimates a session into overrun).
+#
+# On top of the working sets:
+#   * ``_SESSION_OVERHEAD_SECONDS`` — the fixed general warm-up the planner
+#     always prescribes ("5 דקות תנועה קלה") plus a minute of wrap-up;
+#   * ``_WARMUP_SECONDS_PER_EXERCISE`` — the per-exercise warm-up ramp sets
+#     that ``warmup_sets()`` attaches (1-3 short sets with short rests).
+#
+# ASSUMPTIONS (stated so they can be revisited with real logged data):
+#   * a controlled 3 s/rep tempo for every exercise;
+#   * prescribed rest is actually taken;
+#   * no supersets, no circuits, single trainee, equipment available on
+#     arrival at each station.
+_SECONDS_PER_REP = 3.0
+_SESSION_OVERHEAD_SECONDS = 6 * 60
+_WARMUP_SECONDS_PER_EXERCISE = 60
+
+
+def estimate_exercise_seconds(exercise: dict[str, Any]) -> float:
+    """Estimated wall-clock seconds for one exercise (working sets + ramp).
+
+    See the duration-model note above for the assumptions behind this.
+    """
+    try:
+        sets = int(exercise.get("sets") or 0)
+    except (TypeError, ValueError):
+        sets = 0
+    if sets <= 0:
+        return 0.0
+    try:
+        rmin = int(exercise.get("rmin") or 0)
+        rmax = int(exercise.get("rmax") or 0)
+    except (TypeError, ValueError):
+        rmin = rmax = 0
+    reps = (rmin + rmax) / 2.0 if rmin and rmax >= rmin else float(rmin or rmax or 10)
+    try:
+        rest = float(exercise.get("rest") or 90)
+    except (TypeError, ValueError):
+        rest = 90.0
+    per_set = reps * _SECONDS_PER_REP + rest
+    return sets * per_set + _WARMUP_SECONDS_PER_EXERCISE
+
+
+def estimate_session_minutes(session_or_exercises: Any) -> float:
+    """Estimated duration in minutes for a session (or a bare exercise list).
+
+    Accepts either a session dict (uses its ``exercises``) or the list itself,
+    so callers can price a candidate trim without building a session first.
+    """
+    if isinstance(session_or_exercises, dict):
+        exercises = session_or_exercises.get("exercises") or []
+    else:
+        exercises = session_or_exercises or []
+    if not exercises:
+        return 0.0
+    total = _SESSION_OVERHEAD_SECONDS + sum(
+        estimate_exercise_seconds(item) for item in exercises if isinstance(item, dict)
+    )
+    return total / 60.0
+
+
+# Movement patterns that carry the session's primary training stimulus. These
+# are protected from removal for as long as the time budget allows: dropping a
+# squat pattern to keep a lateral raise would be a worse plan, not a shorter
+# one. Everything else counts as lower-priority accessory volume.
+_PRIMARY_MOVEMENTS = frozenset(
+    {
+        "horizontal_push",
+        "vertical_push",
+        "horizontal_pull",
+        "vertical_pull",
+        "squat",
+        "hinge",
+    }
+)
+
+# Trimming floors: an exercise is never reduced below this many working sets
+# (below it the exercise stops being a meaningful stimulus and should be
+# dropped instead), and a fitted session always keeps at least this many
+# exercises so "fitting" can never degenerate into an empty plan.
+_MIN_FITTED_SETS = 2
+_MIN_FITTED_EXERCISES = 1
+
+
+def _is_accessory(exercise: dict[str, Any]) -> bool:
+    """True when the exercise is lower-priority accessory volume."""
+    profile = CATALOG.get(str(exercise.get("id") or ""))
+    if profile is None:
+        # Unknown to the catalog: treat as accessory so an unrecognised
+        # add-on is trimmed before a known compound.
+        return True
+    return profile.movement not in _PRIMARY_MOVEMENTS
+
+
+def fit_session_to_minutes(
+    session: dict[str, Any],
+    minutes: int,
+    *,
+    tolerance_minutes: float = 0.0,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Trim a session so its estimated duration fits ``minutes``.
+
+    TASK-B1. The prescribed main session used to ignore the user's available
+    time entirely, so a 30-minute user and a 90-minute user received identical
+    volume. This fits the canonical session to the resolved time budget.
+
+    The operation is **trim-only**: a session that already fits is returned
+    unchanged (never padded to fill a longer slot). Trimming happens in
+    increasing order of damage to the program:
+
+    1. reduce sets on lower-priority accessory work (down to
+       ``_MIN_FITTED_SETS``);
+    2. drop accessory exercises entirely (last one first, so the earliest —
+       and generally most important — accessory survives longest);
+    3. only if still over budget, reduce sets on primary compounds;
+    4. as a last resort, drop trailing primary compounds, always keeping at
+       least ``_MIN_FITTED_EXERCISES``.
+
+    Movement-pattern coverage is preserved as far as the budget permits: a
+    primary movement is only dropped once every accessory is already gone and
+    every remaining exercise is at the set floor.
+
+    Returns ``(fitted_session, changes)``. The input session and its exercise
+    dicts are never mutated — exercises are copied before any edit — so shared
+    templates upstream (``PLANS``) can never be written through.
+    """
+    budget = max(0.0, float(minutes)) + max(0.0, float(tolerance_minutes))
+    exercises = [
+        dict(item) for item in (session.get("exercises") or []) if isinstance(item, dict)
+    ]
+    changes: list[dict[str, Any]] = []
+    if not exercises or budget <= 0:
+        return {**session, "exercises": exercises}, changes
+
+    def over_budget() -> bool:
+        return estimate_session_minutes(exercises) > budget
+
+    if not over_budget():
+        # Already fits: trim-only means we leave it exactly as it is.
+        return {**session, "exercises": exercises}, changes
+
+    def reduce_sets(accessory: bool) -> bool:
+        """Shave one set off the last eligible exercise. True if anything changed."""
+        for index in range(len(exercises) - 1, -1, -1):
+            entry = exercises[index]
+            if _is_accessory(entry) is not accessory:
+                continue
+            try:
+                sets = int(entry.get("sets") or 0)
+            except (TypeError, ValueError):
+                continue
+            if sets <= _MIN_FITTED_SETS:
+                continue
+            entry["sets"] = sets - 1
+            changes.append(
+                {
+                    "exercise": entry.get("name") or entry.get("id"),
+                    "action": "reduced_sets",
+                    "from_sets": sets,
+                    "to_sets": sets - 1,
+                    "reason": "time_budget",
+                }
+            )
+            return True
+        return False
+
+    def drop_exercise(accessory: bool) -> bool:
+        """Drop the last eligible exercise. True if anything changed."""
+        if len(exercises) <= _MIN_FITTED_EXERCISES:
+            return False
+        for index in range(len(exercises) - 1, -1, -1):
+            entry = exercises[index]
+            if _is_accessory(entry) is not accessory:
+                continue
+            exercises.pop(index)
+            changes.append(
+                {
+                    "exercise": entry.get("name") or entry.get("id"),
+                    "action": "removed",
+                    "reason": "time_budget",
+                }
+            )
+            return True
+        return False
+
+    # Escalating trim ladder; each step is retried until it stops helping.
+    for step in (
+        lambda: reduce_sets(True),
+        lambda: drop_exercise(True),
+        lambda: reduce_sets(False),
+        lambda: drop_exercise(False),
+    ):
+        while over_budget() and step():
+            pass
+        if not over_budget():
+            break
+
+    return {**session, "exercises": exercises}, changes
+
+
 def quick_session(session: dict[str, Any], minutes: int) -> dict[str, Any]:
     """Keep the highest-value exercises that fit a short time window."""
     budget = max(10, int(minutes)) * 60
