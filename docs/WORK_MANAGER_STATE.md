@@ -5,12 +5,12 @@ phase changes and before every pause.
 
 | Field | Value |
 |---|---|
-| Last updated | 2026-07-26 (WAVE-1 complete + CI hardening #21; develop `78e9add`) |
-| Last verified `origin/develop` | `78e9add` (merge of PR #21 — TASK-CI-DAILY-MENU-CONCURRENCY) |
+| Last updated | 2026-07-26 (WAVE-2 complete: PRs #22/#23 merged; develop `dc300cc`) |
+| Last verified `origin/develop` | `dc300cc` (merge of PR #23 — TASK-WORKOUT-REST-NEXT-ACTION) |
 | GitHub default branch | `develop` (verified — the old `codex/*` default is corrected) |
-| Active phase | **PHASE 7 — WAVE-1 CLOSEOUT.** All four WAVE-1 tasks merged: TASK-R1 #15 (`0cfb062`), TASK-B1 #16 (`2674c98`), TASK-LOG004 #18 (`95119bf`), TASK-UX01 #19 (`a5bfc01`); queue/follow-up doc #17 (`91eeac1`). Cumulative full regression run on the combined state. **Next: WAVE-2 (owner-approved workout UX), serialized — TASK-WORKOUT-WEIGHT-TEXT then TASK-WORKOUT-REST-NEXT-ACTION.** |
-| Active task | WAVE-1 closeout (regression + traceability + wave-only worktree cleanup), then WAVE-2 start. |
-| Approved work outstanding | **YES — WAVE-2 is owner-approved and queued** (see the execution-queue section). This supersedes the earlier "no remaining approved tasks" statement, which was true only of the LOG batch on 2026-07-25 and is **no longer current**. |
+| Active phase | **PHASE 8 — WAVE-2 COMPLETE.** Both owner-approved workout-UX tasks are merged, serialized as required: TASK-WORKOUT-WEIGHT-TEXT #22 (`198e6a5`) then TASK-WORKOUT-REST-NEXT-ACTION #23 (`dc300cc`, built on the merged weight-text result). WAVE-1 and its CI hardening remain merged (#15/#16/#18/#19/#21). |
+| Active task | None in flight. Awaiting the next owner-approved scope. |
+| Approved work outstanding | **None.** WAVE-1 and WAVE-2 are both merged. Remaining known items are all DEFERRED or owner-gated: FU-01…FU-04, ledger decision U-3, the blocked scopes, and the stale-`MASTER_TASKS` label tidy-up. None is authorized for implementation. |
 | *(rows below are HISTORICAL)* | *The following rows record the completed 2026-07-21…25 repository-cleanup and LOG-batch work. They are kept for traceability and are **not** current operational state — the current state is the four rows above.* |
 | Baseline @ approval | head `1dbd6c6`; push CI `30154848488` success; PR CI `30154850042` success; PR #6 open, `+591/−0` |
 | Batch A result | **PII in all six docs** (real user id + meal-image refs) → external backup only at `…\cleanup_20260725\local_docs_PII\`; **NOT added to Git** (A2 skipped). No tracked change. |
@@ -295,7 +295,47 @@ proof of overlap. **Tests-only** — inspection found no production defect.
 Verified: 300-iteration stress (100× each) zero failures, module 31, daily-menu
 regression 127, ruff and compileall clean, both CI contexts green.
 
-### WAVE-2 — Workout UX (owner-approved P1; queued, starts after WAVE-1 closeout)
+### WAVE-2 — Workout UX (owner-approved P1) — **COMPLETE**
+
+| Task | PR | Merge commit | CI |
+|---|---|---|---|
+| TASK-WORKOUT-WEIGHT-TEXT | #22 | `198e6a5` | both contexts green |
+| TASK-WORKOUT-REST-NEXT-ACTION | #23 | `dc300cc` | both contexts green |
+
+Serialized as required: REST-NEXT-ACTION was branched from the **merged**
+weight-text result, so the rest flow transitions into free-text weight entry.
+Neither task changed the schema; `db.py` is absent from both diffs.
+
+WEIGHT-TEXT: the weight-selection buttons are replaced by a deterministic
+free-text parser (bare number, `קג`/`ק״ג`, decimal point AND comma, per-hand,
+bodyweight, same-as-previous — the last refused without a previous value), bounded
+0–500 kg. Ambiguous input re-asks in place and writes nothing and advances
+nothing; duplicate delivery cannot double-record (the live row is re-read and the
+step guarded). The flow is armed only while the question is on screen via
+`FlowName.workout_session`, so meal/onboarding/general text is never captured —
+full-match anchoring is an independent second protection. Per-hand/bodyweight are
+represented WITHOUT a migration: `sets.weight` stores the same canonical number
+the buttons produced, the load-type hint rides in the schemaless `sessions.plan`
+JSON, and the interpretation is stated in the prompt and confirmation. The
+`splitw` split-set sub-flow was deliberately left button-driven (a second state
+machine with its own duplicate semantics) — the one remaining inconsistency.
+
+REST-NEXT-ACTION: one **pure** resolver (`noam_coach/services/workout_next_action.py`)
+is consulted by both the rest card and the transition that actually happens at
+zero, so the displayed instruction and the real next state cannot diverge. It
+reads the canonical `sessions` row (never `rest_timers`' denormalised last-set
+data, never the last message), so changes during rest surface on the next edit.
+Review caught and fixed a real defect: because the pointer is advanced by whoever
+saved the set, a rest before a DIFFERENT exercise was rendered with continuation
+framing and carried the previous exercise's weight across; `from_exercise_index`
+(from the already-persisted `rest_timers.exercise_index`) now distinguishes them,
+with regression tests pinning it. The existing throttle/dedupe are untouched, so
+there is no message flooding, and the three inline advance chains were
+deliberately not refactored (their atomic optimistic UPDATE is a real concurrency
+guard) — a test instead asserts the resolver agrees with them at every step.
+
+### WAVE-2 — original queue entry (historical)
+*(original requirement text, kept for traceability)*
 
 Both requirements and their acceptance criteria as supplied by the owner are
 **binding**; they are already approved and must not be re-confirmed.
@@ -353,5 +393,5 @@ authorized for implementation without an explicit owner decision.
 - Canonical implementation ledger: `docs/CANONICAL_IMPLEMENTATION_LEDGER.md`
 - Cleanup ledger: `docs/REPOSITORY_CLEANUP_LEDGER.md`
 - Agent roster & contracts (durable): `docs/WORK_MANAGER_AGENTS.md`
-- Active PRs: PR #4/#5/#7 (merged), PR #6/#8 (merged). Open task branches await PRs:
+- PR history: #4/#5/#6/#7/#8 (earlier tracks), #9–#14 (LOG batch), #15–#21 (WAVE-1 + CI hardening), #22–#23 (WAVE-2) — all merged. No open PRs; no task branches outstanding. Superseded line:
   `fix/log-012/014/015/016-*`, `chore/work-manager-autonomy-config`.
