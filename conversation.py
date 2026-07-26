@@ -178,7 +178,38 @@ class ActiveFlow:
 
 
 def _new_flow_id(user_id: int) -> str:
-    return f"f-{user_id}-{secrets.token_hex(6)}"
+    """Mint a FULLY OPAQUE flow id — no user-derived component (LOG004).
+
+    The historical scheme was ``f-<raw telegram user_id>-<12 hex>``, which
+    leaked the raw account id into active_flow.flow_id, product_events.flow_id
+    and every observability/event surface that correlates on flow identity.
+
+    The replacement carries NO information about the user: both segments are
+    freshly drawn from ``secrets`` on every call. ``user_id`` is retained in
+    the signature only to keep the (many) call sites and the public shape of
+    this helper unchanged — it is deliberately unused, and must NOT be
+    reintroduced into the value in any form (raw, encoded, truncated, or
+    hashed: a hash of the id is still a stable per-user identifier and would
+    re-enable cross-flow linkage of the same account).
+
+    SHAPE is preserved on purpose: ``f-<digits>-<hex>``. The ARCH-04 callback
+    grammar (noam_coach/services/callback_grammar.py:66) recognises a flow
+    token in callback_data only as ``^ff-\\d+-[0-9a-f]{6,}$``. Keeping that
+    shape means old persisted ids and newly minted ids are BOTH extractable by
+    the one existing parser, so resume/stale-callback/version-guard behaviour
+    is identical for legacy and new flows with no schema change and no
+    backfill. The digits are now random, not an account id.
+
+    Entropy: 48 random bits in the digit group (drawn below 10**15, rendered
+    zero-padded to a fixed 15 digits so the length is stable and the value is
+    not distinguishable by width) + 48 bits of hex = 96 bits total. Collisions
+    are governed by the birthday bound: even at 10**9 flows the probability of
+    any collision is ~10**-11. Uniqueness is not relied upon for correctness
+    anyway — flow ids are scoped per user row in active_flow — but this makes
+    accidental correlation between two flows effectively impossible.
+    """
+    del user_id  # intentionally unused: the id must not derive from the user
+    return f"f-{secrets.randbelow(10**15):015d}-{secrets.token_hex(6)}"
 
 
 def _expiry_for(flow: FlowName, expiry_minutes: int | None = None) -> str | None:
