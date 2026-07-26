@@ -255,6 +255,73 @@ only); the deleted root PII audit `.md` plans (FS-CLEANUP-1).
   work; `wt-lease-fix` (empty, OS-locked) retained. Final accounting in the
   session report.
 
+## Execution queue — WAVE-1 (in progress) and WAVE-2 (owner-approved, queued)
+
+### WAVE-1 — correctness + privacy + UX (owner-approved, executing)
+| Task | Branch | PR | State |
+|---|---|---|---|
+| TASK-R1 — recursive fail-closed DSAR redaction of `analytics_events` | `fix/wave1-dsar-analytics-redaction` | #15 | **MERGED** (`0cfb062`) |
+| TASK-B1 — fit the main session to `session_minutes` | `fix/wave1-planning-duration-fitting` | #16 | **MERGED** (`2674c98`) |
+| TASK-LOG004 — fully opaque `flow_id` (no user-derived component) | `fix/wave1-opaque-flow-id` | — | in progress |
+| TASK-UX01 — duplicate-correction notice (idempotent skip) | `fix/wave1-duplicate-correction-notice` | — | in progress |
+
+Closeout after all four merge: sync `develop` → cumulative full-regression on the
+combined state → update this document + traceability → remove ONLY this wave's
+worktrees/branches → consolidated report.
+
+### WAVE-2 — Workout UX (owner-approved P1; queued, starts after WAVE-1 closeout)
+
+Both requirements and their acceptance criteria as supplied by the owner are
+**binding**; they are already approved and must not be re-confirmed.
+
+**TASK-WORKOUT-WEIGHT-TEXT (P1)** — during an active workout, replace the
+predefined weight-selection buttons with validated **free-text** weight entry.
+Deterministic Hebrew/numeric parsing (no AI for simple numerics): `80`, `80 קג`,
+`80 ק״ג`, `17.5`, `17,5`, `12 בכל יד`, `משקל גוף`, `אותו משקל`. Ambiguous input →
+short Hebrew clarification, **no write and no state advance**. Duplicate Telegram
+update must not double-record or double-advance. Free-text is consumed **only**
+while an active workout explicitly awaits a weight (must not steal meal,
+onboarding or general messages). Confirmation states the interpretation actually
+persisted. Non-scope: plan generation, exercise selection, RIR/progression, rest
+timers, alternatives, split-set behavior, DB migration, historical records,
+unrelated navigation/safety buttons.
+
+**TASK-WORKOUT-REST-NEXT-ACTION (P1)** — every visible rest timer must show the
+actual **next action**: another set of the current exercise, the exact next
+exercise, or the correct completion step — derived from the **canonical persisted
+state**, never from the last rendered message. Must be correct for skips,
+alternatives, split sets, resume-after-interruption and final rest; must survive
+timer-message edits without flooding the chat; existing timer controls preserved.
+Prefer **one shared next-action resolver** used by both the rest display and the
+transition that actually occurs when rest ends.
+
+**Sequencing (inspection already performed, read-only):** the two tasks
+**OVERLAP and must be SERIALIZED** — hard collisions in the `callback_session.py`
+handler block, in `workout.py::save_set` advance branches, and potentially in
+`db.py`. Order: **WEIGHT-TEXT first**, then REST-NEXT-ACTION **rebased on the
+merged result**, because the rest flow must transition correctly into free-text
+weight entry. A short re-inspection runs at wave start. Separate tracked tasks,
+separate PRs.
+
+**Engineering decision recorded (no migration, no owner input required):**
+per-hand (`12 בכל יד`) and bodyweight have no representable column today
+(`sets.weight` is a bare `REAL`). Resolution: store the same canonical number the
+buttons would have produced — preserving historical meaning exactly — carry the
+load-type hint in the schemaless `sessions.plan` JSON plus existing equipment
+metadata, and make the interpretation explicit in the prompt and confirmation
+copy; bodyweight → `0`. No schema change, no historical-data modification.
+
+## Follow-up register (recorded, NOT pulled into any active wave)
+
+| ID | Observation | Evidence | Disposition |
+|---|---|---|---|
+| FU-01 | `session_N_missing_time` quality issue when `resolved_preferred_time` is omitted and no availability fact exists | surfaced while building TASK-B1 tests; verified **pre-existing** against a stashed baseline (`_workout_candidate` emits sessions with no time on that path) | **DEFERRED** — real but pre-existing; out of TASK-B1 scope. Candidate for a future small planner-quality task. Not scheduled. |
+| FU-02 | Empty equipment facts can leave a session with zero exercises (equipment adaptation strips to bodyweight) | surfaced while building TASK-B1 tests; **pre-existing** in `adapt_exercises`, not in the new fitting code | **DEFERRED** — pre-existing adaptation behavior, outside TASK-B1 scope. Not scheduled. |
+| FU-03 | Remaining `DIRECT_TABLES` in the DSAR export (e.g. `conversation_state`, `user_facts`, `medical_constraints`) may carry comparable free-text exposure; only `audit` (LOG-012) and `analytics_events` (TASK-R1) are redacted today | `scripts/export_user_data.py` generic `SELECT *` loop | **DEFERRED** — follow-up DSAR audit candidate. Deliberately not expanded into WAVE-1 (scope discipline). Not scheduled. |
+
+These remain visible in the accounting and must not disappear silently; none is
+authorized for implementation without an explicit owner decision.
+
 ## Links
 - Canonical implementation ledger: `docs/CANONICAL_IMPLEMENTATION_LEDGER.md`
 - Cleanup ledger: `docs/REPOSITORY_CLEANUP_LEDGER.md`
