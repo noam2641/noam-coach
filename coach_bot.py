@@ -333,6 +333,7 @@ from noam_coach.bot.workout_runtime import (
     rest_job_name,
     rest_keyboard,
     rest_text,
+    resolve_rest_next_action,
     cancel_rest_timer,
     update_rest_message,
     _MessageEditTarget,
