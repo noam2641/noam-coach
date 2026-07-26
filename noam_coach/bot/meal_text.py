@@ -915,6 +915,26 @@ async def handle_text_message(
     if await try_handle_local_health_path(update, context, user_id, text):
         return
 
+    # A "##"-prefixed message is developer commentary about the product, not
+    # user data. It must be intercepted HERE -- before ConversationRouter.route
+    # below, which calls expire_if_needed and can clear an active flow as a
+    # side effect. Returning early leaves the flow exactly as it was, so the
+    # bot re-asks whatever it was asking and the note never reaches intent
+    # classification, the meal pipeline, or onboarding answers.
+    from noam_coach.services import dev_notes as dev_notes_service
+
+    if dev_notes_service.is_dev_note(text):
+        flow = await conversation.get_active_flow(DB, user_id)
+        await dev_notes_service.record_dev_note(
+            DB,
+            user_id,
+            text,
+            context=dev_notes_service.flow_context(flow),
+        )
+        await track_event(user_id, "DEV_NOTE_RECORDED", text_length=len(text))
+        await update.effective_message.reply_text(dev_notes_service.ACK_TEXT)
+        return
+
     await track_event(user_id, "USER_MESSAGE", text_length=len(text))
     decision = await conversation.ConversationRouter.route(DB, user_id, "text")
 
