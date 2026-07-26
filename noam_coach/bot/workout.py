@@ -107,7 +107,7 @@ from retention import (
 
 from noam_coach.runtime_bind import runtime_bound
 
-RUNTIME_NAMES = ('Any', 'DB', 'Exception', 'InlineKeyboardMarkup', 'KeyError', 'StopIteration', 'TypeError', 'ValueError', '_StaleSetStep', '_rir_known', 'abs', 'advance_sql', 'avg7', 'bool', 'button', 'cal_line', 'cal_remaining', 'calories', 'client_event_id', 'completed', 'conn', 'cue', 'cues', 'cur', 'current', 'cursor', 'datetime', 'day', 'dict', 'duration', 'end', 'ended', 'enumerate', 'esc', 'ex', 'exercise_index', 'explanation', 'fetch_goal', 'float', 'goal', 'goal_note', 'header', 'home_keyboard', 'i', 'idx', 'int', 'json', 'keyboard', 'last', 'last_steps', 'len', 'lines', 'list', 'm', 'meal_count', 'meals', 'muscle', 'muscle_line', 'next', 'plan', 'planned_sets', 'prev', 'prev_line', 'prev_rir', 'prev_rir_label', 'prot_line', 'prot_remaining', 'protein', 'provisional', 'query', 'recommend_load', 'reps', 'rest_line', 'rest_seconds', 'rir', 'rir_line', 'round', 'row', 'rows', 'safe_edit', 'save_set', 'session', 'session_action_data', 'session_id', 'set_count', 'set_no', 'source', 'start', 'started', 'status', 'str', 'sum', 'target_rir', 'text', 'timedelta', 'timezone', 'today_bounds_utc', 'today_consumed', 'today_meals', 'tuple', 'user_id', 'user_model', 'utc_now', 'volume', 'weight', 'why_line', 'wline')
+RUNTIME_NAMES = ('Any', 'DB', 'Exception', 'InlineKeyboardMarkup', 'KeyError', 'StopIteration', 'TypeError', 'ValueError', 'WEIGHT_TEXT_STEP', '_StaleSetStep', '_rir_known', 'abs', 'advance_sql', 'avg7', 'await_weight_text', 'bool', 'button', 'cal_line', 'cal_remaining', 'calories', 'clear_weight_text_flow', 'client_event_id', 'completed', 'conn', 'conversation', 'cue', 'cues', 'cur', 'current', 'cursor', 'datetime', 'day', 'dict', 'duration', 'end', 'ended', 'enumerate', 'esc', 'ex', 'exercise_index', 'explanation', 'fetch_goal', 'float', 'goal', 'goal_note', 'handle_weight_text', 'header', 'home_keyboard', 'i', 'idx', 'int', 'json', 'keyboard', 'last', 'last_steps', 'len', 'lines', 'list', 'm', 'meal_count', 'meals', 'muscle', 'muscle_line', 'next', 'plan', 'planned_sets', 'prev', 'prev_line', 'prev_rir', 'prev_rir_label', 'previous_weight_context', 'prot_line', 'prot_remaining', 'protein', 'provisional', 'query', 'recommend_load', 'record_load_type_hint', 'reps', 'reps_prompt_keyboard', 'rest_line', 'rest_seconds', 'rir', 'rir_line', 'round', 'row', 'rows', 'safe_edit', 'save_set', 'session', 'session_action_data', 'session_id', 'set_count', 'set_no', 'source', 'start', 'started', 'status', 'stored_load_type', 'str', 'sum', 'suppress', 'target_rir', 'text', 'timedelta', 'timezone', 'today_bounds_utc', 'today_consumed', 'today_meals', 'tuple', 'update_session_step', 'user_id', 'user_model', 'utc_now', 'volume', 'weight', 'why_line', 'wline')
 
 
 @runtime_bound(RUNTIME_NAMES)
@@ -499,6 +499,241 @@ async def show_session(query: Any, user_id: int, session_id: int) -> None:
         ]
     )
     await safe_edit(query, text, keyboard)
+
+
+# ---------------------------------------------------------------------------
+# TASK-WORKOUT-WEIGHT-TEXT — typed weight reporting during an active workout.
+#
+# The predefined weight-SELECTION buttons are gone; the user types the load.
+# The three pieces below are the whole contract:
+#
+#   await_weight_text()        arms FlowName.workout_session for exactly the
+#                              current (session, exercise_index, set_number)
+#   previous_weight_context()  the optional "בסט הקודם" context line
+#   handle_weight_text()       parses one typed answer and either advances to
+#                              the EXISTING next step (reps) or re-asks
+#
+# Load type without a migration: sets.weight stays a bare REAL and receives the
+# same canonical number the buttons produced. The per-hand / bodyweight HINT
+# rides in the schemaless sessions.plan JSON (per exercise index), so history
+# keeps its exact historical meaning and no schema change is required.
+# ---------------------------------------------------------------------------
+
+WEIGHT_TEXT_STEP = "await_weight"
+
+
+def _weight_load_type_key(exercise_index: int, set_number: int) -> str:
+    return f"{int(exercise_index)}:{int(set_number)}"
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def await_weight_text(user_id: int, session: dict[str, Any]) -> None:
+    """Arm the free-text weight step for THIS session/exercise/set.
+
+    The payload carries the full step identity. The text consumer re-reads the
+    live session row and refuses to act when the identity no longer matches, so
+    a message typed against a stale prompt cannot write to a different set.
+    """
+    await conversation.set_active_flow(
+        DB,
+        user_id,
+        conversation.FlowName.workout_session,
+        step=WEIGHT_TEXT_STEP,
+        payload={
+            "session_id": int(session["id"]),
+            "exercise_index": int(session["exercise_index"]),
+            "set_number": int(session["set_number"]),
+        },
+    )
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def clear_weight_text_flow(user_id: int) -> None:
+    """Disarm the weight step — always paired with a save, cancel or bail-out.
+
+    Only clears a workout_session flow: a meal or onboarding flow that started
+    in the meantime must never be wiped by the workout path.
+    """
+    flow = await conversation.get_active_flow(DB, user_id)
+    if flow.name == conversation.FlowName.workout_session:
+        await conversation.clear_active_flow(DB, user_id)
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def stored_load_type(session: dict[str, Any], exercise_index: int, set_number: int) -> str:
+    """Load-type hint previously recorded in the plan JSON, if any."""
+    try:
+        plan = json.loads(session["plan"])
+    except (TypeError, json.JSONDecodeError):
+        return "total"
+    hints = plan.get("load_type_hints")
+    if not isinstance(hints, dict):
+        return "total"
+    value = hints.get(_weight_load_type_key(exercise_index, set_number))
+    return value if value in ("total", "per_hand", "bodyweight") else "total"
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def record_load_type_hint(
+    session: dict[str, Any],
+    exercise_index: int,
+    set_number: int,
+    load_type: str,
+) -> None:
+    """Persist the load-type hint into the schemaless sessions.plan JSON.
+
+    Deliberately NOT a migration: sets.weight keeps the same canonical number
+    the buttons wrote, and this hint only records how to READ it back
+    (per-hand / bodyweight) for confirmation and future prompts. A failure here
+    must never break set logging, so the write is best-effort.
+    """
+    if load_type == "total":
+        return
+    try:
+        plan = json.loads(session["plan"])
+    except (TypeError, json.JSONDecodeError):
+        return
+    hints = plan.get("load_type_hints")
+    if not isinstance(hints, dict):
+        hints = {}
+    hints[_weight_load_type_key(exercise_index, set_number)] = load_type
+    plan["load_type_hints"] = hints
+    with suppress(Exception):
+        await DB.execute(
+            "UPDATE sessions SET plan=? WHERE id=?",
+            (json.dumps(plan, ensure_ascii=False), session["id"]),
+        )
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def previous_weight_context(
+    user_id: int,
+    session: dict[str, Any],
+    current: dict[str, Any],
+) -> tuple[float | None, str]:
+    """(previous_weight, previous_load_type) for the prompt's context line.
+
+    Prefers the most recent set of THIS exercise in THIS session (the natural
+    "previous set"), falling back to the last time the exercise was performed.
+    Returns (None, "total") when there is nothing to show — the prompt then
+    simply omits the context line and "אותו משקל" is not accepted.
+    """
+    row = await DB.fetch_one(
+        """
+        SELECT s.weight, s.set_number, s.session_id FROM sets s
+        JOIN sessions ses ON ses.id = s.session_id
+        WHERE ses.user_id=? AND s.exercise_id=?
+          AND s.source != 'telegram_split_secondary'
+        ORDER BY (s.session_id = ?) DESC, s.id DESC
+        LIMIT 1
+        """,
+        (user_id, current["id"], session["id"]),
+    )
+    if not row:
+        return None, "total"
+    load_type = await stored_load_type(
+        session, session["exercise_index"], int(row["set_number"])
+    )
+    return float(row["weight"]), load_type
+
+
+@runtime_bound(RUNTIME_NAMES)
+def reps_prompt_keyboard(session: dict[str, Any], current: dict[str, Any], reps: int) -> Any:
+    """The EXISTING next step after a weight is recorded — unchanged order."""
+    center = max(current["rmin"], min(current["rmax"], reps))
+    choices = list(range(max(1, center - 2), center + 3))
+    rows = [
+        [button(str(value), session_action_data("reps", session, value)) for value in choices[i : i + 5]]
+        for i in range(0, len(choices), 5)
+    ]
+    return center, InlineKeyboardMarkup(rows)
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def handle_weight_text(update: Any, user_id: int, flow: Any, text: str) -> bool:
+    """Consume one typed weight answer.
+
+    Returns True when the message was owned by this step (whether it parsed or
+    not). Returns False only when the flow payload is stale/unusable, letting
+    the caller fall through to normal routing after clearing the flow.
+
+    Guarantees:
+      * a parse failure writes NOTHING and does NOT advance — the same step
+        stays armed and the user is re-asked;
+      * the live session row is re-read and its (exercise_index, set_number)
+        must still equal the payload's, so a duplicate delivery of the same
+        message cannot record twice or advance twice;
+      * the session's exercise/set/identity are never mutated by invalid input.
+    """
+    from noam_coach.services import weight_text as weight_text_service
+
+    payload = dict(flow.payload or {})
+    session_id = int(payload.get("session_id") or 0)
+    if not session_id:
+        return False
+
+    session = await DB.fetch_one(
+        "SELECT * FROM sessions WHERE id=? AND user_id=?",
+        (session_id, user_id),
+    )
+    if not session or session["status"] != "active":
+        return False
+
+    # Step identity: the prompt was armed for one specific set. If the session
+    # has since advanced (a duplicate update already saved, or the user tapped
+    # something else), this message is stale — drop the step rather than write.
+    if int(session["exercise_index"]) != int(payload.get("exercise_index", -1)) or int(
+        session["set_number"]
+    ) != int(payload.get("set_number", -1)):
+        return False
+
+    plan = json.loads(session["plan"])
+    current = plan["exercises"][session["exercise_index"]]
+    previous_weight, previous_load_type = await previous_weight_context(user_id, session, current)
+
+    report = weight_text_service.parse_weight_text(
+        text,
+        previous_weight=previous_weight,
+        previous_load_type=previous_load_type,
+    )
+    if report is None:
+        # Re-ask IN PLACE: no write, no advance, flow stays armed.
+        await update.effective_message.reply_text(
+            weight_text_service.INVALID_WEIGHT_TEXT,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [button("↩️ חזרה לאימון", session_action_data("ready", session))],
+                    [button("סיים", session_action_data("finish", session))],
+                ]
+            ),
+        )
+        return True
+
+    # Atomic, optimistic pending write guarded on the same (exercise_index,
+    # set_number) — a duplicate delivery of the same text is a no-op here.
+    if not await update_session_step(session, "pending_weight=?", (report.weight,)):
+        await clear_weight_text_flow(user_id)
+        return True
+
+    await record_load_type_hint(
+        session, session["exercise_index"], session["set_number"], report.load_type
+    )
+
+    _, reps, _ = await recommend_load(user_id, current)
+    if session["pending_reps"] is not None:
+        reps = int(session["pending_reps"])
+    center, keyboard = reps_prompt_keyboard(session, current, reps)
+
+    # The weight is recorded; the step is over. Clearing here is what keeps the
+    # free-text grammar from capturing meal/onboarding/general chat afterwards.
+    await clear_weight_text_flow(user_id)
+
+    await update.effective_message.reply_text(
+        f"{weight_text_service.format_weight_confirmation(report)}\n"
+        f"כמה חזרות? (יעד ~{center})",
+        reply_markup=keyboard,
+    )
+    return True
 
 
 @runtime_bound(RUNTIME_NAMES)
