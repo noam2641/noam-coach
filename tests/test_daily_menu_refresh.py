@@ -111,20 +111,62 @@ async def test_claim_occurs_before_generation(tmp_path: Path) -> None:
     assert gen.calls == 0, "a losing caller must never reach the AI pipeline"
 
 
+async def _overlapping_refreshes(db, gen, *, deliver=None):
+    """Run two refreshes that PROVABLY overlap, and return their results.
+
+    The previous shape started both tasks behind one ``asyncio.Event`` and
+    assumed that releasing them together made them concurrent. It does not: the
+    gate only synchronizes the task START. Under slow scheduling (observed in
+    CI) the first refresh could complete claim → generation → persistence →
+    delivery before the second one reached its claim. The second attempt then
+    legitimately observed a NEW current menu identity and performed a second,
+    correct refresh — so the assertion failed while production behaviour was
+    right. (A later deliberate refresh after completion *must* regenerate and
+    deliver — DECISION-R — so the test, not production, was wrong.)
+
+    This helper instead blocks the winner INSIDE its generator. Generation runs
+    strictly after ``claim_operation`` (daily_menu_refresh: claim at ~242,
+    ``await generate()`` at ~334), so while the generator is parked the claim is
+    held and the operation is provably incomplete. That establishes, in order:
+
+      1. the first operation has successfully claimed the refresh
+         (``gen.calls == 1`` — it got past the claim into generation);
+      2. the first operation remains blocked before completion
+         (it is parked on ``gen.gate``, which nothing has set yet);
+      3. the second operation attempts the same source identity while that
+         claim is live (it is started only now, and awaited to completion);
+      4. the second operation is suppressed (returned and asserted by callers);
+      5. only then is the first operation released to finish.
+
+    No sleeps, no timing assumptions and no retry loops are used as the proof of
+    overlap — every step waits on an explicit event or on task completion.
+    """
+    gen.gate = asyncio.Event()
+
+    winner = asyncio.create_task(_refresh(db, gen, deliver=deliver))
+    # (1)+(2): wait until the winner is parked inside generation — claim held,
+    # nothing persisted or delivered yet. Cooperative yields only; the loop
+    # cannot exit until the generator has actually been entered.
+    while gen.calls == 0:
+        await asyncio.sleep(0)
+
+    # (3)+(4): the challenger races the SAME source identity against that live
+    # claim and is driven to completion while the winner is still blocked.
+    loser_result = await _refresh(db, gen, deliver=deliver)
+
+    # (5): only now may the winner finish.
+    gen.gate.set()
+    winner_result = await winner
+    return winner_result, loser_result
+
+
 @pytest.mark.asyncio
 async def test_two_concurrent_refreshes_produce_one_ai_call(tmp_path: Path) -> None:
     db = await _make_db(tmp_path)
     await _seed_menu(db)
     gen = _FakeGenerator()
-    gate = asyncio.Event()
 
-    async def _attempt():
-        await gate.wait()
-        return await _refresh(db, gen)
-
-    tasks = [asyncio.create_task(_attempt()) for _ in range(2)]
-    gate.set()
-    results = await asyncio.gather(*tasks)
+    results = await _overlapping_refreshes(db, gen)
 
     assert gen.calls == 1
     assert len([r for r in results if r.status == refresh.REFRESHED]) == 1
@@ -179,16 +221,13 @@ async def test_concurrent_refresh_creates_one_revision(tmp_path: Path) -> None:
     db = await _make_db(tmp_path)
     day = await _seed_menu(db, revision=1)
     gen = _FakeGenerator()
-    gate = asyncio.Event()
 
-    async def _attempt():
-        await gate.wait()
-        return await _refresh(db, gen)
+    winner, loser = await _overlapping_refreshes(db, gen)
 
-    tasks = [asyncio.create_task(_attempt()) for _ in range(2)]
-    gate.set()
-    await asyncio.gather(*tasks)
-
+    # Exactly one winner, one suppressed caller — the overlap is proven by
+    # _overlapping_refreshes, not assumed from scheduling order.
+    assert winner.status == refresh.REFRESHED
+    assert loser.suppressed
     flags = await _read_flags(db, day)
     assert flags[ACTIVE_DAILY_MENU_KEY]["revision"] == 2   # 1 -> 2, exactly once
 
@@ -199,16 +238,16 @@ async def test_concurrent_refresh_creates_one_delivery_attempt(tmp_path: Path) -
     await _seed_menu(db)
     gen = _FakeGenerator()
     deliver = _FakeDelivery()
-    gate = asyncio.Event()
 
-    async def _attempt():
-        await gate.wait()
-        return await _refresh(db, gen, deliver=deliver)
+    winner, loser = await _overlapping_refreshes(db, gen, deliver=deliver)
 
-    tasks = [asyncio.create_task(_attempt()) for _ in range(2)]
-    gate.set()
-    await asyncio.gather(*tasks)
-
+    # One winner delivers; the caller suppressed against the live claim does
+    # not. Previously the two attempts could run sequentially under slow
+    # scheduling, and the second — correctly seeing a NEW menu identity —
+    # delivered again, producing len(deliver.calls) == 2.
+    assert winner.status == refresh.REFRESHED
+    assert loser.suppressed
+    assert gen.calls == 1
     assert len(deliver.calls) == 1
 
 
