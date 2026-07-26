@@ -427,6 +427,12 @@ async def _handle_meal_correction_text(
         scale_corrections = [c for c in corrections if c.kind == "scale"]
 
         used_deterministic = False
+        # TASK-UX01: set when this submission repeated a scale correction that
+        # was ALREADY applied to this meal and changed nothing else — the user
+        # gets an explicit "already applied" notice instead of a silent
+        # re-render, and the no-op is not written to the payload as if it were
+        # a real revision.
+        duplicate_scale_noop = False
         corrected_analysis = original_analysis
 
         # LOG-014: previously-locked corrections must be readable BEFORE the
@@ -509,6 +515,19 @@ async def _handle_meal_correction_text(
                 applied_scale = True
             if applied_scale or skipped_idempotent:
                 used_deterministic = True
+            # TASK-UX01: a submission is a PURE duplicate only when every scale
+            # was skipped as already-locked AND nothing else in this correction
+            # changed the meal. A mixed submission ("חצי מהאורז ובלי שמן"
+            # resubmitted) still carries a real new effect, so it is not a
+            # no-op and must persist and re-render normally.
+            if skipped_idempotent and not applied_scale:
+                duplicate_scale_noop = not (
+                    removal_corrections
+                    or prep_corrections
+                    or qty_corrections
+                    or count_corrections
+                    or [c for c in corrections if c.kind == "replace"]
+                )
 
         replace_corrections = [c for c in corrections if c.kind == "replace"]
 
@@ -579,25 +598,49 @@ async def _handle_meal_correction_text(
             row, corrected_analysis, correction_text
         )
 
-        # Bump revision in payload
-        revision = row["data"].get("revision", 0) + 1
-        row["data"]["analysis"] = corrected_analysis.model_dump()
-        row["data"]["revision"] = revision
-        row["data"].setdefault("locked_corrections", []).append(correction_text)
-        await DB.execute(
-            "UPDATE approvals SET payload=? WHERE id=? AND user_id=? AND status='pending'",
-            (json.dumps(row["data"], ensure_ascii=False), approval_id, user_id),
-        )
+        # Bump revision in payload.
+        #
+        # TASK-UX01: a PURE duplicate scale (already applied, nothing else
+        # changed) is a no-op, so it must not produce a state transition. Two
+        # effects are suppressed:
+        #   * the revision bump — `revision` versions the CONTENT, and
+        #     `is_stale_revision` invalidates the Approve/Reject controls the
+        #     user is currently looking at whenever it moves. Bumping it for a
+        #     correction that changed nothing would retire a still-valid card
+        #     and make the next tap report a phantom "the meal changed".
+        #   * the `locked_corrections` append — that list is replayed as
+        #     constraints (`identity_constraints_from_texts`) and fed verbatim
+        #     into the AI reanalysis prompt, so a second identical entry is a
+        #     duplicate correction effect, not extra evidence.
+        # The idempotency SEMANTICS are untouched: the scale is still skipped
+        # by the same already-locked check, and the entry stays locked exactly
+        # once so future repeats keep being recognized as duplicates.
+        if duplicate_scale_noop:
+            revision = int(row["data"].get("revision", 0) or 0)
+        else:
+            revision = row["data"].get("revision", 0) + 1
+            row["data"]["analysis"] = corrected_analysis.model_dump()
+            row["data"]["revision"] = revision
+            row["data"].setdefault("locked_corrections", []).append(correction_text)
+            await DB.execute(
+                "UPDATE approvals SET payload=? WHERE id=? AND user_id=? AND status='pending'",
+                (json.dumps(row["data"], ensure_ascii=False), approval_id, user_id),
+            )
         # LOG-012: record only the bounded revision counter — the raw
         # `correction_text` free-text is never stored in the audit trail (it
         # also lives in the redacted emit boundary below).
-        await write_audit(
-            user_id,
-            "meal_text_correction",
-            "approval",
-            approval_id,
-            revision=revision,
-        )
+        # TASK-UX01: the audit trail records applied corrections; a duplicate
+        # that changed nothing has no mutation to audit (the observability
+        # event below still records the submission honestly, flagged as a
+        # duplicate, so the repeat is not invisible to analytics).
+        if not duplicate_scale_noop:
+            await write_audit(
+                user_id,
+                "meal_text_correction",
+                "approval",
+                approval_id,
+                revision=revision,
+            )
         # Batch 7: this event moved to the canonical emit boundary. The NAME
         # and every non-sensitive property are unchanged, so existing readers
         # keep working; the raw correction text moved from `properties` into
@@ -613,6 +656,10 @@ async def _handle_meal_correction_text(
             properties={
                 "revision": revision,
                 "deterministic": used_deterministic,
+                # TASK-UX01: the submission still happened — record it, marked
+                # as a no-op, so "user repeated themselves" stays measurable
+                # even though no state transition was written.
+                "duplicate_noop": duplicate_scale_noop,
                 **meal_observability.correction_parse_properties(
                     corrections,
                     used_deterministic=used_deterministic,
@@ -622,16 +669,34 @@ async def _handle_meal_correction_text(
             },
             content={"text": correction_text},
         )
-        await _emit_meal_lifecycle_evidence(
-            user_id,
-            approval_id,
-            revision=revision,
-            original_analysis=original_analysis,
-            corrected_analysis=corrected_analysis,
-            row=row,
-        )
+        # TASK-UX01: lifecycle evidence describes a before→after mutation of
+        # the meal. A duplicate no-op has no before→after, so emitting it would
+        # fabricate a second identical transition for one real change.
+        if not duplicate_scale_noop:
+            await _emit_meal_lifecycle_evidence(
+                user_id,
+                approval_id,
+                revision=revision,
+                original_analysis=original_analysis,
+                corrected_analysis=corrected_analysis,
+                row=row,
+            )
         count = refine_count + 1
         await set_meal_fix(user_id, approval_id, count)
+        if duplicate_scale_noop:
+            # TASK-UX01: without this the repeat re-rendered a card identical to
+            # the one already on screen, so a user who thought their correction
+            # had not registered got no answer — and might keep repeating it.
+            # Say plainly that the SAME update was already applied and that the
+            # current value is therefore unchanged. Sent as its own message
+            # BEFORE the card so the card itself (and its pending
+            # approve/reject controls) stays exactly as the user left it — the
+            # meal is still awaiting approval and nothing here saves it.
+            await update.effective_message.reply_text(
+                "כבר עדכנתי את זה קודם — התיקון הזהה הזה כבר הוחל, "
+                "אז הערך הנוכחי נשאר כפי שהוא ולא שיניתי שוב.\n"
+                "הארוחה עדיין מחכה לאישור שלך."
+            )
         await render_meal(progress, user_id, approval_id, refine_count=count)
     except Exception as exc:  # noqa: BLE001
         LOGGER.exception("Meal correction failed")

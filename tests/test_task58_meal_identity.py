@@ -640,9 +640,15 @@ async def test_repeated_scale_correction_does_not_compound(
     # Chicken never targeted by this correction.
     chicken = next(i for i in saved3.items if "עוף" in i.name)
     assert chicken.grams == 180
-    # Every submission is still audited honestly.
-    assert payload3["revision"] == 3
-    assert payload3["locked_corrections"].count("חצי מהאורז") == 3
+    # TASK-UX01 (refines the LOG-014 expectation below): a repeat that changed
+    # nothing is no longer written as a state transition. `revision` versions
+    # the CONTENT and gates the rendered approve/reject controls, so it stays
+    # at 1 — the single real change — and the correction stays locked exactly
+    # once instead of accumulating duplicate entries that would be replayed as
+    # constraints. The submission itself is still recorded on the
+    # meal_correction_applied event (duplicate_noop=True).
+    assert payload3["revision"] == 1
+    assert payload3["locked_corrections"].count("חצי מהאורז") == 1
 
 
 @pytest.mark.asyncio
@@ -978,3 +984,73 @@ async def test_count_survives_replacement_through_real_handler(
     assert schnitzel.quantity_count == 3.0  # still three, not reset to one
     assert schnitzel.grams == 54  # falafel-derived weight, provenance dropped
     assert schnitzel.quantity_source == "user_count"
+
+
+async def _send_correction_capturing(
+    monkeypatch: pytest.MonkeyPatch, approval_id: str, text: str
+) -> list[str]:
+    """Same as ``_send_correction`` but returns the texts replied to the user.
+
+    TASK-UX01 needs to assert on the user-facing duplicate notice, which the
+    shared helper discards.
+    """
+    from noam_coach.bot import meal_text as meal_text_bot
+
+    async def fake_render(target: Any, user_id: int, approval_id_: str, **k: Any) -> None:
+        return None
+
+    monkeypatch.setattr(coach_bot, "render_meal", fake_render, raising=False)
+    message = _FakeMessage(text)
+    update = SimpleNamespace(
+        effective_message=message,
+        effective_user=SimpleNamespace(id=USER_ID),
+        effective_chat=SimpleNamespace(id=USER_ID),
+    )
+    await meal_text_bot._handle_meal_correction_text(update, USER_ID, approval_id, 0)
+    return list(message.sent.texts)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_scale_tells_the_user_it_was_already_applied(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TASK-UX01: a repeated identical scale must SAY it was already applied.
+
+    Before this, the repeat silently re-rendered a card identical to the one on
+    screen, so a user who thought the correction had not registered got no
+    answer and might keep repeating it.
+    """
+    _fail_ai(monkeypatch)
+    approval_id = await _make_scale_meal_approval()
+
+    first = await _send_correction_capturing(monkeypatch, approval_id, "חצי מהאורז")
+    assert not any("כבר עדכנתי" in t for t in first), "first application must not claim a repeat"
+
+    second = await _send_correction_capturing(monkeypatch, approval_id, "חצי מהאורז")
+    notice = " ".join(second)
+    assert "כבר עדכנתי" in notice          # states the identical update was already applied
+    assert "מחכה לאישור" in notice          # non-alarming: the card is still pending approval
+
+    # And the value really did not move again.
+    saved, payload = await _saved_analysis(approval_id)
+    rice = next(i for i in saved.items if "אורז" in i.name)
+    assert rice.grams == 100
+    assert payload["revision"] == 1  # no duplicate state transition
+
+
+@pytest.mark.asyncio
+async def test_a_genuinely_new_correction_is_not_flagged_as_duplicate(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TASK-UX01 must not produce false positives: a DIFFERENT correction after
+    a scale still applies normally, bumps the revision and shows no notice."""
+    _fail_ai(monkeypatch)
+    approval_id = await _make_scale_meal_approval()
+
+    await _send_correction_capturing(monkeypatch, approval_id, "חצי מהאורז")
+    replies = await _send_correction_capturing(monkeypatch, approval_id, "בלי שמן")
+
+    assert not any("כבר עדכנתי" in t for t in replies)
+    _saved, payload = await _saved_analysis(approval_id)
+    assert payload["revision"] == 2  # the new correction IS a real transition
+    assert payload["locked_corrections"].count("בלי שמן") == 1
