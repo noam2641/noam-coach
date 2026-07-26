@@ -5,8 +5,8 @@ phase changes and before every pause.
 
 | Field | Value |
 |---|---|
-| Last updated | 2026-07-26 (WAVE-1 complete: PRs #15/#16/#18/#19 merged; develop `a5bfc01`) |
-| Last verified `origin/develop` | `a5bfc01` (merge of PR #19 — TASK-UX01; final WAVE-1 head) |
+| Last updated | 2026-07-26 (WAVE-1 complete + CI hardening #21; develop `78e9add`) |
+| Last verified `origin/develop` | `78e9add` (merge of PR #21 — TASK-CI-DAILY-MENU-CONCURRENCY) |
 | GitHub default branch | `develop` (verified — the old `codex/*` default is corrected) |
 | Active phase | **PHASE 7 — WAVE-1 CLOSEOUT.** All four WAVE-1 tasks merged: TASK-R1 #15 (`0cfb062`), TASK-B1 #16 (`2674c98`), TASK-LOG004 #18 (`95119bf`), TASK-UX01 #19 (`a5bfc01`); queue/follow-up doc #17 (`91eeac1`). Cumulative full regression run on the combined state. **Next: WAVE-2 (owner-approved workout UX), serialized — TASK-WORKOUT-WEIGHT-TEXT then TASK-WORKOUT-REST-NEXT-ACTION.** |
 | Active task | WAVE-1 closeout (regression + traceability + wave-only worktree cleanup), then WAVE-2 start. |
@@ -269,10 +269,31 @@ only); the deleted root PII audit `.md` plans (FS-CLEANUP-1).
 | TASK-UX01 — duplicate-correction notice (idempotent skip) | `fix/wave1-duplicate-correction-notice` | #19 | **MERGED** (`a5bfc01`) |
 
 **WAVE-1 is COMPLETE.** All four tasks merged with both CI contexts green on each
-PR; every merge commit is contained in `develop @ a5bfc01`. Cumulative
-full-regression gate on the combined state: **both halves EXIT 0, zero failures**
-(~2,487 tests). Wave-only worktrees/branches removed after proving each held no
-unique or uncommitted work.
+PR; every merge commit is contained in `develop`. Cumulative full-regression gate
+on the combined state: **both halves EXIT 0, zero failures** (~2,487 tests).
+Wave-only worktrees/branches removed after proving each held no unique or
+uncommitted work.
+
+**TASK-CI-DAILY-MENU-CONCURRENCY** (owner-authorized during closeout; PR #21,
+merged as `78e9add`) — deterministic hardening of the three daily-menu refresh
+concurrency tests. The closeout PR's CI failed **deterministically** (two runs)
+on `test_concurrent_refresh_creates_one_delivery_attempt` with
+`len(deliver.calls) == 2`, on a docs-only diff, while the push context and
+`develop`'s own CI were green.
+
+Root cause was in the TEST, not production: the three siblings started both
+refreshes behind one `asyncio.Event`, which synchronizes only the task START. Under
+slow scheduling the first refresh could complete claim → generation → persistence
+→ delivery before the second reached its claim; the second then legitimately saw a
+NEW menu identity and refreshed again — which **DECISION-R requires** for a later
+deliberate refresh. A shared `_overlapping_refreshes` helper now blocks the winner
+INSIDE its generator (generation runs strictly after `claim_operation`, so the
+claim is held and the operation is provably incomplete), drives the challenger to
+completion against that live claim, observes its suppression, and only then
+releases the winner. No sleeps, timing assumptions or retry loops are used as the
+proof of overlap. **Tests-only** — inspection found no production defect.
+Verified: 300-iteration stress (100× each) zero failures, module 31, daily-menu
+regression 127, ruff and compileall clean, both CI contexts green.
 
 ### WAVE-2 — Workout UX (owner-approved P1; queued, starts after WAVE-1 closeout)
 
