@@ -338,3 +338,18 @@ INVALID_WEIGHT_TEXT = (
     "לא הצלחתי לזהות את המשקל. "
     "אפשר לכתוב למשל: 70, 17.5 ק״ג, 12 בכל יד או משקל גוף."
 )
+
+
+def bodyweight_rejected_text(exercise_name: str) -> str:
+    """Re-ask when "bodyweight" was reported for a loaded exercise.
+
+    Framed as a question rather than an error: the user may have meant the
+    bar's own weight, or be doing an unplanned variation. Either way the
+    right move is to ask for a number, not to store 0 kg as training history.
+    """
+    name = (exercise_name or "").strip()
+    subject = f"ב{name}" if name else "בתרגיל הזה"
+    return (
+        f"{subject} יש משקל בתוכנית, אז 'משקל גוף' כנראה לא מה שהתכוונת. "
+        "כמה ק״ג היה בפועל? (למשל 40, או 20 בכל יד)"
+    )

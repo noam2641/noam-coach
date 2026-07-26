@@ -1069,6 +1069,21 @@ async def handle_session_action_callback(
     current = plan["exercises"][session["exercise_index"]]
     weight, reps, _ = await recommend_load(user_id, current)
 
+    # A weight or rep count the user typed during this set OVERRIDES the
+    # recommendation. Without this, handlers that trust the seeded values --
+    # `setok` above all -- persisted the plan default instead of what the user
+    # typed: in the 2026-07-26 session a typed weight was silently replaced by
+    # the plan's 50 kg, while show_session displayed the typed value, so the
+    # card showed one number and the sets table stored another.
+    #
+    # This mirrors the override show_session already performs, and the one the
+    # `rir` branch does by re-reading the row; doing it once here means every
+    # handler sees the user's own input rather than each having to remember.
+    if session["pending_weight"] is not None:
+        weight = float(session["pending_weight"])
+    if session["pending_reps"] is not None:
+        reps = int(session["pending_reps"])
+
     if action in SESSION_SCOPED_ACTIONS and not is_current_session_step(parts, session):
         await safe_answer_callback(query,
             "המסך כבר לא עדכני — מציג את הסט הנוכחי",
