@@ -701,23 +701,182 @@ def _wizard_payload(
     return payload
 
 
+# --- provenance of wizard-confirmed values (W1-6) --------------------------
+#
+# A "✅ אשר" tap on a health-wizard step is real evidence: the user looked at a
+# number and accepted it. But it is *confirmation of a derivation*, not a
+# statement the user made. Writing it as source=SOURCE_USER (as this module
+# used to) manufactures the exact token that _confirmed_fact_value treats as
+# "the user really said this", so a value computed from a single workout
+# became indistinguishable from one the user typed.
+#
+# The honest representation is source=SOURCE_DERIVED + kind=KIND_FACT +
+# confirmed=True:
+#   * source stays DERIVED         → provenance is not laundered; user_model's
+#                                    provenance_kind() keeps reporting
+#                                    "inferred", and any consumer asking "did
+#                                    the user tell me this?" gets the truth.
+#   * kind promoted to KIND_FACT   → it is no longer an open estimate awaiting
+#                                    confirmation; it is a settled planning
+#                                    input.
+#   * confirmed=True               → the tap is recorded. user_model already
+#                                    treats DERIVED+confirmed as trustworthy
+#                                    (see fact_is_actionable), so readiness and
+#                                    plan activation keep working.
+# No new SOURCE_* constant is needed — SOURCE_DERIVED already exists and this
+# combination is already meaningful to user_model.
+_WIZARD_CONFIRMED_SOURCE = user_model.SOURCE_DERIVED
+_WIZARD_CONFIRMED_KIND = user_model.KIND_FACT
+
+# Sub-key stamped into the stored value so the derivation stays recoverable.
+DERIVED_PROVENANCE_KEY = "derived_from"
+
+
 def _confirmed_fact_value(fact: dict[str, Any] | None) -> Any | None:
-    """Return a usable value only for confirmed USER-authored facts.
+    """Return a usable value for a fact the user has actually signed off on.
 
     Health import estimates are useful as suggestions, but they must not count
-    as the "manual override" that suppresses future prompts.  Only facts saved
-    from a typed/user-confirmed answer (source=user) can block the Health wizard
-    from asking again.  This is the guard that keeps HealthKit from overriding
-    the screenshot case: user wrote Sun/Mon/Wed/Fri, so old/partial Health data
-    may be shown as detected data but can no longer reopen/replace those days.
+    as the "manual override" that suppresses future prompts.  This is the guard
+    that keeps HealthKit from overriding the screenshot case: user wrote
+    Sun/Mon/Wed/Fri, so old/partial Health data may be shown as detected data
+    but can no longer reopen/replace those days.
+
+    Two things qualify, and only two:
+      * a typed answer (source=SOURCE_USER, confirmed) — the user authored it;
+      * a derived value the user explicitly confirmed in the wizard
+        (source=SOURCE_DERIVED, kind=KIND_FACT, confirmed) — the user did not
+        author the number but did accept it, which is the same act of consent
+        this gate exists to detect.
+
+    An *un*confirmed derivation still returns None, which is the case the gate
+    was written for.  Requiring KIND_FACT on the derived branch keeps a merely
+    hardened estimate (KIND_ESTIMATE) from sneaking through: only the wizard's
+    deliberate promotion counts.
     """
     if not fact or fact.get("kind") == user_model.KIND_GAP:
         return None
     if not fact.get("confirmed"):
         return None
-    if fact.get("source") != user_model.SOURCE_USER:
+    source = fact.get("source")
+    if source == user_model.SOURCE_USER:
+        return fact.get("value")
+    if (
+        source == _WIZARD_CONFIRMED_SOURCE
+        and fact.get("kind") == _WIZARD_CONFIRMED_KIND
+    ):
+        return fact.get("value")
+    return None
+
+
+def _wizard_derivation_note(
+    step_id: str, pattern: dict[str, Any], field: str
+) -> dict[str, Any]:
+    """Describe where a wizard-confirmed value came from.
+
+    Recorded so the derivation is recoverable *after* the fact. ``set_fact``
+    only writes a ``user_fact_history`` row for a key that already exists, and
+    these planning keys are usually CREATED by the confirm tap — so history
+    cannot be relied on to preserve the origin. Stamping the provenance into
+    the stored value itself is the only representation that survives the very
+    first write, which is exactly the write that loses the information today.
+    """
+    note: dict[str, Any] = {
+        "source_fact": "workout_pattern",
+        "source_field": field,
+        "wizard_step": step_id,
+        "confirmed_by_user": True,
+    }
+    raw = pattern.get(field)
+    if raw is not None:
+        note["raw_value"] = raw
+    # Carry the evidence base forward when the detector recorded it, so a value
+    # backed by a single workout stays legible as such.
+    for meta in (
+        "sessions_sampled",
+        "recent_sessions_sampled",
+        "valid_weeks_sampled",
+        "weekday_selection_source",
+        "weekday_selection_widened",
+        "weekday_selection_window_days",
+    ):
+        if pattern.get(meta) is not None:
+            note[meta] = pattern[meta]
+    return note
+
+
+async def _set_wizard_confirmed_fact(
+    user_id: int,
+    key: str,
+    value: Any,
+    *,
+    provenance: dict[str, Any],
+) -> None:
+    """Persist a wizard-confirmed derived value with its provenance intact.
+
+    ``confidence`` is passed explicitly at the user-confirmation level (0.85):
+    the tap is genuine evidence. When the derivation rests on a thin sample the
+    stored ``*_sampled`` metadata lets ``set_fact`` attenuate that number back
+    down, which is the correct outcome — a value computed from one workout
+    should not end up as confident as one computed from thirty.
+    """
+    await user_model.set_fact(
+        DB, user_id, key, value,
+        kind=_WIZARD_CONFIRMED_KIND,
+        source=_WIZARD_CONFIRMED_SOURCE,
+        confidence=0.85,
+        confirmed=True,
+    )
+    await _record_wizard_provenance(user_id, key, provenance)
+
+
+async def _record_wizard_provenance(
+    user_id: int, key: str, provenance: dict[str, Any]
+) -> None:
+    """Append a history row capturing the derivation behind a confirmed value.
+
+    set_fact writes history only when the key already existed, so for a key the
+    wizard creates the origin would otherwise vanish. Writing the note here
+    guarantees one recoverable row per confirm tap regardless of whether the
+    key is new.
+    """
+    # Provenance is an audit aid, never a reason for a confirm tap to fail.
+    with suppress(Exception):
+        await DB.execute(
+            """
+            INSERT INTO user_fact_history(
+                user_id, key, value, source, confidence, recorded_at
+            ) VALUES(?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                f"{key}:{DERIVED_PROVENANCE_KEY}",
+                json.dumps(provenance, ensure_ascii=False),
+                _WIZARD_CONFIRMED_SOURCE,
+                0.85,
+                utc_now(),
+            ),
+        )
+
+
+async def read_wizard_provenance(
+    user_id: int, key: str
+) -> dict[str, Any] | None:
+    """Return the recorded derivation behind a wizard-confirmed fact, if any."""
+    row = await DB.fetch_one(
+        """
+        SELECT value FROM user_fact_history
+        WHERE user_id=? AND key=?
+        ORDER BY recorded_at DESC, id DESC LIMIT 1
+        """,
+        (user_id, f"{key}:{DERIVED_PROVENANCE_KEY}"),
+    )
+    if not row:
         return None
-    return fact.get("value")
+    try:
+        parsed = json.loads(row["value"])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 async def _has_manual_training_frequency(user_id: int) -> bool:
@@ -1293,10 +1452,11 @@ async def confirm_health_wizard_step(user_id: int, step_id: str) -> str:
         if step_id == WIZARD_STEP_WORKOUT_FREQUENCY:
             freq = value.get("weekly_frequency")
             approved = max(1, min(7, round(float(freq or 1))))
-            await user_model.set_fact(
-                DB, user_id, "training_days_per_week", approved,
-                kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
-                confirmed=True,
+            await _set_wizard_confirmed_fact(
+                user_id, "training_days_per_week", approved,
+                provenance=_wizard_derivation_note(
+                    step_id, value, "weekly_frequency"
+                ),
             )
             ack = f"✅ אושר: {approved} אימונים בשבוע"
         elif step_id == WIZARD_STEP_WORKOUT_DAYS:
@@ -1309,27 +1469,30 @@ async def confirm_health_wizard_step(user_id: int, step_id: str) -> str:
                 })
                 for day in indices
             ]
-            await user_model.set_fact(
-                DB, user_id, "weekly_availability", slots,
-                kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
-                confirmed=True,
+            await _set_wizard_confirmed_fact(
+                user_id, "weekly_availability", slots,
+                provenance=_wizard_derivation_note(
+                    step_id, value, "common_weekdays"
+                ),
             )
             ack = f"✅ אושר: ימי אימון — {', '.join(_workout_days_labels(value))}"
         elif step_id == WIZARD_STEP_WORKOUT_DURATION:
             minutes = int(round(float(value.get("avg_duration_minutes") or 0)))
             minutes = max(10, min(180, minutes))
-            await user_model.set_fact(
-                DB, user_id, "session_minutes", minutes,
-                kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
-                confirmed=True,
+            await _set_wizard_confirmed_fact(
+                user_id, "session_minutes", minutes,
+                provenance=_wizard_derivation_note(
+                    step_id, value, "avg_duration_minutes"
+                ),
             )
             ack = f"✅ אושר: משך אימון טיפוסי — כ־{minutes} דקות"
         else:  # WIZARD_STEP_WORKOUT_HOUR
             hour = str(value.get("typical_hour"))
-            await user_model.set_fact(
-                DB, user_id, "workout_window", hour,
-                kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
-                confirmed=True,
+            await _set_wizard_confirmed_fact(
+                user_id, "workout_window", hour,
+                provenance=_wizard_derivation_note(
+                    step_id, value, "typical_hour"
+                ),
             )
             ack = f"✅ אושר: שעת אימון סביב {hour}"
         await _mark_wizard_substep_done(user_id, step_id, value)
@@ -1356,9 +1519,15 @@ async def apply_health_wizard_trend_choice(
         kind=(fact or {}).get("kind") or user_model.KIND_ESTIMATE,
         source=(fact or {}).get("source") or user_model.SOURCE_DERIVED,
     )
-    await user_model.set_fact(
-        DB, user_id, "training_days_per_week", trend_value,
-        kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
+    # A trend button is still a machine proposal the user accepted, not a
+    # number the user produced — same provenance treatment as the confirm tap.
+    provenance = _wizard_derivation_note(
+        WIZARD_STEP_WORKOUT_FREQUENCY, current, "weekly_frequency"
+    )
+    provenance["source_field"] = "trend_proposal"
+    provenance["raw_value"] = trend_value
+    await _set_wizard_confirmed_fact(
+        user_id, "training_days_per_week", trend_value, provenance=provenance,
     )
     if key == "workout_pattern":
         await _mark_wizard_substep_done(user_id, WIZARD_STEP_WORKOUT_FREQUENCY, updated)
