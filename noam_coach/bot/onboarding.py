@@ -697,7 +697,7 @@ async def advance_after_answer(target: Any, user_id: int) -> None:
             return
         plan = await build_weekly_plan(user_id, freq)
         await message.reply_text(
-            format_weekly_plan(plan, await active_pain_regions_for(user_id)),
+            format_weekly_plan(plan, pain_regions=await active_pain_regions_for(user_id)),
             reply_markup=InlineKeyboardMarkup(
                 [
                     [button("🏋️ התחל אימון", "menu:workout")],
@@ -2695,9 +2695,15 @@ async def active_pain_regions_for(user_id: int) -> dict[str, Any]:
 @runtime_bound(RUNTIME_NAMES)
 def format_weekly_plan(
     plan: dict[str, Any],
+    *,
     pain_regions: dict[str, Any] | None = None,
 ) -> str:
     """Render the weekly plan.
+
+    ``pain_regions`` is keyword-only and optional so the single-argument
+    signature stays intact -- existing callers and test stubs (e.g. the
+    ``lambda _plan:`` in tests/regression/test_abc_plan_request.py) keep
+    working unchanged.
 
     ``pain_regions`` is the output of
     ``training_intelligence.active_pain_regions``. When supplied, every
@@ -2968,7 +2974,7 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
             return True
         plan = await build_weekly_plan(user_id, frequency)
         await message.reply_text(
-            format_weekly_plan(plan, await active_pain_regions_for(user_id)),
+            format_weekly_plan(plan, pain_regions=await active_pain_regions_for(user_id)),
             reply_markup=InlineKeyboardMarkup(
                 [
                     [button("🏋️ התחל אימון", "menu:workout")],

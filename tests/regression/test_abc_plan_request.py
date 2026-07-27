@@ -138,7 +138,12 @@ async def test_abc_request_builds_full_plan(
     monkeypatch.setattr(coach_bot, "check_plan_readiness", no_gaps)
     monkeypatch.setattr(coach_bot, "ask_deferred_for_plan", no_deferred)
     monkeypatch.setattr(coach_bot, "build_weekly_plan", fake_build)
-    monkeypatch.setattr(coach_bot, "format_weekly_plan", lambda _plan: "PLAN-BODY")
+    # **_ absorbs pain_regions, which the renderer takes so it can mark
+    # exercises loading an injured joint. A stub pinned to the exact
+    # signature makes every additive parameter a false failure.
+    monkeypatch.setattr(
+        coach_bot, "format_weekly_plan", lambda _plan, **_: "PLAN-BODY"
+    )
 
     ctx = _plan_ctx("אני רוצה תוכנית ABC")
     handled = await assistant_bot._handle_plan_text_action(ctx)

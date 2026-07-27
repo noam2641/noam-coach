@@ -64,7 +64,7 @@ def test_knee_constraint_marks_the_squat_in_the_weekly_plan() -> None:
     """The regression: this screen showed squats with no knee warning."""
     regions = training_intelligence.active_pain_regions([_pain_row("כאב בברך ימין")])
 
-    rendered = coach_bot.format_weekly_plan(_leg_plan(), regions)
+    rendered = coach_bot.format_weekly_plan(_leg_plan(), pain_regions=regions)
 
     squat_line = next(
         line for line in rendered.splitlines() if "סקוואט" in line
@@ -78,7 +78,7 @@ def test_plan_carries_a_header_naming_the_active_constraint() -> None:
         [_pain_row("טניס אלבו וברך ימין")]
     )
 
-    rendered = coach_bot.format_weekly_plan(_leg_plan(), regions)
+    rendered = coach_bot.format_weekly_plan(_leg_plan(), pain_regions=regions)
 
     assert "מגבלה פעילה" in rendered
     assert "ברך" in rendered
@@ -89,7 +89,7 @@ def test_unaffected_exercises_are_not_marked() -> None:
     """A warning on everything is a warning on nothing."""
     regions = training_intelligence.active_pain_regions([_pain_row("כאב בברך")])
 
-    rendered = coach_bot.format_weekly_plan(_leg_plan(), regions)
+    rendered = coach_bot.format_weekly_plan(_leg_plan(), pain_regions=regions)
 
     lateral = next(
         line for line in rendered.splitlines() if "הרחקת כתפיים" in line
@@ -104,7 +104,7 @@ def test_no_constraint_renders_exactly_as_before() -> None:
     plan = _leg_plan()
 
     without = coach_bot.format_weekly_plan(plan)
-    with_empty = coach_bot.format_weekly_plan(plan, {})
+    with_empty = coach_bot.format_weekly_plan(plan, pain_regions={})
 
     assert without == with_empty
     assert "מגבלה פעילה" not in without
@@ -119,7 +119,7 @@ def test_the_plan_and_the_set_card_agree_on_which_joints_are_loaded() -> None:
     an exercise cannot be flagged on one screen and clean on the other.
     """
     regions = training_intelligence.active_pain_regions([_pain_row("כאב בברך")])
-    rendered = coach_bot.format_weekly_plan(_leg_plan(), regions)
+    rendered = coach_bot.format_weekly_plan(_leg_plan(), pain_regions=regions)
 
     from exercise_plans import PLANS
 

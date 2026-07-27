@@ -335,6 +335,77 @@ def _canonical_ids_in_text(text: str) -> set[str]:
     return found
 
 
+#: Every canonical slug the alias table can produce. Derived rather than
+#: hardcoded so it cannot drift as aliases are added.
+_CANONICAL_IDS: frozenset[str] = frozenset(RESTRICTION_ALIASES.values())
+
+#: Hebrew single-letter particles that attach directly to a noun
+#: ("בטורטייה", "והחציל"). Stripped so a restriction matches its own name
+#: when it appears inflected in a meal description.
+_HEBREW_PREFIXES = ("ו", "ה", "ב", "ל", "כ", "מ", "ש")
+
+#: Plural/feminine endings worth trimming for a stem comparison, longest
+#: first so "יות" is consumed before "ות". Kept short on purpose --
+#: aggressive stemming would collapse distinct foods.
+_HEBREW_SUFFIXES = ("יות", "ות", "ים", "יה", "ה")
+
+
+def _hebrew_stem(word: str) -> str:
+    """A conservative stem for literal restriction matching.
+
+    Strips at most one leading particle and one ending, and only when a
+    usable stem remains. This is deliberately weaker than real morphological
+    analysis: over-stemming would make unrelated foods collide, and a false
+    block on food is worse than a miss the AI layer still sees.
+
+    The feminine singular/plural pair is the case that matters here --
+    "טורטייה" and "טורטיות" must reduce to the same stem, or a restriction
+    stated in the singular misses every plural mention of the same food.
+    """
+    stem = word.strip().lower()
+    if len(stem) > 3 and stem[0] in _HEBREW_PREFIXES:
+        stem = stem[1:]
+    for suffix in _HEBREW_SUFFIXES:
+        if len(stem) - len(suffix) >= 3 and stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    # "טורטיי" -> "טורטי": a trailing yod left by the feminine ending is
+    # not part of the stem.
+    if len(stem) > 3 and stem.endswith("י"):
+        stem = stem[:-1]
+    return stem
+
+
+def _literal_restrictions_in_text(text: str, blocks: dict[str, Any]) -> set[str]:
+    """Match restrictions whose canonical_id is raw user text, not an alias.
+
+    Only consults ids that are NOT known canonical slugs -- an unmapped
+    restriction keeps the user's own wording as its id. Matching is on word
+    stems rather than substrings, so "אגוז" does not match "אגוזי מוסקט"
+    handling that SAFE_COMPOUNDS already governs, and a short id cannot
+    match inside an unrelated longer word.
+    """
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return set()
+
+    item_stems = {_hebrew_stem(token) for token in _tokenize(lowered)}
+    item_stems.discard("")
+
+    found: set[str] = set()
+    for cid in blocks:
+        # Recognised slugs are handled by the alias table; only raw text
+        # needs this path.
+        if cid in _CANONICAL_IDS:
+            continue
+        for part in _tokenize(cid.lower()):
+            stem = _hebrew_stem(part)
+            if stem and stem in item_stems:
+                found.add(cid)
+                break
+    return found
+
+
 def _negated_canonical_ids(lowered_text: str) -> set[str]:
     """Return restriction IDs explicitly stated as absent in an item text.
 
@@ -694,6 +765,18 @@ def validate_meal_restrictions(
 
         # Find all canonical IDs present in the item text
         found_in_item = _canonical_ids_in_text(search_text)
+
+        # A restriction the alias table does not recognise keeps its raw user
+        # text as its canonical_id, and that literal is not an alias -- so it
+        # could never match its own name and was silently unenforceable.
+        #
+        # Measured against the live profile ("חציל, טורטייה ואגוזים"): a
+        # tortilla wrap and a baked aubergine both returned ZERO violations,
+        # while nuts was caught only because it happens to be in the table.
+        # The alias table has 85 entries; anything outside it was stored,
+        # displayed, counted and sent to the AI, with the deterministic
+        # firewall blind to it.
+        found_in_item |= _literal_restrictions_in_text(search_text, effective_blocks)
 
         # Check each found canonical ID against effective blocks
         reported_restrictions: set[str] = set()

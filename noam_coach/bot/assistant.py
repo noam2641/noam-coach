@@ -446,7 +446,7 @@ async def _handle_plan_text_action(ctx: FreeTextContext) -> bool:
             from noam_coach.bot.onboarding import active_pain_regions_for
 
             plan_text = format_weekly_plan(
-                plan, await active_pain_regions_for(ctx.user_id)
+                plan, pain_regions=await active_pain_regions_for(ctx.user_id)
             )
             if split_freq is not None and frequency == split_freq:
                 if frequency >= 4:
