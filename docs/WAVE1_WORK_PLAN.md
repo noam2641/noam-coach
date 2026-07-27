@@ -16,33 +16,68 @@ production this session: `Intent.slots` (10/10 classifications succeeded, was
 
 ## Progress
 
-**Shipped: 10 PRs.** P0-1..P0-4 (#33–#36), docs (#37), and five WAVE-1 items.
+**Shipped: 14 PRs.** P0-1..P0-4 (#33–#36), docs (#37, #43), and eight WAVE-1
+items. Every value below was verified **on `develop` after merge**, not taken
+from the PR that claimed it.
 
 | Item | PR | Verified on `develop` |
 |---|---|---|
 | W1-1 restriction enforcement | #38 | tortilla and aubergine now blocked; 7 unrelated foods stay clean |
 | W1-2 calorie target | #39 | 2290 → **2420 kcal** |
 | W1-3 window anchoring | #42 | `sessions_sampled` 1 → **10**, frequency 0.2 → **2.5** |
+| W1-4 weekday disclosure | #44 | floors `{28:2, 60:3, 90:4, 180:4}`, monotonic, capped |
+| W1-5 confidence scaling | #45 | n=1 fact 0.90 → **0.45**; scalar facts unchanged |
+| W1-6 provenance | #46 | `source=derived` preserved, still decision-usable |
 | W1-9 duplicate status | #40 | `LIVE_DUPLICATE_APPROVAL_STATUSES = ('pending',)` |
 | W1-12 interaction terminal | #41 | `interaction.completed` emitted |
 
-**W1-2 and W1-3 compose as intended** — two independent defences on the same
-number. W1-3 fixed the *inference* (0.2 → 2.5); W1-2 still prefers the value
-the user *confirmed* (4.0). A user who never stated a frequency now gets 2.5
-instead of 0.2.
+### Three independent defences on one defect
+
+W1-3, W1-5 and W1-6 all touch the same failure — a training frequency derived
+from a single sample being treated as established fact. They were built by
+three separate agents and compose without conflict. Measured on `develop`:
+
+```
+W1-3  inference : 2.5 /wk from 10 sessions   (was 0.2 from 1)
+W1-5  confidence: asked 0.85 -> stored 0.425 (n=1 attenuated)
+W1-6  provenance: source=derived, NOT laundered to user_report
+      still usable for decision: True
+```
+
+W1-2 sits above all three: it prefers the frequency the user *confirmed* (4.0)
+over any inference. A user who never stated one now gets 2.5 instead of 0.2.
+
+None of the four depends on another. That is the property worth preserving —
+each is a separate reason the original defect cannot recur.
 
 ### Lesson: give each parallel agent its own worktree
 
-Three writer agents were run in parallel on disjoint files. The **files** never
-collided — but all three shared one git working tree, so their branches
-stacked on each other instead of branching from `develop`: W1-9's commit
-landed on W1-12's branch, and W1-9's own branch pointed at `develop` with
-nothing on it. One agent also had its uncommitted work discarded when another
-switched the shared tree mid-task.
+The first parallel batch (W1-3/W1-9/W1-12) ran on disjoint **files** and the
+files never collided — but all three shared one git working tree, so their
+branches stacked on each other instead of branching from `develop`: W1-9's
+commit landed on W1-12's branch, and W1-9's own branch pointed at `develop`
+with nothing on it. One agent had uncommitted work discarded when another
+switched the shared tree mid-task. Both agents reported it independently.
 
 Untangling was possible (cherry-pick each commit onto a clean branch, verify
-each in isolation) but it is avoidable. **Disjoint file ownership is necessary
-and not sufficient — parallel writers also need `git worktree add` isolation.**
+each in isolation) but avoidable. **Disjoint file ownership is necessary and
+not sufficient — parallel writers also need `git worktree add` isolation.**
+
+The second batch (W1-4/W1-5/W1-6) used one worktree per agent under
+`C:/coach_bot/wt-*` and produced **zero collisions**. That is now the standard
+for any parallel writer.
+
+### Cross-agent composition must be instructed, not hoped for
+
+W1-6 was launched while W1-5 was still changing `set_fact` in a different
+worktree. Its brief said explicitly: *another agent is adding sample-based
+confidence attenuation — do not fight it; if you pass `confidence=0.85` for a
+one-sample derivation their change will attenuate it, which is correct; design
+for that outcome.*
+
+It did. The merged result is the 0.85 → 0.425 line above. Left to infer the
+situation, an agent would reasonably have "defended" its value against the
+attenuation and the two fixes would have cancelled out.
 
 ## Verification status and agent assignment
 
@@ -215,8 +250,8 @@ sessions exist in the file's own last 45 days.
 **Acceptance:** all `learn_*` functions anchor to the data; a test with a stale
 fixture yields the same result as a fresh one.
 
-## W1-4 · The weekday detector widens until it succeeds
-**[DONE — #42]** · Lane B
+## ✅ W1-4 · The weekday detector widens until it succeeds
+**[DONE — #44]** · Lane B
 **Severity: HIGH · This is why Saturday kept coming back**
 
 `_historical_workout_weekdays` (`health_jobs.py:442`) retries at
@@ -231,8 +266,8 @@ identically to `last_28_days`.
 **Acceptance:** the caller can distinguish "found" from "widened"; the user is
 told when the window was widened.
 
-## W1-5 · Confidence is keyed on a string, never on sample size
-**[DONE — #40]** · Lane B
+## ✅ W1-5 · Confidence is keyed on a string, never on sample size
+**[DONE — #45]** · Lane B
 **Severity: HIGH**
 
 `user_model.py:778-779` assigns confidence from `SOURCE_CONFIDENCE[source]`.
@@ -248,8 +283,8 @@ Facts in your DB that contradict their own metadata:
 **Acceptance:** confidence scales with sample size; a fact derived from n=1
 cannot reach 0.90.
 
-## W1-6 · One tap converts a machine guess into "the user told me"
-**[DONE — #41]** · Lane B
+## ✅ W1-6 · One tap converts a machine guess into "the user told me"
+**[DONE — #46]** · Lane B
 **Severity: HIGH**
 
 Five sites (`health_jobs.py:1191, 1207, 1216, 1224, 1254`) rewrite a derived
