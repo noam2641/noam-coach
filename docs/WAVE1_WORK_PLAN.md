@@ -525,3 +525,96 @@ the handlers that own the logic.
 # Out of scope
 AI Gateway · `planning._meal_slots` Phase-2 · multi-user · live Apple Health
 integration · destructive sleep-fact migration · ledger decision U-3.
+
+---
+
+# W1-44 · Supported reconciliation of a saved plan after an availability change
+
+**[SCOPED — not started]** · Lane D · Blocked on a design decision, not on effort
+
+## Why this exists
+
+W1-8 made a training-day correction apply to the availability facts. It
+deliberately does **not** touch the saved workout plan, because an architecture
+gate restricts direct readers of the `active_workout_plan` fact to an allowlist
+and routes everyone else through `workout_catalog` — which today exposes
+**readers only**. There is no supported way to write a corrected weekday back.
+
+Removing that capability was the right call (see `PIL-003`), but it leaves a
+real gap:
+
+> A user corrects "I train Friday, not Saturday". Availability updates. A saved
+> plan may still schedule a Saturday session until it is rebuilt.
+
+This item closes that gap **as a domain capability**, not as a patch.
+
+## What this is NOT
+
+- Not "fix stale Saturday" — a targeted edit to one fact would recreate exactly
+  the boundary violation the gate rejected.
+- Not broadening `_ALLOWED_READER_FILES`.
+- Not a generic fact-mutation helper. A general "write any field of
+  `active_workout_plan`" API hands every caller the ability to desynchronise the
+  plan from availability, which is the failure mode this is meant to end.
+
+## Shape
+
+A narrow operation owned **inside** the workout-plan domain, e.g.:
+
+```python
+reconcile_saved_plan_after_availability_change(
+    db, user_id, *, availability: Sequence[int], reason: str
+) -> ReconciliationOutcome
+```
+
+Callers state *what changed and why*; the domain decides what happens to the
+plan. Callers never name a field.
+
+## Design decisions this task must resolve
+
+**1. Edit, regenerate, invalidate, or version?** Four different products:
+
+| Strategy | Keeps | Costs |
+|---|---|---|
+| Edit weekdays in place | session identity, history | may violate the plan's own spacing/recovery rules |
+| Regenerate | internal consistency | discards user edits and exercise substitutions |
+| Invalidate + prompt | honesty, user control | leaves the user without a plan until they act |
+| Version (new revision, old retained) | auditability, reversibility | more state, needs a selection rule |
+
+Not answerable from the code — it is a product decision about whose intent wins
+when a schedule change makes an existing plan partly invalid.
+
+**2. Both tiers.** Tier-2 is the `active_workout_plan` fact; Tier-1 is the
+authoritative `plan_versions` row read by `workout_catalog._tier1_sessions`.
+Reconciling only Tier-2 creates a second source of truth — the precise defect
+W1-2 cost 130 kcal/day. Either both move, or the operation must state which is
+authoritative and why.
+
+**3. Completed and in-flight sessions.** A session already logged against a
+removed day is history and must not be rewritten. A session scheduled for
+today, mid-workout, is a live object. The operation must define both.
+
+**4. Auditability.** Every reconciliation needs a recoverable before/after and
+a reason. `user_fact_history` writes only for keys that already exist (see
+W1-6), so this likely needs an explicit record.
+
+**5. Truthful user-facing behaviour when reconciliation is delayed or
+impossible.** The current reply is honest because it claims only what it did.
+Any richer behaviour must stay that way — never "your plan was updated" unless
+it was.
+
+## Acceptance criteria
+
+- `_ALLOWED_READER_FILES` unchanged; the architecture guard passes untouched
+- No caller outside the workout-plan domain reads or writes the fact directly
+- Availability and the saved plan cannot disagree after the operation returns —
+  or, if reconciliation is deferred, both the API and the user-facing reply say so
+- Completed sessions are never rewritten
+- The before/after and the reason are recoverable
+- The W1-8 test asserting the plan is currently *unchanged* is updated
+  deliberately, with its replacement asserting the new contract
+
+## Dependencies
+
+W1-8 (#52) and its wiring must be merged first — this reconciles what that
+flow corrects.
