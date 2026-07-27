@@ -220,6 +220,63 @@ async def analyze_duplicate_candidate(
     await set_meal_fix(user_id, approval_id, 0)
 
 
+#: W1-9 — the only approval status that constitutes a live duplicate.
+#
+# The defect: the lookup filtered user / file id / 6h window / kind but never
+# status, so a *decided* approval still raised a duplicate. Live evidence —
+# approval ``W-RbRHEKu94`` was rejected (its image unlinked); the user re-sent
+# the photo and 15 seconds later ``Lk2XAFA31bI`` (kind ``meal_duplicate``) was
+# raised against it, telling the user their retry duplicated the very thing
+# they had just discarded.
+#
+# Why only 'pending' counts, status by status:
+#   - pending    — a live, undecided analysis the user can still open. The one
+#                  true duplicate, and the only one the caller can act on: the
+#                  "open existing analysis" button requires status == 'pending'.
+#   - rejected   — deliberately discarded, and the reject path unlinks the
+#                  image (callback_meals ``reject_meal``). Re-sending the photo
+#                  IS the retry. Recovering a rejected approval is an explicit
+#                  act (``restore_meal``), never an implicit one.
+#   - approved   — ``persist_meal`` wrote a real meal AND registered its
+#                  fingerprint, so ``find_image_duplicate`` already catches it
+#                  and carries a ``meal_id`` (the "edit the existing meal"
+#                  button). Matching here too would only add a second, weaker
+#                  duplicate card with no actionable target.
+#   - superseded — discarded by definition (and never set for meal kinds).
+LIVE_DUPLICATE_APPROVAL_STATUSES = ("pending",)
+
+#: Window in which a re-sent photo is treated as the same meal.
+DUPLICATE_APPROVAL_WINDOW_HOURS = 6
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def find_live_duplicate_approval(
+    user_id: int,
+    telegram_file_unique_id: str,
+) -> dict[str, Any] | None:
+    """Most recent *live* meal approval for this exact Telegram photo.
+
+    Returns None when the only matching approvals are decided (rejected,
+    approved, superseded) — those must never raise a duplicate. See
+    ``LIVE_DUPLICATE_APPROVAL_STATUSES`` for the reasoning per status.
+    """
+    placeholders = ",".join("?" * len(LIVE_DUPLICATE_APPROVAL_STATUSES))
+    cutoff = (
+        datetime.now(timezone.utc)
+        - timedelta(hours=DUPLICATE_APPROVAL_WINDOW_HOURS)
+    ).isoformat()
+    return await DB.fetch_one(
+        f"""
+        SELECT id, status FROM approvals
+        WHERE user_id=? AND telegram_file_unique_id=?
+          AND created_at>=? AND kind IN ('meal','meal_edit')
+          AND status IN ({placeholders})
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        (user_id, telegram_file_unique_id, cutoff, *LIVE_DUPLICATE_APPROVAL_STATUSES),
+    )
+
+
 @runtime_bound(RUNTIME_NAMES)
 async def handle_photo(
     update: Update,
@@ -257,19 +314,7 @@ async def handle_photo(
         )
 
         # Detect both exact Telegram duplicates and visually similar saved meals.
-        pending_dup = await DB.fetch_one(
-            """
-            SELECT id, status FROM approvals
-            WHERE user_id=? AND telegram_file_unique_id=?
-              AND created_at>=? AND kind IN ('meal','meal_edit')
-            ORDER BY created_at DESC LIMIT 1
-            """,
-            (
-                user_id,
-                file_unique_id,
-                (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat(),
-            ),
-        )
+        pending_dup = await find_live_duplicate_approval(user_id, file_unique_id)
         saved_dup = await meal_intelligence.find_image_duplicate(
             DB,
             user_id=user_id,
