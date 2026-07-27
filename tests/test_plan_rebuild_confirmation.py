@@ -54,12 +54,17 @@ def _callbacks(markup: Any) -> set[str]:
 
 
 @pytest.fixture
-def plan_world(monkeypatch: pytest.MonkeyPatch):
+def plan_world(monkeypatch: pytest.MonkeyPatch, tmp_path):
     """Stub every dependency of the build_plan path.
 
     Nothing here touches sqlite — ``user_model.get_fact`` and
     ``planning.get_active_plan`` are replaced outright, so the suite cannot
     create a stray ./noam_coach.db.
+
+    ``DB`` is still bound to a real (empty) file under tmp_path, because the
+    gate checks that its database exists before reading: a Database pointing
+    at a path that does not exist would make the gate short-circuit, and
+    these tests need it to reach the stubs.
     """
 
     state: dict[str, Any] = {
@@ -87,6 +92,18 @@ def plan_world(monkeypatch: pytest.MonkeyPatch):
     async def fake_build(_user_id: int, frequency: int) -> dict[str, Any]:
         state["built"].append(frequency)
         return {"frequency": frequency, "sessions": []}
+
+    from db import Database
+
+    # `runtime_bound` re-syncs module globals from the coach_bot facade on
+    # every call, so patching only the module attribute is overwritten. Both
+    # must point at a real (empty) file: the gate checks its database exists
+    # before reading, and a non-existent path would make it short-circuit
+    # before reaching the stubs below.
+    real_path = tmp_path / "plan_world.db"
+    real_path.write_bytes(b"")
+    monkeypatch.setattr(coach_bot, "DB", Database(str(real_path)))
+    monkeypatch.setattr(assistant_bot, "DB", Database(str(real_path)))
 
     monkeypatch.setattr(assistant_bot.user_model, "get_fact", fake_get_fact)
     monkeypatch.setattr(assistant_bot.planning, "get_active_plan", fake_get_active_plan)
@@ -276,3 +293,25 @@ async def test_gate_never_blocks_when_lookups_fail(
 
     assert await assistant_bot._handle_plan_text_action(ctx) is True
     assert plan_world["built"] == [4]
+
+
+@pytest.mark.asyncio
+async def test_gate_never_creates_a_database(tmp_path, monkeypatch) -> None:
+    """The gate must not conjure a database into existence.
+
+    sqlite creates a database on connect, so an unguarded query against a
+    path that does not exist materialises one. `database_path` defaults to
+    `./noam_coach.db` -- the repo root -- and CI has no `.env`, so the
+    default applies there. Two `stray database artifacts` guards failed on
+    exactly this, twice now: first for the plan-render pain lookup, then for
+    this gate. Hence a test rather than another fix.
+    """
+    from db import Database
+    from noam_coach.bot import assistant as assistant_module
+
+    missing = tmp_path / "does-not-exist.db"
+    monkeypatch.setattr(assistant_module, "DB", Database(str(missing)))
+    monkeypatch.setattr(coach_bot, "DB", Database(str(missing)))
+
+    assert await assistant_module._plan_rebuild_confirmation(1, 6) is None
+    assert not missing.exists(), "the gate must not create the database"

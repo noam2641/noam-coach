@@ -452,6 +452,22 @@ async def _split_availability_gate(user_id: int, split_freq: int) -> tuple[str, 
 _PLAN_CONFLICT_THRESHOLD = 1  # coach_intelligence.py:140, declared-vs-plan rule
 
 
+def _database_is_materialised(db: Any) -> bool:
+    """True when *db*'s file exists, so reading it will not create one.
+
+    sqlite creates a database on connect. Read-only lookups on a
+    speculative path must therefore check first, or they leave a file
+    wherever `database_path` points -- the repo root by default.
+
+    A db with no discoverable path (an in-memory or stubbed one, as in
+    tests) is treated as materialised: there is nothing to create.
+    """
+    path = getattr(db, "path", None)
+    if not path or path == ":memory:":
+        return True
+    return Path(path).exists()
+
+
 async def _plan_rebuild_confirmation(
     user_id: int, frequency: int
 ) -> tuple[str, Any] | None:
@@ -462,6 +478,16 @@ async def _plan_rebuild_confirmation(
     short-circuits with ``return True`` and persists nothing.
     """
     from noam_coach.bot.ui import button
+
+    # sqlite CREATES a database on connect, so reading through a Database
+    # whose file does not exist leaves one behind. `database_path` defaults to
+    # the repo root (config.py:22) and CI has no `.env`, so the default
+    # applies there -- two `stray database artifacts` guards fail on exactly
+    # this. A missing database also means there is no stored commitment to
+    # contradict, so skipping the reads is the honest answer as well as the
+    # safe one.
+    if not _database_is_materialised(DB):
+        return None
 
     try:
         fact = await user_model.get_fact(DB, user_id, "training_days_per_week")
