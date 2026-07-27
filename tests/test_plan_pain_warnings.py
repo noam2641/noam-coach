@@ -16,8 +16,6 @@ so the two screens cannot disagree about which exercises are affected.
 
 from __future__ import annotations
 
-import pytest
-
 import coach_bot
 import training_intelligence
 
