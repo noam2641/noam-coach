@@ -415,6 +415,10 @@ async def test_prompt_shows_previous_weight_as_context_only(
         ("80 ק״ג", 80.0, "נרשם: 80 ק״ג ✅"),
         ("80 קג", 80.0, "נרשם: 80 ק״ג ✅"),
         ("12 בכל יד", 12.0, "נרשם: 12 ק״ג בכל יד ✅"),
+        # Bodyweight is exercised on a bodyweight exercise (plan weight 0).
+        # Reporting it on a *loaded* exercise is now refused and re-asked --
+        # see tests/test_workout_typed_weight_persistence.py -- because it
+        # persisted 0.0 kg on a barbell press as permanent training history.
         ("משקל גוף", 0.0, "נרשם: משקל גוף ✅"),
     ],
 )
@@ -427,7 +431,12 @@ async def test_typed_weight_is_recorded_and_confirmed(
 ) -> None:
     db = await _make_db(tmp_path, "record")
     _bind(monkeypatch, db)
-    session_id = await _start_session(db)
+    exercises = None
+    if typed == "משקל גוף":
+        bodyweight_exercise = dict(_ex(exercise_id="plank", name="פלאנק"))
+        bodyweight_exercise["weight"] = 0.0
+        exercises = [bodyweight_exercise]
+    session_id = await _start_session(db, exercises=exercises)
     await _ask_for_weight(db, session_id)
 
     update = await _send_text(typed)

@@ -709,6 +709,25 @@ async def handle_weight_text(update: Any, user_id: int, flow: Any, text: str) ->
         )
         return True
 
+    # A bodyweight report on an exercise the plan loads is almost always a
+    # misparse, not a real set: in the 2026-07-26 session a barbell bench
+    # press was persisted at 0.0 kg, and because sets are training history
+    # that number then feeds progression for every future session. The plan's
+    # own weight is the signal — a genuine bodyweight movement is planned at
+    # 0, everything else carries a load — so this rejects only the
+    # contradictory case and leaves real bodyweight exercises untouched.
+    if report.load_type == "bodyweight" and float(current.get("weight") or 0) > 0:
+        await update.effective_message.reply_text(
+            weight_text_service.bodyweight_rejected_text(current.get("name") or ""),
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [button("↩️ חזרה לאימון", session_action_data("ready", session))],
+                    [button("סיים", session_action_data("finish", session))],
+                ]
+            ),
+        )
+        return True
+
     # Atomic, optimistic pending write guarded on the same (exercise_index,
     # set_number) — a duplicate delivery of the same text is a no-op here.
     if not await update_session_step(session, "pending_weight=?", (report.weight,)):
