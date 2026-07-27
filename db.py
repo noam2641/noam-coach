@@ -450,6 +450,19 @@ CREATE TABLE IF NOT EXISTS plan_feedback(
     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
     FOREIGN KEY(plan_id) REFERENCES plan_versions(id) ON DELETE CASCADE
 );
+
+-- Developer commentary captured mid-conversation (messages prefixed "##").
+-- Deliberately NOT a user fact: these are notes ABOUT the product, and must
+-- never reach diet_restrictions, meals, or any onboarding answer. `context`
+-- records which flow/step was active so a note can be correlated later.
+CREATE TABLE IF NOT EXISTS dev_notes(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    context TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
 """
 
 
@@ -613,6 +626,7 @@ SCHEMA_MIGRATIONS: tuple[tuple[int, str], ...] = (
     (12, "daily_flags_revision"),
     (13, "observability_correlation"),
     (14, "exercise_override_identity"),
+    (15, "dev_notes_table"),
 )
 
 FK_MIGRATION_TABLES: tuple[str, ...] = (
@@ -1352,6 +1366,29 @@ async def _migration_exercise_override_identity(db: Database) -> None:
             "CREATE INDEX IF NOT EXISTS idx_exercise_overrides_identity "
             "ON exercise_overrides(user_id, exercise_id)"
         )
+
+
+async def _migration_dev_notes(db: Database) -> None:
+    """Migration 15: capture developer commentary separately from user data.
+
+    Messages prefixed "##" are notes ABOUT the product, not statements about
+    the user. Before this table existed they fell through to intent routing
+    and were persisted as facts -- one landed in ``diet_restrictions`` and was
+    then echoed back on the profile screen as a dietary preference. This table
+    gives them somewhere to go that no coaching read path consults.
+    """
+    async with db.transaction() as connection:
+        await connection.execute(
+            """CREATE TABLE IF NOT EXISTS dev_notes(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+                text TEXT NOT NULL, context TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)"""
+        )
+        await connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dev_notes_user ON dev_notes(user_id, id DESC)"
+        )
+        await _record_migration(connection, 15, "dev_notes_table")
         await _record_migration(connection, 14, "exercise_override_identity")
 
 
@@ -1401,6 +1438,8 @@ async def run_migrations(
             await _migration_observability_correlation(db)
         elif version == 14:
             await _migration_exercise_override_identity(db)
+        elif version == 15:
+            await _migration_dev_notes(db)
         else:
             raise RuntimeError(f"Unknown schema migration {version}")
         LOGGER.info("Applied schema migration %s: %s", version, name)
