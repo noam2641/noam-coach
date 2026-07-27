@@ -443,7 +443,11 @@ async def _handle_plan_text_action(ctx: FreeTextContext) -> bool:
             if await ask_deferred_for_plan(ctx.message, ctx.user_id, frequency):
                 return True
             plan = await build_weekly_plan(ctx.user_id, frequency)
-            plan_text = format_weekly_plan(plan)
+            from noam_coach.bot.onboarding import active_pain_regions_for
+
+            plan_text = format_weekly_plan(
+                plan, pain_regions=await active_pain_regions_for(ctx.user_id)
+            )
             if split_freq is not None and frequency == split_freq:
                 if frequency >= 4:
                     plan_text = "בניתי לך תוכנית ABC + Full Body מותאמת ל־4 ימים — בלי להוריד יום אימון שהזנת:\n\n" + plan_text
