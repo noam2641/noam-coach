@@ -2735,11 +2735,21 @@ async def build_weekly_plan(user_id: int, frequency: int) -> dict[str, Any]:
 async def active_pain_regions_for(user_id: int) -> dict[str, Any]:
     """Active pain regions for a user, for screens that render a plan.
 
-    Best-effort: a telemetry or query failure must not stop a plan from
-    rendering, but it must also not silently pretend there are no
-    constraints -- so the failure path returns an empty map and the caller
-    renders exactly what it would have rendered before.
+    Best-effort: a query failure must not stop a plan from rendering, so the
+    failure path returns an empty map and the caller renders exactly what it
+    would have rendered before.
+
+    The database file is checked first because sqlite CREATES a database on
+    connect. Without that guard, rendering a plan in a context with no
+    database -- a unit test, a fresh checkout, CI -- silently materialises
+    one at whatever `database_path` points to, which defaults to the repo
+    root (`config.py:22`). CI caught exactly that: two `stray database
+    artifacts` tests failed because this helper conjured `./noam_coach.db`
+    into existence.
     """
+    path = getattr(DB, "path", None)
+    if path and not Path(path).exists():
+        return {}
     try:
         rows = await DB.fetch_all(
             "SELECT * FROM medical_constraints WHERE user_id=? AND kind='pain'",

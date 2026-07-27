@@ -16,6 +16,8 @@ so the two screens cannot disagree about which exercises are affected.
 
 from __future__ import annotations
 
+import pytest
+
 import coach_bot
 import training_intelligence
 
@@ -109,6 +111,32 @@ def test_no_constraint_renders_exactly_as_before() -> None:
     assert without == with_empty
     assert "מגבלה פעילה" not in without
     assert "⚠️" not in without
+
+
+@pytest.mark.asyncio
+async def test_pain_lookup_never_creates_a_database(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rendering a plan must not conjure a database into existence.
+
+    sqlite creates a database on connect, so an unguarded query against a
+    path that does not exist materialises one. `database_path` defaults to
+    `./noam_coach.db` -- the repo root -- so in any context without a
+    database (a unit test, a fresh checkout, CI) this helper would leave a
+    stray file behind. CI caught exactly that: two `stray database
+    artifacts` tests failed because of this lookup.
+    """
+    from db import Database
+    from noam_coach.bot import onboarding as onboarding_bot
+
+    missing = tmp_path / "does-not-exist.db"
+    monkeypatch.setattr(onboarding_bot, "DB", Database(str(missing)))
+    monkeypatch.setattr(coach_bot, "DB", Database(str(missing)))
+
+    regions = await onboarding_bot.active_pain_regions_for(1)
+
+    assert regions == {}
+    assert not missing.exists(), "the lookup must not create the database"
 
 
 def test_the_plan_and_the_set_card_agree_on_which_joints_are_loaded() -> None:
