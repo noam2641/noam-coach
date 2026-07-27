@@ -47,9 +47,27 @@ wave. Where the distinction matters, this document says "WAVE-1 (2026-07-27)".
   #30 (docs), #31 (the migration-15 startup fix found post-merge). See below.
 
 ## Active task
-WAVE-1 (2026-07-27). Four P0s fixed and pushed (`95a82f2`, `5d0e60e`,
-`e2b0c1a`, `f8a5982`); PR #33 open. Next: W1-1 (unenforceable dietary
-restrictions — food safety).
+WAVE-1 (2026-07-27). **14 PRs merged (#33–#46)**: four P0s, two docs, and eight
+WAVE-1 items (W1-1, W1-2, W1-3, W1-4, W1-5, W1-6, W1-9, W1-12). `develop` @
+`3d5dd18`, zero open PRs, single worktree.
+
+Next: W1-7 (`build_plan` mutates with no confirmation) and W1-8 (a schedule
+correction was discarded while the bot said it agreed) — Lane E, which shares
+reach with Lane A and must therefore be serialized rather than run in parallel
+with nutrition work.
+
+### Parallel-writer protocol (learned this wave, now standard)
+Disjoint file ownership is **necessary and not sufficient**. The first parallel
+batch shared one git working tree and the branches stacked on each other —
+one agent's commit landed on another's branch, and one had uncommitted work
+discarded mid-task. The second batch gave each agent its own `git worktree` and
+produced zero collisions.
+
+**Additionally: cross-agent composition must be instructed.** W1-6 was launched
+while W1-5 was still changing `set_fact`; its brief told it explicitly not to
+defend its confidence value against the other agent's attenuation. It complied,
+and the merged result is correct. Left to infer, it would reasonably have
+fought the change and the two fixes would have cancelled out.
 
 The database was reset at the owner's request (2026-07-27): both running bot
 processes stopped first, a hash-verified backup taken outside the repo, then
