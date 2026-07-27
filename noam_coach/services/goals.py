@@ -275,6 +275,41 @@ async def get_goal_history(user_id: int, limit: int = 10) -> list[dict[str, Any]
 
 
 @runtime_bound(RUNTIME_NAMES)
+async def _weekly_training_frequency(user_id: int) -> float | None:
+    """Training sessions per week, preferring what the user confirmed.
+
+    Two stores hold this number and they disagree. ``routine_profile`` is
+    recomputed from the health export -- in the 2026-07-27 session that
+    yielded **0.2** sessions/week, because ``learn_workout_pattern`` measures
+    45 days back from *now* while the export ended 43 days earlier, so 1 of
+    296 workouts survived the window. ``training_days_per_week`` held the
+    **4** the user actually stated and confirmed.
+
+    This function read the profile, so the calorie target was computed as if
+    the user barely trained: 2290 kcal instead of 2420 -- **130 kcal/day,
+    ~910 a week**, understated for a full year of a fat-loss phase.
+
+    Every other input to compute_targets already goes through
+    ``get_decision_value``, which prefers confirmed user facts. Only this one
+    reached around it into the raw profile. It no longer does.
+
+    The profile stays as the fallback: for a user who has never stated a
+    frequency, an inferred number is better than none.
+    """
+    stated = await user_model.get_decision_value(DB, user_id, "training_days_per_week")
+    if stated is not None:
+        try:
+            value = float(stated)
+        except (TypeError, ValueError):
+            value = None
+        if value is not None and value > 0:
+            return value
+
+    profile = await load_routine_profile(user_id)
+    return (profile.get("workout") or {}).get("weekly_frequency")
+
+
+@runtime_bound(RUNTIME_NAMES)
 async def compute_personal_targets(user_id: int) -> targets.Targets | None:
     """Derive personalized targets from the user model, or None if no weight.
 
@@ -294,8 +329,7 @@ async def compute_personal_targets(user_id: int) -> targets.Targets | None:
     goal_weight = await user_model.get_decision_value(DB, user_id, "goal_weight_kg")
     body_fat = await user_model.get_decision_value(DB, user_id, "body_fat_pct")
     timeframe = await user_model.get_decision_value(DB, user_id, "goal_timeframe_weeks")
-    profile = await load_routine_profile(user_id)
-    workouts = (profile.get("workout") or {}).get("weekly_frequency")
+    workouts = await _weekly_training_frequency(user_id)
     goal_type = _goal_type_from_fact(
         await user_model.get_decision_value(DB, user_id, "primary_goal")
     )
