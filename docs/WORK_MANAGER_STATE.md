@@ -25,9 +25,13 @@ phase changes and before every pause.
 | Protected/PII data | `noam_coach_complete_release\noam_coach.db` (sha `5bd8ac1b…`); `C:\coach_bot\noam-coach-private-audit\` (session trace + meal images) |
 
 ## Current objective
-**WAVE-0 — correctness defects found in the 2026-07-26 live sessions.** Five
-parallel lanes on disjoint functions, verified against a function-level
-conflict matrix built by four read-only agents before any code was written.
+**WAVE-1 — defects found in the 2026-07-27 live session.** The plan is
+`docs/WAVE1_WORK_PLAN.md` (43 items, five bands). WAVE-0 is closed and its
+fixes are confirmed working in production; see §WAVE-1 below for the evidence.
+
+Naming note: an earlier, unrelated batch was also called "WAVE-1" (B1 / R1 /
+LOG-004 / UX-01, merged as PR #17). The current WAVE-1 is the 2026-07-27 audit
+wave. Where the distinction matters, this document says "WAVE-1 (2026-07-27)".
 
 ## Completed batches
 - **P1.1 DayPlan Phase 1** — merged (PR #4, `08f953a`).
@@ -43,12 +47,46 @@ conflict matrix built by four read-only agents before any code was written.
   #30 (docs), #31 (the migration-15 startup fix found post-merge). See below.
 
 ## Active task
-None in flight. WAVE-0 is closed and `develop` @ `bb917f1` is clean, synced,
-single-worktree, with zero open PRs.
+WAVE-1 (2026-07-27). Four P0s fixed and pushed (`95a82f2`, `5d0e60e`,
+`e2b0c1a`, `f8a5982`); PR #33 open. Next: W1-1 (unenforceable dietary
+restrictions — food safety).
 
 The database was reset at the owner's request (2026-07-27): both running bot
 processes stopped first, a hash-verified backup taken outside the repo, then
 rebuilt fresh. The bot runs on it with zero errors.
+
+## Verification discipline for agent findings (added 2026-07-27)
+
+Agent output is a **proposal with evidence, never a finding**. Across two audit
+waves, roughly a quarter of agent claims did not survive verification — nine in
+WAVE-0 and several more in WAVE-1 — and acting on them would have meant
+"fixing" correct code.
+
+Before any claim enters a work plan the Work Manager must:
+
+1. **Reproduce it** against the live database or a copy, not against the
+   agent's narrative. Every WAVE-1 critical item was re-run independently
+   (restriction matching, the 0.2/4.0 store split, `parent_span_id` nullity,
+   the plan-render diff, logging density).
+2. **Quantify the user impact.** "The stores disagree" became actionable only
+   once measured as 130 kcal/day.
+3. **Cross-check against sibling claims.** Several agents reported the same
+   root cause from different angles; several others contradicted each other.
+   The cross-cutting read is what separates one defect with many symptoms from
+   many defects.
+4. **Record what was disproven**, in the plan, with the reason — otherwise the
+   next session re-finds the symptom and re-fixes working code.
+
+Examples of claims **rejected** at verification in WAVE-1:
+- "The approved meal bypassed plausibility." It did not — the check runs on
+  every card render; beverages simply disable two of the rules. That is a
+  measurement gap, not an enforcement gap, and is recorded as such.
+- "The knee constraint was never detected." It was detected correctly, and
+  `squat`/`leg_press` both declare `knee` in `joint_load`. The real defect was
+  narrower: the weekly-plan renderer never called the warning function.
+- "`audit` rows have no corresponding product events." Partly wrong — the
+  windows are not empty. The claim survives only for `safety_alert` and
+  `approve_substitution`, which have boilerplate but no domain event.
 
 ## Blocking dependencies / pending human approvals
 None. The owner granted standing autonomy through verified integration and
@@ -482,7 +520,50 @@ was not running at those times — it started at 22:14, eight minutes after the
 evening slot. `run_daily` has no catch-up-on-startup behaviour. Making it
 catch up is a product decision, not a bug fix, and is not scheduled.
 
+## WAVE-1 — second live session (2026-07-27), audit + plan
+
+Driven by 779 `product_events` from the 05:00–07:15 UTC session on a freshly
+reset database (full onboarding from zero), plus `logs/session_20260727_075856.log`.
+**Seven** read-only agents across disjoint domains; every critical finding was
+re-verified independently before being recorded.
+
+**The full plan is `docs/WAVE1_WORK_PLAN.md` — 43 items in five bands.** It is
+the single source for this wave; do not maintain a copy outside the repository.
+
+### WAVE-0 held in production
+| Fix | Evidence this session |
+|---|---|
+| `Intent.slots` (#26) | 10/10 intent classifications succeeded (was 0/9); zero `ai.call.failed` all session |
+| Typed weight (#27) | Typed 50 while the card offered 54 → `sets.weight = 50.0` |
+| Mini App button (#29) | 93/93 deliveries succeeded; zero BadRequest |
+
+### P0 fixed this session
+| ID | Defect | Commit |
+|---|---|---|
+| P0-1 | `menu:goals` was emitted by the top-priority CTA and handled nowhere — 4 silent taps, and no goal could ever be created. Unhandled callbacks now answer the user and emit an event | `95a82f2` |
+| P0-2 | The dev-note guard required `##` while every real note used `#...#` — 5 notes lost, one stored as a confirmed nutrition fact | `5d0e60e` |
+| P0-3 | The weekly plan prescribed squats and leg press to a user with an active knee constraint, with no warning, while attaching the elbow caveat to a back exercise | `f8a5982` |
+| P0-4 | `allergies="none"` was written `confirmed=1` from an unanswered question, while nuts sat unclassified | `e2b0c1a` |
+
+### The three findings that most change priorities
+1. **Two of three dietary restrictions are unenforceable.** Matching resolves
+   only through an 85-entry alias table, so a restriction stored as raw Hebrew
+   cannot match its own name. Verified: a tortilla wrap and a baked eggplant
+   both return zero violations against the user's own stored restrictions.
+   Compounding it, `avoidance` maps to `warn` and menu validation acts only on
+   `block`, so no `diet_restrictions` entry can ever hard-block a menu.
+2. **The calorie target is 130 kcal/day too low.** `routine_profile` says 0.2
+   workouts/week and `user_facts` says 4.0; `goals.py:297` reads the former.
+   Measured: 2290 vs 2420 kcal. The sync is one-way, so it re-diverges nightly.
+3. **The observability layer cannot reconstruct causality.** `parent_span_id` is
+   NULL on all 779 rows, no `interaction.*` terminal event exists, and the
+   application wrote 2 log lines in 2h15m (`callback_session.py`, `workout.py`
+   and `assistant.py` contain zero logging calls). This is *why* a dead button
+   survived: `routing.decided` is written before dispatch and nothing records
+   the outcome.
+
 ## Links
+- **WAVE-1 work plan (current): `docs/WAVE1_WORK_PLAN.md`**
 - Canonical implementation ledger: `docs/CANONICAL_IMPLEMENTATION_LEDGER.md`
 - Cleanup ledger: `docs/REPOSITORY_CLEANUP_LEDGER.md`
 - Agent roster & contracts (durable): `docs/WORK_MANAGER_AGENTS.md`
