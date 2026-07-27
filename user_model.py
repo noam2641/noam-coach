@@ -55,6 +55,122 @@ SOURCE_CONFIDENCE = {
     SOURCE_SYSTEM: 0.7,
 }
 
+# ---------------------------------------------------------------------------
+# Evidence weighting (W1-5)
+# ---------------------------------------------------------------------------
+#
+# Confidence used to be a pure function of the *source string*: a
+# ``workout_pattern`` derived from ONE sampled session and one derived from
+# 120 both scored 0.55, and one confirmation tap lifted either to 0.90. The
+# stored number described where a fact came from, never how much evidence
+# stood behind it.
+#
+# Derived facts already carry their own sample counts inside the value dict —
+# ``sessions_sampled``, ``meals_sampled``, ``nights_sampled``,
+# ``valid_weeks_sampled``, ``days_sampled``, ``weekday_hour_samples`` — a
+# convention established in routine.py and read all over health_jobs.py. We
+# key off that *naming convention* rather than a hardcoded list of keys, so a
+# new derived fact that follows the house style is covered automatically and
+# the list cannot drift out of sync with its producers.
+
+# A value-dict key counts as a sample tally when its name ends in one of
+# these. ``weekday_hour_samples`` style dicts count their summed tallies.
+SAMPLE_KEY_SUFFIXES = ("_sampled", "_samples")
+
+# Sample count at (or above) which evidence is considered complete and the
+# source confidence applies unattenuated.
+EVIDENCE_FULL_N = 10
+
+# The evidence factor floor. n=1 never scores zero — one real observation is
+# still information — but it is worth roughly half of a saturated sample.
+EVIDENCE_MIN_FACTOR = 0.5
+
+
+def _sample_tally(candidate: Any) -> int | None:
+    """Coerce one sample-metadata value into a count, or None if it isn't one.
+
+    Handles the two shapes actually used: a plain integer tally
+    (``sessions_sampled: 4``) and a histogram of tallies
+    (``weekday_hour_samples: {"6": 1}`` → 1).
+    """
+    if isinstance(candidate, bool):
+        return None
+    if isinstance(candidate, int):
+        return max(0, candidate)
+    if isinstance(candidate, float):
+        # Counts arrive as floats through JSON round-trips.
+        return max(0, int(candidate)) if candidate == candidate else None
+    if isinstance(candidate, dict):
+        total = 0
+        for sub in candidate.values():
+            tally = _sample_tally(sub)
+            if tally is None:
+                return None
+            total += tally
+        return total
+    if isinstance(candidate, (list, tuple)):
+        return len(candidate)
+    return None
+
+
+def sample_size(value: Any) -> int | None:
+    """Return the evidence count behind ``value``, or None when unknown.
+
+    Scans a fact's value dict for keys following the ``*_sampled`` /
+    ``*_samples`` house convention and returns the **minimum** positive tally
+    found. Minimum, not maximum or mean: a fact is only as well-evidenced as
+    its weakest supporting dimension. ``workout_pattern`` claiming four
+    training days from ``sessions_sampled=1`` with ``weekday_hour_samples
+    {"6": 1}`` is an n=1 fact no matter how many other counters look healthy.
+
+    Returns None — meaning "no sample metadata, don't attenuate" — when the
+    value is not a dict or carries no recognised tally. This is what keeps
+    every scalar fact (weight_kg, session_minutes, age) on exactly today's
+    behaviour.
+    """
+    if not isinstance(value, dict):
+        return None
+    tallies: list[int] = []
+    for key, candidate in value.items():
+        if not isinstance(key, str):
+            continue
+        if not key.endswith(SAMPLE_KEY_SUFFIXES):
+            continue
+        tally = _sample_tally(candidate)
+        if tally is None:
+            continue
+        tallies.append(tally)
+    if not tallies:
+        return None
+    return min(tallies)
+
+
+def evidence_factor(n: int | None) -> float:
+    """Map a sample count onto a multiplier in [EVIDENCE_MIN_FACTOR, 1.0].
+
+    ``None`` (no sample metadata) → 1.0, i.e. unchanged from the pre-W1-5
+    behaviour. n=0 is *claimed* evidence that does not exist, so it takes the
+    floor. The curve rises linearly to 1.0 at EVIDENCE_FULL_N and never
+    exceeds it, which guarantees the new confidence is always <= the old one:
+    no existing threshold can be crossed upward by this change.
+    """
+    if n is None:
+        return 1.0
+    if n >= EVIDENCE_FULL_N:
+        return 1.0
+    if n <= 1:
+        return EVIDENCE_MIN_FACTOR
+    span = 1.0 - EVIDENCE_MIN_FACTOR
+    return EVIDENCE_MIN_FACTOR + span * ((n - 1) / (EVIDENCE_FULL_N - 1))
+
+
+def evidence_weighted_confidence(base_confidence: float, value: Any) -> float:
+    """Attenuate ``base_confidence`` by the evidence behind ``value``."""
+    factor = evidence_factor(sample_size(value))
+    if factor >= 1.0:
+        return float(base_confidence)
+    return round(float(base_confidence) * factor, 4)
+
 
 @dataclass(frozen=True)
 class FactSpec:
@@ -777,6 +893,11 @@ async def set_fact(
     """
     if confidence is None:
         confidence = SOURCE_CONFIDENCE.get(source, 0.7)
+    # W1-5: the source only sets a *ceiling*. What the fact is actually worth
+    # depends on how much evidence stands behind it. Applied to explicitly
+    # passed confidences too — otherwise a caller rewriting a one-sample
+    # derived value as ``confidence=0.85`` would launder it right back.
+    confidence = evidence_weighted_confidence(confidence, value)
     spec = FACT_REGISTRY.get(key)
     if affects is None:
         affects = spec.affects if spec else ()
@@ -929,17 +1050,39 @@ async def _set_fact_plain(
     return value_changed
 
 
+# The confidence a confirmation tap can reach on its own.
+CONFIRMED_CONFIDENCE = 0.9
+
+
 async def confirm_fact(db: SupportsDB, user_id: int, key: str) -> None:
-    """User confirmed an estimate — harden it (confidence floor + confirmed)."""
+    """User confirmed an estimate — harden it (confidence floor + confirmed).
+
+    W1-5: a confirmation IS real evidence — the user looked at the value and
+    said yes — so it still raises confidence, and for a fact with no sample
+    metadata it reaches the historical 0.9 floor unchanged.
+
+    But a tap does not retroactively create observations. When the fact
+    declares its own sample count, the confirmed floor is capped by that
+    evidence, so an ``eating_windows`` built from ``meals_sampled=1`` cannot
+    reach 0.9 by being approved once. The user is confirming that the *value
+    looks right*, not attesting that it rests on 100 meals. Confirmation is
+    still worth strictly more than not confirming: the floor is the larger of
+    the evidence-capped ceiling and whatever the fact already held, so
+    ``confirmed`` never lowers a confidence.
+    """
+    fact = await get_fact(db, user_id, key)
+    ceiling = CONFIRMED_CONFIDENCE
+    if fact is not None:
+        ceiling = evidence_weighted_confidence(CONFIRMED_CONFIDENCE, fact.get("value"))
     await db.execute(
         """
         UPDATE user_facts
         SET confirmed=1,
-            confidence=MAX(confidence, 0.9),
+            confidence=MAX(confidence, ?),
             updated_at=?
         WHERE user_id=? AND key=?
         """,
-        (_now(), user_id, key),
+        (float(ceiling), _now(), user_id, key),
     )
 
 
