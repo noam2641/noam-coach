@@ -109,6 +109,29 @@ from noam_coach.bot.ui import safe_answer_callback
 
 RUNTIME_NAMES = ('APP_VERSION', 'Any', 'CALLBACK_DEBOUNCE_SECONDS', 'CONFIRM_PENDING', 'ContextTypes', 'DB', 'EXERCISE_MUSCLES', 'Exception', 'GOAL_STATUS_PROPOSED', 'GOAL_STATUS_PROVISIONAL', 'InlineKeyboardButton', 'InlineKeyboardMarkup', 'KeyError', 'LOGGER', 'MealAnalysis', 'PENDING_QUESTION', 'Path', 'RIR_UNKNOWN', 'SESSION_SCOPED_ACTIONS', 'SETTINGS', 'TypeError', 'Update', 'ValueError', 'WebAppInfo', '_DEBOUNCE_PREFIXES', '_LAST_CALLBACK', '_StaleSetStep', '_duration_s', '_home_hint', '_is_duplicate_tap', '_plan_type_label', '_started', 'action', 'activate_goal_version_provisional', 'active_flow', 'active_session', 'actual_reps', 'actual_rir', 'actual_weight', 'aiosqlite', 'alt', 'alt_muscle', 'alternative', 'alternative_index', 'analysis', 'analyze_duplicate_candidate', 'apply_reconcile_proposal', 'approval_id', 'await_weight_text', 'bool', 'build_daily_status', 'build_evening_summary_text', 'build_health_status_text', 'build_morning_menu_text', 'build_next_meal_text', 'build_now_action_text', 'build_weekly_summary_text', 'button', 'buttons', 'callback_flow_id', 'callback_version', 'cancel_rest_timer', 'candidate', 'center', 'changed', 'check_duplicate_meal', 'choices', 'chosen_reps', 'chosen_weight', 'claimed', 'clear_confirm_pending', 'clear_meal_fix', 'clear_pending', 'clear_split_state', 'code', 'command_profile_query', 'completed', 'conn', 'connection', 'constraint_id', 'context', 'conversation', 'create_approval', 'create_goal_version', 'create_meal_edit_approval', 'cur', 'current', 'cursor', 'cutoff', 'data', 'datetime', 'decide_approval', 'deleted', 'delta', 'delta_text', 'dict', 'done', 'draft', 'dup', 'duplicate_approval_id', 'edit_approval_id', 'ensure_user', 'enumerate', 'error_id', 'esc', 'event_log', 'ex', 'exc', 'exercise_index', 'exercise_index_text', 'exercise_picker_keyboard', 'existing', 'extra', 'extra_seconds', 'fetch_approval', 'fetch_goal', 'field', 'final_rir', 'first_reps', 'first_weight', 'flags', 'float', 'format_load_decision_details', 'frequency', 'friendly_error', 'get_daily_flags', 'get_meal_fix', 'get_split_state', 'get_user_plan', 'getattr', 'goal', 'goal_id', 'gv_id', 'handle_checkin_callback', 'handle_flags_callback', 'handle_goal_callback', 'handle_meal_callback', 'handle_menu_callback', 'handle_onboarding_callback', 'handle_plan_callback', 'handle_session_action_callback', 'handle_workout_setup_callback', 'home_keyboard', 'index', 'int', 'is_allowed', 'is_current_session_step', 'is_partial', 'is_provisional', 'isinstance', 'item', 'item_index', 'item_index_text', 'job', 'jobs', 'json', 'k', 'kb', 'key', 'kind', 'label', 'labels', 'last', 'len', 'level', 'list', 'logged_sets', 'max', 'meal', 'meal_id', 'meal_id_text', 'min', 'mini_app_url', 'missing', 'missing_labels', 'more_keyboard', 'msg', 'new_grams', 'new_max', 'new_min', 'new_val', 'new_weight', 'note', 'notify_admin', 'now', 'nutrition', 'object', 'ok', 'old_grams', 'option', 'option_index', 'pain_location', 'part', 'parts', 'parts_v2', 'payload', 'persist_meal', 'plan', 'plan_id', 'plan_now', 'plan_type', 'planned_sets', 'planning', 'plans_keyboard', 'previous_weight_context', 'progress', 'quality', 'query', 'range', 'ratio', 'rc', 'readiness', 'recommend_load', 'recommend_load_decision', 'refreshed', 'render_candidate_list', 'render_exercise_params', 'render_meal', 'render_profile_snapshot', 'render_quantity_editor', 'render_smart_plan_hub', 'render_unified_plan', 'render_workout_overview', 'reopened', 'replacement', 'reps', 'reps_value', 'rest', 'rest_job_name', 'result', 'round', 'route_decision', 'row', 'rows', 'safe_edit', 'save_medical_constraint', 'save_split_set', 'second_base', 'second_reps', 'second_weight', 'secrets', 'select_todays_workout_code', 'selected', 'send_weight_chart', 'session', 'session_action_arg', 'session_action_data', 'session_id', 'set', 'set_daily_flags', 'set_exercise_override', 'set_goal_weight', 'set_meal_fix', 'set_pending', 'set_split_state', 'severity', 'show_session', 'split_reps_keyboard', 'split_rir_keyboard', 'split_state', 'split_summary_line', 'split_weight_keyboard', 'start_rest_timer', 'status', 'status_line', 'step', 'str', 'sum', 'summary_line', 'suppress', 't', 'tail', 'target_change_note', 'text', 'time', 'total_reps', 'track_event', 'training_intelligence', 'try_save_set', 'tuple', 'undo_last_set', 'undone', 'update', 'update_rest_message', 'update_session_step', 'url', 'user_choice', 'user_id', 'user_model', 'utc_now', 'value', 'value_text', 'warn', 'weight', 'weight_prompt_text', 'workout', 'workout_summary', 'write_audit')
 
+async def _reject_unhandled_callback(query: Any, user_id: int, data: str) -> None:
+    """Terminal handler for a callback that matched nothing anywhere.
+
+    ``handle_session_action_callback`` is the END of the dispatch chain, so
+    anything reaching it that is not a session-scoped action matched no
+    handler at all. It used to ``return`` bare -- no reply, no event, no log
+    -- which made a mis-wired button indistinguishable from a working one
+    both to the user (the Telegram message did not even change, so it read as
+    a frozen app) and to us (the event stream records routing.decided BEFORE
+    dispatch and never records the outcome).
+
+    That is how a singular/plural typo in one callback name -- the bot's own
+    top-priority CTA -- went unnoticed while it blocked every nutrition
+    feature in the product.
+    """
+    await _emit_unhandled_callback(user_id, data)
+    await safe_answer_callback(
+        query,
+        "הכפתור הזה לא זמין כרגע — נסה דרך התפריט.",
+        show_alert=False,
+    )
+
+
 async def _emit_unhandled_callback(user_id: int, data: str) -> None:
     """Record a callback that matched no handler.
 
@@ -1136,23 +1159,7 @@ async def handle_session_action_callback(
     """Route a session-scoped workout callback to one focused action family."""
     parts = data.split(":")
     if len(parts) < 2 or not parts[1].isdigit():
-        # This is the END of the dispatch chain: anything arriving here that
-        # is not a session-scoped action matched NO handler anywhere. It used
-        # to `return` bare -- no reply, no event, no log -- so a mis-wired
-        # button was indistinguishable from a working one both to the user
-        # (the Telegram message did not even change, so it read as a frozen
-        # app) and to us (the event stream records routing.decided BEFORE
-        # dispatch and never records the outcome).
-        #
-        # That is how a singular/plural typo in one callback name -- the
-        # bot's own top-priority CTA -- went unnoticed while it blocked every
-        # nutrition feature in the product.
-        await _emit_unhandled_callback(user_id, data)
-        await safe_answer_callback(
-            query,
-            "הכפתור הזה לא זמין כרגע — נסה דרך התפריט.",
-            show_alert=False,
-        )
+        await _reject_unhandled_callback(query, user_id, data)
         return
 
     action = parts[0]

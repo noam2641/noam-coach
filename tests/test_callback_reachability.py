@@ -138,21 +138,34 @@ def test_unhandled_callbacks_are_announced_and_recorded() -> None:
     source = (ROOT / "noam_coach/bot/callback_session.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
 
-    target = next(
+    dispatcher = next(
         node
         for node in ast.walk(tree)
         if isinstance(node, ast.AsyncFunctionDef)
         and node.name == "handle_session_action_callback"
     )
-    # The guard is the first statement after the `parts = data.split(":")`.
-    guard_src = ast.get_source_segment(source, target) or ""
+    # The guard is the first statement after `parts = data.split(":")`. It
+    # delegates rather than inlining, so the dispatcher stays within the size
+    # budget test_architecture enforces.
+    guard_src = ast.get_source_segment(source, dispatcher) or ""
     head = guard_src.split("action = parts[0]")[0]
+    assert "_reject_unhandled_callback" in head, (
+        "the terminal dispatch branch must hand off to the rejection handler"
+    )
 
-    assert "_emit_unhandled_callback" in head, (
+    handler = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_reject_unhandled_callback"
+    )
+    body = ast.get_source_segment(source, handler) or ""
+
+    assert "_emit_unhandled_callback" in body, (
         "an unroutable callback must emit an event -- otherwise a dead button "
         "is indistinguishable from a working one in the event stream"
     )
-    assert "safe_answer_callback" in head, (
+    assert "safe_answer_callback" in body, (
         "an unroutable callback must answer the user -- otherwise Telegram "
         "leaves the button spinning and the app reads as frozen"
     )
