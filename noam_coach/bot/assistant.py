@@ -419,6 +419,132 @@ async def _split_availability_gate(user_id: int, split_freq: int) -> tuple[str, 
     return text, keyboard
 
 
+# W1-7: a plan rebuild must never happen silently on a CONTRADICTORY request.
+#
+# The defect this closes: the user typed "6 ארוחות ביום" (6 MEALS a day — a
+# nutrition statement). The intent classifier has no meals-per-day label in its
+# Action taxonomy, so it returned build_plan(frequency=6) at 0.95 confidence and
+# this handler rebuilt the weekly training plan on the spot — overwriting a
+# confirmed training_days_per_week and the active plan. The user corrected it 47
+# seconds later. One misclassification became persisted damage because the
+# rebuild had no confirmation step.
+#
+# WHEN WE ASK vs WHEN WE PROCEED — the deliberate line:
+#   * We ask ONLY when the requested frequency CONTRADICTS an existing
+#     commitment the user already made. A commitment is either (a) a CONFIRMED
+#     training_days_per_week fact, or (b) the frequency of the ACTIVE workout
+#     plan. Both are the exact sources coach_intelligence.profile_conflicts
+#     compares, and we reuse its threshold (>= 1 session/week apart, the
+#     plan-vs-declared rule at coach_intelligence.py:140) rather than inventing
+#     a second, drifting definition of "conflict".
+#   * We do NOT ask a first-time user (no confirmed fact, no active plan) —
+#     that is the normal path and must stay ONE step. Asking there would be a
+#     regression, not a fix.
+#   * We do NOT ask when the request MATCHES what the user already committed to
+#     (re-requesting the same 4 days is not suspicious), nor when the only
+#     existing frequency is an UNCONFIRMED estimate — an estimate is not a
+#     commitment, so contradicting one is not evidence of a misclassification.
+#
+# Note the asymmetry with profile_conflicts: that function compares two STORED
+# values, so it cannot see the INCOMING frequency that has not been written yet
+# — which is precisely the write we are trying to gate. We therefore read the
+# same two sources it reads and apply its threshold to the incoming number.
+_PLAN_CONFLICT_THRESHOLD = 1  # coach_intelligence.py:140, declared-vs-plan rule
+
+
+def _database_is_materialised(db: Any) -> bool:
+    """True when *db*'s file exists, so reading it will not create one.
+
+    sqlite creates a database on connect. Read-only lookups on a
+    speculative path must therefore check first, or they leave a file
+    wherever `database_path` points -- the repo root by default.
+
+    A db with no discoverable path (an in-memory or stubbed one, as in
+    tests) is treated as materialised: there is nothing to create.
+    """
+    path = getattr(db, "path", None)
+    if not path or path == ":memory:":
+        return True
+    return Path(path).exists()
+
+
+async def _plan_rebuild_confirmation(
+    user_id: int, frequency: int
+) -> tuple[str, Any] | None:
+    """Return (message, keyboard) when a rebuild to ``frequency`` contradicts an
+    existing commitment and must be confirmed first; None to proceed silently.
+
+    Follows the shape of the readiness / deferred-question gates: the caller
+    short-circuits with ``return True`` and persists nothing.
+    """
+    from noam_coach.bot.ui import button
+
+    # sqlite CREATES a database on connect, so reading through a Database
+    # whose file does not exist leaves one behind. `database_path` defaults to
+    # the repo root (config.py:22) and CI has no `.env`, so the default
+    # applies there -- two `stray database artifacts` guards fail on exactly
+    # this. A missing database also means there is no stored commitment to
+    # contradict, so skipping the reads is the honest answer as well as the
+    # safe one.
+    if not _database_is_materialised(DB):
+        return None
+
+    try:
+        fact = await user_model.get_fact(DB, user_id, "training_days_per_week")
+    except Exception:  # noqa: BLE001 - the gate must never block plan building
+        fact = None
+    declared: float | None = None
+    # Only a CONFIRMED fact counts as a commitment worth defending. An
+    # unconfirmed estimate is a draft; contradicting it is not suspicious.
+    if fact is not None and fact.get("confirmed"):
+        try:
+            declared = float(fact.get("value"))
+        except (TypeError, ValueError):
+            declared = None
+
+    try:
+        plan = await planning.get_active_plan(DB, user_id, "workout")
+    except Exception:  # noqa: BLE001 - same: never block on a lookup failure
+        plan = None
+    plan_freq: float | None = None
+    if plan:
+        try:
+            plan_freq = float((plan.get("payload") or {}).get("frequency"))
+        except (TypeError, ValueError):
+            plan_freq = None
+
+    # The contradicted commitment, preferring the confirmed declaration.
+    for existing in (declared, plan_freq):
+        if existing is None:
+            continue
+        if abs(existing - frequency) < _PLAN_CONFLICT_THRESHOLD:
+            # Matches what the user already committed to — not suspicious, and
+            # a matching commitment overrides a stale disagreement elsewhere.
+            return None
+        current = int(existing)
+        text = (
+            f"רגע — עד עכשיו סיכמנו {current} אימונים בשבוע, "
+            f"ועכשיו הבנתי {frequency}. לפני שאני בונה מחדש את התוכנית השבועית, "
+            "רק שאדע שהתכוונת לאימונים ולא למשהו אחר (למשל ארוחות ביום).\n\n"
+            f"לבנות תוכנית של {frequency} אימונים בשבוע?"
+        )
+        keyboard = InlineKeyboardMarkup(
+            [
+                # `plan:set:<n>` is the existing convention for "commit to this
+                # weekly frequency": it writes the confirmed fact and rebuilds,
+                # exactly what a confirmed rebuild already does. It is also
+                # already in callback_router's _DEBOUNCE_PREFIXES, so a
+                # double-tap is dropped and the plan is built ONCE.
+                [button(f"✅ כן, {frequency} אימונים בשבוע", f"plan:set:{frequency}")],
+                # Rejecting is a plain navigation callback: it persists nothing,
+                # so the existing plan and facts are left untouched.
+                [button(f"לא, להשאיר {current} אימונים", "menu:plan")],
+            ]
+        )
+        return text, keyboard
+    return None
+
+
 @runtime_bound(RUNTIME_NAMES)
 async def _handle_plan_text_action(ctx: FreeTextContext) -> bool:
     if ctx.action == "build_plan":
@@ -441,6 +567,13 @@ async def _handle_plan_text_action(ctx: FreeTextContext) -> bool:
                 )
                 return True
             if await ask_deferred_for_plan(ctx.message, ctx.user_id, frequency):
+                return True
+            # W1-7: last gate before the write. A rebuild that contradicts a
+            # confirmed frequency or the active plan asks first; a first-time
+            # build with nothing to contradict falls straight through.
+            confirm = await _plan_rebuild_confirmation(ctx.user_id, frequency)
+            if confirm is not None:
+                await ctx.send(confirm[0], confirm[1])
                 return True
             plan = await build_weekly_plan(ctx.user_id, frequency)
             from noam_coach.bot.onboarding import active_pain_regions_for
