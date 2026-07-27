@@ -385,6 +385,76 @@ def _parse_health_start(value: Any) -> datetime | None:
 
 _MIN_RECURRING_WORKOUTS_PER_WEEKDAY = 2
 
+# A weekday only counts as "recurring" if it shows up in at least this share of
+# the weeks the window covers. The old absolute floor of 2 did not scale: over a
+# 90-day window *every* weekday clears 2 hits for anyone who trains regularly,
+# so widening the window turned "found a pattern" into an unconditional yes and
+# manufactured training days the user never picked. Requiring ~1 workout every
+# 3 weeks keeps sparse-but-real habits while rejecting the noise a long window
+# accumulates.
+_MIN_RECURRING_WEEKDAY_RATE_PER_WEEK = 1 / 3
+
+# Ceiling on the scaled floor. Without it the floor outruns the evidence a
+# genuinely sparse routine can ever accumulate: someone training a fixed weekday
+# once a month clears the 60-day floor but NOT the 90- or 180-day one, so
+# widening the window would *shrink* the answer to nothing and a real (if
+# infrequent) pattern would be reported as no pattern at all. Capping keeps
+# widening monotonic — a wider window may never admit fewer weekdays than a
+# narrower one.
+_MAX_RECURRING_WORKOUTS_PER_WEEKDAY = 4
+
+# Window the detector is allowed to use before the answer needs a caveat. Past
+# this the evidence is older than the user's current routine, so the caller must
+# say so rather than presenting it as "the days you trained most".
+_DEFAULT_WEEKDAY_WINDOW_DAYS = 28
+
+_WEEKDAY_WINDOW_LADDER = (28, 60, 90, 180)
+
+
+def _min_recurring_workouts_for_window(window_days: int) -> int:
+    """Recurrence floor scaled to the window, clamped at both ends.
+
+    Grows with the window so a long lookback demands proportionally more
+    evidence, but never below the historical absolute floor and never above
+    ``_MAX_RECURRING_WORKOUTS_PER_WEEKDAY`` (see its comment: an uncapped floor
+    makes widening non-monotonic and strands sparse users with no answer).
+    """
+    weeks = max(1.0, window_days / 7.0)
+    scaled = math.ceil(_MIN_RECURRING_WEEKDAY_RATE_PER_WEEK * weeks)
+    return max(
+        _MIN_RECURRING_WORKOUTS_PER_WEEKDAY,
+        min(scaled, _MAX_RECURRING_WORKOUTS_PER_WEEKDAY),
+    )
+
+
+def weekday_source_is_widened(source: str) -> bool:
+    """True when the weekday answer needed more than the default window.
+
+    The caller uses this to decide whether the proposal must be presented with
+    a "I had to look further back" caveat. Previously only ``full_history`` was
+    flagged, so ``last_60_days``/``last_90_days``/``last_180_days`` rendered
+    identically to the default window and silently overstated the evidence.
+    """
+    if source in {"full_history", "insufficient_history"}:
+        return True
+    if not source.startswith("last_") or not source.endswith("_days"):
+        return False
+    try:
+        window_days = int(source[len("last_"):-len("_days")])
+    except ValueError:
+        return False
+    return window_days > _DEFAULT_WEEKDAY_WINDOW_DAYS
+
+
+def weekday_source_window_days(source: str) -> int | None:
+    """Window length a weekday source represents, or None when unbounded."""
+    if source.startswith("last_") and source.endswith("_days"):
+        try:
+            return int(source[len("last_"):-len("_days")])
+        except ValueError:
+            return None
+    return None
+
 
 def _rank_weekdays_from_dates(dates: list[datetime]) -> list[int]:
     counts: dict[int, int] = defaultdict(int)
@@ -401,15 +471,25 @@ def _rank_weekdays_from_dates(dates: list[datetime]) -> list[int]:
     return ranked
 
 
-def _recurring_weekdays_from_dates(dates: list[datetime]) -> list[int]:
+def _recurring_weekdays_from_dates(
+    dates: list[datetime], window_days: int | None = None
+) -> list[int]:
+    """Weekdays that recur often enough to be a pattern, best-ranked first.
+
+    ``window_days`` is the length of the window ``dates`` was drawn from; the
+    recurrence floor scales with it so a longer window demands proportionally
+    more evidence. Omitting it keeps the legacy absolute floor.
+    """
     counts: dict[int, int] = defaultdict(int)
     for date in dates:
         counts[date.weekday()] += 1
     ranked = _rank_weekdays_from_dates(dates)
-    return [
-        day for day in ranked
-        if counts[day] >= _MIN_RECURRING_WORKOUTS_PER_WEEKDAY
-    ]
+    minimum = (
+        _MIN_RECURRING_WORKOUTS_PER_WEEKDAY
+        if window_days is None
+        else _min_recurring_workouts_for_window(window_days)
+    )
+    return [day for day in ranked if counts[day] >= minimum]
 
 
 async def _historical_workout_weekdays(user_id: int, target_count: int) -> tuple[list[int], str]:
@@ -439,14 +519,15 @@ async def _historical_workout_weekdays(user_id: int, target_count: int) -> tuple
         return [], "no_history"
 
     newest = max(dates)
-    for window_days in (28, 60, 90, 180):
+    for window_days in _WEEKDAY_WINDOW_LADDER:
         cutoff = newest - timedelta(days=window_days)
         window_dates = [date for date in dates if date >= cutoff]
-        ranked = _recurring_weekdays_from_dates(window_dates)
+        ranked = _recurring_weekdays_from_dates(window_dates, window_days)
         if len(ranked) >= target_count:
             return sunday_first_order(ranked[:target_count]), f"last_{window_days}_days"
 
-    ranked = _recurring_weekdays_from_dates(dates)
+    history_days = max(1, (newest - min(dates)).days)
+    ranked = _recurring_weekdays_from_dates(dates, history_days)
     if len(ranked) >= target_count:
         return sunday_first_order(ranked[:target_count]), "full_history"
     return sunday_first_order(ranked), "insufficient_history"
@@ -1093,9 +1174,15 @@ async def ask_next_health_confirm_step(
 
         # Keep display AND the eventual confirm consistent: the proposal becomes
         # the value that gets approved.
+        widened = weekday_source_is_widened(history_source)
         value["common_weekdays"] = proposed
         value["weekday_selection_basis"] = "health_workout_history"
         value["weekday_selection_source"] = history_source
+        # Record how much evidence actually backs the answer so downstream
+        # consumers (and any later correction) can tell a fresh 28-day pattern
+        # apart from one scraped out of a widened window.
+        value["weekday_selection_widened"] = widened
+        value["weekday_selection_window_days"] = weekday_source_window_days(history_source)
         await user_model.set_fact(
             DB, user_id, "workout_pattern", value,
             kind=fact.get("kind", user_model.KIND_ESTIMATE),
@@ -1107,13 +1194,31 @@ async def ask_next_health_confirm_step(
         lines = [header.rstrip()]
         if desired is not None:
             lines.append(f"עדכנת שאתה רוצה {desired} אימונים בשבוע ✅\n")
-        lines.append(
-            "לפי היסטוריית האימונים שתועדה בקובץ, הימים שבהם התאמנת הכי הרבה הם:\n"
-            f"{', '.join(proposed_labels)}."
-        )
-        if history_source == "full_history":
+        if widened:
+            # Do NOT claim "the days you trained most" when the default window
+            # did not actually support that: say the window was widened and that
+            # the answer is a guess the user should correct.
             lines.append(
-                "השתמשתי בכל היסטוריית האימונים הזמינה בקובץ כי התקופה האחרונה לבדה לא הספיקה לדפוס יציב."
+                "לפי היסטוריית האימונים שתועדה בקובץ, ההערכה שלי לימי האימון היא:\n"
+                f"{', '.join(proposed_labels)}."
+            )
+            window_days = weekday_source_window_days(history_source)
+            if window_days is not None:
+                lines.append(
+                    f"שים לב: ב-{_DEFAULT_WEEKDAY_WINDOW_DAYS} הימים האחרונים לא היה דפוס מספיק ברור, "
+                    f"אז הרחבתי את הבדיקה ל-{window_days} הימים האחרונים. "
+                    "יכול להיות שזה לא מדויק לשגרה שלך היום."
+                )
+            else:
+                lines.append(
+                    f"שים לב: ב-{_DEFAULT_WEEKDAY_WINDOW_DAYS} הימים האחרונים לא היה דפוס מספיק ברור, "
+                    "אז השתמשתי בכל היסטוריית האימונים שבקובץ. "
+                    "יכול להיות שזה לא מדויק לשגרה שלך היום."
+                )
+        else:
+            lines.append(
+                "לפי היסטוריית האימונים שתועדה בקובץ, הימים שבהם התאמנת הכי הרבה הם:\n"
+                f"{', '.join(proposed_labels)}."
             )
         lines.append("\nלאשר את הימים האלה לתוכנית האימונים?")
         if desired is not None:
