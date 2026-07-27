@@ -195,6 +195,18 @@ class SleepSchedule:
     avg_duration_minutes: float | None = None
     variability_minutes: float | None = None
     nights_sampled: int = 0
+    # W1-3 disclosure. ``nights_sampled`` counts EVERY night in history (the
+    # statistics are exponentially weighted, not windowed) and is therefore
+    # not the effective sample size: a user with 120 nights spanning 456 days
+    # has ~9 nights carrying real weight under the half-life. These fields
+    # expose that gap WITHOUT changing ``nights_sampled``, which existing
+    # confidence code (health_quality._sleep_section, the health_jobs wizard)
+    # already keys on — see learn_sleep_schedule's docstring.
+    nights_in_window: int = 0  # nights inside the last ``window_days`` of data
+    window_days: int = DEFAULT_WINDOW_DAYS
+    # Local date the window is anchored to: the newest night in the data, not
+    # today. None when there is no sleep data.
+    window_end: str | None = None
 
 
 @dataclass
@@ -957,6 +969,34 @@ async def learn_sleep_schedule(
     tz: ZoneInfo,
     window_days: int = DEFAULT_WINDOW_DAYS,
 ) -> SleepSchedule:
+    """Learn bedtime / wake time / duration from HealthKit sleep sessions.
+
+    Windowing (W1-3). Unlike the workout and eating learners, this function
+    deliberately still reads ALL sleep history and does NOT filter to
+    ``window_days``. ``window_days`` is used as an exponential half-life
+    instead: a night ``window_days`` old carries half the weight of the newest
+    night, so old history decays smoothly rather than falling off a cliff. That
+    is the right shape for sleep — it is the sparsest signal (HealthKit sleep
+    is often missing for whole stretches), and a hard cut would leave many
+    users with no learnable schedule at all.
+
+    The half-life is anchored to ``max(night_dates)`` — the newest night in the
+    DATA, not today — which is the same principle ``average_daily_steps``
+    applies. A 43-day-old export therefore still decays from its own last
+    night rather than being uniformly crushed toward zero weight.
+
+    What WAS wrong: the returned ``nights_sampled`` counts every night ever
+    recorded, so a profile could claim "120 nights" (read as high confidence by
+    health_quality._sleep_section) while the effective sample size under the
+    half-life was ~9 nights spread over 456 days. Rather than silently redefine
+    ``nights_sampled`` — several modules already key confidence on it, and
+    changing it here would move their behavior invisibly — this function now
+    additionally reports ``nights_in_window`` (nights inside the last
+    ``window_days`` before the newest night), ``window_days`` and
+    ``window_end``. Callers that want the honest recent-sample count can read
+    ``nights_in_window``; nobody's existing reading of ``nights_sampled``
+    changes. Re-keying confidence onto it is W1-5's job, not this task's.
+    """
     rows = await db.fetch_all(
         """
         SELECT start_time, end_time, value, source_device
@@ -1020,12 +1060,17 @@ async def learn_sleep_schedule(
     if not night_dates:
         return SleepSchedule()
 
+    # Anchor on the newest night in the DATA (not today) so a stale export
+    # still decays from its own last night — same principle as
+    # average_daily_steps' dataset-end anchor.
     newest_night = max(night_dates)
     half_life_days = max(float(window_days), 1.0)
     weights = [
         0.5 ** (max((newest_night - night_date).days, 0) / half_life_days)
         for night_date in night_dates
     ]
+    window_start = newest_night - dt.timedelta(days=window_days - 1)
+    nights_in_window = sum(1 for night_date in night_dates if night_date >= window_start)
 
     bedtime_hour = weighted_mean(bedtimes, weights)
     _mean_duration = weighted_mean(durations, weights)
@@ -1036,6 +1081,9 @@ async def learn_sleep_schedule(
         avg_duration_minutes=(round(_mean_duration, 1) if _mean_duration is not None else None),
         variability_minutes=(round(variability, 1) if variability is not None else None),
         nights_sampled=len(night_dates),
+        nights_in_window=nights_in_window,
+        window_days=window_days,
+        window_end=newest_night.isoformat(),
     )
 
 
@@ -1044,16 +1092,49 @@ async def learn_workout_pattern(
     user_id: int,
     tz: ZoneInfo,
     window_days: int = DEFAULT_WINDOW_DAYS,
+    *,
+    anchor: dt.date | None = None,
 ) -> WorkoutPattern:
-    since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=window_days)).isoformat()
+    """Learn training frequency / typical hour / weekdays from HealthKit workouts.
+
+    ``anchor`` ends the analysis window (defaults to the dataset's own newest
+    health sample, falling back to today when the user has no health data).
+    HealthKit exports are routinely stale, and a window measured back from
+    ``now()`` intersects such a file almost nowhere: a real export ending
+    2026-06-14, analyzed on 2026-07-27, matched 1 of 296 workouts and produced
+    ``weekly_frequency = 0.2`` sessions/week — while the file's OWN last 45
+    days contain 10 sessions. Anchoring to the dataset end (the same fix
+    ``average_daily_steps`` and ``analyze_training_weeks`` already apply) makes
+    the learner describe the last period the data actually covers.
+
+    The window LENGTH is unchanged, so a user whose export is current gets
+    exactly the previous result: for them the dataset end IS today.
+    """
+    window_end = anchor or await newest_health_sample_date(db, user_id, tz)
+    # A dataset-derived end is a fully-elapsed day already covered by data, so
+    # a Mon-Sun week ending exactly on it IS complete. Only the ``now()``
+    # fallback is an in-progress day — see `_complete_weeks`'s `inclusive_end`.
+    dataset_anchored = window_end is not None
+    if window_end is None:
+        window_end = dt.datetime.now(tz).date()
+    since = (
+        dt.datetime.combine(window_end - dt.timedelta(days=window_days), dt.time.min, tzinfo=tz)
+        .astimezone(dt.timezone.utc)
+        .isoformat()
+    )
+    until = (
+        dt.datetime.combine(window_end + dt.timedelta(days=1), dt.time.min, tzinfo=tz)
+        .astimezone(dt.timezone.utc)
+        .isoformat()
+    )
     rows = await db.fetch_all(
         """
         SELECT start_time, value
         FROM health
-        WHERE user_id=? AND sample_type='workout' AND start_time>=?
+        WHERE user_id=? AND sample_type='workout' AND start_time>=? AND start_time<?
         ORDER BY start_time
         """,
-        (user_id, since),
+        (user_id, since, until),
     )
     if not rows:
         return WorkoutPattern()
@@ -1068,7 +1149,12 @@ async def learn_workout_pattern(
         workout_days.append(local.date())
 
     _mean_duration = robust_mean(durations)
-    recent_cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=RECENT_WINDOW_DAYS)
+    # The recent window rides on the same anchor: "the last 14 days OF THE
+    # DATA", not the last 14 days of wall-clock time (which a stale export
+    # never reaches).
+    recent_cutoff = dt.datetime.combine(
+        window_end - dt.timedelta(days=RECENT_WINDOW_DAYS), dt.time.min, tzinfo=tz
+    )
     recent_rows = [row for row in rows if _to_local(row["start_time"], tz) >= recent_cutoff]
 
     # --- Wear-aware weekly frequency -----------------------------------
@@ -1076,14 +1162,15 @@ async def learn_workout_pattern(
     # trusted; a week containing an unworn day is burned (its true workout
     # count is unknown). When no wear evidence exists, or no week survives,
     # fall back to the naive window average so legacy data keeps working.
-    today_local = dt.datetime.now(tz).date()
-    window_start = today_local - dt.timedelta(days=window_days)
-    wear_days = await load_wear_days(db, user_id, tz, window_days)
+    window_start = window_end - dt.timedelta(days=window_days)
+    wear_days = await load_wear_days(db, user_id, tz, window_days, anchor=window_end)
     valid_weeks: list[tuple[dt.date, dt.date]] = []
     if wear_days is not None:
         valid_weeks = [
             week
-            for week in _complete_weeks(window_start, today_local)
+            for week in _complete_weeks(
+                window_start, window_end, inclusive_end=dataset_anchored
+            )
             if _fully_worn(week, wear_days)
         ]
 
@@ -1100,7 +1187,7 @@ async def learn_workout_pattern(
             if any(start <= day <= end for start, end in valid_weeks)
         ] or workout_days
 
-        recent_start = today_local - dt.timedelta(days=RECENT_WINDOW_DAYS)
+        recent_start = window_end - dt.timedelta(days=RECENT_WINDOW_DAYS)
         recent_valid = [
             (start, end) for start, end in valid_weeks if end >= recent_start
         ]
@@ -1184,16 +1271,57 @@ async def learn_eating_windows(
 
     Assumption (matches the bot): the photo timestamp == the eating moment, so
     ``meals.eaten_at`` is the eating time.
+
+    Anchoring (W1-3), and why it is a weaker case than workouts. ``meals`` is
+    NOT an imported table — rows are written live as the user logs, so a gap
+    here means the user actually stopped logging, not that a file went stale.
+    That is why the anchor is deliberately taken from the ``meals`` table's own
+    newest row (``MAX(eaten_at)``) and NOT from ``newest_health_sample_date``:
+    the HealthKit export end date says nothing about when meals were logged,
+    and borrowing it would window meals against an unrelated clock.
+
+    Anchoring to the newest meal is still the right call over ``now()``. The
+    two differ only for a user who paused logging for longer than
+    ``window_days``; for them, ``now()`` returns a blank ``EatingWindows()``
+    that erases the pattern entirely, whereas the anchored window returns the
+    last routine actually observed — the same "describe the period the data
+    covers" principle ``average_daily_steps`` documents. ``meals_sampled`` and
+    the times still describe a real, contiguous stretch of logging; the caller
+    decides how much to trust an old one (freshness is reported separately by
+    health_quality, and confidence weighting is W1-5).
     """
-    since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=window_days)).isoformat()
+    anchor_rows = await db.fetch_all(
+        "SELECT MAX(eaten_at) AS newest FROM meals WHERE user_id=?",
+        (user_id,),
+    )
+    newest_raw = anchor_rows[0].get("newest") if anchor_rows else None
+    window_end: dt.date | None = None
+    if newest_raw:
+        try:
+            window_end = _to_local(str(newest_raw), tz).date()
+        except ValueError:
+            window_end = None
+    if window_end is None:
+        window_end = dt.datetime.now(tz).date()
+
+    since = (
+        dt.datetime.combine(window_end - dt.timedelta(days=window_days), dt.time.min, tzinfo=tz)
+        .astimezone(dt.timezone.utc)
+        .isoformat()
+    )
+    until = (
+        dt.datetime.combine(window_end + dt.timedelta(days=1), dt.time.min, tzinfo=tz)
+        .astimezone(dt.timezone.utc)
+        .isoformat()
+    )
     rows = await db.fetch_all(
         """
         SELECT eaten_at, calories
         FROM meals
-        WHERE user_id=? AND eaten_at>=?
+        WHERE user_id=? AND eaten_at>=? AND eaten_at<?
         ORDER BY eaten_at
         """,
-        (user_id, since),
+        (user_id, since, until),
     )
     if not rows:
         return EatingWindows()
