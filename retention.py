@@ -124,6 +124,9 @@ async def cleanup_operational_data_once() -> dict[str, int]:
         "audit": (now - timedelta(days=SETTINGS.audit_retention_days)).isoformat(),
         "job_state": (now - timedelta(days=SETTINGS.job_state_retention_days)).isoformat(),
         "approvals": (now - timedelta(days=SETTINGS.approval_retention_days)).isoformat(),
+        "product_events": (
+            now - timedelta(days=SETTINGS.product_events_retention_days)
+        ).isoformat(),
     }
     deleted: dict[str, int] = {}
     deleted["health"] = await _db.DB.execute_rowcount(
@@ -149,6 +152,10 @@ async def cleanup_operational_data_once() -> dict[str, int]:
           AND COALESCE(decided_at, created_at)<?
         """,
         (cutoffs["approvals"],),
+    )
+    deleted["product_events"] = await _db.DB.execute_rowcount(
+        "DELETE FROM product_events WHERE created_at<?",
+        (cutoffs["product_events"],),
     )
     return deleted
 

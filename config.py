@@ -91,6 +91,13 @@ class Settings(BaseSettings):
     audit_retention_days: int = 365
     job_state_retention_days: int = 90
     approval_retention_days: int = 90
+    # product_events is the canonical interaction trace, read by trace_reader,
+    # session_trace, session_review and turn_context. It grows at roughly
+    # 1,150 rows per hour of active use and was the only high-volume table
+    # with no retention at all. The window is deliberately long: purging it
+    # aggressively would break historical reconstruction, which is the whole
+    # point of the table.
+    product_events_retention_days: int = 365
     intraday_calorie_trigger: int = 650  # first "next meals" nudge threshold
 
     # Proactive messaging: useful coaching without notification fatigue.
@@ -179,6 +186,7 @@ class Settings(BaseSettings):
                 self.audit_retention_days,
                 self.job_state_retention_days,
                 self.approval_retention_days,
+                self.product_events_retention_days,
             )
             <= 0
         ):
