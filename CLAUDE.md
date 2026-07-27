@@ -157,3 +157,39 @@ Full local suite runs in two halves (environment long-run limit):
 runs: `compileall -q .`, `ruff check .`, `pytest --cov`, `run_evaluations.py`,
 `build_release.py`, and the forbidden-files gate. A PR is not ready until **both**
 the push- and pull-request-context CI runs are green.
+
+## Completion status vocabulary (mandatory)
+
+**A task requiring a PR merge is not "Complete" until the verified
+implementation is merged AND its reachability from the target branch is
+proven.** Validated-but-unmerged work is not complete: it is validated.
+
+Report status using exactly these terms, never a looser synonym:
+
+| Status | Means |
+|---|---|
+| `IMPLEMENTATION COMPLETE` | code written; validation or merge remains |
+| `VALIDATION COMPLETE` | tests and gates pass; **merge remains** |
+| `WAITING ON EXTERNAL CI` | merge blocked on checks not yet reported |
+| `MERGED` | merged; post-merge verification remains |
+| `COMPLETE` | merged, reachability proven, repository state confirmed |
+
+`COMPLETE` requires a proof, not an assertion:
+
+```
+git merge-base --is-ancestor <verified-commit> develop   # exit 0
+```
+
+Quote the command and its exit code. If the merge strategy does not preserve
+the original commit, prove reachability through the merge commit instead.
+
+**Future-tense statements are not completion evidence.** "I'll merge it when
+green", "this will land once CI passes", "the remaining step is routine" —
+none of these describe an action performed or an artefact observed. A
+completion report states what was *done* and what was *seen*. A promise about
+the next step belongs under a non-`COMPLETE` status.
+
+This rule exists because a report was issued describing merged work while one
+PR was still open and the verified commit was not yet proven reachable. The
+engineering was sound; the classification was not, and a reader would have
+believed the work had landed.
