@@ -148,7 +148,11 @@ async def test_v13_shaped_database_upgrades_successfully(tmp_path: Path) -> None
     assert row["exercise_id"] is None
 
     migrations = await db.fetch_all("SELECT version FROM schema_migrations ORDER BY version")
-    assert [row["version"] for row in migrations] == list(range(1, 15))
+    # Derived from the registry: a v13-shaped database must upgrade through
+    # EVERY registered migration, whatever the newest one happens to be.
+    from db import SCHEMA_MIGRATIONS
+
+    assert [row["version"] for row in migrations] == [v for v, _ in SCHEMA_MIGRATIONS]
 
 
 @pytest.mark.asyncio
