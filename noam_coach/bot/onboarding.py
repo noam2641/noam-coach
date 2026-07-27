@@ -697,7 +697,7 @@ async def advance_after_answer(target: Any, user_id: int) -> None:
             return
         plan = await build_weekly_plan(user_id, freq)
         await message.reply_text(
-            format_weekly_plan(plan),
+            format_weekly_plan(plan, await active_pain_regions_for(user_id)),
             reply_markup=InlineKeyboardMarkup(
                 [
                     [button("🏋️ התחל אימון", "menu:workout")],
@@ -2673,8 +2673,46 @@ async def build_weekly_plan(user_id: int, frequency: int) -> dict[str, Any]:
 
 
 @runtime_bound(RUNTIME_NAMES)
-def format_weekly_plan(plan: dict[str, Any]) -> str:
+async def active_pain_regions_for(user_id: int) -> dict[str, Any]:
+    """Active pain regions for a user, for screens that render a plan.
+
+    Best-effort: a telemetry or query failure must not stop a plan from
+    rendering, but it must also not silently pretend there are no
+    constraints -- so the failure path returns an empty map and the caller
+    renders exactly what it would have rendered before.
+    """
+    try:
+        rows = await DB.fetch_all(
+            "SELECT * FROM medical_constraints WHERE user_id=? AND kind='pain'",
+            (user_id,),
+        )
+        return training_intelligence.active_pain_regions(rows)
+    except Exception:  # noqa: BLE001 — never block a plan render
+        LOGGER.debug("pain region lookup failed for %s", user_id, exc_info=True)
+        return {}
+
+
+@runtime_bound(RUNTIME_NAMES)
+def format_weekly_plan(
+    plan: dict[str, Any],
+    pain_regions: dict[str, Any] | None = None,
+) -> str:
+    """Render the weekly plan.
+
+    ``pain_regions`` is the output of
+    ``training_intelligence.active_pain_regions``. When supplied, every
+    exercise that loads an affected joint is marked inline.
+
+    That marking is the point. In the 2026-07-27 session this screen listed
+    barbell squats and leg press three separate times to a user with an
+    active right-knee constraint, with no knee warning anywhere -- while the
+    live set card *did* warn, so the safety information existed and simply
+    never reached the screen where the user chooses what to do. The plan is
+    read before training; the set card only appears once the exercise is
+    already underway.
+    """
     structure = plan.get("structure") or "תוכנית אימונים"
+    regions = pain_regions or {}
     lines = [
         f"<b>התוכנית השבועית שלך — {plan['frequency']} אימונים</b>",
         f"מבנה: {esc(str(structure))}",
@@ -2682,6 +2720,16 @@ def format_weekly_plan(plan: dict[str, Any]) -> str:
         "<i>כל יום מוצג עם התרגילים המרכזיים, סטים, חזרות, מנוחה ודגש קצר — לא רק שם האימון.</i>",
         "",
     ]
+    if regions:
+        labels = ", ".join(
+            str(getattr(region, "label", key)) for key, region in sorted(regions.items())
+        )
+        lines += [
+            f"⚠️ <b>רשומה אצלך מגבלה פעילה ({esc(labels)}).</b> "
+            "תרגילים שמעמיסים על האזור מסומנים למטה — דלג או החלף אותם "
+            "אם יש כאב.",
+            "",
+        ]
     sorted_sessions = sorted(plan["sessions"], key=lambda s: sunday_first_key(s["weekday"]))
     for i, s in enumerate(sorted_sessions, start=1):
         when = weekday_he(s["weekday"])
@@ -2697,10 +2745,27 @@ def format_weekly_plan(plan: dict[str, Any]) -> str:
             cues = ex.get("cues") or []
             if cues:
                 cue = f" · דגש: {esc(str(cues[0]))}"
+            # Mark the exercise when it loads a joint the user reported pain
+            # in. The joint map is the same CATALOG the live set card uses, so
+            # the two screens cannot disagree about which exercises are
+            # affected.
+            caution = ""
+            if regions:
+                profile = training_intelligence.CATALOG.get(str(ex.get("id")))
+                hit = next(
+                    (
+                        regions[joint]
+                        for joint in (getattr(profile, "joint_load", None) or ())
+                        if joint in regions
+                    ),
+                    None,
+                )
+                if hit is not None:
+                    caution = f" ⚠️ <i>({esc(str(getattr(hit, 'label', '')))})</i>"
             lines.append(
                 f"  {ex_index}. {esc(str(ex.get('name') or ex.get('name_he') or 'תרגיל'))} — "
                 f"{int(ex.get('sets') or 0)}×{int(ex.get('rmin') or 0)}–{int(ex.get('rmax') or 0)}, "
-                f"מנוחה {rest_label}, RIR 2{cue}"
+                f"מנוחה {rest_label}, RIR 2{cue}{caution}"
             )
         lines.append("")
     if plan.get("days_source") == "default":
@@ -2903,7 +2968,7 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
             return True
         plan = await build_weekly_plan(user_id, frequency)
         await message.reply_text(
-            format_weekly_plan(plan),
+            format_weekly_plan(plan, await active_pain_regions_for(user_id)),
             reply_markup=InlineKeyboardMarkup(
                 [
                     [button("🏋️ התחל אימון", "menu:workout")],
