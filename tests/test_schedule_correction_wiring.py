@@ -163,10 +163,18 @@ async def test_the_correction_is_attempted_before_any_acknowledgement(
 
 
 def test_the_handler_calls_the_service_and_owns_no_parser() -> None:
-    """The wiring must not duplicate the parsing that W1-8 already owns."""
+    """The wiring must not duplicate the parsing that W1-8 already owns.
+
+    `inspect.unwrap` is required: `runtime_bound` decorates the handler, so
+    `getsource` on the bound name returns the *wrapper* and this assertion
+    fails while the wiring is perfectly correct. That false negative is the
+    reason source inspection is only ever a supplement here -- the behavioural
+    tests above are what actually prove the call happens.
+    """
     import inspect
 
-    source = inspect.getsource(assistant_bot._handle_redundant_question_challenge)
+    handler = inspect.unwrap(assistant_bot._handle_redundant_question_challenge)
+    source = inspect.getsource(handler)
     assert "apply_schedule_correction" in source
     assert "weekday" not in source.lower(), (
         "weekday parsing belongs to health_jobs, not to the dispatch site"
