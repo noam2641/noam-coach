@@ -1036,7 +1036,6 @@ async def handle_onboarding_callback(query: Any, user_id: int, data: str) -> Non
                 "sensitivity": "רגישות",
             }
             type_label = type_labels.get(restriction_type, restriction_type)
-            await _mark_no_allergies_if_missing(user_id)
             # Review 2026-07-18_1 / F-08: the chosen level used to survive
             # only in the ack text — persist it per item so the profile and
             # future menu logic can distinguish a soft preference from a
@@ -1051,6 +1050,14 @@ async def handle_onboarding_callback(query: Any, user_id: int, data: str) -> Non
                     source=user_model.SOURCE_USER,
                     confirmed=True,
                 )
+            # AFTER the level is persisted, so the item just classified counts
+            # as done. Only close the allergy question once nothing the user
+            # named is still unclassified: classifying one food says nothing
+            # about the others, and in the live session the unclassified
+            # remainder was "טורטייה ואגוזים" -- it included nuts.
+            await _mark_no_allergies_if_missing(
+                user_id, items_left=await _unclassified_restriction_count(user_id)
+            )
             await safe_edit(
                 query,
                 f"רשמתי: {esc(food_item)} — {esc(type_label)} ✅",
@@ -1326,8 +1333,56 @@ async def _existing_list_value(user_id: int, key: str) -> list[str]:
 
 
 @runtime_bound(RUNTIME_NAMES)
-async def _mark_no_allergies_if_missing(user_id: int) -> bool:
-    """Close the allergy question when a typed food was classified as non-allergy."""
+@runtime_bound(RUNTIME_NAMES)
+async def _unclassified_restriction_count(user_id: int) -> int:
+    """How many named dietary items still have no per-item classification.
+
+    The free-text answer can name several foods ("חציל, טורטייה ואגוזים"),
+    but only the first is ever put through the "how should I treat X?"
+    keyboard. The rest land in ``diet_restrictions`` with no entry in
+    ``diet_restriction_levels`` -- unclassified, and in particular not ruled
+    out as allergies.
+
+    Counting is deliberately conservative: an item is "classified" only on an
+    exact match, so a compound entry the splitter did not separate (Hebrew
+    "טורטייה ואגוזים" is two foods joined by a prefixed vav) stays counted as
+    outstanding. Over-counting keeps the allergy question open; under-counting
+    would close it on a food nobody ever asked about.
+    """
+    named = await _existing_list_value(user_id, "diet_restrictions")
+    named = [item for item in named if item and item.lower() != "none"]
+    if not named:
+        return 0
+
+    levels_fact = await user_model.get_fact(DB, user_id, "diet_restriction_levels")
+    levels = levels_fact.get("value") if levels_fact else None
+    if not isinstance(levels, dict):
+        levels = {}
+
+    classified = {str(key).strip() for key in levels}
+    return sum(1 for item in named if item.strip() not in classified)
+
+
+async def _mark_no_allergies_if_missing(user_id: int, *, items_left: int = 0) -> bool:
+    """Close the allergy question when EVERY named food was classified non-allergy.
+
+    Allergies are safety data. This used to fire after classifying a single
+    food, writing ``allergies="none"`` with ``source=SOURCE_USER,
+    confirmed=True`` -- asserting the user had declared they have no
+    allergies when no allergy question had been asked at all.
+
+    In the 2026-07-27 session the user named three foods
+    ("חציל, טורטייה ואגוזים"), only the first was ever classified, and the
+    system recorded "no allergies" in the same instant -- while the
+    unclassified remainder included **nuts**, the most common serious
+    allergen. A confirmed "none" then propagates into menu generation as
+    fact.
+
+    ``items_left`` is the count of named foods still awaiting
+    classification; while any remain, the question stays open.
+    """
+    if items_left > 0:
+        return False
     fact = await user_model.get_fact(DB, user_id, "allergies")
     if fact is not None and fact.get("kind") != user_model.KIND_GAP:
         return False
@@ -1337,8 +1392,12 @@ async def _mark_no_allergies_if_missing(user_id: int) -> bool:
         "allergies",
         "none",
         kind=user_model.KIND_FACT,
-        source=user_model.SOURCE_USER,
-        confirmed=True,
+        # Inferred from "the user classified every food they named and none
+        # was an allergy" -- NOT a statement the user made. SOURCE_DERIVED
+        # and confirmed=False keep it correctable and stop it being replayed
+        # as the user's own declaration.
+        source=user_model.SOURCE_DERIVED,
+        confirmed=False,
         affects=("menu_planning", "safety"),
     )
     return True
