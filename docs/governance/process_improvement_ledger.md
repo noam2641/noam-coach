@@ -257,6 +257,58 @@ passes.
 
 ---
 
+## PIL-007 · Long verification runs silently destroyed by branch switches
+
+| | |
+|---|---|
+| **Date** | 2026-07-27 |
+| **Work item** | W1-8 validation (PRs #52, #54) |
+
+**Observed failure.** The full required suite was started three times and
+killed twice — not by a test failure, but because the manager switched
+branches mid-run to open a PR or query CI. The suite runs from the working
+tree, so a checkout mid-flight leaves it executing against files that no
+longer match the branch under test.
+
+**Immediate impact.** Roughly 40 minutes of wall-clock verification lost.
+Worse than the delay: the loss is **silent**. The background task reports
+`exit code 0` and the output file contains only the echoed branch name, so a
+careless reading would record it as a passing run. This is a reporting
+hazard, not only a scheduling one.
+
+**Technical root cause.** One working tree shared between long-running
+verification and short interactive git operations.
+
+**Process root cause.** The manager treated "start the suite" as fire-and-
+forget and continued using the same checkout. No rule reserved the tree for
+the duration of a run.
+
+**Why existing controls missed it.** Nothing distinguishes "exited 0 having
+run 2,800 tests" from "exited 0 having been truncated after printing one
+line". Exit status alone is not evidence of coverage.
+
+**Corrective action.** The run was repeated on a checkout left untouched
+until it reported.
+
+**Preventive process change.** Manager verification rule:
+
+1. A long verification run **reserves its checkout**. Do not switch branches,
+   stash, or check out anything in that tree until it reports. PR and CI work
+   during a run goes to a separate worktree.
+2. **A suite result counts as evidence only if its output contains an explicit
+   pass/fail count.** Exit code 0 with no summary line is a truncated run and
+   must be re-executed, never reported as passing.
+
+**Manager instructions updated.** This entry; propagated to the report format
+— any claim of "full suite passes" must quote the count.
+
+**Validation evidence.** The authoritative run for #54 was executed on a
+reserved checkout and its summary line quoted verbatim in the final report.
+
+**Status.** Implemented.
+
+---
+
 ## Manager self-review — WAVE-1 batch 3
 
 **What worked.** Pre-flight inspection before writing a brief reshaped two
