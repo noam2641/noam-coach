@@ -12,7 +12,19 @@ contract changes incompatibly; readers can then branch on
 from __future__ import annotations
 
 # interaction.*
+#
+# ``interaction.received`` opens the lifecycle; ``interaction.completed``
+# CLOSES it. Both are required for an interaction to be well-formed: a
+# received-without-completed row is an interaction that was dropped mid-flight
+# (process died, task cancelled), and is now detectable as such.
+#
+# Why a terminal event exists at all: ``routing.decided`` is written BEFORE
+# dispatch, so it proves only that a handler was CHOSEN — not that one ran or
+# produced anything. A callback whose route resolved to a handler that does
+# not exist looked identical, in the event stream, to a working button. The
+# terminal event records what actually happened after dispatch.
 INTERACTION_RECEIVED = "interaction.received"
+INTERACTION_COMPLETED = "interaction.completed"
 
 # routing.*
 ROUTING_DECIDED = "routing.decided"

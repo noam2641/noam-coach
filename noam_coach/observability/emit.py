@@ -32,9 +32,31 @@ import event_log
 from noam_coach.observability import obs_context
 from noam_coach.observability.modes import ObservabilityMode, get_mode
 from noam_coach.observability.redaction import redact
-from noam_coach.observability.taxonomy import OBSERVABILITY_WRITE_FAILED, event_version
+from noam_coach.observability.taxonomy import (
+    DELIVERY_ATTEMPTED,
+    DELIVERY_SUCCEEDED,
+    OBSERVABILITY_WRITE_FAILED,
+    UI_RENDER_PREPARED,
+    UI_VIEW_RENDERED,
+    event_version,
+)
 
 LOGGER = logging.getLogger("noam_coach.observability")
+
+# Events that prove the interaction produced something for the user.
+#
+# ``delivery.attempted`` counts deliberately: an interaction that TRIED to
+# answer and failed at the transport is a delivery defect, not a routing
+# black hole, and the two must not collapse into the same outcome. The
+# accompanying ``delivery.failed`` is what distinguishes them.
+RESPONSE_EVENTS: frozenset[str] = frozenset(
+    {
+        UI_RENDER_PREPARED,
+        UI_VIEW_RENDERED,
+        DELIVERY_ATTEMPTED,
+        DELIVERY_SUCCEEDED,
+    }
+)
 
 # In-process health state: observability degradation must stay detectable
 # even when event persistence itself is what failed.
@@ -103,6 +125,15 @@ async def emit_event(
     ``properties`` is correlation/metadata (kept in every non-OFF mode).
     ``content`` is conversational/payload material governed by the mode.
     """
+    if event in RESPONSE_EVENTS:
+        # Response evidence is scope state, not a persisted row: record it
+        # before the mode gate so an interaction's outcome does not silently
+        # change meaning when capture is dialled down.
+        try:
+            obs_context.mark_response()
+        except Exception:  # noqa: BLE001 — rule 1: never break coaching.
+            pass
+
     mode = get_mode()
     if mode is ObservabilityMode.OFF:
         return None
