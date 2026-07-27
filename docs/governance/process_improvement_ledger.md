@@ -257,35 +257,59 @@ passes.
 
 ---
 
-## PIL-007 · Long verification runs silently destroyed by branch switches
+## PIL-007 · A suite result asserted from its file size instead of its output
 
 | | |
 |---|---|
 | **Date** | 2026-07-27 |
 | **Work item** | W1-8 validation (PRs #52, #54) |
 
-**Observed failure.** The full required suite was started three times and
-killed twice — not by a test failure, but because the manager switched
-branches mid-run to open a PR or query CI. The suite runs from the working
-tree, so a checkout mid-flight leaves it executing against files that no
-longer match the branch under test.
+> **This entry was itself corrected.** Its first version claimed the suite had
+> been "killed twice by branch switches". Reading the output files properly
+> showed that only **one** run was truncated; the other two had completed, and
+> one of them had caught a real test failure. The corrected entry is below —
+> the original error is preserved here because a ledger that quietly rewrites
+> its own findings is worth less than one that shows them being corrected.
 
-**Immediate impact.** Roughly 40 minutes of wall-clock verification lost.
-Worse than the delay: the loss is **silent**. The background task reports
-`exit code 0` and the output file contains only the echoed branch name, so a
-careless reading would record it as a passing run. This is a reporting
-hazard, not only a scheduling one.
+**Observed failure.** The manager characterised two completed suite runs as
+"killed by branch switches" and reported that no count existed. Both had in
+fact finished, and one reported `1 failed, 2894 passed` — the failure being a
+real defect in a test's own assertion. The manager inferred truncation from a
+small output file and a `tail` that showed only the last lines.
 
-**Technical root cause.** One working tree shared between long-running
-verification and short interactive git operations.
+**Immediate impact.** A real test failure was nearly dismissed as
+infrastructure noise. It was caught only because the file was eventually read
+in full rather than tailed.
 
-**Process root cause.** The manager treated "start the suite" as fire-and-
-forget and continued using the same checkout. No rule reserved the tree for
-the duration of a run.
+**Technical root cause (secondary, real).** One run *was* genuinely truncated
+by a mid-run branch switch, since the suite executes from the working tree.
+That much of the original entry holds.
 
-**Why existing controls missed it.** Nothing distinguishes "exited 0 having
-run 2,800 tests" from "exited 0 having been truncated after printing one
-line". Exit status alone is not evidence of coverage.
+**Process root cause.** Reporting from a proxy — file size, exit code, the
+last three lines — instead of from the artefact. Every wrong claim in this
+episode came from summarising output that had not been read.
+
+**Why existing controls missed it.** Nothing forced reading a result before
+characterising it, and `tail` on a `--tb=short` run ending in a failure summary
+genuinely looks sparse.
+
+**Corrective action.** Every suite output was read in full and reconciled
+against the commit it ran on. The one real failure was fixed (`84db9d0`).
+
+**Preventive process change.** Two rules, both narrower and more useful than
+the original entry's:
+
+1. **Never characterise a run without reading its output.** Not the size, not
+   the exit code, not the tail — the file. Exit 0 proves nothing about
+   coverage, and a small file may contain a failure rather than nothing.
+2. **A long verification run reserves its checkout.** Concurrent PR and CI
+   work goes to a separate worktree. This one is enforced structurally: the
+   verification worktree exists, and git refused a checkout of a branch it
+   held — blocking the mistake mechanically rather than by discipline.
+
+**Validation evidence.** The authoritative run is quoted verbatim in the final
+report with its count (`2895 passed, 1 skipped`), the commit it ran on, and
+the worktree it ran in.
 
 **Corrective action.** The run was repeated on a checkout left untouched
 until it reported.
