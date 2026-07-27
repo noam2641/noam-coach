@@ -195,8 +195,18 @@ async def assess_day(
 
 
 async def active_goal_quality(db: Any, user_id: int) -> QualityReport:
+    # 'active_provisional' is an ACTIVE goal the user chose to use before final
+    # approval -- planning.active_goal and the db.py migrations both treat the
+    # two statuses together. This query did not, so a user whose only goal was
+    # provisional scored 0.0 ("no_active_goal") instead of 0.55, and
+    # can_send_proactive refused every gated message with
+    # goal_quality_insufficient. That silently blocked morning_menu, evening,
+    # weekly_summary, overpace_alert and intraday_nudge indefinitely; the
+    # provisional branch below existed but was unreachable for exactly the
+    # users it was written for.
     goal = await db.fetch_one(
-        "SELECT * FROM goal_versions WHERE user_id=? AND status='active' ORDER BY id DESC LIMIT 1",
+        "SELECT * FROM goal_versions WHERE user_id=? "
+        "AND status IN ('active', 'active_provisional') ORDER BY id DESC LIMIT 1",
         (user_id,),
     )
     if not goal:

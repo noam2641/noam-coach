@@ -438,7 +438,11 @@ async def _handle_workout_menu_actions(
         return True
 
     if data == "menu:app":
-        url = mini_app_url(user_id)
+        # for_web_app_button: Telegram rejects a non-HTTPS web-app URL
+        # server-side, so a localhost base URL must NOT produce a button here
+        # -- every tap failed with a BadRequest and fell back to a plain
+        # message anyway.
+        url = mini_app_url(user_id, for_web_app_button=True)
         if url:
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🌐 פתח Mini App", web_app=WebAppInfo(url=url))],
@@ -448,7 +452,11 @@ async def _handle_workout_menu_actions(
         else:
             await safe_edit(
                 query,
-                "Mini App עדיין לא הוגדר (PUBLIC_BASE_URL חסר).",
+                "Mini App עדיין לא זמין.\n\n"
+                "צריך כתובת HTTPS ציבורית: הפעל את השרת המקומי, פתח מנהרת "
+                "Cloudflare אליו, והעתק את כתובת ה-HTTPS אל PUBLIC_BASE_URL "
+                "בקובץ .env.\n\n"
+                "הוראות מלאות: docs/MINIAPP_SETUP.md",
                 InlineKeyboardMarkup([[button("⬅️ תפריט", "menu:home")]]),
             )
         return True

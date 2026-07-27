@@ -198,13 +198,20 @@ _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
 @runtime_bound(RUNTIME_NAMES)
-def _is_valid_public_url(url: str) -> bool:
+def _is_valid_public_url(url: str, *, for_web_app_button: bool = False) -> bool:
     """Return whether Mini App access is usable in the current environment.
 
     Production accepts only a real HTTPS host.  Development also permits
     localhost over HTTP so the complete Mini App can be tested without buying
     a server.  A phone still needs an HTTPS tunnel because its localhost is not
     the developer's computer.
+
+    ``for_web_app_button`` tightens that dev allowance for the one case where
+    it cannot hold: Telegram validates a web-app URL server-side and rejects
+    anything non-HTTPS outright ("Inline keyboard button web app url
+    'http://127.0.0.1:8000...'"). Offering the button anyway meant every tap
+    failed with a BadRequest, so the dev exemption produced a button that
+    could never work rather than a testable one.
     """
     if not url:
         return False
@@ -214,14 +221,20 @@ def _is_valid_public_url(url: str) -> bool:
     host = (parsed.hostname or "").lower()
     if not host or host in _BLOCKED_HOSTS or host.endswith(".example.com"):
         return False
-    if SETTINGS.app_env == "dev" and host in _LOCAL_HOSTS:
+    if (
+        not for_web_app_button
+        and SETTINGS.app_env == "dev"
+        and host in _LOCAL_HOSTS
+    ):
         return parsed.scheme in {"http", "https"}
     return parsed.scheme == "https"
 
 
 @runtime_bound(RUNTIME_NAMES)
-def mini_app_url(user_id: int) -> str | None:
-    if not _is_valid_public_url(SETTINGS.public_base_url or ""):
+def mini_app_url(user_id: int, *, for_web_app_button: bool = False) -> str | None:
+    if not _is_valid_public_url(
+        SETTINGS.public_base_url or "", for_web_app_button=for_web_app_button
+    ):
         return None
     base = SETTINGS.public_base_url.rstrip("/")
     token = make_mini_token(
@@ -239,7 +252,7 @@ async def command_app(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     user_id = await ensure_user(update)
     await track_event(user_id, "command_app")
-    url = mini_app_url(user_id)
+    url = mini_app_url(user_id, for_web_app_button=True)
     if not url:
         await update.effective_message.reply_text(
             "Mini App עדיין לא זמין.\n\n"

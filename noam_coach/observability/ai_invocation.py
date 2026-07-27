@@ -217,6 +217,19 @@ class _ObservedResponses:
                         "error_type": type(exc).__name__,
                         "failure_class": _classify_failure(exc),
                     },
+                    # The message goes in CONTENT, not properties: provider
+                    # errors routinely echo the rejected request, which for
+                    # this product means meal text and profile details.
+                    # Content is mode-gated and digested under METADATA;
+                    # properties are always retained in full.
+                    #
+                    # Recording it at all is the point. Every intent
+                    # classification failed with BadRequestError for months
+                    # and only error_type was kept, so the events said "9 of 9
+                    # failed" without ever saying why -- the reason (a
+                    # free-form dict is illegal under strict mode) was in the
+                    # message that was thrown away.
+                    content={"error_message": _error_message(exc)},
                 )
                 raise
             output_content, output_kind = _output_snapshot(operation, response)
@@ -242,6 +255,26 @@ class _ObservedResponses:
                 content=output_content,
             )
             return response
+
+
+#: Provider errors can carry an entire rejected request body. The diagnostic
+#: value is in the opening sentence; the rest is bulk.
+_MAX_ERROR_MESSAGE_CHARS = 300
+
+
+def _error_message(exc: BaseException) -> str:
+    """The exception's own message, bounded.
+
+    Truncation is by length only -- redaction is emit_event's job and applies
+    to content as well, so no attempt is made to scrub here.
+    """
+    try:
+        message = str(exc).strip()
+    except Exception:  # noqa: BLE001 — a __str__ that raises must not mask the real error
+        return ""
+    if len(message) <= _MAX_ERROR_MESSAGE_CHARS:
+        return message
+    return message[:_MAX_ERROR_MESSAGE_CHARS] + "…"
 
 
 def _classify_failure(exc: BaseException) -> str:
