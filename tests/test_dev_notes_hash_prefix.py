@@ -117,15 +117,65 @@ def test_leading_hash_hash_is_a_dev_note() -> None:
     assert dev_notes_service.is_dev_note("  ##עם רווח מוביל")
 
 
-def test_single_hash_is_not_a_dev_note() -> None:
-    """The old protocol used a single '#'. Only '##' counts now."""
+def test_wrapped_single_hash_is_a_dev_note() -> None:
+    """The form that is actually typed.
+
+    The guard originally accepted only '##'. In the 2026-07-27 session all
+    five developer notes used '#...#' and every one fell through to intent
+    classification -- one was stored as a confirmed nutrition fact, another
+    regenerated the weekly workout plan mid-set.
+    """
+    assert dev_notes_service.is_dev_note("#לצמצם את הכתב#")
+    assert dev_notes_service.is_dev_note(
+        "#לדעתי אמרתי לו שאני מתאמן בשישי לא בשבת#"
+    )
+
+
+def test_bare_leading_single_hash_is_not_a_dev_note() -> None:
+    """Without a closing marker a single '#' is ordinary text.
+
+    "#3 בבוקר" is a plausible thing to type at a coach; requiring the closing
+    hash is what makes the single-hash form safe to accept at all.
+    """
     assert not dev_notes_service.is_dev_note("#לצמצם את הכתב")
+    assert not dev_notes_service.is_dev_note("#3 בבוקר")
+
+
+def test_lone_hash_is_not_a_dev_note() -> None:
+    assert not dev_notes_service.is_dev_note("#")
+    assert not dev_notes_service.is_dev_note("")
+
+
+def test_wrapped_note_strips_both_markers() -> None:
+    assert dev_notes_service.strip_prefix("#לצמצם את הכתב#") == "לצמצם את הכתב"
 
 
 def test_hash_inside_text_is_not_a_dev_note() -> None:
     """A '#' mid-message is ordinary user text and must stay routable."""
     assert not dev_notes_service.is_dev_note("כמה קלוריות יש ב#1?")
     assert not dev_notes_service.is_dev_note("אכלתי סטייק ## טעים")
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        "#הייתי רוצה שישאל אותי על כולם איך היתי רוצה שאתייחס הוא שאל רק על חציל#",
+        "#לדעתי אמרתי לו שאני מתאמן בשישי לא בשבת#",
+        "#זה ארוחה שלא אישרתי לכן לא אמור להופיע לי ההודעה הזאת#",
+        "#אני רוצה שנחשוב איך בסט מפוצל נוכל לעשות את זה בלי לחצנים לשקל#",
+        "#הוא לא זיהה שיום שבת השעת אימון שלי שונה אני מתאמן בבוקר#",
+    ],
+)
+def test_every_real_note_from_the_live_session_is_caught(note: str) -> None:
+    """The exact five messages the guard failed to catch in production.
+
+    Each of these was classified as user speech instead. Their real
+    consequences: one became `user_facts.food_environment_context` with
+    confirmed=1, one was classified `build_plan` and rebuilt the training
+    week mid-set, three were answered with a help menu.
+    """
+    assert dev_notes_service.is_dev_note(note)
+    assert "#" not in dev_notes_service.strip_prefix(note)
 
 
 def test_strip_prefix_removes_marker_only() -> None:
