@@ -1896,7 +1896,17 @@ async def apply_schedule_correction(user_id: int, text: str) -> tuple[bool, str]
         DB, user_id, "detected_training_days", updated,
         kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
     )
-    await _realign_active_workout_plan_weekdays(user_id, updated)
+    # The fact-tier `active_workout_plan` is deliberately NOT realigned here.
+    # An architecture guard restricts direct readers of that fact to an
+    # allowlist and routes everyone else through `workout_catalog` -- which
+    # today exposes readers only, with no way to write a corrected weekday
+    # back. Broadening the allowlist to make this file a reader is exactly
+    # what that guard's failure message says not to do silently.
+    #
+    # Consequence, recorded rather than hidden: after a correction the
+    # availability stores say Friday while a stored plan may still schedule
+    # Saturday, until the plan is rebuilt. Closing that needs a write path in
+    # workout_catalog (and, for Tier-1, in planning.py) -- a separate task.
 
     labels = ", ".join(weekday_labels_he(updated))
     reply = f"עודכן: ימי אימון — {labels} ✅"
@@ -1948,37 +1958,6 @@ async def _current_training_hour(user_id: int) -> str | None:
                 if isinstance(start, str) and len(start) == 5 and start[2] == ":":
                     return start
     return None
-
-
-async def _realign_active_workout_plan_weekdays(user_id: int, weekdays: list[int]) -> None:
-    """Re-pin the fact-tier weekly plan's sessions onto the corrected weekdays.
-
-    Only the ``weekday`` field moves — session codes, names and order are the
-    user's plan and are not this function's to rewrite. If the plan has more
-    sessions than corrected days (or none at all) it is left untouched and the
-    mismatch is surfaced by the normal plan-rebuild path rather than being
-    papered over here.
-    """
-    plan = await user_model.get_value(DB, user_id, "active_workout_plan")
-    if not isinstance(plan, dict):
-        return
-    sessions = plan.get("sessions")
-    if not isinstance(sessions, list) or not sessions:
-        return
-    if len(sessions) != len(weekdays):
-        return
-    realigned = [
-        {**session, "weekday": day}
-        for session, day in zip(sessions, weekdays)
-        if isinstance(session, dict)
-    ]
-    if len(realigned) != len(sessions):
-        return
-    await user_model.set_fact(
-        DB, user_id, "active_workout_plan",
-        {**plan, "sessions": realigned, "weekday_schema": WEEKDAY_SCHEMA_VERSION},
-        kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
-    )
 
 
 async def skip_health_wizard_item(user_id: int, step_id: str) -> None:
