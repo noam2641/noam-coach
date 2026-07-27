@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 
+import coach_bot
 from noam_coach.bot import assistant as assistant_bot
 
 
@@ -169,4 +170,105 @@ def test_the_handler_calls_the_service_and_owns_no_parser() -> None:
     assert "apply_schedule_correction" in source
     assert "weekday" not in source.lower(), (
         "weekday parsing belongs to health_jobs, not to the dispatch site"
+    )
+
+
+# ---------------------------------------------------------------------------
+# End-to-end delta and truthfulness, through the real service.
+#
+# The handler tests above stub the service to prove the WIRING. These drive
+# the real one to prove the SEMANTICS survive that wiring -- a correctly
+# wired call to a wrong delta would pass every test above.
+# ---------------------------------------------------------------------------
+import os  # noqa: E402
+import tempfile  # noqa: E402
+
+import user_model  # noqa: E402
+from db import Database  # noqa: E402
+from noam_coach.services import health_jobs  # noqa: E402
+
+LIVE_DAYS = [0, 2, 5, 6]  # Mon, Wed, Sat, Sun -- the live user's stored set
+FRIDAY, SATURDAY = 4, 5
+
+
+async def _seeded_db() -> Database:
+    db = Database(os.path.join(tempfile.mkdtemp(), "wiring.db"))
+    await db.init()
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(1,'T',NULL,'x')"
+    )
+    slots = [
+        {
+            "weekday": day,
+            "start": "18:00",
+            "minutes": 45,
+            "available": True,
+            "weekday_schema": "monday_first_v1",
+        }
+        for day in LIVE_DAYS
+    ]
+    await user_model.set_fact(
+        db, 1, "weekly_availability", slots,
+        kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
+    )
+    await user_model.set_fact(
+        db, 1, "active_training_days", LIVE_DAYS,
+        kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
+    )
+    return db
+
+
+def _bind(monkeypatch: pytest.MonkeyPatch, db: Database) -> None:
+    for module in (coach_bot, health_jobs, user_model):
+        if hasattr(module, "DB"):
+            monkeypatch.setattr(module, "DB", db)
+
+
+async def _days(db: Database) -> set[int]:
+    slots = await user_model.get_value(db, 1, "weekly_availability")
+    return {int(s["weekday"]) for s in slots if s.get("available", True)}
+
+
+@pytest.mark.asyncio
+async def test_saturday_is_removed_not_merely_friday_added(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """{0,2,5,6} -> {0,2,4,6}. The displaced day must leave the set."""
+    db = await _seeded_db()
+    _bind(monkeypatch, db)
+
+    applied, _ = await health_jobs.apply_schedule_correction(1, LIVE)
+
+    assert applied is True
+    days = await _days(db)
+    assert days == {0, 2, FRIDAY, 6}
+    assert SATURDAY not in days, "adding Friday while keeping Saturday is not a fix"
+
+
+@pytest.mark.asyncio
+async def test_the_reply_does_not_claim_the_saved_plan_changed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Truthfulness: only availability moved, so only availability is claimed.
+
+    The saved plan is deliberately untouched (no supported mutation API --
+    see W1-44). A reply implying otherwise would be a defect even though the
+    availability change itself is correct.
+    """
+    db = await _seeded_db()
+    _bind(monkeypatch, db)
+    await user_model.set_fact(
+        db, 1, "active_workout_plan",
+        {"sessions": [{"weekday": SATURDAY, "code": "C", "name": "Legs"}]},
+        kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
+    )
+
+    applied, reply = await health_jobs.apply_schedule_correction(1, LIVE)
+
+    assert applied is True
+    assert "תוכנית" not in reply, "the reply must not claim the plan was updated"
+
+    plan = await user_model.get_value(db, 1, "active_workout_plan")
+    assert [s["weekday"] for s in plan["sessions"]] == [SATURDAY], (
+        "the saved plan is intentionally unchanged until W1-44 lands"
     )
