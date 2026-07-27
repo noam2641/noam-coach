@@ -586,11 +586,36 @@ class Database:
         async with self.transaction() as connection:
             await connection.executemany(sql, seq_of_parameters)
 
+    def _is_materialised(self) -> bool:
+        """True when connecting will not CREATE the database file.
+
+        sqlite creates a database on connect, so a *read* against a path that
+        does not exist silently materialises an empty one. ``database_path``
+        defaults to ``./noam_coach.db`` -- the repo root -- and CI has no
+        ``.env``, so any read reached before ``init()`` leaves a stray file
+        there and the forbidden-files guards fail.
+
+        This reached CI twice from two unrelated features (a plan-render pain
+        lookup and a plan-confirmation gate), each fixed at its own call site.
+        There are ~67 read sites; guarding them individually is a losing race,
+        so the check lives here, at the one chokepoint every read passes.
+
+        In-memory databases are always materialised -- there is no file to
+        create.
+        """
+        return self.path == ":memory:" or Path(self.path).exists()
+
     async def fetch_one(
         self,
         sql: str,
         parameters: tuple[Any, ...] = (),
     ) -> dict[str, Any] | None:
+        # A read before init() has nothing to return, and connecting would
+        # create the file. Writes are deliberately NOT guarded: they are
+        # expected to run against an initialised database, and silently
+        # dropping one would hide a real bug.
+        if not self._is_materialised():
+            return None
         async with self._connect() as connection:
             connection.row_factory = aiosqlite.Row
             await self._prepare(connection)
@@ -603,6 +628,8 @@ class Database:
         sql: str,
         parameters: tuple[Any, ...] = (),
     ) -> list[dict[str, Any]]:
+        if not self._is_materialised():
+            return []
         async with self._connect() as connection:
             connection.row_factory = aiosqlite.Row
             await self._prepare(connection)
