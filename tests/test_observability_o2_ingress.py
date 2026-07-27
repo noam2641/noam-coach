@@ -104,7 +104,13 @@ async def test_text_interaction_has_one_stable_interaction_id(db: Database) -> N
     await wrapped(_update(text="מה לאכול עכשיו?"), None)
 
     events = await trace_reader.events_for_interaction(db, ALLOWED_USER_ID, seen["interaction_id"])
-    assert [e.event for e in events] == ["interaction.received", "context.built"]
+    # W1-12 appended the terminal event: the interaction now CLOSES. The
+    # opening events and their order are unchanged.
+    assert [e.event for e in events] == [
+        "interaction.received",
+        "context.built",
+        "interaction.completed",
+    ]
     received = events[0]
     assert received.trace_id == seen["trace_id"]
     assert received.surface == "telegram"

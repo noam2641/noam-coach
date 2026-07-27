@@ -9,6 +9,10 @@ or the (protected) handler modules:
    and emits ``interaction.received`` (plus ``ui.control.activated`` for
    callbacks) before delegating to the real handler. Every ``emit_event``
    deeper in the same asyncio task inherits the correlation automatically.
+   The scope is opened via ``observed_interaction`` (W1-12), which CLOSES
+   the lifecycle with ``interaction.completed`` on every exit path — so an
+   interaction that reaches no handler is distinguishable from one that
+   worked, which ``routing.decided`` alone (written before dispatch) is not.
 
 2. ROUTING — :func:`install_routing_observer` wraps
    ``ConversationRouter.route`` and records ``routing.decided`` from the
@@ -34,7 +38,8 @@ from typing import Any, Awaitable, Callable
 import conversation
 from noam_coach.observability import taxonomy
 from noam_coach.observability.emit import emit_event
-from noam_coach.observability.obs_context import interaction_scope, span_scope
+from noam_coach.observability.interaction_lifecycle import observed_interaction
+from noam_coach.observability.obs_context import span_scope
 
 TelegramHandler = Callable[..., Awaitable[Any]]
 
@@ -236,7 +241,20 @@ def observed_handler(
                     db, user_id, getattr(source_message, "message_id", None)
                 )
 
-        with interaction_scope(trace_id=trace_id, user_id=user_id):
+        # W1-12: observed_interaction owns the correlation scope AND emits the
+        # terminal interaction.completed from its finally, so an interaction
+        # cannot end without a verdict — including the case this was written
+        # for, where dispatch reaches no handler at all and the old code
+        # simply returned in silence.
+        interaction_properties = {"kind": kind, "surface": SURFACE_TELEGRAM}
+        if command:
+            interaction_properties["command"] = command
+        async with observed_interaction(
+            db,
+            user_id,
+            trace_id=trace_id,
+            properties=interaction_properties,
+        ):
             with suppress(Exception):
                 await _ensure_user_row(user)
             flow_before = await _pre_routing_flow_snapshot(db, user_id)

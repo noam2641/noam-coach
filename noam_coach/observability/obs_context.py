@@ -58,6 +58,38 @@ def correlation_kwargs() -> dict[str, Any]:
     }
 
 
+# Response evidence for the active interaction.
+#
+# "Did anything answer the user?" cannot be asked of the handler's return
+# value — handlers return None whether they rendered a full menu or silently
+# fell through. It IS answerable from the egress events the interaction
+# produced, so the emit boundary marks the scope whenever a response-bearing
+# event is written (see ``mark_response`` / ``RESPONSE_EVENTS`` in emit.py).
+#
+# A mutable single-element list rather than an int: the counter must be
+# incremented from nested spans/tasks that inherit this contextvar by
+# reference, and rebinding an int inside a child context would not be visible
+# to the scope that has to read it at exit.
+_responses: ContextVar[list[int] | None] = ContextVar("obs_responses", default=None)
+
+
+def mark_response() -> None:
+    """Record that this interaction produced user-visible output.
+
+    Best-effort and never raises: called from the emit boundary, which must
+    stay non-breaking. Outside an interaction scope this is a no-op.
+    """
+    counter = _responses.get()
+    if counter is not None:
+        counter[0] += 1
+
+
+def response_count() -> int:
+    """How many response-bearing events the active interaction has produced."""
+    counter = _responses.get()
+    return counter[0] if counter is not None else 0
+
+
 @dataclass(frozen=True)
 class InteractionScope:
     trace_id: str
@@ -76,6 +108,12 @@ def interaction_scope(
     ``trace_id=None`` continues the ambient trace when one exists (e.g. a
     callback that belongs to an ongoing journey passes the stored trace id
     explicitly; a fresh message starts a fresh trace).
+
+    This scope only carries correlation identity. The interaction's TERMINAL
+    event is emitted by :func:`noam_coach.observability.interaction_lifecycle
+    .observed_interaction`, which wraps this scope — correlation propagation
+    stays synchronous and dependency-free, while termination (which needs a
+    db handle and an await) lives one layer up.
     """
     resolved_trace = trace_id or _trace_id.get() or new_trace_id()
     resolved_interaction = interaction_id or new_interaction_id()
@@ -84,6 +122,7 @@ def interaction_scope(
     t3 = _span_id.set(None)
     t4 = _parent_span_id.set(None)
     t5 = _user_id.set(user_id if user_id is not None else _user_id.get())
+    t6 = _responses.set([0])
     try:
         yield InteractionScope(trace_id=resolved_trace, interaction_id=resolved_interaction)
     finally:
@@ -92,6 +131,7 @@ def interaction_scope(
         _span_id.reset(t3)
         _parent_span_id.reset(t4)
         _user_id.reset(t5)
+        _responses.reset(t6)
 
 
 @dataclass(frozen=True)
