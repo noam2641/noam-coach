@@ -25,10 +25,9 @@ phase changes and before every pause.
 | Protected/PII data | `noam_coach_complete_release\noam_coach.db` (sha `5bd8ac1b…`); `C:\coach_bot\noam-coach-private-audit\` (session trace + meal images) |
 
 ## Current objective
-Establish the persistent Work Manager and produce the non-destructive repository
-consolidation audit + architecture-finding revalidation, ending in a
-Ready-for-review PR against `develop`. **No deletions/moves/retirement** until
-the human approves with `APPROVE REPOSITORY CLEANUP EXECUTION`.
+**WAVE-0 — correctness defects found in the 2026-07-26 live sessions.** Five
+parallel lanes on disjoint functions, verified against a function-level
+conflict matrix built by four read-only agents before any code was written.
 
 ## Completed batches
 - **P1.1 DayPlan Phase 1** — merged (PR #4, `08f953a`).
@@ -36,29 +35,37 @@ the human approves with `APPROVE REPOSITORY CLEANUP EXECUTION`.
   Sleep-schema shared accessor + reader-first migration + canonical-only writers;
   Today's Menu count unified with Status/DayPlan; architecture guard; legacy-
   caller reclassification.
+- **Repository consolidation + Batch A/B/C cleanup** — merged (PR #6, #7).
+- **FS-CLEANUP-1 physical filesystem cleanup** — merged (PR #8). See §FS-CLEANUP-1.
+- **WAVE-1** (B1 / R1 / LOG-004 / UX-01) and **WAVE-2** (weight text, rest next
+  action) — merged (PR #17, #23, #24).
+- **WAVE-0** — merged PR #26, #27, #28, #29; PR #25 open. See below.
 
 ## Active task
-Work Manager bootstrap (PHASE 1) + consolidation audit (PHASE 2) +
-architecture-finding revalidation (PHASE 3).
+WAVE-0 integration. Four of five lanes merged into `develop`; the fifth
+(PR #25, `##` developer notes) is re-running CI after a fix.
 
 ## Blocking dependencies / pending human approvals
-- **`APPROVE REPOSITORY CLEANUP EXECUTION`** required before any deletion/move/
-  archive/branch-removal/worktree-removal/source-retirement (PHASE 4).
-- GitHub PR creation from this environment needs the operator (no `gh`/token
-  here) — a prefilled URL is provided at each PR step.
+None. The owner granted standing autonomy through verified integration and
+cleanup, and on 2026-07-27 extended it to `git push`, `gh pr merge` and
+`git merge` without per-operation approval.
+
+Two safety constraints remain self-imposed regardless: **a red PR is never
+merged**, and protected data (`noam_coach_complete_release`,
+`noam-coach-private-audit`) is never touched.
 
 ## Last test evidence
-P1.1b head `4f9c664`: local full suite **2428 passed, 0 failed, 1 skipped**;
-CI (push + pull_request contexts) **green**. Verified in the PR #5 pre-merge review.
+WAVE-0 lanes: 69 new focused tests, all green. ~590 workout/session tests and
+180 infra/observability tests pass. CI green in **both** push and
+pull_request contexts for PR #26–#29 before merge.
+
+The typed-weight coverage was validated by reverting the fix: exactly the
+three typed-weight tests failed and the untyped one-tap path stayed green,
+confirming the tests fail for the right reason.
 
 ## Next exact action
-Audit is complete and PR #6 is open with the corrected 14-part output + the
-three-batch (A/B/C) execution plan in `REPOSITORY_CLEANUP_LEDGER.md` §G.
-**PAUSED — awaiting the human token `APPROVE REPOSITORY CLEANUP EXECUTION`.**
-On approval, execute Batch A (backups + archival copies) → verify → Batch B
-(remove verified strays) → verify → Batch C (origin/HEAD + prune 0-unique merged
-branches). Backup destination: `C:\coach_bot_BACKUP_20260721_150908\cleanup_20260725\`.
-No source retirement (P2.7/P2.8 stay future work).
+Land PR #25 once its CI re-run is green, then run the full two-half suite on
+the merged `develop`, sync, and remove the merged lane branches.
 
 ## Prohibited scopes (this session)
 AI Gateway · stored weekly-plan regeneration (`planning._meal_slots` Phase 2) ·
@@ -388,6 +395,45 @@ copy; bodyweight → `0`. No schema change, no historical-data modification.
 
 These remain visible in the accounting and must not disappear silently; none is
 authorized for implementation without an explicit owner decision.
+
+## WAVE-0 — live-session correctness defects (2026-07-27)
+
+Driven by 1,729 `product_events` from two live sessions on 2026-07-26 plus 21
+owner comments. Five lanes were run in parallel against a **function-level**
+conflict matrix produced by four read-only agents before any code was written;
+all five merged into an integration branch with **zero conflicts**, which is
+the evidence the matrix was correct.
+
+| PR | Defect | Evidence |
+|---|---|---|
+| #25 | `##`-prefixed messages persisted as user data — one comment reached `diet_restrictions` and was echoed back as a declared dietary preference; another was stored as a meal | live session; profile screen |
+| #26 | **Intent classification had never worked.** `Intent.slots` was `dict[str, Any]`, which is unrepresentable in strict mode, so every request was rejected before generating a token (9/9) while every other AI purpose succeeded | `ai.call.failed`, `BadRequestError` |
+| #27 | The typed weight was discarded: the router seeded from `recommend_load` and `setok` wrote the plan default, while `show_session` displayed the typed value — **the card and the database disagreed**. Separately, `0.0` kg persisted on a barbell press | 3 typed weights, 0 stored correctly |
+| #28 | Skip emitted no event at all; pain reached `medical_constraints`/`audit` but no domain event | 20:42:33, 20:41:49 |
+| #29 | Proactive messages permanently blocked (`status='active'` never matched `active_provisional`); `product_events` had no retention; AI errors recorded no message; the Mini App button could never work | 0/8 sent; ~1,150 rows/hour |
+
+### Verification that the plan itself was wrong (recorded so it is not repeated)
+
+Nine items in the pre-implementation plan were **disproven** by the agents and
+deliberately NOT implemented:
+
+| Item | Claim | Reality |
+|---|---|---|
+| Israel timezone | Scheduler runs in UTC | **There is no APScheduler in this repo.** Jobs use PTB's `JobQueue`; every `run_daily` already passes `tzinfo=TZ` |
+| DB backup | No backup exists | `scripts/backup.py` + `restore.py` + compose volume + documented cron all exist; only in-process scheduling is absent |
+| AI schema guard | 6 models at risk | All six already convert to strict schemas; the new test is a guard, not a fix |
+| `loadwhy` | Explains nothing | Fully wired; an empty explanation is a data problem in the `planned_load` path |
+| `pain_location` | Stays `NULL` = lost write | `NULL` is the **success** state — a transactional claim token. Now pinned by a test |
+| Rest-timer persistence | Not implemented | Already implemented, including startup restore |
+| AI progress indicator | Missing | Exists at `meals.py:234` |
+| Session-card limitation | Never surfaced | `_exercise_pain_warning_line` already renders it per exercise |
+| Cosmetics lane | Parallelizable | **False.** No central strings module; every Hebrew literal is inline in the handler that owns the logic, so cosmetics collide with every logic lane |
+
+The proactive-message failure also had a **second, non-code cause**: morning
+(08:00), evening (22:00) and weekly (Sat 20:30) never fired because the bot
+was not running at those times — it started at 22:14, eight minutes after the
+evening slot. `run_daily` has no catch-up-on-startup behaviour. Making it
+catch up is a product decision, not a bug fix, and is not scheduled.
 
 ## Links
 - Canonical implementation ledger: `docs/CANONICAL_IMPLEMENTATION_LEDGER.md`
