@@ -483,7 +483,17 @@ async def _handle_workout_menu_actions(
         )
         return True
 
-    if data == "menu:goal":
+    # "menu:goals" (plural) is what coach_intelligence's next-best-action and
+    # the assistant's "write a different goal" button emit; the handler was
+    # only ever registered for the singular. The plural had NO handler at all:
+    # it fell through every branch to handle_session_action_callback, whose
+    # parts[1].isdigit() guard returned bare, so the tap produced no render,
+    # no reply and no event. In the 2026-07-27 session the user tapped the
+    # bot's own top-priority CTA four times and nothing happened -- and since
+    # a goal_version can only be created from the approval this screen mints,
+    # no goal could ever exist, which blocked every nutrition feature behind
+    # "missing: approved daily target".
+    if data in {"menu:goal", "menu:goals"}:
         from noam_coach.bot.onboarding import ask_next_goal_wizard_question
 
         # RE10-9: complete the facts that make the proposal meaningful
