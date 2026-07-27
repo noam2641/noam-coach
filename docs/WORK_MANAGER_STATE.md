@@ -39,11 +39,16 @@ conflict matrix built by four read-only agents before any code was written.
 - **FS-CLEANUP-1 physical filesystem cleanup** — merged (PR #8). See §FS-CLEANUP-1.
 - **WAVE-1** (B1 / R1 / LOG-004 / UX-01) and **WAVE-2** (weight text, rest next
   action) — merged (PR #17, #23, #24).
-- **WAVE-0** — merged PR #26, #27, #28, #29; PR #25 open. See below.
+- **WAVE-0** — **COMPLETE.** All seven PRs merged: #25–#29 (the five lanes),
+  #30 (docs), #31 (the migration-15 startup fix found post-merge). See below.
 
 ## Active task
-WAVE-0 integration. Four of five lanes merged into `develop`; the fifth
-(PR #25, `##` developer notes) is re-running CI after a fix.
+None in flight. WAVE-0 is closed and `develop` @ `bb917f1` is clean, synced,
+single-worktree, with zero open PRs.
+
+The database was reset at the owner's request (2026-07-27): both running bot
+processes stopped first, a hash-verified backup taken outside the repo, then
+rebuilt fresh. The bot runs on it with zero errors.
 
 ## Blocking dependencies / pending human approvals
 None. The owner granted standing autonomy through verified integration and
@@ -54,18 +59,60 @@ Two safety constraints remain self-imposed regardless: **a red PR is never
 merged**, and protected data (`noam_coach_complete_release`,
 `noam-coach-private-audit`) is never touched.
 
+## Migration safety gate (added 2026-07-27 — learned the hard way)
+
+**Any PR that adds or changes a schema migration MUST upgrade a copy of a
+real, previously-migrated database before merge.** Green CI and a green full
+suite are not sufficient evidence and did not catch the defect below.
+
+Migration 15 shipped in PR #25 recording BOTH version 15 and version 14,
+because the `_record_migration` call belonging to migration 14 was inserted
+into `_migration_dev_notes`. On a fresh database every migration runs in one
+pass and nothing collides, so every test passed. On any database that already
+had 14 — i.e. every existing installation — re-inserting 14 violates the
+`schema_migrations` primary key, `Database.init()` raises `IntegrityError`,
+and **the bot cannot boot**. It was found only by upgrading a copy of the live
+database as a post-merge check, and fixed in PR #31.
+
+The generalised guard is
+`tests/test_migration_15_dev_notes.py::test_every_registered_migration_records_its_own_version`,
+which asserts the recorded `{version: name}` mapping equals
+`SCHEMA_MIGRATIONS`. It fails for whichever migration makes this mistake, not
+just migration 15. The v14-shaped upgrade fixture in the same file is the
+pattern to copy for future migrations.
+
 ## Last test evidence
-WAVE-0 lanes: 69 new focused tests, all green. ~590 workout/session tests and
-180 infra/observability tests pass. CI green in **both** push and
-pull_request contexts for PR #26–#29 before merge.
+`develop` @ `bb917f1`: both suite halves pass (exit 0, no failures), `ruff
+check .` clean, `compileall` clean. CI green in **both** push and
+pull_request contexts for PR #25–#31 before each merge.
+
+WAVE-0 added 75 focused tests across seven PRs.
+
+Runtime verification on the reset database: bot boots clean (zero errors in
+`logs/session_20260727_075856.log`), migration level 15, 31 tables,
+`dev_notes` present. Scheduled jobs carry `tzinfo=Asia/Jerusalem` and resolve
+to the correct local times (evening 22:00 IDT, weekly 20:30 IDT, morning
+08:00 IDT). The APScheduler lines in the log are python-telegram-bot's
+internal JobQueue backend — the repo never constructs a scheduler itself.
 
 The typed-weight coverage was validated by reverting the fix: exactly the
 three typed-weight tests failed and the untyped one-tap path stayed green,
 confirming the tests fail for the right reason.
 
 ## Next exact action
-Land PR #25 once its CI re-run is green, then run the full two-half suite on
-the merged `develop`, sync, and remove the merged lane branches.
+Awaiting a fresh owner-driven session against the reset database. WAVE-0
+changed five things the owner will feel immediately (intent classification,
+typed weight, `##` notes, proactive messages, the Mini App button), and the
+profile is now empty, so a full onboarding pass is the highest-value way to
+exercise them. The resulting `product_events` are a better basis for the next
+wave than continuing from the plan alone.
+
+Ready-to-run when authorised, from `NOAM_COACH_WORK_PLAN_EXECUTABLE.md`:
+**Lane B** (infrastructure — `/help`, voice/video/sticker handlers, medical
+disclaimer) and **Lane C** (technical debt — DSAR redaction, Mini App
+calendar-vs-coaching-day) are file-disjoint and can run in parallel. The
+workout / nutrition / UX lanes share `meal_text.py` and `workout.py` and must
+be serialised.
 
 ## Prohibited scopes (this session)
 AI Gateway · stored weekly-plan regeneration (`planning._meal_slots` Phase 2) ·
