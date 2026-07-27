@@ -294,6 +294,25 @@ async def _handle_redundant_question_challenge(ctx: FreeTextContext) -> bool:
                     source="user_challenge",
                 )
                 return True
+    # A challenge often CARRIES the correction ("I train Friday, not
+    # Saturday"). Try to apply it before acknowledging anything: the live
+    # defect was this exact reply -- "you're right, I'll use what I already
+    # have" -- emitted over an input that was then discarded, twice, while
+    # weekly_availability kept saying Saturday. Agreeing without mutating is
+    # worse than silence, so the mutation has to be attempted first.
+    from noam_coach.services.health_jobs import apply_schedule_correction
+
+    applied, correction_reply = await apply_schedule_correction(ctx.user_id, ctx.text)
+    if applied:
+        await ctx.send(
+            correction_reply,
+            InlineKeyboardMarkup([
+                [button("👤 פרופיל", "menu:profile")],
+                [button("⬅️ תפריט", "menu:home")],
+            ]),
+        )
+        return True
+
     # Generic response when not in a specific question flow
     await ctx.send(
         "צודק, אשתמש במידע שכבר יש לי.\nאם משהו השתנה — אפשר לעדכן בפרופיל.",
