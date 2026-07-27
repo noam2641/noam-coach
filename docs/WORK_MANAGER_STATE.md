@@ -5,22 +5,13 @@ phase changes and before every pause.
 
 | Field | Value |
 |---|---|
-| Last updated | 2026-07-26 (WAVE-2 complete: PRs #22/#23 merged; develop `dc300cc`) |
-| Last verified `origin/develop` | `dc300cc` (merge of PR #23 — TASK-WORKOUT-REST-NEXT-ACTION) |
-| GitHub default branch | `develop` (verified — the old `codex/*` default is corrected) |
-| Active phase | **PHASE 8 — WAVE-2 COMPLETE.** Both owner-approved workout-UX tasks are merged, serialized as required: TASK-WORKOUT-WEIGHT-TEXT #22 (`198e6a5`) then TASK-WORKOUT-REST-NEXT-ACTION #23 (`dc300cc`, built on the merged weight-text result). WAVE-1 and its CI hardening remain merged (#15/#16/#18/#19/#21). |
-| Active task | None in flight. Awaiting the next owner-approved scope. |
-| Approved work outstanding | **None.** WAVE-1 and WAVE-2 are both merged. Remaining known items are all DEFERRED or owner-gated: FU-01…FU-04, ledger decision U-3, the blocked scopes, and the stale-`MASTER_TASKS` label tidy-up. None is authorized for implementation. |
-| *(rows below are HISTORICAL)* | *The following rows record the completed 2026-07-21…25 repository-cleanup and LOG-batch work. They are kept for traceability and are **not** current operational state — the current state is the four rows above.* |
-| Baseline @ approval | head `1dbd6c6`; push CI `30154848488` success; PR CI `30154850042` success; PR #6 open, `+591/−0` |
-| Batch A result | **PII in all six docs** (real user id + meal-image refs) → external backup only at `…\cleanup_20260725\local_docs_PII\`; **NOT added to Git** (A2 skipped). No tracked change. |
-| Batch A CI | `b6db987`: push run `30155534787` success; pull_request run `30155536081` **success on re-run attempt 2** (attempt 1 flaked on `test_daily_menu_refresh::test_lease_loss_during_generation_fences_persistence`). Flake-record commit `52d6a10` CI: push `30156817298` success + pull_request `30156817976` success. **The deferred CI-hardening is now DONE** — PR #7 / commit `4697298` (event-driven deterministic synchronization; 150/150 local stress), merged to develop as `3ec5296`. |
-| Batch B result | **DONE @ `69a4450`** (both CI green first; `52d6a10` was the preceding Batch-A flake-record doc commit, NOT Batch B). Fail-closed removal of the 3 verified strays after creating+hash-verifying their backups: `C:\coach_bot\noam_coach.db` (0-byte), `C:\coach_bot\.git\` (only `info\exclude`, sha `584f2cca…06ef`), `C:\coach_bot\.agents\` (empty). All outside the repo → **no git diff**. Backups at `…\cleanup_20260725\{stray_root_db,stray_root_git}\`. Canonical repo, protected worktree/DB, PII, runtime data untouched. |
-| Active branch | `chore/repository-consolidation-audit` (head advances with each audit-correction commit; latest pushed head recorded in the CI table below) |
-| Audit PR | **#6** (open, not merged) → base `develop` @ `3ec5296`; head `chore/repository-consolidation-audit` (synced to develop) |
-| CI on PR #6 head (pre-sync `ad1da97`) | pull_request run `30158084198` **success**; push run `30158082421` **startup_failure** — verified **0 jobs ran** (workflow-START failure, NOT a pytest failure). Superseded by the post-sync head; re-verify both contexts on the new head. |
-| PR statistics | Counts per PR #6 checks at the live synced head (earlier `+445/−0 @ e9ebeac` is stale). |
-| Active worktree | `C:\coach_bot\noam-coach` (single writer) |
+| Last updated | 2026-07-27 (WAVE-1 batch 2: PRs #44/#45/#46/#47 merged; develop `25f7c81`) |
+| Last verified `origin/develop` | `25f7c81` — full suite exit 0, no stray DB, verified at `3d5dd18` with only docs changed since |
+| GitHub default branch | `develop` |
+| Active phase | **WAVE-1 (2026-07-27 audit wave) — in progress.** 15 PRs merged (#33–#47): four P0s, two docs, and eight WAVE-1 items. Zero open PRs, single worktree. |
+| Active task | W1-7 (`build_plan` mutates with no confirmation) running in an isolated worktree. W1-8 queued behind it — both are Lane E and share reach. |
+| Approved work outstanding | WAVE-1 items W1-7, W1-8, W1-10, W1-11, W1-13..W1-43. See `docs/WAVE1_WORK_PLAN.md`. |
+| Active worktree | `C:\coach_bot\noam-coach` (integration) + one per parallel writer under `C:\coach_bot\wt-*` |
 | Protected worktree | `C:\coach_bot\noam_coach_complete_release` @ `6d57c04` — do not touch |
 | Protected/PII data | `noam_coach_complete_release\noam_coach.db` (sha `5bd8ac1b…`); `C:\coach_bot\noam-coach-private-audit\` (session trace + meal images) |
 
