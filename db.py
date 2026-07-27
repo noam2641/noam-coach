@@ -1366,6 +1366,7 @@ async def _migration_exercise_override_identity(db: Database) -> None:
             "CREATE INDEX IF NOT EXISTS idx_exercise_overrides_identity "
             "ON exercise_overrides(user_id, exercise_id)"
         )
+        await _record_migration(connection, 14, "exercise_override_identity")
 
 
 async def _migration_dev_notes(db: Database) -> None:
@@ -1389,7 +1390,6 @@ async def _migration_dev_notes(db: Database) -> None:
             "CREATE INDEX IF NOT EXISTS idx_dev_notes_user ON dev_notes(user_id, id DESC)"
         )
         await _record_migration(connection, 15, "dev_notes_table")
-        await _record_migration(connection, 14, "exercise_override_identity")
 
 
 async def run_migrations(
