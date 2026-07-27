@@ -33,19 +33,58 @@ ACK_TEXT = "נרשם כהערה ✅"
 # Guards against a runaway paste becoming an unbounded row.
 MAX_NOTE_LENGTH = 4000
 
+# A single leading "#" only counts as a note when the message also CLOSES with
+# one. That wrapped form is unambiguous, while a bare leading "#" is not:
+# "#3 בבוקר" is a plausible thing to type at a coach. Requiring the closing
+# marker keeps the single-hash form safe to accept.
+_MIN_WRAPPED_BODY = 1
+
+
+def _wrapped_single_hash(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped.startswith("#") or stripped.startswith(DEV_NOTE_PREFIX):
+        return False
+    if not stripped.endswith("#"):
+        return False
+    return len(stripped) >= 2 + _MIN_WRAPPED_BODY
+
 
 def is_dev_note(text: str) -> bool:
     """True when ``text`` is a developer comment.
 
-    Only a leading ``##`` counts. A ``#`` appearing mid-message is ordinary
-    user text -- "כמה קלוריות ב#1?" must stay a real question.
+    Two forms are accepted:
+
+    * a leading ``##`` -- the documented protocol;
+    * a message wrapped in single hashes, ``#...#``.
+
+    The wrapped form is here because it is what actually gets typed. The
+    guard originally required ``##`` only, and in the 2026-07-27 session all
+    five developer notes used ``#...#``: every one fell through to intent
+    classification. One was stored as ``user_facts.food_environment_context``
+    with ``confirmed=1`` -- a complaint about the bot's questioning, filed as
+    the user's dietary profile -- and another was classified ``build_plan``
+    and regenerated the weekly workout plan mid-set.
+
+    A ``#`` appearing anywhere else is ordinary user text: "כמה קלוריות ב#1?"
+    must stay a real question, and so must a bare leading "#3 בבוקר".
     """
-    return text.lstrip().startswith(DEV_NOTE_PREFIX)
+    if not text:
+        return False
+    return text.lstrip().startswith(DEV_NOTE_PREFIX) or _wrapped_single_hash(text)
 
 
 def strip_prefix(text: str) -> str:
-    """Return the note body without its ``##`` marker."""
-    return text.lstrip()[len(DEV_NOTE_PREFIX) :].strip()
+    """Return the note body without its markers.
+
+    Handles both accepted forms, including a wrapped ``#...#`` whose trailing
+    marker must come off too.
+    """
+    stripped = text.strip()
+    if stripped.startswith(DEV_NOTE_PREFIX):
+        return stripped[len(DEV_NOTE_PREFIX) :].strip()
+    if _wrapped_single_hash(stripped):
+        return stripped[1:-1].strip()
+    return stripped
 
 
 async def record_dev_note(
