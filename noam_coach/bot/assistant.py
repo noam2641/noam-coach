@@ -677,7 +677,61 @@ async def _handle_goal_text_action(ctx: FreeTextContext) -> bool:
     if ctx.action == "set_dietary_pref":
         await record_dietary_preference(ctx.user_id, ctx.slots, ctx.text, ctx.send)
         return True
+
+    if ctx.action == "set_meal_frequency":
+        await _handle_meal_frequency(ctx)
+        return True
     return False
+
+
+@runtime_bound(RUNTIME_NAMES)
+async def _handle_meal_frequency(ctx: FreeTextContext) -> None:
+    """Persist "N meals a day" through the existing preference writer.
+
+    The taxonomy previously had no label for this, so "6 ארוחות ביום" was
+    classified as build_plan(frequency=6) and rebuilt the weekly TRAINING
+    plan. The count now lands on the same confirmed ``preferred_meal_count``
+    fact the onboarding routine question writes, via its single canonical
+    writer -- no second storage path.
+    """
+    from noam_coach.bot.ui import button
+    from noam_coach.services.day_plan import persist_preferred_meal_count
+
+    minimum = ctx.slots.get("meals_per_day")
+    maximum = ctx.slots.get("meals_per_day_max")
+    try:
+        low = int(minimum)
+    except (TypeError, ValueError):
+        await ctx.send(
+            "כמה ארוחות ביום אתה אוכל? כתוב מספר (למשל \"6 ארוחות ביום\").",
+            None,
+        )
+        return
+    try:
+        high = int(maximum) if maximum is not None else None
+    except (TypeError, ValueError):
+        high = None
+    if not 1 <= low <= 10 or (high is not None and not 1 <= high <= 10):
+        await ctx.send(
+            "כמה ארוחות ביום אתה אוכל? כתוב מספר בין 1 ל-10.",
+            None,
+        )
+        return
+    if high is not None and high < low:
+        low, high = high, low
+
+    await persist_preferred_meal_count(DB, ctx.user_id, minimum=low, maximum=high)
+    label = f"{low}" if high is None or high == low else f"{low}-{high}"
+    await ctx.send(
+        f"רשמתי שאתה אוכל <b>{label}</b> ארוחות ביום ✅\n"
+        "אחלק את התפריט והקלוריות לפי זה. זה לא משנה את תוכנית האימונים.",
+        InlineKeyboardMarkup(
+            [
+                [button("📋 תפריט היום", "menu:daily_menu")],
+                [button("👤 פרופיל", "menu:profile"), button("⬅️ תפריט", "menu:home")],
+            ]
+        ),
+    )
 
 
 def _is_explicit_calorie_goal_change(text: str) -> bool:

@@ -35,6 +35,7 @@ Action = Literal[
     "evening_summary",  # "סיכום" / "איך היה היום"
     "log_meal_text",  # "אכלתי 2 ביצים וטוסט" (ללא תמונה)
     "meal_status",  # "מה עם הארוחות?" / "כמה ארוחות שמרתי?" (REC-PLAN-MEAL-03-04)
+    "set_meal_frequency",  # "6 ארוחות ביום" / "אני אוכל 5-6 ארוחות ביום"
     "build_plan",  # "תבנה לי תוכנית" / "3 אימונים בשבוע"
     "start_workout",  # "בוא נתאמן" / "אימון"
     "set_goal",  # "אני רוצה לרדת ל-85"
@@ -79,6 +80,14 @@ class Slots(BaseModel):
     item: str | None = None
     kind: str | None = None
     location: str | None = None
+    # How many meals per day the user eats. A single stated value fills
+    # meals_per_day only; a range ("5-6 ארוחות ביום") fills both, and the
+    # handler passes them straight to persist_preferred_meal_count's
+    # minimum/maximum. Deliberately NOT 'frequency' -- that slot means
+    # workouts per week, and sharing it is exactly how "6 ארוחות ביום"
+    # rebuilt the training plan to 6 workouts.
+    meals_per_day: int | None = None
+    meals_per_day_max: int | None = None
     note: str | None = None
     polarity: str | None = None
     status: str | None = None
@@ -127,8 +136,17 @@ SYSTEM_PROMPT = (
     "- meal_status: asks about meals logged today, meal history, or what happened "
     "with a specific meal. Examples: 'מה עם הארוחות?', 'כמה ארוחות שמרתי?', "
     "'מה אכלתי היום?', 'תראה לי את הארוחות', 'מה מצב האוכל?'.\n"
+    "- set_meal_frequency: states HOW MANY MEALS PER DAY they eat or want to "
+    "eat. Examples: '6 ארוחות ביום', 'אני אוכל 5-6 ארוחות ביום', 'אני אוכל 3 "
+    "פעמים ביום', 'תחלק לי ל-5 ארוחות'. Slot 'meals_per_day' = the number "
+    "(typically 1-10); for a range also fill 'meals_per_day_max' (e.g. '5-6' "
+    "-> meals_per_day=5, meals_per_day_max=6). This is about EATING "
+    "frequency, never training. A message counting ארוחות/meals is NEVER "
+    "build_plan, and its number must NOT go into 'frequency'.\n"
     "- build_plan: wants a workout program built; slot 'frequency' if a number "
-    "of workouts/week is mentioned.\n"
+    "of WORKOUTS PER WEEK is mentioned (אימונים/אימון/תוכנית/ספליט). A bare "
+    "number is only build_plan when the message is about training. If the "
+    "message counts meals (ארוחות), use set_meal_frequency instead.\n"
     "- start_workout: wants to start/open a workout now.\n"
     "- set_goal: states a target body weight; slot 'goal_weight'.\n"
     "- set_calorie_goal: wants to set/change the DAILY CALORIE target. Examples: "
@@ -194,6 +212,47 @@ _EQUIPMENT_PATTERNS = re.compile(
 def _equipment_occupied(text: str) -> bool:
     """Detect 'device/bench/station is occupied' — NOT pain."""
     return bool(_EQUIPMENT_PATTERNS.search(text))
+
+
+# Meals-per-day statements: a count of ארוחות/פעמים attached to an eating
+# frame. The unit word is required -- a bare "6" stays ambiguous and must not
+# be read as a meal count any more than it should be read as a workout count.
+# Training words are excluded outright so "4 אימונים בשבוע" can never match.
+_MEAL_UNIT = ("ארוחות", "ארוחה", "ארוחות ביום")
+_MEAL_TRAINING_WORDS = ("אימון", "אימונים", "להתאמן", "נתאמן", "ספליט", "תוכנית אימון")
+_MEAL_FREQUENCY_RANGE = re.compile(r"(\d+)\s*[-–—]\s*(\d+)")
+
+
+def _meal_frequency(text: str) -> tuple[int, int] | None:
+    """Return (min, max) meals/day if *text* states an eating frequency.
+
+    Requires an explicit meal unit word ("ארוחות"/"ארוחה") or an eating verb
+    plus "פעמים ביום", so a bare number never lands here. Returns None for
+    training messages and for counts outside a plausible 1-10 meals/day.
+    """
+    t = text.strip()
+    if any(w in t for w in _MEAL_TRAINING_WORDS):
+        return None
+    has_meal_unit = any(w in t for w in _MEAL_UNIT)
+    # "אני אוכל 5 פעמים ביום" -- no ארוחה word, but unmistakably eating.
+    eats_n_times = ("פעמים ביום" in t or "פעמים ב יום" in t) and any(
+        v in t for v in ("אוכל", "אוכלת", "לאכול", "אכילות")
+    )
+    if not (has_meal_unit or eats_n_times):
+        return None
+    match = _MEAL_FREQUENCY_RANGE.search(t)
+    if match:
+        lo, hi = int(match.group(1)), int(match.group(2))
+        if lo > hi:
+            lo, hi = hi, lo
+    else:
+        number = re.search(r"\d+", t)
+        if not number:
+            return None
+        lo = hi = int(number.group(0))
+    if not (1 <= lo <= 10 and 1 <= hi <= 10):
+        return None
+    return lo, hi
 
 
 # Verbs that mark eating/drinking. A negated one ("לא אוכל בשר", "לא שותה
@@ -274,6 +333,18 @@ def keyword_fallback(text: str) -> Intent:
            "תראה לי את הארוחות", "מה מצב האוכל", "כמה נשאר לי לאכול",
            "מצב הארוחות"):
         return Intent(action="meal_status", confidence=0.8)
+    # Meals-per-day STATEMENT ("6 ארוחות ביום", "אני אוכל 5-6 ארוחות ביום").
+    # Must come after the meal_status questions above (those ask ABOUT logged
+    # meals) and before both the calorie-goal branch -- which matches
+    # "לאכול" + "ביום" -- and build_plan, whose bare-number reading is what
+    # turned "6 ארוחות ביום" into a 6-workout training plan.
+    band = _meal_frequency(t)
+    if band is not None:
+        lo, hi = band
+        slots: dict[str, Any] = {"meals_per_day": lo}
+        if hi != lo:
+            slots["meals_per_day_max"] = hi
+        return Intent(action="set_meal_frequency", slots=slots, confidence=0.8)
     if has("מה לאכול עכשיו", "נשאר לי", "נשארו לי", "כמה נשאר"):
         return Intent(action="next_meal", confidence=0.7)
     if has("תפריט", "מה לאכול", "ארוחות היום"):
