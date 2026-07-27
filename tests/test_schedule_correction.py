@@ -80,6 +80,11 @@ def _weekdays_of(value: Any) -> list[int]:
     )
 
 
+async def _current_weekdays(db: Database) -> list[int]:
+    """The stored availability weekdays, read the way the product reads them."""
+    return _weekdays_of(await user_model.get_value(db, 1, "weekly_availability"))
+
+
 @pytest.mark.asyncio
 async def test_live_utterance_updates_the_weekday_set(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -248,36 +253,47 @@ async def test_correction_emptying_the_schedule_is_refused_not_agreed_with(
 
 
 @pytest.mark.asyncio
-async def test_active_workout_plan_sessions_follow_the_corrected_days(
+async def test_a_stored_plan_is_left_to_the_rebuild_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The built plan must not keep a Saturday session after the correction."""
+    """The correction deliberately does NOT rewrite the stored plan.
+
+    An earlier draft realigned `active_workout_plan` here, and an
+    architecture guard rejected it: direct readers of that fact are
+    allowlisted and everyone else must route through `workout_catalog`,
+    which today exposes readers only -- there is no supported way to write
+    a corrected weekday back. The guard's own failure message says a new
+    reader is a signal to stop and report, not to broaden the allowlist.
+
+    So the availability stores move and the stored plan does not. This test
+    pins that gap deliberately rather than leaving it to be discovered: a
+    user who corrects their schedule may still see a Saturday session until
+    the plan is rebuilt. Closing it needs a write path in workout_catalog
+    (and, for Tier-1, in planning.py) -- a separate task.
+    """
     db = await _make_db(tmp_path)
     _patch_db(monkeypatch, db)
     await _seed_live_schedule(db)
+    stored_plan = {
+        "sessions": [
+            {"weekday": MONDAY, "code": "A", "name": "Push"},
+            {"weekday": WEDNESDAY, "code": "B", "name": "Pull"},
+            {"weekday": SATURDAY, "code": "C", "name": "Legs"},
+            {"weekday": SUNDAY, "code": "D", "name": "Full"},
+        ]
+    }
     await user_model.set_fact(
-        db, 1, "active_workout_plan",
-        {
-            "sessions": [
-                {"weekday": MONDAY, "code": "A", "name": "Push"},
-                {"weekday": WEDNESDAY, "code": "B", "name": "Pull"},
-                {"weekday": SATURDAY, "code": "C", "name": "Legs"},
-                {"weekday": SUNDAY, "code": "D", "name": "Full"},
-            ]
-        },
+        db, 1, "active_workout_plan", stored_plan,
         kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
     )
 
     applied, _reply = await health_jobs.apply_schedule_correction(1, LIVE_UTTERANCE)
-    assert applied is True
+    assert applied is True, "the availability correction itself must still apply"
 
     plan = await user_model.get_value(db, 1, "active_workout_plan")
-    weekdays = [session["weekday"] for session in plan["sessions"]]
-    assert SATURDAY not in weekdays, "plan still schedules a Saturday session"
-    assert FRIDAY in weekdays
-    assert weekdays == [MONDAY, WEDNESDAY, FRIDAY, SUNDAY]
-    # Session identity is the user's plan and must not be rewritten.
-    assert [session["code"] for session in plan["sessions"]] == ["A", "B", "C", "D"]
+    assert [s["weekday"] for s in plan["sessions"]] == [
+        MONDAY, WEDNESDAY, SATURDAY, SUNDAY
+    ], "the stored plan is intentionally untouched by this path"
 
 
 @pytest.mark.asyncio
@@ -315,3 +331,81 @@ async def test_correction_survives_a_later_save_routine_profile_recompute(
         "a derived estimate overwrote the user's stated schedule"
     )
     assert FRIDAY in resolved.preferred_days
+
+
+# ---------------------------------------------------------------------------
+# Displacement phrasings — every marker that drops a day must SPLIT, not add.
+#
+# "לא" was handled from the start. "במקום" ("instead of") was accepted as a
+# correction marker but was NOT a split marker, so "מתאמן בשישי במקום בשבת"
+# asserted BOTH Friday and Saturday -- the cumulative-parser bug in a second
+# costume, silently keeping the day the user was dropping.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "utterance",
+    [
+        LIVE_UTTERANCE,
+        "אני מתאמן בשישי במקום בשבת",
+        "מתאמן בשישי ולא בשבת",
+    ],
+)
+def test_every_displacement_phrasing_yields_the_same_delta(utterance: str) -> None:
+    parsed = health_jobs.parse_schedule_correction(utterance)
+    assert parsed is not None, f"not recognised as a correction: {utterance}"
+    assert parsed["asserted"] == [FRIDAY]
+    assert parsed["removed"] == [SATURDAY], (
+        "the displaced day must be REMOVED, never asserted alongside the new one"
+    )
+
+
+def test_a_removal_only_correction_asserts_nothing() -> None:
+    parsed = health_jobs.parse_schedule_correction("אני כבר לא מתאמן בשבת")
+    assert parsed is not None
+    assert parsed["asserted"] == []
+    assert parsed["removed"] == [SATURDAY]
+
+
+def test_an_addition_only_correction_removes_nothing() -> None:
+    parsed = health_jobs.parse_schedule_correction("אמרתי לך שאני מתאמן גם בשישי")
+    assert parsed is not None
+    assert parsed["asserted"] == [FRIDAY]
+    assert parsed["removed"] == []
+
+
+@pytest.mark.asyncio
+async def test_removing_a_day_that_is_already_absent_is_a_no_op(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Idempotency: dropping Thursday when Thursday was never there."""
+    db = await _make_db(tmp_path)
+    _patch_db(monkeypatch, db)
+    await _seed_live_schedule(db)
+
+    applied, _reply = await health_jobs.apply_schedule_correction(
+        1, "אני מתאמן בשישי לא בחמישי"
+    )
+
+    assert applied is True
+    days = await _current_weekdays(db)
+    assert SATURDAY in days, "an unrelated day must not be disturbed"
+    assert FRIDAY in days
+
+
+@pytest.mark.asyncio
+async def test_asserting_a_day_that_is_already_active_is_a_no_op(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repeating an existing day must not duplicate or reorder it."""
+    db = await _make_db(tmp_path)
+    _patch_db(monkeypatch, db)
+    await _seed_live_schedule(db)
+    before = await _current_weekdays(db)
+
+    applied, _reply = await health_jobs.apply_schedule_correction(
+        1, "אמרתי לך שאני מתאמן בשני"
+    )
+
+    assert applied is True
+    after = await _current_weekdays(db)
+    assert sorted(after) == sorted(before), "an already-active day changed the set"
+    assert len(after) == len(set(after)), "the day was duplicated"
