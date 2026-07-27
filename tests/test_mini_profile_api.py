@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -148,7 +148,12 @@ async def test_mini_today_meals_returns_meals_logged_in_db(
         "INSERT INTO users(id, first_name, username, updated_at) VALUES(1,'A',NULL,?)",
         (utc_now(),),
     )
-    eaten_at = datetime.now(TZ).replace(hour=12, minute=30, second=0, microsecond=0).isoformat()
+    # Seeded relative to the real clock, not pinned to 12:30. This endpoint
+    # selects "today" by calendar date, so a future-pinned meal happens to
+    # still match -- but the same shape (fixed hour + a production clock) is
+    # what made test_mini_api_returns_same_rendered_recommendation fail 15
+    # hours out of every 24. Kept relative so it cannot become that.
+    eaten_at = (datetime.now(TZ) - timedelta(minutes=5)).isoformat()
     await db.execute(
         """
         INSERT INTO meals(user_id, name, calories, protein, carbs, fat, confidence, eaten_at, created_at)
