@@ -14,6 +14,36 @@ production this session: `Intent.slots` (10/10 classifications succeeded, was
 
 ---
 
+## Progress
+
+**Shipped: 10 PRs.** P0-1..P0-4 (#33–#36), docs (#37), and five WAVE-1 items.
+
+| Item | PR | Verified on `develop` |
+|---|---|---|
+| W1-1 restriction enforcement | #38 | tortilla and aubergine now blocked; 7 unrelated foods stay clean |
+| W1-2 calorie target | #39 | 2290 → **2420 kcal** |
+| W1-3 window anchoring | #42 | `sessions_sampled` 1 → **10**, frequency 0.2 → **2.5** |
+| W1-9 duplicate status | #40 | `LIVE_DUPLICATE_APPROVAL_STATUSES = ('pending',)` |
+| W1-12 interaction terminal | #41 | `interaction.completed` emitted |
+
+**W1-2 and W1-3 compose as intended** — two independent defences on the same
+number. W1-3 fixed the *inference* (0.2 → 2.5); W1-2 still prefers the value
+the user *confirmed* (4.0). A user who never stated a frequency now gets 2.5
+instead of 0.2.
+
+### Lesson: give each parallel agent its own worktree
+
+Three writer agents were run in parallel on disjoint files. The **files** never
+collided — but all three shared one git working tree, so their branches
+stacked on each other instead of branching from `develop`: W1-9's commit
+landed on W1-12's branch, and W1-9's own branch pointed at `develop` with
+nothing on it. One agent also had its uncommitted work discarded when another
+switched the shared tree mid-task.
+
+Untangling was possible (cherry-pick each commit onto a clean branch, verify
+each in isolation) but it is avoidable. **Disjoint file ownership is necessary
+and not sufficient — parallel writers also need `git worktree add` isolation.**
+
 ## Verification status and agent assignment
 
 Every item below carries a verification verdict. **Agent output is a proposal,
@@ -100,8 +130,8 @@ WAVE-0's five-lane merge produce zero conflicts.
 
 # 🔴 WAVE-1A — Correctness defects with direct user impact
 
-## W1-1 · Two of your three dietary restrictions are unenforceable
-**[REPRODUCED]** · Lane A
+## ✅ W1-1 · Two of your three dietary restrictions are unenforceable
+**[DONE — #38]** · Lane A
 **Severity: CRITICAL (food safety) · Verified end-to-end**
 
 `load_restrictions_from_facts("חציל, טורטייה ואגוזים", …)` parses **3**
@@ -138,8 +168,8 @@ the owner whether `avoidance` should block or warn.
 **Acceptance:** the three real restrictions all produce a violation on a
 matching meal name; a test drives the exact live values.
 
-## W1-2 · Your calorie target is 130 kcal/day too low
-**[REPRODUCED]** · Lane B
+## ✅ W1-2 · Your calorie target is 130 kcal/day too low
+**[DONE — #39]** · Lane B
 **Severity: CRITICAL · Verified by direct computation**
 
 Two stores hold the same quantity and disagree by 20×:
@@ -168,8 +198,8 @@ profile read back from confirmed facts, or make `goals.py` read the fact.
 **Acceptance:** the two stores cannot disagree; a test asserts the target uses
 the user-confirmed frequency.
 
-## W1-3 · Learning windows anchored to today, on a 43-day-old export
-**[CODE-CONFIRMED]** · Lane B
+## ✅ W1-3 · Learning windows anchored to today, on a 43-day-old export
+**[DONE — #42]** · Lane B
 **Severity: HIGH · Root cause of W1-2**
 
 `learn_workout_pattern` (`routine.py:1048`) measures 45 days back from `now()`.
@@ -186,7 +216,7 @@ sessions exist in the file's own last 45 days.
 fixture yields the same result as a fresh one.
 
 ## W1-4 · The weekday detector widens until it succeeds
-**[REPRODUCED]** · Lane B
+**[DONE — #42]** · Lane B
 **Severity: HIGH · This is why Saturday kept coming back**
 
 `_historical_workout_weekdays` (`health_jobs.py:442`) retries at
@@ -202,7 +232,7 @@ identically to `last_28_days`.
 told when the window was widened.
 
 ## W1-5 · Confidence is keyed on a string, never on sample size
-**[REPRODUCED]** · Lane B
+**[DONE — #40]** · Lane B
 **Severity: HIGH**
 
 `user_model.py:778-779` assigns confidence from `SOURCE_CONFIDENCE[source]`.
@@ -219,7 +249,7 @@ Facts in your DB that contradict their own metadata:
 cannot reach 0.90.
 
 ## W1-6 · One tap converts a machine guess into "the user told me"
-**[REPRODUCED]** · Lane B
+**[DONE — #41]** · Lane B
 **Severity: HIGH**
 
 Five sites (`health_jobs.py:1191, 1207, 1216, 1224, 1254`) rewrite a derived
@@ -263,8 +293,8 @@ You said it twice (07:01:03 and 07:15:09). Both discarded.
 **Acceptance:** a schedule correction updates availability, or the bot says it
 cannot and asks. It must never claim agreement while dropping the input.
 
-## W1-9 · Duplicate detection matches against rejected meals
-**[REPRODUCED]** · Lane A
+## ✅ W1-9 · Duplicate detection matches against rejected meals
+**[DONE — #40]** · Lane A
 **Severity: MEDIUM · You reported this verbatim**
 
 `meals.py:262-264` filters user, file id, 6-hour window and kind — **never
@@ -300,8 +330,8 @@ After substituting, `sets.exercise_id='lat_pull'` matches no plan entry (only
 (`telegram_ingress.py:349`, `ai_invocation.py:198`) are never nested. So
 `trace_reader.span_children()` is dead code against real data.
 
-## W1-12 · No interaction ever terminates
-**[CODE-CONFIRMED]** · Lane C
+## ✅ W1-12 · No interaction ever terminates
+**[DONE — #41]** · Lane C
 There is **no `interaction.completed`/`.failed` event in the taxonomy**. All 87
 interactions are formally unterminated — no latency, no verdict, no way to tell
 "handled" from "silently dropped".
@@ -340,7 +370,7 @@ would report neither happened.
 payload shapes share the name, and `event_version` is `1` on every row.
 
 ## W1-17 · Three stores, no shared key, case-drift names
-**[CODE-CONFIRMED]** · Lane C
+**[DONE — #42]** · Lane C
 `analytics_events` and `audit` have no `trace_id`. The same fact is written as
 `user_callback` and `USER_CALLBACK` (and 5 more pairs), so a cross-store join on
 `event` returns nothing for 6 of 7 types.
@@ -359,7 +389,7 @@ banding, propagation — is built and tested. Only the trigger is missing.
 preference at all, which is why you saw exactly 3 slots after asking for 6.
 
 ## W1-19 · Calorie target has two resolvers over different stores
-**[CODE-CONFIRMED]** · Lane A
+**[DONE — #40]** · Lane A
 `nutrition_context.py:318-325` reads `goal_versions` → falls back to
 `SETTINGS.default_calories` (**2100**). `goals.py:337-405` computes **2290** and
 writes a `proposal_only` fact. Two screens can legitimately show different
