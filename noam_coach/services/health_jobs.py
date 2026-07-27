@@ -1718,6 +1718,269 @@ async def apply_health_wizard_text_edit(
     return False, "לא הצלחתי לעדכן את הפריט הזה."
 
 
+# ---------------------------------------------------------------------------
+# W1-8: standalone schedule correction (no wizard step pending)
+# ---------------------------------------------------------------------------
+#
+# The defect this closes: the user wrote "לדעתי אמרתי לו שאני מתאמן בשישי לא
+# בשבת" as ordinary free text. The bot answered "צודק, אשתמש במידע שכבר יש לי"
+# and mutated nothing — weekly_availability still decoded to Mon/Wed/Sat/Sun.
+# The parsing was never the problem: apply_health_wizard_text_edit already
+# reads a typed weekday correction correctly, but it is only reachable while a
+# health-wizard step is pending. This section makes the SAME parsing reachable
+# from free text, and nothing else about the wizard path changes.
+
+# (1) How a correction is recognised.
+#
+# Recognition has to be specific enough that a weekday mentioned in passing —
+# "אכלתי בשבת סלט עם טונה" — can never rewrite the training schedule. A bare
+# weekday token is therefore NOT a trigger. We require BOTH:
+#
+#   * a training predicate (מתאמן / אימון / ...), so the sentence is about
+#     training rather than about food, sleep or an appointment; and
+#   * a correction/assertion frame (לא / במקום / אמרתי / טעות / ...), so we act
+#     on "I train on Friday NOT Saturday" but stay out of the way of a plain
+#     scheduling request that other flows own.
+#
+# Both lists are deliberately narrow. A sentence that fails either test returns
+# `applied=False` and the caller must not claim agreement.
+
+_SCHEDULE_TRAINING_MARKERS: tuple[str, ...] = (
+    "מתאמן", "מתאמנת", "אימון", "אימונים", "להתאמן", "מתאמנים", "אתאמן",
+)
+
+# Frames that make the utterance a *correction or restatement* of the schedule.
+_SCHEDULE_CORRECTION_MARKERS: tuple[str, ...] = (
+    "לא ב", "לא ה", "ולא ", " לא ", "במקום", "אמרתי", "טעות", "התכוונתי",
+    "תקן", "שיניתי", "בעצם", "לדעתי",
+)
+
+# (2) Negation. The existing parser is intentionally additive: on the live
+# utterance it returns BOTH Friday(4) and Saturday(5), because "לא בשבת" still
+# contains a weekday token. Feeding that straight through would have ADDED
+# Friday while keeping Saturday — a different wrong answer, not a fix. So the
+# text is split on the negation marker first: days before it are asserted, days
+# after it are removed.
+_NEGATION_SPLIT_RE = re.compile(r"(?:\bולא\b|\bלא\b)")
+
+
+def parse_schedule_correction(text: str) -> dict[str, Any] | None:
+    """Parse a free-text training-day correction, or None if this is not one.
+
+    Returns ``{"asserted": [...], "removed": [...], "window": str | None,
+    "session_minutes": int | None}`` with weekday indices in
+    ``monday_first_v1``. Returning None means "not a schedule correction" —
+    callers must then leave the schedule alone.
+    """
+    from noam_coach.services.availability import parse_hebrew_availability_answer
+
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    padded = f" {raw} "
+    if not any(marker in padded for marker in _SCHEDULE_TRAINING_MARKERS):
+        return None
+    if not any(marker in padded for marker in _SCHEDULE_CORRECTION_MARKERS):
+        return None
+
+    # Split on the negation so "בשישי לא בשבת" yields asserted=[4], removed=[5].
+    parts = _NEGATION_SPLIT_RE.split(padded, maxsplit=1)
+    head = parts[0]
+    tail = parts[1] if len(parts) > 1 else ""
+
+    asserted_parsed = parse_hebrew_availability_answer(head)
+    asserted = sorted({int(s["weekday"]) for s in asserted_parsed.weekly_availability})
+    removed = sorted(
+        {
+            int(s["weekday"])
+            for s in parse_hebrew_availability_answer(tail).weekly_availability
+        }
+        if tail.strip()
+        else set()
+    )
+    # A day cannot be both asserted and removed; the assertion wins.
+    removed = [day for day in removed if day not in asserted]
+
+    if not asserted and not removed:
+        return None
+    return {
+        "asserted": asserted,
+        "removed": removed,
+        "window": asserted_parsed.workout_window,
+        "session_minutes": asserted_parsed.session_minutes,
+    }
+
+
+async def apply_schedule_correction(user_id: int, text: str) -> tuple[bool, str]:
+    """Apply a free-text training-day correction outside the health wizard.
+
+    Returns ``(applied, reply)``. When ``applied`` is False the reply says so
+    explicitly — the W1-8 defect was a reply claiming agreement ("צודק,
+    אשתמש במידע שכבר יש לי") over a discarded input, and a silent no-op here
+    would reproduce exactly that.
+    """
+    from noam_coach.services.availability import (
+        ParsedAvailabilityAnswer,
+        save_user_training_availability,
+    )
+
+    parsed = parse_schedule_correction(text)
+    if parsed is None:
+        return False, "לא זיהיתי כאן שינוי בימי האימון. כתוב למשל: אני מתאמן בשישי, לא בשבת."
+
+    asserted: list[int] = parsed["asserted"]
+    removed: list[int] = parsed["removed"]
+
+    # Start from the currently active weekday set so a *partial* correction
+    # ("בשישי לא בשבת") edits the schedule instead of replacing it: Mon/Wed/Sun
+    # were never in dispute and must survive.
+    current = await _current_training_weekdays(user_id)
+    updated = sorted((set(current) | set(asserted)) - set(removed))
+
+    if not updated:
+        return (
+            False,
+            "לא עדכנתי — התיקון הזה מרוקן את כל ימי האימון. "
+            "כתוב אילו ימים כן מתאימים לך.",
+        )
+    if updated == sorted(set(current)):
+        labels = ", ".join(weekday_labels_he(updated))
+        return True, f"ימי האימון כבר מעודכנים: {labels} ✅"
+
+    # (3) Provenance. This is a weekday set the user STATED, so it is written as
+    # source=user_report / kind=fact / confirmed=True. That is deliberately
+    # different from W1-6, which stores wizard-confirmed *derivations* as
+    # source=derived + confirmed=True precisely so they are not mistaken for
+    # user statements. Here there is no derivation involved at all.
+    typical_hour = parsed["window"] or await _current_training_hour(user_id)
+    minutes = parsed["session_minutes"]
+    slots = [
+        with_weekday_schema({
+            "weekday": day,
+            "start": typical_hour,
+            "minutes": minutes or _correction_default_minutes(current, day),
+            "available": True,
+        })
+        for day in updated
+    ]
+
+    # (2) Which facts move together — all of these carry the weekday set, and
+    # W1-2 showed what happens when one is updated and another is not (training
+    # frequency read 0.2 in one store and 4.0 in another, costing 130 kcal/day).
+    # They are written as ONE unit:
+    #   weekly_availability      — the per-day slot list planners read;
+    #   preferred/active_training_days + training_days_per_week — written by
+    #       save_user_training_availability, the same call the wizard path uses;
+    #   detected_training_days   — the Health-derived mirror; left stale it
+    #       would keep re-proposing Saturday as an observed training day;
+    #   active_workout_plan.sessions — the built plan still lists a Saturday
+    #       session otherwise, so the plan and the availability disagree.
+    await user_model.set_fact(
+        DB, user_id, "weekly_availability", slots,
+        kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
+    )
+    await save_user_training_availability(
+        DB,
+        user_id,
+        ParsedAvailabilityAnswer(
+            weekly_availability=slots,
+            workout_window=parsed["window"],
+            session_minutes=minutes,
+        ),
+    )
+    # detected_training_days is normally a Health *estimate*. Once the user has
+    # stated the days, leaving the old inference in place is what lets a later
+    # import resurrect the removed day, so it is realigned and marked as coming
+    # from the user rather than from inference.
+    await user_model.set_fact(
+        DB, user_id, "detected_training_days", updated,
+        kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
+    )
+    await _realign_active_workout_plan_weekdays(user_id, updated)
+
+    labels = ", ".join(weekday_labels_he(updated))
+    reply = f"עודכן: ימי אימון — {labels} ✅"
+    if removed:
+        reply += f" (הסרתי: {', '.join(weekday_labels_he(sorted(removed)))})"
+    return True, reply
+
+
+def _correction_default_minutes(current_days: list[int], day: int) -> int:
+    """Session length for a newly asserted day. Kept simple on purpose: the
+    correction is about WHICH day, not how long, so we do not invent a new
+    duration — 45 matches the availability parser's own default."""
+    del current_days, day
+    return 45
+
+
+async def _current_training_weekdays(user_id: int) -> list[int]:
+    """The weekday set currently in force, preferring the most authoritative
+    store. Reads only; never writes, so an unrecognised utterance is inert."""
+    for key in ("weekly_availability", "active_training_days", "preferred_training_days"):
+        value = await user_model.get_value(DB, user_id, key)
+        if not value or not isinstance(value, list):
+            continue
+        days: list[int] = []
+        for item in value:
+            raw = item.get("weekday") if isinstance(item, dict) else item
+            if isinstance(item, dict) and not item.get("available", True):
+                continue
+            schema = (
+                item.get("weekday_schema") if isinstance(item, dict) else None
+            ) or WEEKDAY_SCHEMA_VERSION
+            normalized = normalize_weekday(raw, schema)
+            if normalized.weekday is not None:
+                days.append(normalized.weekday)
+        if days:
+            return sorted(set(days))
+    return []
+
+
+async def _current_training_hour(user_id: int) -> str | None:
+    """Existing typical workout time, so a day-only correction keeps the hour."""
+    for key in ("workout_window", "weekly_availability"):
+        value = await user_model.get_value(DB, user_id, key)
+        if isinstance(value, str) and len(value) == 5 and value[2] == ":":
+            return value
+        if isinstance(value, list):
+            for slot in value:
+                start = slot.get("start") if isinstance(slot, dict) else None
+                if isinstance(start, str) and len(start) == 5 and start[2] == ":":
+                    return start
+    return None
+
+
+async def _realign_active_workout_plan_weekdays(user_id: int, weekdays: list[int]) -> None:
+    """Re-pin the fact-tier weekly plan's sessions onto the corrected weekdays.
+
+    Only the ``weekday`` field moves — session codes, names and order are the
+    user's plan and are not this function's to rewrite. If the plan has more
+    sessions than corrected days (or none at all) it is left untouched and the
+    mismatch is surfaced by the normal plan-rebuild path rather than being
+    papered over here.
+    """
+    plan = await user_model.get_value(DB, user_id, "active_workout_plan")
+    if not isinstance(plan, dict):
+        return
+    sessions = plan.get("sessions")
+    if not isinstance(sessions, list) or not sessions:
+        return
+    if len(sessions) != len(weekdays):
+        return
+    realigned = [
+        {**session, "weekday": day}
+        for session, day in zip(sessions, weekdays)
+        if isinstance(session, dict)
+    ]
+    if len(realigned) != len(sessions):
+        return
+    await user_model.set_fact(
+        DB, user_id, "active_workout_plan",
+        {**plan, "sessions": realigned, "weekday_schema": WEEKDAY_SCHEMA_VERSION},
+        kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
+    )
+
+
 async def skip_health_wizard_item(user_id: int, step_id: str) -> None:
     """Defer one wizard item without applying or invalidating it.
 
