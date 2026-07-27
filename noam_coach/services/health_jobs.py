@@ -1761,7 +1761,14 @@ _SCHEDULE_CORRECTION_MARKERS: tuple[str, ...] = (
 # Friday while keeping Saturday — a different wrong answer, not a fix. So the
 # text is split on the negation marker first: days before it are asserted, days
 # after it are removed.
-_NEGATION_SPLIT_RE = re.compile(r"(?:\bולא\b|\bלא\b)")
+#
+# EVERY phrasing that displaces a day must appear here, not only "לא". A
+# correction marker that is not also a split marker is the same bug in a second
+# costume: "מתאמן בשישי במקום בשבת" ("Friday INSTEAD OF Saturday") passed the
+# correction gate and then asserted BOTH days, silently keeping the day the
+# user was dropping. Each displacement marker means "what follows is the day
+# being given up".
+_NEGATION_SPLIT_RE = re.compile(r"(?:\bבמקום\b|\bולא\b|\bלא\b)")
 
 
 def parse_schedule_correction(text: str) -> dict[str, Any] | None:
