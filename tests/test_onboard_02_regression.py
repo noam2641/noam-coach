@@ -153,7 +153,15 @@ async def test_non_allergy_diet_classification_closes_missing_allergy_question(
     restrictions = await user_model.get_fact(db, 1, "diet_restrictions")
     assert allergies is not None
     assert allergies["value"] == "none"
-    assert allergies["confirmed"] == 1
+    # The question still closes -- the single named food WAS classified, and
+    # as a sensitivity rather than an allergy. But "none" is an inference the
+    # system drew, not something the user said, so it is no longer stored as
+    # a confirmed user_report. See tests/test_allergy_not_fabricated.py: the
+    # old confirmed=1 / source=user_report write fired after classifying just
+    # one of several named foods, and in the 2026-07-27 session recorded "no
+    # allergies" while nuts sat unclassified.
+    assert allergies["confirmed"] == 0
+    assert allergies["source"] == user_model.SOURCE_DERIVED
     assert restrictions is not None
     assert restrictions["value"] == "nuts"
 
