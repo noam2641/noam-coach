@@ -333,6 +333,65 @@ reserved checkout and its summary line quoted verbatim in the final report.
 
 ---
 
+## PIL-008 · A completion report issued while a PR was still open
+
+| | |
+|---|---|
+| **Date** | 2026-07-27 |
+| **Work item** | W1-8 final report (PRs #52, #54, #55) |
+
+**Observed failure.** A full completion report was delivered — eight sections,
+headed "Final Report" — while PR #55 was still open and the verified commit
+`84db9d0` had not been proven reachable from `develop`. The report's own
+section 6 listed the open PR and section 8 flagged the pending confirmation,
+so the facts were present. The **classification** was wrong: a report titled
+"Final" describing merged work reads as done regardless of what its later
+sections qualify.
+
+**Immediate impact.** None to the code — the engineering was sound and every
+claim was individually accurate. The harm is to trust: a reader would
+reasonably conclude the work had landed. That is a reporting defect of exactly
+the kind this ledger exists to catch, and it was committed by the author of
+the ledger.
+
+**Technical root cause.** None. No code was wrong.
+
+**Process root cause.** No vocabulary distinguished *validated* from *merged*.
+"Complete" was doing double duty for "the engineering is finished" and "the
+change is in the target branch", so the honest intent — the first — was
+expressed in words that assert the second.
+
+Compounding it: the report ended with **"I'll merge it when green"**, a
+future-tense promise presented inside a completion report. A statement about
+what will happen is not evidence of what did.
+
+**Why existing controls missed it.** The repo's Definition of Done requires
+merge and cleanup, but nothing constrained the *language of the report*. A
+correct process can still be reported incorrectly, and only the report reaches
+the reader.
+
+**Corrective action.** PR #55 merged (`c313717`); reachability proven with
+`git merge-base --is-ancestor 84db9d0 develop` → exit 0.
+
+**Preventive process change.** A five-term status vocabulary added to
+`CLAUDE.md` → "Completion status vocabulary (mandatory)":
+`IMPLEMENTATION COMPLETE` / `VALIDATION COMPLETE` / `WAITING ON EXTERNAL CI` /
+`MERGED` / `COMPLETE`. `COMPLETE` requires the reachability command and its
+exit code quoted, not asserted. Future-tense statements are explicitly named
+as non-evidence.
+
+**Manager instructions updated.** `CLAUDE.md`. This is deliberately the
+top-level operating file rather than an agent brief — the failure was the
+manager's, and it applies to every report the manager issues.
+
+**Validation evidence.** This report opens with `COMPLETE` only after the
+merge commit and the exit-0 reachability proof, both quoted. The distinction
+is now mechanical: a reader can check whether the required proof is present.
+
+**Status.** Implemented.
+
+---
+
 ## Manager self-review — WAVE-1 batch 3
 
 **What worked.** Pre-flight inspection before writing a brief reshaped two
