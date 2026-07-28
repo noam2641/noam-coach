@@ -546,7 +546,19 @@ async def test_mini_api_can_persist_workout_clarification(db: Database, monkeypa
 
 @pytest.mark.asyncio
 async def test_mini_api_returns_same_rendered_recommendation(db: Database, monkeypatch: pytest.MonkeyPatch) -> None:
-    now = datetime.now(TZ).replace(hour=15, minute=0, second=0, microsecond=0)
+    # This test is the one case in the file that lets the endpoint resolve its
+    # own "now" -- every other test injects it. Pinning the seeded meal to a
+    # fixed 15:00 therefore made the test time-of-day dependent: run it before
+    # 15:00 and the meal is in the FUTURE relative to the real clock, falls
+    # outside the coaching day, and consumed_calories reads 0 instead of 700.
+    # It passed all afternoon and began failing at 00:40.
+    #
+    # Seeding relative to the real clock keeps the meal inside the current
+    # coaching day at every hour. The offset is deliberately minutes, not
+    # hours: an hour back would land on the previous calendar day when the
+    # suite runs between 00:00 and 01:00, trading one time-of-day dependency
+    # for a narrower one.
+    now = datetime.now(TZ) - timedelta(minutes=5)
     await _ready_user(db, now)
     monkeypatch.setattr(mini_api, "DB", db)
 
