@@ -257,12 +257,16 @@ async def save_split_set(
         if cur.rowcount != 1:
             raise _StaleSetStep()
 
+        # Both rows carry the SAME exercise_index: a split set is one physical
+        # set performed at one position, recorded as two rows. Undo deletes the
+        # secondary alongside the primary and rewinds from the primary's index.
         await conn.executemany(
             """
             INSERT INTO sets(
                 session_id, exercise_id, exercise_name, set_number,
-                weight, reps, rir, source, client_event_id, created_at
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                weight, reps, rir, source, client_event_id,
+                exercise_index, created_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -275,6 +279,7 @@ async def save_split_set(
                     rir,
                     "telegram_split_primary",
                     f"{event_base}:primary",
+                    idx,
                     now,
                 ),
                 (
@@ -287,6 +292,7 @@ async def save_split_set(
                     rir,
                     "telegram_split_secondary",
                     f"{event_base}:secondary",
+                    idx,
                     now,
                 ),
             ],

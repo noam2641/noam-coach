@@ -814,8 +814,9 @@ async def save_set(
             """
             INSERT INTO sets(
                 session_id, exercise_id, exercise_name, set_number,
-                weight, reps, rir, source, client_event_id, created_at
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                weight, reps, rir, source, client_event_id,
+                exercise_index, created_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session["id"],
@@ -827,6 +828,9 @@ async def save_set(
                 rir,
                 source,
                 client_event_id,
+                # Where the user actually was. `exercise_id` cannot answer this
+                # when a plan programs the same movement twice -- see undo.
+                idx,
                 utc_now(),
             ),
         )
@@ -853,7 +857,7 @@ async def undo_last_set(user_id: int, session_id: int) -> bool:
             return False
 
         cursor = await conn.execute(
-            "SELECT id, exercise_id, set_number, source FROM sets "
+            "SELECT id, exercise_id, set_number, source, exercise_index FROM sets "
             "WHERE session_id=? ORDER BY id DESC LIMIT 1",
             (session_id,),
         )
@@ -861,15 +865,25 @@ async def undo_last_set(user_id: int, session_id: int) -> bool:
         if not last:
             return False
 
-        # Map the set's exercise_id back to its index in the plan so we can
-        # rewind the pointer (the sets table stores exercise_id, not the index).
-        try:
-            plan = json.loads(session["plan"])
-            exercise_index = next(
-                i for i, ex in enumerate(plan["exercises"]) if ex["id"] == last["exercise_id"]
-            )
-        except (KeyError, StopIteration, TypeError, json.JSONDecodeError):
-            exercise_index = session["exercise_index"]
+        # Prefer the position recorded when the set was logged. Reverse-mapping
+        # the exercise_id answers "where does this id live now"; the pointer
+        # needs "where was the user then". Those differ whenever a plan
+        # programs the same movement twice -- next() would return the FIRST
+        # match and rewind past work the user had already finished.
+        stored_index = last["exercise_index"]
+        if stored_index is not None:
+            exercise_index = int(stored_index)
+        else:
+            # Rows written before migration 16 carry NULL and are not
+            # recoverable, so they keep the original behaviour: correct
+            # whenever the plan holds the exercise exactly once.
+            try:
+                plan = json.loads(session["plan"])
+                exercise_index = next(
+                    i for i, ex in enumerate(plan["exercises"]) if ex["id"] == last["exercise_id"]
+                )
+            except (KeyError, StopIteration, TypeError, json.JSONDecodeError):
+                exercise_index = session["exercise_index"]
 
         # Remove the last set (and a split-secondary partner logged with it).
         await conn.execute("DELETE FROM sets WHERE id=?", (last["id"],))

@@ -132,6 +132,12 @@ CREATE TABLE IF NOT EXISTS sets(
     source TEXT NOT NULL,
     client_event_id TEXT UNIQUE,
     created_at TEXT NOT NULL,
+    -- Position in the session's plan at the moment the set was logged.
+    -- Nullable: rows written before migration 16 carry NULL and fall back to
+    -- reverse-mapping exercise_id. NOT a substitute for exercise_id -- it
+    -- answers "where was the user", which the id cannot when a plan programs
+    -- the same movement twice. Added by migration 16 for existing databases.
+    exercise_index INTEGER,
     FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
 
@@ -654,6 +660,7 @@ SCHEMA_MIGRATIONS: tuple[tuple[int, str], ...] = (
     (13, "observability_correlation"),
     (14, "exercise_override_identity"),
     (15, "dev_notes_table"),
+    (16, "set_occurrence_identity"),
 )
 
 FK_MIGRATION_TABLES: tuple[str, ...] = (
@@ -1419,6 +1426,33 @@ async def _migration_dev_notes(db: Database) -> None:
         await _record_migration(connection, 15, "dev_notes_table")
 
 
+async def _migration_set_occurrence_identity(db: Database) -> None:
+    """Migration 16: record WHERE in the plan a set was performed.
+
+    `sets` stored `exercise_id` and no position, so undo had to reverse-map the
+    id back to a plan index with ``next(...)`` -- which returns the FIRST match.
+    A plan that legitimately programs one movement twice (a superset, or an
+    exercise placed early and repeated late) therefore rewound the pointer to
+    the wrong occurrence, sending the user backwards through work they had
+    already completed.
+
+    Nullable with no backfill, deliberately: the position a historical set was
+    performed at is not recoverable from the row, and guessing it would be the
+    same class of error the column exists to remove. NULL keeps the previous
+    reverse-mapping behaviour, which is correct whenever the plan holds the
+    exercise exactly once -- the common case. New rows carry the real index.
+
+    No index: the column is read only for the single row undo already located
+    by primary key, never used as a search key.
+    """
+    async with db.transaction() as connection:
+        cursor = await connection.execute("PRAGMA table_info(sets)")
+        present = {row["name"] for row in await cursor.fetchall()}
+        if "exercise_index" not in present:
+            await connection.execute("ALTER TABLE sets ADD COLUMN exercise_index INTEGER")
+        await _record_migration(connection, 16, "set_occurrence_identity")
+
+
 async def run_migrations(
     db: Database,
     *,
@@ -1467,6 +1501,8 @@ async def run_migrations(
             await _migration_exercise_override_identity(db)
         elif version == 15:
             await _migration_dev_notes(db)
+        elif version == 16:
+            await _migration_set_occurrence_identity(db)
         else:
             raise RuntimeError(f"Unknown schema migration {version}")
         LOGGER.info("Applied schema migration %s: %s", version, name)
