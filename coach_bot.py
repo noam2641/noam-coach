@@ -330,6 +330,7 @@ from noam_coach.bot.workout_runtime import (
     split_rir_keyboard,
     split_summary_line,
     save_split_set,
+    effort_to_rir,
     rest_job_name,
     rest_keyboard,
     rest_text,

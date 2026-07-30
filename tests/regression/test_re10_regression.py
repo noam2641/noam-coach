@@ -409,6 +409,10 @@ _ROUTER_OWNED_PREFIXES = {
 # and are legitimately handled by the final session-scoped fallback.
 _SESSION_SCOPED_PREFIXES = {
     "split", "sub", "restadd", "wdone", "wpause", "wcancel",
+    # Effort reported from the rest screen. Session-scoped like `restadd`, but
+    # it carries a trailing set id + effort token because it names the set it
+    # describes rather than resolving "the most recent set" at tap time.
+    "seteffort",
 }
 
 

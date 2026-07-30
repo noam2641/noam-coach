@@ -306,10 +306,41 @@ def rest_job_name(user_id: int, session_id: int) -> str:
     return f"rest:{user_id}:{session_id}"
 
 
+#: How the set felt, in the vocabulary the explicit RIR keyboard already uses.
+#: Deliberately the SAME four values (3/2/1/0) rather than a new scale: this is
+#: a relabelling of "reps in reserve" into words, so progression never has to
+#: reconcile two vocabularies describing the same thing.
+_EFFORT_TO_RIR: dict[str, int] = {
+    "easy": 3,      # קל מדי -- could have done several more
+    "ok": 2,        # מתאים
+    "hard": 1,      # כמעט כשל
+    "failure": 0,   # כשל
+}
+
+_EFFORT_LABELS: tuple[tuple[str, str], ...] = (
+    ("easy", "קל מדי"),
+    ("ok", "מתאים"),
+    ("hard", "כמעט כשל"),
+    ("failure", "כשל"),
+)
+
+
+def effort_to_rir(token: str) -> int | None:
+    """Map an effort token to an RIR value, or None if it is not one of ours.
+
+    Returning None rather than a default matters: a malformed callback must not
+    be coerced into a plausible number. An unknown RIR is honest; an invented
+    one silently feeds progression.
+    """
+    return _EFFORT_TO_RIR.get(token)
+
+
 @runtime_bound(RUNTIME_NAMES)
 def rest_keyboard(
     session_step: dict[str, Any],
     finished: bool = False,
+    last_set_rir: int | None = None,
+    last_set_id: int | None = None,
 ) -> InlineKeyboardMarkup:
     if finished:
         return InlineKeyboardMarkup(
@@ -323,26 +354,42 @@ def rest_keyboard(
             ]
         )
 
-    return InlineKeyboardMarkup(
+    rows = [
         [
+            button(
+                "✅ מוכן עכשיו",
+                session_action_data("ready", session_step),
+            ),
+            button(
+                "➕ 30 שניות",
+                session_action_data("restadd", session_step, 30),
+            ),
+        ],
+        [
+            button(
+                "↩️ בטל את הסט האחרון",
+                session_action_data("undoset", session_step),
+            ),
+        ],
+    ]
+
+    # Offered only when the set carries no RIR -- i.e. it came through one-tap.
+    # If the user already reported effort explicitly, asking again is the
+    # re-asking the product forbids. The row sits below the existing actions
+    # and is never required: ignoring it leaves the set exactly as written.
+    if last_set_id is not None and not _rir_known(last_set_rir):
+        rows.append(
             [
                 button(
-                    "✅ מוכן עכשיו",
-                    session_action_data("ready", session_step),
-                ),
-                button(
-                    "➕ 30 שניות",
-                    session_action_data("restadd", session_step, 30),
-                ),
-            ],
-            [
-                button(
-                    "↩️ בטל את הסט האחרון",
-                    session_action_data("undoset", session_step),
-                ),
-            ],
-        ]
-    )
+                    label,
+                    f"seteffort:{session_step['id']}:{session_step['exercise_index']}"
+                    f":{session_step['set_number']}:{last_set_id}:{token}",
+                )
+                for token, label in _EFFORT_LABELS
+            ]
+        )
+
+    return InlineKeyboardMarkup(rows)
 
 
 @runtime_bound(RUNTIME_NAMES)
@@ -896,6 +943,14 @@ async def start_rest_timer(
     with suppress(Exception):
         await persist_rest_timer(timer_data)
 
+    # The set this rest follows, so the effort CTA can name it explicitly
+    # rather than resolving "the most recent set" at tap time -- which would
+    # race the watch ingest path.
+    last_set = await DB.fetch_one(
+        "SELECT id, rir FROM sets WHERE session_id=? ORDER BY id DESC LIMIT 1",
+        (session_id,),
+    )
+
     await safe_edit(
         query,
         rest_text(
@@ -907,7 +962,11 @@ async def start_rest_timer(
             summary_line,
             next_action,
         ),
-        rest_keyboard(session_step),
+        rest_keyboard(
+            session_step,
+            last_set_rir=last_set["rir"] if last_set else None,
+            last_set_id=int(last_set["id"]) if last_set else None,
+        ),
     )
 
     if context.job_queue is None:
