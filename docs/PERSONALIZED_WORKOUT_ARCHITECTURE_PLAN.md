@@ -118,6 +118,56 @@ should be approached:
    only then did removing the scope fail it. **Every guard added from here must be verified
    by breaking the thing it guards**, not merely by passing.
 
+## 3.6 Batch 2 — file ownership and merge order
+
+Batch 2 is A4, A5, A6 and A11a. Calling them "independent" was too loose: their
+*dependency graphs* are independent, but their **file surfaces overlap**, and a merge
+conflict in a shared file is just as expensive as a logical dependency. Verified at
+`1fc4154`:
+
+| Pair | Shared files | Nature |
+|---|---|---|
+| **A4 ∩ A6** | `noam_coach/bot/onboarding.py`, `noam_coach/bot/ui.py`, `noam_coach/bot/callback_plans.py` | A4 governs the `active_workout_plan` write surface; A6 changes the pre-activation `editparams_menu:` route. Both live in the onboarding/callback layer |
+| **A5 ∩ A11a** | `noam_coach/bot/workout.py` | A5 edits the history readers at `:454` and `:625`; A11a adds unmapped-slot guards at `:418`, `:691`, `:778`, `:789`, `:883`, `:950`. Distinct regions of the **same file** |
+
+### Ownership
+
+Exactly one writer per file. Where a file is shared, the **earlier item in merge order
+owns it** and the later one rebases onto the result.
+
+| Item | Owns exclusively | Shares (as owner) | Must not touch |
+|---|---|---|---|
+| **A4** | `tests/test_workout_catalog_architecture_guards.py`, `user_model.py` | `onboarding.py`, `ui.py`, `callback_plans.py` | `workout.py`, `training.py` |
+| **A5** | `noam_coach/services/training.py`, new implementations service, `db.py` | `workout.py` | onboarding/callback layer |
+| **A6** | `noam_coach/bot/workout_compat.py` | — (rebases onto A4) | `workout.py`, `training.py` |
+| **A11a** | `exercise_plans.py`, new reader-helper module | — (rebases onto A5) | onboarding/callback layer, `training.py` |
+
+### Merge order — fixed in advance
+
+```
+A4  ──►  A6        (A6 rebases; both in the onboarding/callback layer)
+A5  ──►  A11a      (A11a rebases; both in workout.py)
+```
+
+The two chains are genuinely parallel: no file appears in both. Within a chain the
+order is strict.
+
+**Why this order.** A4 lands first because it *adds a guard* — if the write surface
+is governed before A6 changes a route that mints callbacks, A6 gets the guard's
+protection for free rather than having to be re-audited afterwards. A5 lands before
+A11a because A5 changes query semantics in `workout.py` while A11a only adds
+defensive `.get()` guards there; rebasing guards onto changed queries is safe, the
+reverse is not.
+
+**Worktrees.** One per item, four total, since all four may start concurrently:
+`wt-a4`, `wt-a5`, `wt-a6`, `wt-a11a`. A6 and A11a do not open PRs until their
+predecessor is merged and they have rebased — starting early is fine, merging out of
+order is not.
+
+**A6 is gated on a harm test.** It is classified `[H]`. If the harm test cannot be
+made to fail, A6 closes as documentation and no code is written — in which case A4
+owns the shared onboarding/callback files outright.
+
 ## 4. Track A — Workout architecture
 
 | ID | Task | Domain | Depends | Justification | Acceptance criteria |
