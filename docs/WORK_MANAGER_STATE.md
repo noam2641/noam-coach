@@ -9,8 +9,9 @@ phase changes and before every pause.
 | Last verified `origin/develop` | `25f7c81` — full suite exit 0, no stray DB, verified at `3d5dd18` with only docs changed since |
 | GitHub default branch | `develop` |
 | Active phase | **WAVE-1 (2026-07-27 audit wave) — in progress.** 15 PRs merged (#33–#47): four P0s, two docs, and eight WAVE-1 items. Zero open PRs, single worktree. |
-| Active task | W1-7 (`build_plan` mutates with no confirmation) running in an isolated worktree. W1-8 queued behind it — both are Lane E and share reach. |
-| Approved work outstanding | WAVE-1 items W1-7, W1-8, W1-10, W1-11, W1-13..W1-43. See `docs/WAVE1_WORK_PLAN.md`. |
+| Active task | **Workout architecture programme registered 2026-07-29.** Implementation authorized; first batch A1+A2+A3. See `docs/PERSONALIZED_WORKOUT_ARCHITECTURE_PLAN.md`. |
+| Approved work outstanding | **Track A** (workout architecture): A1–A12. **Track B** (WAVE-1 survivors): W1-11, W1-13, W1-14, W1-15, W1-16, W1-18, W1-20, W1-21, W1-22, W1-23. |
+| Corrected 2026-07-29 | This row previously named W1-7 as the active task and listed W1-7/W1-8 as outstanding. **Both are merged and live in code** — verified on `develop`. W1-17 (#42) and W1-19 (#40) are also done. W1-10 is split into A2+A8; W1-44 is absorbed into A9. |
 | Active worktree | `C:\coach_bot\noam-coach` (integration) + one per parallel writer under `C:\coach_bot\wt-*` |
 | Protected worktree | `C:\coach_bot\noam_coach_complete_release` @ `6d57c04` — do not touch |
 | Protected/PII data | `noam_coach_complete_release\noam_coach.db` (sha `5bd8ac1b…`); `C:\coach_bot\noam-coach-private-audit\` (session trace + meal images) |

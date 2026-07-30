@@ -300,7 +300,12 @@ matters because `_confirmed_fact_value` (`health_jobs.py:623-639`) trusts
 `confirmed_by_user` marker; provenance is recoverable.
 
 ## W1-7 · `build_plan` mutates state with no confirmation
-**[REPRODUCED]** · Lane E
+**[DONE — verified live on `develop`]** · Lane E
+
+> Status corrected 2026-07-29: this entry read `[REPRODUCED]` while the fix was
+> already merged. `_plan_rebuild_confirmation` is present in
+> `noam_coach/bot/assistant.py` and pinned by
+> `tests/test_plan_rebuild_confirmation.py`.
 **Severity: HIGH**
 
 "6 ארוחות ביום" (6 *meals* a day) was classified `build_plan(frequency=6)` at
@@ -316,7 +321,16 @@ misread becomes persisted damage.
 correct intent to land on.
 
 ## W1-8 · A correction was discarded while the bot said it agreed
-**[REPRODUCED]** · Lane E
+**[DONE — verified live on `develop`]** · Lane E
+
+> Status corrected 2026-07-29: this entry read `[REPRODUCED]` while the fix was
+> already merged. `apply_schedule_correction` is called before the
+> acknowledgement in `noam_coach/bot/assistant.py`, pinned by
+> `tests/test_schedule_correction.py` and `tests/test_schedule_correction_wiring.py`.
+>
+> The saved plan is still **not** reconciled after the correction — that is a
+> separate, still-open defect, now owned by **A9** in
+> `docs/PERSONALIZED_WORKOUT_ARCHITECTURE_PLAN.md`.
 **Severity: HIGH**
 
 "אני מתאמן בשישי לא בשבת" → classified `redundant_question_challenge` (0.95).
@@ -342,16 +356,34 @@ Your note: *"זה ארוחה שלא אישרתי לכן לא אמור להופי
 raises a duplicate; the pending row is also swept.
 
 ## W1-10 · Exercise substitution orphans the set history
-**[REPRODUCED]** · Lane D
+**[SPLIT — absorbed into A2 + A8; no longer a standalone item]** · Lane D
 **Severity: MEDIUM**
 
 After substituting, `sets.exercise_id='lat_pull'` matches no plan entry (only
 `original_id`). Verified: `Match in plan by id? False`.
 
-- **Undo is broken** — `workout.py:868` raises `StopIteration` and rewinds the
-  wrong exercise.
-- **Progression history is orphaned** — `workout.py:454` and `:625` look up by
-  `exercise_id`.
+> **Correction 2026-07-29 — the original description was factually wrong.**
+> It claimed `workout.py:868` *raises* `StopIteration`. It does not: the
+> exception is **caught** at `workout.py:871`, together with `KeyError`,
+> `TypeError` and `json.JSONDecodeError`, and the handler falls back to
+> `session["exercise_index"]`. The delete is correct and the transaction is
+> intact — no data is corrupted.
+>
+> The real residual defects are narrower, and there are **two**:
+> 1. The fallback uses the **live pointer**, which is wrong only once the user
+>    has advanced past the substitution point.
+> 2. `next(...)` returns the **first** matching index. A plan that legitimately
+>    programs the same exercise twice (a superset, or one movement early and
+>    late) rewinds to the wrong occurrence. This is independent of substitution
+>    and was never catalogued.
+
+- **Undo targets the wrong occurrence** — now owned by **A2** (occurrence
+  identity on `sets`).
+- **Progression history is orphaned** — `workout.py:454`, `workout.py:625` and
+  `noam_coach/services/training.py:268` all look up by `exercise_id`. That is
+  **three** readers, not two; now owned by **A5** and **A8**.
+
+See `docs/PERSONALIZED_WORKOUT_ARCHITECTURE_PLAN.md`.
 
 ---
 
@@ -530,7 +562,19 @@ integration · destructive sleep-fact migration · ledger decision U-3.
 
 # W1-44 · Supported reconciliation of a saved plan after an availability change
 
-**[SCOPED — not started]** · Lane D · Blocked on a design decision, not on effort
+**[ABSORBED into A9 — not started]** · Lane D
+
+> Reassigned 2026-07-29. The design decision this was blocked on is resolved:
+> the answer is a **copy-on-write weekday remap proposed for approval**, not an
+> in-place edit (test-forbidden), not invalidation, and not silent regeneration.
+>
+> W1-44 is now **A9** in `docs/PERSONALIZED_WORKOUT_ARCHITECTURE_PLAN.md`, one
+> operation on a single supported mutation boundary. **No standalone bypass is
+> authorized** — in particular no direct write to the `active_workout_plan`
+> fact, and no direct JSON or database mutation of a saved plan.
+>
+> The scope and design notes below remain accurate and are retained as the
+> historical record.
 
 ## Why this exists
 

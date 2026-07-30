@@ -361,6 +361,41 @@ Repository evidence justified changing the prior plan. Each deviation:
 
 ---
 
+## Part D-2 — Personalized workout architecture programme (registered 2026-07-29)
+
+**Status: APPROVED FOR PLANNING REGISTRATION. NOT AUTHORIZED FOR IMPLEMENTATION.**
+
+Plan: `docs/PERSONALIZED_WORKOUT_ARCHITECTURE_PLAN.md`. Baseline `develop` @ `0c0724d`.
+
+Twelve items (A1–A12) across five domains: runtime safety, governance, load/identity, slot
+model, patterns. Produced by a read-only investigation of flows A–H, six independent domain
+reviews, and a final consolidation pass. Every load-bearing claim carries an evidence label and
+was re-verified at `0c0724d`.
+
+**Linked backlog changes:**
+
+- **W1-44** → **A9** (mutation boundary + saved-plan reconciliation). No standalone bypass
+  authorized.
+- **W1-10** → split into **A2** (occurrence identity) and **A8** (substitution persistence);
+  removed as a standalone item. Its stated defect — a `StopIteration` crash — was **factually
+  wrong**; the exception is caught. Corrected in place.
+- **W1-7, W1-8** → marked DONE; both fixes verified live while the plan still read
+  `[REPRODUCED]`.
+
+**Four investigated claims were disproven and deleted rather than retained**: the `avg_rir`
+load bias, the missing pain mirror, the override readers as a live corruption, and the proactive
+pipeline as a viable transport for workout-surface proposals. Reasons recorded in §3 of the plan
+so they are not re-derived.
+
+**Separation from other scopes:** independent of the blocked AI Gateway scope, the
+`planning._meal_slots` Phase-2 scope, multi-user, and live Apple Health. Track B (WAVE-1 Lanes A
+and C) remains separately owned; W1-14 and W1-16 serve A9's audit requirement and should be
+sequenced adjacent to it.
+
+**Next owner gate:** `AUTHORIZE WORKOUT ARCHITECTURE IMPLEMENTATION`.
+
+---
+
 ## Part E — Unresolved decisions & risks
 
 | ID | Item | Recommendation / needed input |
