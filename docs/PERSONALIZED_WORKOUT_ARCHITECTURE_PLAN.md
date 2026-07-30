@@ -168,6 +168,66 @@ order is not.
 made to fail, A6 closes as documentation and no code is written — in which case A4
 owns the shared onboarding/callback files outright.
 
+### Rebase discipline (binding)
+
+**1. Rebase onto `origin/develop` after the merge, never onto the lead item's branch
+head.** The canonical state includes the merge commit and any CI change that landed
+with it. Rebasing onto a branch head validates against something that was never the
+integration state.
+
+**2. A clean rebase is not evidence.** "No conflict" says the text merged, not that
+the behaviour survived. After rebasing, every later item re-runs, and reports:
+
+- its own focused tests;
+- **the lead item's tests**;
+- the architecture guards and the callback-prefix guard;
+- **at least one test proving the lead item's change is still active.**
+
+That last one is the point. A rebase can silently revert a semantic change while
+leaving both diffs syntactically intact — the only way to know the lead is still doing
+its job is to assert it.
+
+**3. Write against the future contract; do not guess the implementation.** A6 and
+A11a may start research and tests immediately, but must not locally reproduce the lead
+item's logic to move faster. Concretely: A11a may add reader helpers and unmapped-slot
+guards, and must **not** copy A5's history-reader logic. A duplicated implementation is
+worse than waiting — it creates the second reader this programme exists to remove.
+
+### Risk: A4 → A6 must not be closed by an allowlist entry
+
+"A6 inherits A4's protection" holds **only** if A4 states, explicitly and testably:
+
+- who the permitted owners of an `active_workout_plan` write are;
+- which wrappers count as legitimate;
+- how the runtime assertion detects an **indirect** call;
+- how the protection itself is verified by breaking it on purpose.
+
+Without that, A6 hits the new guard and the cheapest escape is to add itself to the
+allowlist — going green while never routing through the canonical boundary. That is
+the exact failure the guard exists to prevent, dressed as compliance.
+
+**Therefore A6's acceptance criterion is that its route uses the managed interface —
+not that CI is green.** Broadening `_ALLOWED_*` to pass a check is explicitly
+forbidden, consistent with the standing rule for the reader guard.
+
+### Risk: A5 → A11a must not turn a contract violation into a silent fallback
+
+A11a adds guards on exercise payload structure. After A5 changes query semantics,
+those guards must not convert a *semantic error* into a quiet empty state. If A5
+returns history for the wrong implementation, or `None` from a malformed query, A11a
+rendering "no history" would hide a real defect behind a plausible screen.
+
+Three states must stay distinguishable, and must not collapse into one branch:
+
+| State | Meaning | Correct behaviour |
+|---|---|---|
+| **Legacy / legitimately absent** | pre-migration row, no history yet | render the empty state; this is normal |
+| **Deliberately unmapped slot** | the slot has no implementation on purpose | render the slot placeholder; not an error |
+| **Contract violation** | shape or value that should be impossible | must be **loud** — never rendered as "no history" |
+
+The third case needs an explicit signal (raise, or log-and-flag), never a `.get()`
+default that makes it indistinguishable from the first.
+
 ## 4. Track A — Workout architecture
 
 | ID | Task | Domain | Depends | Justification | Acceptance criteria |
@@ -175,14 +235,14 @@ owns the shared onboarding/callback files outright.
 | **A1** | Pain mirror inside the transaction boundary | Runtime | — | The mirror sits after `except _StaleSetStep`, outside the transaction and unwrapped **[V]**. A failure leaves the constraint written, the planning fact stale, and surfaces an error on a report that succeeded | Forced mirror failure leaves both stores consistent; no error surfaced to the user; no second write path introduced |
 | **A2** | Occurrence identity on `sets` | Runtime | — | `undo_last_set` reverse-maps `exercise_id` with `next()`, returning the first match **[V]**. `sets` has no `exercise_index` column **[V]** | Plan with the same exercise at index 0 and 3: a set logged at 3 undoes to 3. Split sets share the index; rewind keys off the primary |
 | **A3** | Effort CTA on the rest screen | Runtime | — | One-tap logging writes `RIR_UNKNOWN` and never asks, so progression can rarely confirm mastery **[V]**. This is the real fix for sparse RIR — it adds data | Ignoring the CTA changes nothing; tapping updates only a row whose value is `RIR_UNKNOWN`; targeted by set id captured at arm time, never "most recent set" |
-| **A4** | Write governance: AST guard + runtime assertion | Governance | — | The guard is a regex blind to writes, and `[^,]+` fails on any call whose first two arguments contain a comma **[V]**. Two ungoverned `set_fact` writers exist | A new writer fails CI; a non-constant key fails CI; `getattr` spelling and raw SQL covered; runtime contextvar assertion complements the static guard |
+| **A4** | Write governance: AST guard + runtime assertion | Governance | — | The guard is a regex blind to writes, and `[^,]+` fails on any call whose first two arguments contain a comma **[V]**. Two ungoverned `set_fact` writers exist | A new writer fails CI; a non-constant key fails CI; `getattr` spelling and raw SQL covered; runtime contextvar assertion complements the static guard. **Must also publish the contract A6 depends on**: the permitted owners of an `active_workout_plan` write, which wrappers are legitimate, how the runtime assertion detects an indirect call, and a test that verifies the protection by breaking it deliberately |
 | **A5** | Ladder-ready history reads (three sites) | Load | — | Three readers key on canonical `exercise_id` **[V]**; no equipment, machine, gym, brand or model column exists anywhere in the schema **[V]** | All three surfaces agree; none blends machines; an unattributed set still counts via the canonical tier |
-| **A6** | Pre-activation `editparams_menu:` route | Identity | — | The plan-review wizard mints the legacy callback before activation **[V]**; with no active plan the user edits template parameters believing they edit their plan. Harm **[H]** | Harm test fails first, then passes. If it cannot be made to fail, the item closes as documentation |
+| **A6** | Pre-activation `editparams_menu:` route | Identity | A4 | The plan-review wizard mints the legacy callback before activation **[V]**; with no active plan the user edits template parameters believing they edit their plan. Harm **[H]** | Harm test fails first, then passes. If it cannot be made to fail, the item closes as documentation. **The route must go through the managed interface — a green CI is not sufficient, and adding A6 to any allowlist to satisfy A4's guard is forbidden** |
 | **A7** | Pain persistence semantics | Runtime | A1 | `medical_constraints` expires after 14 days; `training_limitations` never does **[V]**, and the mirror concatenates strings — a one-time report becomes a permanent limitation | Four states distinguished (temporary event / active / confirmed / historical); expiry clears the planning fact; non-pain limitations survive; recompute, not append |
 | **A8** | Substitution occurrence correctness | Slot | A2 | `alts.index(alt)` is a value-based lookup **[V]**; re-ranking mutates the list, so a stale callback substitutes a valid-but-wrong exercise | A mutated list causes a stale callback to be rejected, never misapplied. Keyed on alternative id plus occurrence identity |
 | **A9** | Mutation boundary + saved-plan reconciliation (**W1-44**) | Governance | A4 | An availability correction deliberately leaves the plan contradicting it **[V]**, and the reply reports success with no hint of the divergence | The corrected day is removed after approval; the divergence is named before it; an in-flight session defers the swap; audit rows are recoverable |
 | **A10** | Free-text intent + degraded plan | Governance | A9 | Only a frequency integer survives parsing **[V]**; exercise-less plans become active with no readiness gate | Weekdays, time and duration all land; a legacy user below full readiness receives a degraded plan with explicit disclosure and a completion CTA, never silence; safety-critical gaps still block |
-| **A11a** | Slot model — read-only | Slot | — | Static data, reader helpers and consumer guards; no-ops on current payloads | Every consumer tolerates a slot with no implementation without raising |
+| **A11a** | Slot model — read-only | Slot | A5 | Static data, reader helpers and consumer guards; no-ops on current payloads | Every consumer tolerates a slot with no implementation without raising. **A contract violation must stay loud**: legitimately-absent history, a deliberately unmapped slot, and an impossible payload shape must remain three distinguishable states, never one silent empty branch |
 | **A11b** | Slot model — minting | Slot | A9 | No identity survives regeneration **[V]**; the weekly plan renders from the global template, so substitutions are invisible **[V]** | A slot survives removal, blocking, substitution and reordering; two slots may share one canonical exercise; repair never silently deletes a slot |
 | **A12** | Proposal ledger + two transports | Patterns | ledger: — · write: A9 | No cooldown state exists **[V]**; `job_state` is keyed per-day so an 8-week cooldown is inexpressible **[V]** | A decline suppresses the same subject ≥8 weeks; workout-moment proposals render directly rather than through the deferred pipeline |
 
