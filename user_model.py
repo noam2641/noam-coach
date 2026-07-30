@@ -20,10 +20,13 @@ take the bot's ``DB`` object (anything with awaitable ``execute`` /
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Iterator, Protocol
 
 # ---------------------------------------------------------------------------
 # Kinds, sources, and the registry that classifies every known fact
@@ -868,6 +871,141 @@ def _dumps(value: Any) -> str:
 # ---------------------------------------------------------------------------
 
 
+#: Facts whose write surface is governed. A fact lands here when it is a
+#: DERIVED MIRROR of an authoritative store: writing it directly is an
+#: authority claim, and two independently-writable copies of the same truth is
+#: how stores drift apart.
+#:
+#: `active_workout_plan` mirrors `plan_versions`, which is copy-on-write and
+#: test-enforced. The mirror had no protection at all, so the weaker store had
+#: the weaker guarantee -- backwards, and the reason this exists.
+GOVERNED_FACT_KEYS: frozenset[str] = frozenset({"active_workout_plan"})
+
+#: Set while an authorized owner is performing a governed write.
+#:
+#: A ContextVar rather than frame inspection: `runtime_bound` re-syncs module
+#: globals from the coach_bot facade on every call, so the immediate caller's
+#: module is not a reliable signal, and async wrappers add further indirection.
+#: A ContextVar follows the logical flow instead of the stack, including across
+#: `await`.
+#:
+#: The value carries the owning task's id, not just a reason. `contextvars` are
+#: COPIED into a task at `asyncio.create_task`, so a bare reason would let an
+#: owner spawn a background task that inherits the authorization and writes
+#: after the `with` block has already exited -- authorization outliving the
+#: operation that granted it. Recording the task makes that inheritance
+#: detectable, and it is refused.
+#: (reason, owning task object | _ANY_TASK | None).
+#:
+#: The task OBJECT, never `id(task)`: CPython reuses ids after collection, so a
+#: finished task's id could later belong to an unrelated object and be mistaken
+#: for the authorizing task. The ContextVar holds the reference only for the
+#: lifetime of the `with` block, which is strictly shorter than the task's own.
+_governed_fact_write: ContextVar[tuple[str, object] | None] = ContextVar(
+    "_governed_fact_write", default=None
+)
+
+#: Sentinel for an authorization that is NOT bound to the task that opened it.
+#: Distinct from `None`, which is a real value meaning "granted outside any
+#: task" -- conflating the two would silently unbind every synchronous
+#: authorization.
+_ANY_TASK = object()
+
+
+def _current_task() -> "asyncio.Task[Any] | None":
+    """The running asyncio task, or None outside a loop.
+
+    Returns the OBJECT, never `id(task)`. CPython reuses `id()` after an object
+    is collected, so a finished task's id can be handed to an unrelated object
+    later -- an authorization could then be honoured in a task that merely
+    inherited a recycled number. Comparing objects makes that impossible.
+
+    None is a legitimate value: synchronous callers and `asyncio.run` entry
+    points have no task, and an authorization granted there is honoured within
+    that same synchronous flow.
+    """
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:  # no running loop
+        return None
+    return task
+
+
+@contextmanager
+def authorize_governed_fact_write(
+    reason: str, *, bind_to_task: bool = True
+) -> Iterator[None]:
+    """Authorize a governed fact write for the duration of this block.
+
+    The static guard in tests narrows *where* a governed write may appear; it
+    cannot prove what a dynamic key writes. This is the half that actually
+    holds at runtime, and it fails loudly rather than silently permitting.
+
+    `reason` is required and surfaced in errors -- an authorization with no
+    stated purpose is not one, and the reason is what makes a temporary
+    authorization removable later rather than permanent by inertia.
+
+    Scope is the block AND, by default, the task that opened it. Nesting
+    restores the outer authorization on exit; an exception inside still
+    releases it.
+
+    `bind_to_task=False` drops the task check, so an authorization opened in
+    one task is honoured in a child task. It exists for **test setup**, where a
+    synchronous fixture and an async test body legitimately run in different
+    tasks (pytest-asyncio creates one per test) and the inheritance is not the
+    background-write hazard the binding guards against. Production code must
+    not use it: perform the write in the authorizing flow, or open a fresh
+    authorization inside the task that genuinely owns it.
+    """
+    owning_task = _current_task() if bind_to_task else _ANY_TASK
+    token = _governed_fact_write.set((reason, owning_task))
+    try:
+        yield
+    finally:
+        # `reset` restores the PREVIOUS value, so a nested authorization
+        # returns to the outer one rather than clearing it outright.
+        _governed_fact_write.reset(token)
+
+
+def _assert_governed_fact_write_is_authorized(key: str) -> None:
+    """Refuse a governed write that no owner claimed responsibility for.
+
+    Raising rather than logging is deliberate. A silently-dropped write leaves
+    the mirror stale while the caller believes it succeeded, which is the exact
+    divergence this guards against -- worse than an error, because nothing
+    surfaces until a user sees the wrong plan.
+    """
+    if key not in GOVERNED_FACT_KEYS:
+        return
+    authorization = _governed_fact_write.get()
+    if authorization is not None:
+        reason, owning_task = authorization
+        # Identity comparison, not equality: two distinct Task objects are
+        # never the same authorization even if they compare equal somehow.
+        if owning_task is _ANY_TASK or owning_task is _current_task():
+            return
+        # Inherited by a child task at create_task. The authorizing block may
+        # already have exited, so honouring it here would let a background
+        # write happen under an authority that no longer exists. A governed
+        # write must be made by the flow that claimed responsibility for it.
+        raise PermissionError(
+            f"Governed write to {key!r} attempted from a task that inherited "
+            f"authorization granted elsewhere ({reason!r}). contextvars are "
+            "copied into tasks at create_task, so the authorizing block may "
+            "already have exited. Perform the write in the authorizing flow, "
+            "or open a new authorization inside the task if it is genuinely "
+            "the owner."
+        )
+    raise PermissionError(
+        f"Unauthorized write to the governed fact {key!r}. This fact is a "
+        "derived mirror -- it must be written by its owner, inside "
+        "user_model.authorize_governed_fact_write(reason). Writing the mirror "
+        "directly lets it diverge from the authoritative store. If a new route "
+        "needs this, route it through an existing owner rather than wrapping "
+        "the authorization around the new call site."
+    )
+
+
 async def set_fact(
     db: SupportsDB,
     user_id: int,
@@ -891,6 +1029,7 @@ async def set_fact(
     The read, history-write, and upsert are wrapped in a single transaction
     so concurrent calls cannot interleave and corrupt history.
     """
+    _assert_governed_fact_write_is_authorized(key)
     if confidence is None:
         confidence = SOURCE_CONFIDENCE.get(source, 0.7)
     # W1-5: the source only sets a *ceiling*. What the fact is actually worth
