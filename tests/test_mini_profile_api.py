@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta
+from datetime import timezone as dt_timezone
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,6 @@ import pytest
 import coach_bot
 import mini_api
 import user_model
-from config import TZ
 from db import Database
 from helpers import utc_now
 from models import MiniProfileUpdate
@@ -148,12 +148,19 @@ async def test_mini_today_meals_returns_meals_logged_in_db(
         "INSERT INTO users(id, first_name, username, updated_at) VALUES(1,'A',NULL,?)",
         (utc_now(),),
     )
-    # Seeded relative to the real clock, not pinned to 12:30. This endpoint
-    # selects "today" by calendar date, so a future-pinned meal happens to
-    # still match -- but the same shape (fixed hour + a production clock) is
-    # what made test_mini_api_returns_same_rendered_recommendation fail 15
-    # hours out of every 24. Kept relative so it cannot become that.
-    eaten_at = (datetime.now(TZ) - timedelta(minutes=5)).isoformat()
+    # Seeded relative to the real clock, not pinned to an hour -- a fixed hour
+    # plus a production clock is what made
+    # test_mini_api_returns_same_rendered_recommendation fail 15 hours out of
+    # every 24.
+    #
+    # Stored as UTC, matching what production writes (`utc_now()` at
+    # meals.py:213). The endpoint filters with a STRING comparison against
+    # `today_bounds_utc()`, whose bounds carry a "+00:00" offset, so a value
+    # carrying "+03:00" sorts wrongly even when the instant is inside the
+    # window: at 22:43 Israel time, "…T22:43…+03:00" > "…T21:00:00+00:00"
+    # lexically, while the actual instant (19:43 UTC) is comfortably within.
+    # That made this test fail every evening after 21:00 local.
+    eaten_at = (datetime.now(dt_timezone.utc) - timedelta(minutes=5)).isoformat()
     await db.execute(
         """
         INSERT INTO meals(user_id, name, calories, protein, carbs, fat, confidence, eaten_at, created_at)
