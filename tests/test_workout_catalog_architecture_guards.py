@@ -430,18 +430,56 @@ def test_the_write_guard_detects_a_hidden_key() -> None:
 #: `user_model.py` is the fact layer itself -- its own INSERT/UPDATE statements
 #: ARE the implementation of set_fact and the history append.
 #:
-#: `db.py` holds migration 10, a one-time cleanup of corrupted gap strings. It
-#: is bounded twice over: it selects only `kind='fact' AND value LIKE
-#: '%missing%'`, then skips any row whose decoded value is not a `str`. The
-#: governed fact is a dict, so it cannot be reached. Verified by reading the
-#: migration, not assumed from its name.
-_ALLOWED_RAW_FACT_SQL_FILES = frozenset({"user_model.py", "db.py"})
+#: Only `user_model.py` gets a whole-file exemption: its INSERT/UPDATE
+#: statements ARE the implementation of set_fact and the history append.
+_ALLOWED_RAW_FACT_SQL_FILES = frozenset({"user_model.py"})
+
+#: Narrower exemptions, scoped to a single FUNCTION rather than a whole file.
+#:
+#: `db.py` would otherwise need a blanket pass for one historical migration,
+#: which would silently permit any future raw fact write anywhere in a 1500-line
+#: module. Scoping to the function keeps the rest of db.py governed.
+#:
+#: `_migration_clean_polluted_gap_values` is migration 10, a one-time cleanup of
+#: corrupted gap strings. It is bounded twice over: it selects only
+#: `kind='fact' AND value LIKE '%missing%'`, then skips any row whose decoded
+#: value is not a `str`. The governed fact is a dict, so the path cannot reach
+#: it. Established by reading the migration, not inferred from its name.
+_ALLOWED_RAW_FACT_SQL_FUNCTIONS = frozenset(
+    {"db.py::_migration_clean_polluted_gap_values"}
+)
 
 #: INSERT INTO user_facts / UPDATE user_facts, in raw SQL string literals.
 _RAW_FACT_TABLE_WRITE_RE = re.compile(
     r"(?:INSERT\s+INTO|UPDATE)\s+user_facts\b",
     re.IGNORECASE,
 )
+
+
+def _exempt_function_ranges(relative: str, source: str) -> list[tuple[int, int]]:
+    """Line ranges of functions exempted for raw fact SQL in this file.
+
+    Function-scoped rather than file-scoped so that exempting one historical
+    migration does not quietly license every future raw write in the same
+    module.
+    """
+    ranges: list[tuple[int, int]] = []
+    exempt_names = {
+        entry.split("::", 1)[1]
+        for entry in _ALLOWED_RAW_FACT_SQL_FUNCTIONS
+        if entry.split("::", 1)[0] == relative
+    }
+    if not exempt_names:
+        return ranges
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:  # pragma: no cover
+        return ranges
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name in exempt_names:
+                ranges.append((node.lineno, node.end_lineno or node.lineno))
+    return ranges
 
 
 def test_no_new_raw_sql_write_path_to_user_facts() -> None:
@@ -461,9 +499,12 @@ def test_no_new_raw_sql_write_path_to_user_facts() -> None:
         relative = str(path.relative_to(ROOT)).replace("\\", "/")
         if relative in _ALLOWED_RAW_FACT_SQL_FILES:
             continue
-        text = path.read_text(encoding="utf-8")
-        for match in _RAW_FACT_TABLE_WRITE_RE.finditer(text):
-            line_number = text.count("\n", 0, match.start()) + 1
+        source = path.read_text(encoding="utf-8")
+        exempt_ranges = _exempt_function_ranges(relative, source)
+        for match in _RAW_FACT_TABLE_WRITE_RE.finditer(source):
+            line_number = source.count("\n", 0, match.start()) + 1
+            if any(start <= line_number <= end for start, end in exempt_ranges):
+                continue
             offenders.append(f"{relative}:{line_number}")
 
     assert not offenders, (

@@ -417,3 +417,76 @@ def test_bind_to_task_escape_is_confined_to_test_setup() -> None:
         "after its owner has finished. Perform the write in the authorizing "
         "flow, or open a fresh authorization inside the owning task."
     )
+
+
+def test_bind_to_task_defaults_to_true() -> None:
+    """The safe behaviour must be what a caller gets without asking.
+
+    A keyword-only parameter defaulting the other way would make every
+    ordinary authorization inheritable, and nothing would look wrong at the
+    call site.
+    """
+    import inspect
+
+    signature = inspect.signature(user_model.authorize_governed_fact_write)
+    parameter = signature.parameters["bind_to_task"]
+    assert parameter.default is True
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, (
+        "bind_to_task must be keyword-only so it can never be relaxed by a "
+        "positional argument passed at the wrong index"
+    )
+
+
+def test_bind_to_task_escape_is_used_only_by_test_infrastructure() -> None:
+    """Even within tests/, only fixtures and helpers may relax the binding.
+
+    A test that relaxes it inline would be asserting against a weaker rule than
+    production runs under, and would pass while the real contract regressed.
+    """
+    from pathlib import Path as _Path
+
+    root = _Path(__file__).resolve().parents[1]
+    allowed = {"tests/conftest.py"}
+    offenders: list[str] = []
+    for path in (root / "tests").rglob("*.py"):
+        if "__pycache__" in path.parts:
+            continue
+        relative = str(path.relative_to(root)).replace("\\", "/")
+        if relative in allowed or relative == "tests/test_governed_fact_write_authorization.py":
+            continue
+        if "bind_to_task=False" in path.read_text(encoding="utf-8"):
+            offenders.append(relative)
+
+    assert not offenders, (
+        f"bind_to_task=False used outside test infrastructure: {offenders}. "
+        "Only the autouse fixture in conftest.py may relax the task binding; "
+        "a test relaxing it inline is testing a weaker rule than production."
+    )
+
+
+def test_task_identity_uses_the_object_not_a_reusable_id() -> None:
+    """Identity must survive garbage collection without aliasing.
+
+    CPython reuses `id()` after an object is collected, so a finished task's id
+    can later belong to an unrelated object. Storing the task itself and
+    comparing with `is` makes a recycled number impossible to mistake for the
+    authorizing task.
+    """
+    import ast
+    import inspect
+
+    source = inspect.getsource(user_model._current_task)
+    tree = ast.parse(source.lstrip())
+    # Strip the docstring: it EXPLAINS why id(task) is wrong, so a raw text
+    # scan would flag the very comment documenting the rule.
+    body = [n for n in tree.body[0].body if not (
+        isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
+        and isinstance(n.value.value, str)
+    )]
+    code = "\n".join(ast.unparse(n) for n in body)
+
+    assert "return task" in code
+    assert "id(task)" not in code, (
+        "task identity must be the object, never id(task) -- ids are reused "
+        "after collection, so a finished task's id can alias a new object"
+    )

@@ -895,28 +895,40 @@ GOVERNED_FACT_KEYS: frozenset[str] = frozenset({"active_workout_plan"})
 #: after the `with` block has already exited -- authorization outliving the
 #: operation that granted it. Recording the task makes that inheritance
 #: detectable, and it is refused.
+#: (reason, owning task object | _ANY_TASK | None).
+#:
+#: The task OBJECT, never `id(task)`: CPython reuses ids after collection, so a
+#: finished task's id could later belong to an unrelated object and be mistaken
+#: for the authorizing task. The ContextVar holds the reference only for the
+#: lifetime of the `with` block, which is strictly shorter than the task's own.
 _governed_fact_write: ContextVar[tuple[str, object] | None] = ContextVar(
     "_governed_fact_write", default=None
 )
 
 #: Sentinel for an authorization that is NOT bound to the task that opened it.
-#: Distinct from `None`, which is a real task id meaning "no running task" --
-#: conflating the two would silently unbind every synchronous authorization.
+#: Distinct from `None`, which is a real value meaning "granted outside any
+#: task" -- conflating the two would silently unbind every synchronous
+#: authorization.
 _ANY_TASK = object()
 
 
-def _current_task_id() -> int | None:
-    """Identity of the running asyncio task, or None outside a loop.
+def _current_task() -> "asyncio.Task[Any] | None":
+    """The running asyncio task, or None outside a loop.
+
+    Returns the OBJECT, never `id(task)`. CPython reuses `id()` after an object
+    is collected, so a finished task's id can be handed to an unrelated object
+    later -- an authorization could then be honoured in a task that merely
+    inherited a recycled number. Comparing objects makes that impossible.
 
     None is a legitimate value: synchronous callers and `asyncio.run` entry
-    points have no task. Authorization granted outside a task is honoured
-    within that same synchronous flow.
+    points have no task, and an authorization granted there is honoured within
+    that same synchronous flow.
     """
     try:
         task = asyncio.current_task()
     except RuntimeError:  # no running loop
         return None
-    return id(task) if task is not None else None
+    return task
 
 
 @contextmanager
@@ -945,7 +957,7 @@ def authorize_governed_fact_write(
     not use it: perform the write in the authorizing flow, or open a fresh
     authorization inside the task that genuinely owns it.
     """
-    owning_task = _current_task_id() if bind_to_task else _ANY_TASK
+    owning_task = _current_task() if bind_to_task else _ANY_TASK
     token = _governed_fact_write.set((reason, owning_task))
     try:
         yield
@@ -968,7 +980,9 @@ def _assert_governed_fact_write_is_authorized(key: str) -> None:
     authorization = _governed_fact_write.get()
     if authorization is not None:
         reason, owning_task = authorization
-        if owning_task is _ANY_TASK or owning_task == _current_task_id():
+        # Identity comparison, not equality: two distinct Task objects are
+        # never the same authorization even if they compare equal somehow.
+        if owning_task is _ANY_TASK or owning_task is _current_task():
             return
         # Inherited by a child task at create_task. The authorizing block may
         # already have exited, so honouring it here would let a background
