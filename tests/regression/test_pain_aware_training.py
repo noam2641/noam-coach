@@ -825,6 +825,65 @@ async def test_painlevel_mirrors_into_training_limitations_fact(
     assert "מרפק" in fact["value"]["location"]
 
 
+@pytest.mark.asyncio
+async def test_painlevel_survives_a_failing_limitation_mirror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing mirror must not surface as an error on a pain report that worked.
+
+    The mirror (`training_limitations`) ran *after* the `except _StaleSetStep`
+    block that closes the pain transaction, and nothing guarded it. So a failure
+    there escaped the handler: the constraint row was already committed and the
+    pain genuinely recorded, but the user saw an error and the two stores
+    silently disagreed -- `medical_constraints` said "elbow", the planning fact
+    said nothing.
+
+    Pain reporting is the one interaction that must never look broken. The
+    constraint is what actually gates load and exercise selection; the mirror is
+    a projection for planning. A projection failing is not a reason to tell the
+    user their pain was not recorded.
+    """
+    db = await _make_db(tmp_path, "mirror_failure.db")
+    _patch_all(monkeypatch, db)
+    session = await _make_lat_pull_session(db)
+
+    real_set_fact = user_model.set_fact
+
+    async def _fail_on_limitations(*args: Any, **kwargs: Any) -> Any:
+        # Positional: (db, user_id, key, value, ...) -- key is args[2].
+        if len(args) > 2 and args[2] == "training_limitations":
+            raise RuntimeError("fact store unavailable")
+        return await real_set_fact(*args, **kwargs)
+
+    monkeypatch.setattr(user_model, "set_fact", _fail_on_limitations)
+
+    query = _FakeQuery()
+    painloc_data = coach_bot.session_action_data("painloc", session, "elbow")
+    await callback_session_bot.handle_session_action_callback(
+        query, context=None, user_id=1, data=painloc_data
+    )
+    refreshed = await db.fetch_one("SELECT * FROM sessions WHERE id=?", (session["id"],))
+    severity_data = coach_bot.session_action_data("painlevel", dict(refreshed), 4)
+
+    # The handler must absorb the projection failure, not propagate it. It is
+    # reaching this call at all -- rather than raising -- that is the assertion.
+    await callback_session_bot.handle_session_action_callback(
+        query, context=None, user_id=1, data=severity_data
+    )
+
+    # Severity 4 is a stop: the user still gets the stop card, not an error.
+    assert any("לעצור" in message for message in query.messages)
+
+    # The safety-critical write is intact and still gates training.
+    rows = await db.fetch_all(
+        "SELECT * FROM medical_constraints WHERE user_id=1 AND kind='pain'"
+    )
+    assert len(rows) == 1
+    assert rows[0]["location"] == "elbow"
+    assert rows[0]["severity"] == 4
+    assert rows[0]["status"] == "active"
+
+
 # ---------------------------------------------------------------------------
 # constraint_banner — clean Hebrew label instead of raw/mixed text
 # ---------------------------------------------------------------------------
