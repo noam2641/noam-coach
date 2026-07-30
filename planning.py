@@ -1537,15 +1537,20 @@ async def activate_plan(db: Any, user_id: int, plan_id: int) -> dict[str, Any] |
         )
     result = await get_plan(db, user_id, plan_id)
     if result and result["plan_type"] == "workout":
-        await user_model.set_fact(
-            db,
-            user_id,
-            "active_workout_plan",
-            {"plan_id": result["id"], **result["payload"]},
-            kind=user_model.KIND_FACT,
-            source=user_model.SOURCE_USER,
-            confirmed=True,
-        )
+        # Authorized: this is the mirror being written from the row that was
+        # just activated, so the fact is derived from Tier-1 rather than
+        # authored independently. That is the whole reason a write here is
+        # legitimate while the same call elsewhere is not.
+        with user_model.authorize_governed_fact_write("activate_plan mirrors Tier-1"):
+            await user_model.set_fact(
+                db,
+                user_id,
+                "active_workout_plan",
+                {"plan_id": result["id"], **result["payload"]},
+                kind=user_model.KIND_FACT,
+                source=user_model.SOURCE_USER,
+                confirmed=True,
+            )
     return result
 
 

@@ -2717,17 +2717,26 @@ async def build_weekly_plan(user_id: int, frequency: int) -> dict[str, Any]:
         source=user_model.SOURCE_USER,
         confirmed=True,
     )
-    await user_model.set_fact(
-        DB,
-        user_id,
-        "active_workout_plan",
-        plan,
-        kind=user_model.KIND_FACT,
-        source=user_model.SOURCE_SYSTEM,
-        confidence=0.85 if availability.confirmed else 0.65,
-        confirmed=True,
-        affects=("workout_schedule",),
-    )
+    # Authorized under protest, and deliberately recorded as such: this path
+    # writes the mirror WITHOUT a plan_versions row behind it, so the fact is
+    # the only copy and there is nothing to derive it from. That is the defect
+    # A10 removes by routing free-text plan building through the canonical
+    # pipeline. Until then the authorization keeps the write visible rather
+    # than silently permitted -- the reason string is the audit trail.
+    with user_model.authorize_governed_fact_write(
+        "build_weekly_plan writes a fact-only plan (superseded by A10)"
+    ):
+        await user_model.set_fact(
+            DB,
+            user_id,
+            "active_workout_plan",
+            plan,
+            kind=user_model.KIND_FACT,
+            source=user_model.SOURCE_SYSTEM,
+            confidence=0.85 if availability.confirmed else 0.65,
+            confirmed=True,
+            affects=("workout_schedule",),
+        )
     return plan
 
 
