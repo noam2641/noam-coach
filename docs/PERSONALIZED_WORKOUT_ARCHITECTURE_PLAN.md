@@ -92,6 +92,32 @@ into permanent identity and destroying the information `NULL` currently carries.
 
 ---
 
+## 3.5 Delivery status
+
+| ID | Status | Commit | PR | Reachability |
+|---|---|---|---|---|
+| **A1** | **COMPLETE** | `0691da3` | #59 | proven, exit 0 |
+| **A2** | **COMPLETE** | `09e06d9` | #60 | proven, exit 0 |
+| **A3** | **COMPLETE** | `295bb9f`, `2bd99da` | #61 | proven, exit 0 |
+| A4–A12 | not started | — | — | — |
+
+Two findings from delivering batch 1, recorded because they change how later items
+should be approached:
+
+1. **The callback-orphan guard is real and local runs miss it.**
+   `tests/regression/test_re10_regression.py::test_no_orphan_callback_prefixes` scans `bot/`
+   for every literal `callback_data` prefix and fails on any the router does not own. A3
+   minted `seteffort` without declaring it and CI caught it in both contexts. Any later item
+   that mints a new callback prefix must register it in the same pass — **A8 and A12 both
+   will**.
+
+2. **A guard test can pass for the wrong reason.** A3's isolation test initially passed
+   because the router already resolves the session with `AND user_id=?` before any handler
+   runs — so the in-query ownership scope was never exercised. The test was rewritten to
+   target the one client-supplied value the router does *not* validate (the set id), and
+   only then did removing the scope fail it. **Every guard added from here must be verified
+   by breaking the thing it guards**, not merely by passing.
+
 ## 4. Track A — Workout architecture
 
 | ID | Task | Domain | Depends | Justification | Acceptance criteria |
