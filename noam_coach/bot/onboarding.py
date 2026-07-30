@@ -2238,9 +2238,15 @@ async def render_workout_structure_choice(target: Any, user_id: int, strategy: s
 
 @runtime_bound(RUNTIME_NAMES)
 async def render_workout_exercise_review(target: Any, user_id: int, plan_id: int) -> None:
-    """Wizard step C (RE10-11): final exercise list before activation, with
-    the existing per-exercise edit entry point (editparams_menu) available
-    before the user commits."""
+    """Wizard step C (RE10-11): final exercise list before activation.
+
+    Read-only by design. This screen once offered a per-exercise edit button,
+    but the callback it minted resolved against the user's CURRENT plan --
+    which a reviewing user does not have -- so edits landed on the global
+    template instead of the plan on screen. See the comment at the session
+    loop and tests/test_preactivation_edit_route_harm.py. The decision here is
+    approve or regenerate; per-exercise tuning follows activation.
+    """
     candidates = await planning.list_plan_candidates(DB, user_id, "workout")  # type: ignore[arg-type]
     candidate = next((c for c in candidates if int(c["id"]) == plan_id), None)
     if candidate is None:
@@ -2273,9 +2279,29 @@ async def render_workout_exercise_review(target: Any, user_id: int, plan_id: int
             rmax = exercise_entry.get("rmax")
             lines.append(f"  • {name} — {sets}×{rmin}-{rmax}")
         lines.append("")
-        code = session.get("code")
-        if code:
-            rows.append([button(f"🔁 החלף/ערוך תרגילים ב-{esc(session_name)}", f"editparams_menu:{code}")])
+        # No per-session edit button here, deliberately.
+        #
+        # `editparams_menu:<code>` carries only a plan CODE, and
+        # workout_compat.resolve_legacy_code maps a bare code onto the user's
+        # CURRENT plan. A user on this screen is reviewing a CANDIDATE, so they
+        # frequently have no current plan at all -- the first-plan case always
+        # does -- and the code resolves to `template_fallback`. The editor then
+        # reads the GLOBAL template while the user believes they are editing the
+        # plan in front of them.
+        #
+        # Demonstrated in tests/test_preactivation_edit_route_harm.py: with a
+        # candidate whose ordering differs from the template, editing the first
+        # row on screen writes an override bound to template position 0 -- the
+        # user adjusts one exercise and a different one receives the weight.
+        # `exercise_overrides` carries no plan id, so the row survives
+        # activation and reapplies against a plan it was never written for.
+        #
+        # The managed alternative (`wk:ex:<identity>:<sidx>:<index>`) needs a
+        # resolved plan identity, which a candidate does not have by
+        # construction. Rather than mint a third editing route for a plan that
+        # may never be activated, the button is withheld until there is a plan
+        # to edit: the wizard's job is approve-or-regenerate, and per-exercise
+        # tuning is available immediately afterwards through the v2 editor.
 
     select_cb = conversation.encode_callback(
         "planv2", "select", str(plan_id), version=flow.version, flow_id=flow.flow_id,
