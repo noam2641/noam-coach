@@ -272,3 +272,104 @@ def test_the_fix_does_not_disturb_legitimate_edit_entry_points() -> None:
         "the legacy edit entry point should survive where it is valid -- only "
         "the pre-activation review case was harmful"
     )
+
+
+# ---------------------------------------------------------------------------
+# The stale button: removal does not reach into Telegram history
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_a_stale_review_button_cannot_still_write_a_template_override(
+    tmp_path, monkeypatch
+) -> None:
+    """Removing the button does not retract the ones already sent.
+
+    Telegram messages are durable. Every user who reached wizard step 3 before
+    this change still has an `editparams_menu:` button in their chat history,
+    and pressing it re-enters the same route the harm tests describe. If the
+    handler still resolves it through the template path, the fix protects only
+    new users and the defect stays live for exactly the people who already met
+    it.
+
+    The adapter returns False for template_fallback, letting the caller run the
+    explicit legacy template path -- correct for a plan-less user editing the
+    template deliberately, wrong for a stale review button. This pins that the
+    press cannot silently produce a template-bound override.
+    """
+    from noam_coach.bot import callback_plans
+
+    db = await _user(tmp_path, monkeypatch)
+    await _candidate_with_reordered_exercises(db)
+    monkeypatch.setattr(callback_plans, "DB", db)
+
+    before = await db.fetch_all("SELECT * FROM exercise_overrides WHERE user_id=1")
+    assert before == [], "fixture starts with no overrides"
+
+    class _Query:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+            self.answers: list[str] = []
+            self.message = type("M", (), {"chat_id": 1, "message_id": 1})()
+
+        async def edit_message_text(self, text, reply_markup=None, parse_mode=None):
+            self.messages.append(text)
+
+        async def answer(self, text=None, show_alert=False):
+            if text:
+                self.answers.append(text)
+
+    query = _Query()
+    # The exact callback a stale review button carries.
+    await callback_plans.handle_plan_callback(query, 1, "editparams_menu:A")
+
+    after = await db.fetch_all("SELECT * FROM exercise_overrides WHERE user_id=1")
+    assert after == [], (
+        "a stale review button wrote an override bound to template positions -- "
+        "the same defect the removal was meant to close, still reachable for "
+        "every user who saw the old screen"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_stale_picker_still_leads_to_a_template_bound_write(
+    tmp_path, monkeypatch
+) -> None:
+    """The honest bound on what removing the button achieved.
+
+    Opening the picker writes nothing, so the previous test passes trivially.
+    The write happens on the NEXT tap -- `param:<code>:<index>:<field>:<delta>`
+    -- and that route is unchanged: it is the legitimate template editor a
+    plan-less user reaches from the workout menu, and it cannot tell a
+    deliberate template edit from a stale review button.
+
+    Recording this as an asserted fact rather than a footnote. A6 removes the
+    route that CREATES the confusion for new users; it does not and cannot
+    retract buttons already in Telegram history. Closing that gap needs stable
+    identity in the callback itself -- A11b's slot identity -- not another
+    special case here.
+
+    If this assertion ever flips, the legacy template editor has gained
+    identity awareness and this bound should be revisited.
+    """
+    from noam_coach.bot import callback_plans
+
+    db = await _user(tmp_path, monkeypatch)
+    await _candidate_with_reordered_exercises(db)
+    monkeypatch.setattr(callback_plans, "DB", db)
+
+    outcome = await workout_compat.resolve_legacy_code(db, 1, "A")
+    assert outcome["outcome"] == workout_compat.OUTCOME_TEMPLATE_FALLBACK
+
+    # The legacy template editor remains reachable and template-bound. This is
+    # correct for its intended user and unavoidable for a stale button, since
+    # the callback carries no plan identity to distinguish them.
+    await profile_service.set_exercise_override(1, "A", 0, "weight", 77.0)
+    row = await db.fetch_one(
+        "SELECT exercise_index, exercise_id FROM exercise_overrides "
+        "WHERE user_id=1 AND code='A' AND field='weight'"
+    )
+    assert row is not None
+    assert row["exercise_id"] is None, (
+        "the legacy route still writes positionally; a stale button is "
+        "indistinguishable from a deliberate template edit until the callback "
+        "carries stable identity (A11b)"
+    )
