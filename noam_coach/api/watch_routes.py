@@ -12,6 +12,7 @@ from models import WatchSetPayload
 from noam_coach.api.health_routes import health_auth
 from noam_coach.bot.workout import try_save_set
 from noam_coach.runtime_bind import runtime_bound
+from noam_coach.services import workout_slots
 from noam_coach.services.core import ensure_user_record
 from noam_coach.services.training import RIR_UNKNOWN, active_session, recommend_load
 
@@ -24,6 +25,7 @@ _RUNTIME = (
     "recommend_load",
     "try_save_set",
     "RIR_UNKNOWN",
+    "workout_slots",
 )
 
 
@@ -46,6 +48,24 @@ async def watch_current(user_id: int) -> dict[str, Any]:
             "error": "Session exercise_index is out of range; session may be in an invalid state.",
         }
     current = exercises[exercise_index]
+    # The watch is an external contract: a half-populated exercise object
+    # renders as garbage on a device we do not control. A slot with no
+    # implementation, or a malformed entry, is reported as a typed state rather
+    # than passed through to recommend_load -- which would read `current["id"]`
+    # and raise inside an API handler.
+    entry_state = workout_slots.classify_entry(current)
+    if not workout_slots.is_performable(current):
+        workout_slots.observe_plan_entries(
+            [current], user_id=user_id, session_id=session["id"],
+            context="watch_current",
+        )
+        return {
+            "active": True,
+            "exercise_ready": False,
+            "reason": entry_state,
+            "exercise_index": exercise_index,
+            "set_number": session["set_number"],
+        }
     weight, reps, _ = await recommend_load(user_id, current)
     if session.get("pending_weight") is not None:
         weight = float(session["pending_weight"])

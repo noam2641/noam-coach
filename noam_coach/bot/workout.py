@@ -66,7 +66,7 @@ import reconcile
 import targets
 import training_intelligence
 import user_model
-from noam_coach.services import daily_state
+from noam_coach.services import daily_state, workout_slots
 
 # --- Extracted modules (re-exported for backward compatibility) ---
 from config import (  # noqa: F401
@@ -958,10 +958,25 @@ async def workout_summary(user_id: int, session_id: int) -> str:
     ended = datetime.fromisoformat(session["ended_at"] or utc_now())
     duration = round((ended - started).total_seconds() / 60)
 
+    # Per-entry rather than all-or-nothing. The previous form summed with a bare
+    # `ex["sets"]` inside one try, so a single entry missing the key raised and
+    # the except zeroed the count for the WHOLE session -- the user finishes a
+    # workout and is told 0 sets were planned. `planned_sets_of` returns 0 for
+    # an entry that legitimately contributes none (an unmapped or blocked slot)
+    # and for a malformed one, so every well-formed exercise still counts.
     planned_sets = 0
     try:
         plan = json.loads(session["plan"])
-        planned_sets = sum(int(ex["sets"]) for ex in plan["exercises"])
+        exercises = plan.get("exercises")
+        workout_slots.observe_plan_entries(
+            exercises,
+            user_id=user_id,
+            session_id=session_id,
+            context="workout_summary",
+        )
+        planned_sets = sum(
+            workout_slots.planned_sets_of(ex) for ex in (exercises or [])
+        )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         planned_sets = 0
 
