@@ -260,6 +260,39 @@ default that makes it indistinguishable from the first.
 | **A11a** | Slot model — read-only | Slot | A5 | Static data, reader helpers and consumer guards; no-ops on current payloads | Every consumer tolerates a slot with no implementation without raising. **A contract violation must stay loud**: legitimately-absent history, a deliberately unmapped slot, and an impossible payload shape must remain three distinguishable states, never one silent empty branch |
 | **A11b** | Slot model — minting | Slot | A9 | No identity survives regeneration **[V]**; the weekly plan renders from the global template, so substitutions are invisible **[V]** | A slot survives removal, blocking, substitution and reordering; two slots may share one canonical exercise; repair never silently deletes a slot |
 | **A12** | Proposal ledger + two transports | Patterns | ledger: — · write: A9 | No cooldown state exists **[V]**; `job_state` is keyed per-day so an 8-week cooldown is inexpressible **[V]** | A decline suppresses the same subject ≥8 weeks; workout-moment proposals render directly rather than through the deferred pipeline |
+| **A13** | Persist the load decision to audit | Observability | A5 (landed) | `LoadRecommendation.to_audit_dict()` exists and is complete, but its **only** consumer is a Mini App debug endpoint **[V]**. Nothing writes it to `audit` or the event stream, so there is no way to reconstruct what load was recommended for a past set — the one question an operator asks when a user disputes a weight | See A13 scope below |
+
+#### A13 — scope, deliberately narrow
+
+Surfaced by A5 and given an owner rather than left as a loose observation.
+
+**In scope**: persist the **existing** `to_audit_dict()` output through the **existing**
+mechanism — `services/core.write_audit` or `observability.emit_event`, whichever the
+implementer verifies is the better fit at the time. One decision record per recommendation
+that a user actually acts on.
+
+**Explicitly out of scope**: any change to how a load is calculated, chosen or displayed.
+A13 is a recording change. If a load decision differs before and after A13, the change is
+wrong.
+
+**Privacy**: structured fields only — `decision`, `confidence`, `data_completeness`,
+bounded `signals` / `missing_context` tokens, `exercise_id`, internal session id. Never the
+Hebrew `explanation` prose, never raw set rows, never plan payloads. Note
+`_allowlist_audit_details` silently drops list-valued details **[V]**, so `signals` and
+`missing_context` must be encoded as bounded scalars or the fields will vanish while the
+test still passes.
+
+**Acceptance criteria**:
+1. A recommendation acted on produces exactly one audit record with the fields above.
+2. A write failure is logged and **does not** break the workout — recording is best-effort,
+   the set is not.
+3. Duplicate suppression: re-rendering the same step must not produce a second record.
+   `ui.py` calls `recommend_load` **per exercise in a render loop** **[V]**, so a naive
+   write-on-every-call would emit N records per screen view.
+4. A test asserts the Hebrew explanation is absent from what is persisted.
+5. Verified by deliberate breakage, per the standing rule.
+
+**Not blocking A11a.**
 
 ### Deferred, with cause
 
