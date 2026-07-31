@@ -1903,22 +1903,38 @@ async def apply_schedule_correction(user_id: int, text: str) -> tuple[bool, str]
         DB, user_id, "detected_training_days", updated,
         kind=user_model.KIND_FACT, source=user_model.SOURCE_USER, confirmed=True,
     )
-    # The fact-tier `active_workout_plan` is deliberately NOT realigned here.
-    # An architecture guard restricts direct readers of that fact to an
-    # allowlist and routes everyone else through `workout_catalog` -- which
-    # today exposes readers only, with no way to write a corrected weekday
-    # back. Broadening the allowlist to make this file a reader is exactly
-    # what that guard's failure message says not to do silently.
+    # W1-44, closed. The saved plan is realigned onto the corrected weekdays
+    # through the supported mutation boundary, which builds a NEW plan version
+    # and activates it via `activate_plan` -- the sole writer A4 authorizes for
+    # the `active_workout_plan` fact. No allowlist was broadened and no second
+    # writer was introduced, which is what the comment this replaces warned
+    # against.
     #
-    # Consequence, recorded rather than hidden: after a correction the
-    # availability stores say Friday while a stored plan may still schedule
-    # Saturday, until the plan is rebuilt. Closing that needs a write path in
-    # workout_catalog (and, for Tier-1, in planning.py) -- a separate task.
+    # The outcome is reported to the user rather than assumed. Previously this
+    # reply said "ימי אימון עודכנו ✅" while the stored plan still scheduled the
+    # removed day -- true about the availability facts, misleading about the
+    # thing the user actually trains from.
+    from noam_coach.services import plan_mutations
+
+    outcome = await plan_mutations.realign_saved_plan_to_weekdays(
+        DB, user_id, updated, reason="schedule_correction"
+    )
 
     labels = ", ".join(weekday_labels_he(updated))
     reply = f"עודכן: ימי אימון — {labels} ✅"
     if removed:
         reply += f" (הסרתי: {', '.join(weekday_labels_he(sorted(removed)))})"
+
+    if outcome.outcome == plan_mutations.OUTCOME_REALIGNED:
+        reply += "\nגם תוכנית האימונים עודכנה בהתאם."
+    elif outcome.is_failure:
+        # Never silent. The availability facts DID update, so the correction is
+        # not lost -- but the plan the user trains from did not move, and saying
+        # nothing here is the defect W1-44 describes.
+        reply += (
+            "\n⚠️ לא הצלחתי לעדכן את תוכנית האימונים עצמה — "
+            "היא עדיין מתוזמנת לימים הקודמים. אפשר לבנות אותה מחדש מהתפריט."
+        )
     return True, reply
 
 

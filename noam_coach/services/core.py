@@ -319,6 +319,19 @@ def _pass(key: str):
 
 
 _AUDIT_ALLOWLIST: dict[tuple[str, str], dict[str, Any]] = {
+    # Saved-plan weekday realignment (A9 / W1-44). The before/after weekday sets
+    # arrive as short sorted STRINGS ("0,2,4"), not lists: an unregistered or
+    # list-valued detail is dropped by `_scalar_only` below without any error,
+    # so a list here would vanish while its test still passed. `outcome` and
+    # `reason` are bounded codes, never prose, and the plan payload never
+    # appears -- an audit row must not carry the user's programme.
+    ("realign_weekdays", "plan"): {
+        "outcome": _pass("outcome"),
+        "reason": _pass("reason"),
+        "new_plan_id": _pass("new_plan_id"),
+        "before_days": _pass("before_days"),
+        "after_days": _pass("after_days"),
+    },
     # Goal approvals: keep the bounded targets; DROP the `explanation` prose.
     ("approve", "goal"): {
         "calories": _pass("calories"),

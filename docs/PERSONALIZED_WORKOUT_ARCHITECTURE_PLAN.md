@@ -102,7 +102,35 @@ into permanent identity and destroying the information `NULL` currently carries.
 | **A4** | **COMPLETE** | `9d0341d`, `2cc4035` | #64 | proven, exit 0 |
 | **A6** | **COMPLETE** | `d07cb9e`, `cb67c9b` | #65 | proven, exit 0 |
 | **A5** | **COMPLETE** | `71e0106` | #67 | proven, exit 0 |
-| A7–A12 | not started | — | — | — |
+| **A11a** | **COMPLETE** | `6acc172` | #69 | proven, exit 0 |
+| **A9** | **COMPLETE** | `4345993` | #70 | proven, exit 0 |
+| A7, A8, A10, A11b, A12, A13 | not started | — | — | — |
+
+### A9 contracts for A10, A11b and A12
+
+A9 is the single supported way to change a saved plan. The three items that
+depend on it consume the same shape rather than inventing their own:
+
+* **`realign_saved_plan_to_weekdays(db, user_id, target_days, *, reason)`** —
+  the only entry point today. It never edits a payload: it inserts a new
+  version and activates it through `activate_plan`, which A4 authorizes to write
+  the governed fact. **A10, A11b and A12 must add operations beside it in the
+  same module, never a second writer elsewhere.**
+* **`MutationOutcome`** — `outcome` always set; `reason` only for BLOCKED and
+  FAILED. `is_failure` is False for `no_change` and `no_plan`, because "already
+  correct" and "nothing to change" are successes. Any caller that reports them
+  as failure is wrong.
+* **Audit** — `("realign_weekdays", "plan")` is registered in
+  `_AUDIT_ALLOWLIST`. A new operation needs its **own** entry: unregistered
+  pairs fall through to scalar-only and lists are dropped **silently**, so
+  weekday-style data must be encoded as short strings.
+* **Gates are not optional.** `_validate_plan_for_activation` runs on every
+  mutation. Readiness and quality raise the same exception type and are
+  separated by token shape (`_looks_like_quality`) — a new quality check whose
+  tokens do not match those markers would be misreported as readiness.
+* **Sessions are untouched.** `sessions` has no `plan_id` and no FK to
+  `plan_versions`, so an in-flight workout keeps its snapshot through a
+  supersession. This is a UX/staleness concern, never a data-integrity one.
 
 **A5 correction to this document's own inventory.** Section 3.3 claimed a third
 history reader made the total three. A full sweep during A5 found **six**
@@ -255,7 +283,7 @@ default that makes it indistinguishable from the first.
 | **A6** | Pre-activation `editparams_menu:` route | Identity | A4 | The plan-review wizard mints the legacy callback before activation **[V]**; with no active plan the user edits template parameters believing they edit their plan. Harm **[H]** | Harm test fails first, then passes. If it cannot be made to fail, the item closes as documentation. **The route must go through the managed interface — a green CI is not sufficient, and adding A6 to any allowlist to satisfy A4's guard is forbidden** |
 | **A7** | Pain persistence semantics | Runtime | A1 | `medical_constraints` expires after 14 days; `training_limitations` never does **[V]**, and the mirror concatenates strings — a one-time report becomes a permanent limitation | Four states distinguished (temporary event / active / confirmed / historical); expiry clears the planning fact; non-pain limitations survive; recompute, not append |
 | **A8** | Substitution occurrence correctness | Slot | A2 | `alts.index(alt)` is a value-based lookup **[V]**; re-ranking mutates the list, so a stale callback substitutes a valid-but-wrong exercise | A mutated list causes a stale callback to be rejected, never misapplied. Keyed on alternative id plus occurrence identity |
-| **A9** | Mutation boundary + saved-plan reconciliation (**W1-44**) | Governance | A4 | An availability correction deliberately leaves the plan contradicting it **[V]**, and the reply reports success with no hint of the divergence | The corrected day is removed after approval; the divergence is named before it; an in-flight session defers the swap; audit rows are recoverable |
+| **A9** | Mutation boundary + saved-plan reconciliation (**W1-44**) — **DONE** | Governance | A4 | An availability correction deliberately leaves the plan contradicting it **[V]**, and the reply reports success with no hint of the divergence | The corrected day is removed after approval; the divergence is named before it; an in-flight session defers the swap; audit rows are recoverable |
 | **A10** | Free-text intent + degraded plan | Governance | A9 | Only a frequency integer survives parsing **[V]**; exercise-less plans become active with no readiness gate | Weekdays, time and duration all land; a legacy user below full readiness receives a degraded plan with explicit disclosure and a completion CTA, never silence; safety-critical gaps still block. **Must also retire A4's temporary authorization**: remove `noam_coach/bot/onboarding.py` from `_ALLOWED_FACT_WRITER_FILES`, delete the `authorize_governed_fact_write` block in `build_weekly_plan`, and delete `test_build_weekly_plan_is_marked_a_temporary_owner`. After A10 the writer allowlist contains `planning.py` only, and a reintroduced independent mirror write must fail CI |
 | **A11a** | Slot model — read-only | Slot | A5 | Static data, reader helpers and consumer guards; no-ops on current payloads | Every consumer tolerates a slot with no implementation without raising. **A contract violation must stay loud**: legitimately-absent history, a deliberately unmapped slot, and an impossible payload shape must remain three distinguishable states, never one silent empty branch |
 | **A11b** | Slot model — minting | Slot | A9 | No identity survives regeneration **[V]**; the weekly plan renders from the global template, so substitutions are invisible **[V]** | A slot survives removal, blocking, substitution and reordering; two slots may share one canonical exercise; repair never silently deletes a slot |
