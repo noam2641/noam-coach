@@ -447,6 +447,14 @@ async def show_session(query: Any, user_id: int, session_id: int) -> None:
     )
 
     # Previous performance on this exercise, for comparison (P1).
+    #
+    # Deliberately NOT routed through training.select_exercise_history: that
+    # resolver answers "which SESSIONS inform the load", while this line needs
+    # "the single most recent SET, excluding the current session". Same table,
+    # different question. What they must share -- and now do -- is the identity
+    # they key on: the canonical exercise id. When per-machine identity lands,
+    # this query gains the same implementation filter and both stay in
+    # agreement; until then there is only one layer and they cannot disagree.
     prev = await DB.fetch_one(
         """
         SELECT s.weight, s.reps, s.rir FROM sets s
@@ -617,6 +625,12 @@ async def previous_weight_context(
     "previous set"), falling back to the last time the exercise was performed.
     Returns (None, "total") when there is nothing to show — the prompt then
     simply omits the context line and "אותו משקל" is not accepted.
+
+    Like the comparison line in `show_session`, this asks for a single most
+    recent SET rather than the sessions that inform a load, so it stays a
+    direct query rather than routing through `training.select_exercise_history`.
+    Both key on the canonical exercise id, which is what keeps this line and the
+    recommendation beside it describing the same exercise.
     """
     row = await DB.fetch_one(
         """

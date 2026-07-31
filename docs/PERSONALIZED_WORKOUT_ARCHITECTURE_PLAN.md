@@ -74,7 +74,7 @@ into permanent identity and destroying the information `NULL` currently carries.
 
 | Item | Consequence |
 |---|---|
-| `workout.py:454` — a **third** history reader **[V]** | The machine-aware ladder must apply at three sites, not two |
+| `workout.py:454` — a **third** history reader **[V]** | Superseded by A5's full inventory: there are **six** history-reading sites across five functions, not three. Four are exercise-keyed; two (`build_fatigue_assessment`, `reconcile._session_perf_by_day`) key on `session_id` only and are exercise-blind by design |
 | `workout.py:625` `previous_weight_context` **[V]** | Second reader; drives the user-facing "previous weight" line |
 | `onboarding.py:2278` mints `editparams_menu:` pre-activation **[V]** | The genuine route into the override edge case |
 | `_allowlist_audit_details` in `services/core.py` **[V]** | Silently drops list-valued audit details |
@@ -99,7 +99,22 @@ into permanent identity and destroying the information `NULL` currently carries.
 | **A1** | **COMPLETE** | `0691da3` | #59 | proven, exit 0 |
 | **A2** | **COMPLETE** | `09e06d9` | #60 | proven, exit 0 |
 | **A3** | **COMPLETE** | `295bb9f`, `2bd99da` | #61 | proven, exit 0 |
-| A4–A12 | not started | — | — | — |
+| **A4** | **COMPLETE** | `9d0341d`, `2cc4035` | #64 | proven, exit 0 |
+| **A6** | **COMPLETE** | `d07cb9e`, `cb67c9b` | #65 | proven, exit 0 |
+| **A5** | **COMPLETE** | `71e0106` | #67 | proven, exit 0 |
+| A7–A12 | not started | — | — | — |
+
+**A5 correction to this document's own inventory.** Section 3.3 claimed a third
+history reader made the total three. A full sweep during A5 found **six**
+history-reading sites across five functions. Four are exercise-keyed
+(`recommend_load_decision` uses two distinct queries, plus `show_session` and
+`previous_weight_context`); two are exercise-blind and stay out of scope.
+
+**A5 finding, deliberately measured rather than fixed.** The session picker does
+not exclude `telegram_split_secondary` while the per-session fetch does, so a
+split-only session consumes one of three slots and contributes nothing. Fixing
+it changes which sessions inform a load — load behaviour, not read plumbing —
+so A5 emits `sessions_dropped:<n>` and leaves the decision to a later item.
 
 Two findings from delivering batch 1, recorded because they change how later items
 should be approached:
@@ -236,7 +251,7 @@ default that makes it indistinguishable from the first.
 | **A2** | Occurrence identity on `sets` | Runtime | — | `undo_last_set` reverse-maps `exercise_id` with `next()`, returning the first match **[V]**. `sets` has no `exercise_index` column **[V]** | Plan with the same exercise at index 0 and 3: a set logged at 3 undoes to 3. Split sets share the index; rewind keys off the primary |
 | **A3** | Effort CTA on the rest screen | Runtime | — | One-tap logging writes `RIR_UNKNOWN` and never asks, so progression can rarely confirm mastery **[V]**. This is the real fix for sparse RIR — it adds data | Ignoring the CTA changes nothing; tapping updates only a row whose value is `RIR_UNKNOWN`; targeted by set id captured at arm time, never "most recent set" |
 | **A4** | Write governance: AST guard + runtime assertion | Governance | — | The guard is a regex blind to writes, and `[^,]+` fails on any call whose first two arguments contain a comma **[V]**. Two ungoverned `set_fact` writers exist | A new writer fails CI; a non-constant key fails CI; `getattr` spelling and raw SQL covered; runtime contextvar assertion complements the static guard. **Must also publish the contract A6 depends on**: the permitted owners of an `active_workout_plan` write, which wrappers are legitimate, how the runtime assertion detects an indirect call, and a test that verifies the protection by breaking it deliberately |
-| **A5** | Ladder-ready history reads (three sites) | Load | — | Three readers key on canonical `exercise_id` **[V]**; no equipment, machine, gym, brand or model column exists anywhere in the schema **[V]** | All three surfaces agree; none blends machines; an unattributed set still counts via the canonical tier |
+| **A5** | Ladder-ready history reads | Load | — | **Four** exercise-keyed readers, not three **[V]**; no equipment/machine/gym/brand column exists anywhere in the schema **[V]**; a query failure was indistinguishable from "never trained" **[V]** | **DONE** — one `HistorySelection` contract; `no_history` vs `history_unavailable` kept distinct and logged with ids only; layer reported on every decision; guards pin that every exercise-keyed history SELECT keys on `exercise_id` and none on `exercise_name` |
 | **A6** | Pre-activation `editparams_menu:` route | Identity | A4 | The plan-review wizard mints the legacy callback before activation **[V]**; with no active plan the user edits template parameters believing they edit their plan. Harm **[H]** | Harm test fails first, then passes. If it cannot be made to fail, the item closes as documentation. **The route must go through the managed interface — a green CI is not sufficient, and adding A6 to any allowlist to satisfy A4's guard is forbidden** |
 | **A7** | Pain persistence semantics | Runtime | A1 | `medical_constraints` expires after 14 days; `training_limitations` never does **[V]**, and the mirror concatenates strings — a one-time report becomes a permanent limitation | Four states distinguished (temporary event / active / confirmed / historical); expiry clears the planning fact; non-pain limitations survive; recompute, not append |
 | **A8** | Substitution occurrence correctness | Slot | A2 | `alts.index(alt)` is a value-based lookup **[V]**; re-ranking mutates the list, so a stale callback substitutes a valid-but-wrong exercise | A mutated list causes a stale callback to be rejected, never misapplied. Keyed on alternative id plus occurrence identity |
@@ -320,7 +335,7 @@ nullable column between them, no callback-compatibility impact, each rolling bac
 | Product requirement | Verified gap | Work item | Domain |
 |---|---|---|---|
 | Plan must reflect stated availability (§28.1) | `health_jobs.py:1906-1916` divergence **[V]** | A9 (W1-44) | Governance |
-| Per-machine load history (§18) | Three readers, no equipment dimension **[V]** | A5 | Load |
+| Per-machine load history (§18) | Four exercise-keyed readers, no equipment dimension **[V]** | A5 (contract landed; per-machine identity still to come) | Load |
 | Substitution scope choice (§19.2) | Session-only; `original_id` never read **[V]** | A8, A12 | Slot / Patterns |
 | Slot survives implementation change (§3) | Identity is `(plan_id, session_index)` **[V]** | A11a, A11b | Slot |
 | AI may not activate a plan from text alone (§25) | `assistant.py:568` → exercise-less fact **[V]** | A10 | Governance |
