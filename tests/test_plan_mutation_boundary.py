@@ -74,12 +74,20 @@ def _payload(weekdays: list[int]) -> dict[str, Any]:
 def _bind_audit(monkeypatch: pytest.MonkeyPatch, db: Database) -> None:
     """Point the audit writer at the test database.
 
-    `write_audit` resolves `DB` from its own module globals via runtime_bound,
-    so patching the caller is not enough -- the write lands on the real
-    configured path and fails with "no such table: audit".
+    `write_audit` is `runtime_bound` and `DB` is in its RUNTIME_NAMES, so the
+    decorator re-syncs `DB` from the `coach_bot` facade on EVERY call. Patching
+    only `core_services.DB` is therefore overwritten before the write happens --
+    and it appeared to work locally purely because an earlier test in the same
+    process had left the facade pointing at a temp database. In CI, running the
+    file alone, the write landed on the real configured path and vanished.
+
+    So the facade is the thing to patch, and `core_services` is patched too for
+    the window before the first re-sync.
     """
+    import coach_bot
     from noam_coach.services import core as core_services
 
+    monkeypatch.setattr(coach_bot, "DB", db, raising=False)
     monkeypatch.setattr(core_services, "DB", db, raising=False)
 
 
