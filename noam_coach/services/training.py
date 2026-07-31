@@ -153,6 +153,143 @@ class LoadRecommendation:
         }
 
 
+# ---------------------------------------------------------------------------
+# A5: one shared contract for selecting exercise history.
+#
+# Four production sites read set history keyed on the canonical exercise id --
+# recommend_load_decision's session picker and its per-session fetch, plus
+# show_session's "previous performance" line and previous_weight_context. They
+# were written independently and answer the same question in three different
+# ways, so a screen can show one exercise's history while the recommendation
+# beside it uses another's.
+#
+# Two further readers (build_fatigue_assessment, reconcile._session_perf_by_day)
+# key on session_id ONLY -- they are exercise-blind by design, aggregating a
+# whole session. They are deliberately NOT part of this contract: giving them an
+# exercise dimension would change what they measure, not just how they read it.
+#
+# This layer records WHICH history was selected and WHY, so every consumer can
+# agree. It changes no query semantics today: `implementation_id` does not exist
+# yet, so the only reachable layer is CANONICAL and behaviour is identical. The
+# ladder tiers are declared now so the consumers, the audit fields and the tests
+# are already in place when A-later introduces implementation identity.
+# ---------------------------------------------------------------------------
+
+#: Which identity the history came from. Ordered strongest to weakest -- the
+#: resolver returns the first layer that yields rows.
+HISTORY_LAYER_IMPLEMENTATION = "implementation"   # this exact machine (future)
+HISTORY_LAYER_EQUIVALENT = "equivalent"           # user-approved equivalent (future)
+HISTORY_LAYER_CANONICAL = "canonical"             # same movement, any machine
+HISTORY_LAYER_NONE = "none"                       # nothing found
+
+#: Why the resolver returned no usable history. These are NOT interchangeable,
+#: and collapsing them is the failure this contract exists to prevent: a
+#: database that could not be read must never look like a user who has never
+#: trained. `history_unavailable` means the query could not be answered;
+#: `no_history` means it was answered and the answer was "none".
+HISTORY_ABSENT_NO_HISTORY = "no_history"
+HISTORY_ABSENT_UNAVAILABLE = "history_unavailable"
+
+#: Confidence ceiling per layer. A canonical-layer answer is real history and
+#: keeps today's confidence; the weaker layers cap lower because they describe
+#: a different machine. Applied as a ceiling, never a floor, so no existing
+#: branch can be made MORE confident by this change.
+_LAYER_CONFIDENCE_CEILING = {
+    HISTORY_LAYER_IMPLEMENTATION: 100,
+    HISTORY_LAYER_EQUIVALENT: 74,
+    HISTORY_LAYER_CANONICAL: 100,
+}
+
+
+@dataclass(frozen=True)
+class HistorySelection:
+    """What history was found, from which identity layer, and how sure we are.
+
+    `absent_reason` is populated only when `rows` is empty, and distinguishing
+    its two values is the point of the type: a caller can render "no history
+    yet" for one and must not for the other.
+    """
+
+    rows: tuple[dict[str, Any], ...] = ()
+    layer: str = HISTORY_LAYER_NONE
+    absent_reason: str | None = None
+
+    @property
+    def found(self) -> bool:
+        return bool(self.rows)
+
+    @property
+    def is_unavailable(self) -> bool:
+        """True when history could not be READ, as opposed to not existing."""
+        return self.absent_reason == HISTORY_ABSENT_UNAVAILABLE
+
+    def confidence_ceiling(self, base: int) -> int:
+        """Cap a branch's confidence by the layer the history came from."""
+        ceiling = _LAYER_CONFIDENCE_CEILING.get(self.layer)
+        return base if ceiling is None else min(base, ceiling)
+
+    def missing_context(self) -> tuple[str, ...]:
+        """The missing-context tokens this selection implies."""
+        if self.found:
+            return ()
+        return (self.absent_reason or HISTORY_ABSENT_NO_HISTORY,)
+
+
+async def select_exercise_history(
+    db: Any,
+    user_id: int,
+    exercise_id: str,
+    *,
+    limit_sessions: int = 3,
+) -> HistorySelection:
+    """Resolve the strongest available history layer for one exercise.
+
+    Today only the canonical layer is reachable -- there is no per-machine
+    identity to query -- so this returns exactly what the previous inline query
+    returned. The value is that every consumer now learns WHICH layer answered
+    and, when nothing came back, whether that was an answer or a failure.
+
+    A query error is surfaced as `history_unavailable` rather than propagating.
+    The callers render a workout screen; a locked database should degrade the
+    load recommendation, not break the set the user is mid-way through. The
+    distinction is preserved in the return value and logged, so it does not
+    become a silent "no data".
+    """
+    try:
+        rows = await db.fetch_all(
+            """
+            SELECT ws.id, COALESCE(ws.ended_at, ws.started_at) AS performed_at
+            FROM sessions ws
+            JOIN sets s ON s.session_id=ws.id
+            WHERE ws.user_id=?
+              AND s.exercise_id=?
+              AND ws.status IN ('completed', 'partial')
+            GROUP BY ws.id
+            ORDER BY performed_at DESC, ws.id DESC
+            LIMIT ?
+            """,
+            (user_id, exercise_id, limit_sessions),
+        )
+    except Exception:
+        # Bounded reason code + internal ids only -- never the row contents,
+        # which are the user's training data.
+        LOGGER.exception(
+            "history_selection_failed user_id=%s exercise_id=%s layer=%s",
+            user_id, exercise_id, HISTORY_LAYER_CANONICAL,
+        )
+        return HistorySelection(
+            layer=HISTORY_LAYER_NONE,
+            absent_reason=HISTORY_ABSENT_UNAVAILABLE,
+        )
+
+    if not rows:
+        return HistorySelection(
+            layer=HISTORY_LAYER_NONE,
+            absent_reason=HISTORY_ABSENT_NO_HISTORY,
+        )
+    return HistorySelection(rows=tuple(rows), layer=HISTORY_LAYER_CANONICAL)
+
+
 def format_load_decision_details(decision: LoadRecommendation) -> str:
     """Render an auditable load decision for the workout "how was this decided" UI."""
     lines = [
@@ -259,23 +396,22 @@ async def recommend_load_decision(
     if pain_caution is not None:
         signals.append(f"active_pain:{pain_caution.region}")
 
-    session_rows = await DB.fetch_all(
-        """
-        SELECT ws.id, COALESCE(ws.ended_at, ws.started_at) AS performed_at
-        FROM sessions ws
-        JOIN sets s ON s.session_id=ws.id
-        WHERE ws.user_id=?
-          AND s.exercise_id=?
-          AND ws.status IN ('completed', 'partial')
-        GROUP BY ws.id
-        ORDER BY performed_at DESC, ws.id DESC
-        LIMIT 3
-        """,
-        (user_id, current_exercise["id"]),
+    selection = await select_exercise_history(
+        DB, user_id, current_exercise["id"], limit_sessions=3
     )
+    session_rows = list(selection.rows)
 
     if not session_rows:
-        missing_context.append("exercise_history")
+        # Two different situations, deliberately not collapsed. "no_history" is
+        # an answer -- the user has not trained this exercise. "history_
+        # unavailable" means the question could not be answered at all, and
+        # reporting that as a data condition would hide an infrastructure one.
+        missing_context.extend(selection.missing_context())
+        if selection.is_unavailable:
+            signals.append("history_unavailable")
+        else:
+            # Preserved for every existing consumer of this token.
+            missing_context.append("exercise_history")
         return LoadRecommendation(
             float(current_exercise["weight"]),
             int(current_exercise["rmin"]),
@@ -287,7 +423,17 @@ async def recommend_load_decision(
             data_completeness=45,
         )
 
+    # NOTE (behaviour preserved deliberately): the session picker above does
+    # NOT exclude `telegram_split_secondary`, while this per-session fetch
+    # does. A session whose only sets for this exercise are split-secondary is
+    # therefore selected, consumes one of the three slots, and then contributes
+    # nothing -- so the recommendation can rest on fewer sessions than it
+    # appears to. Changing the picker would alter which sessions inform the
+    # load, which is a load-behaviour change and not A5's scope; A5 makes the
+    # selection observable so the asymmetry is measurable before anyone acts
+    # on it. `sessions_dropped` below is that measurement.
     history: list[list[dict[str, Any]]] = []
+    sessions_dropped = 0
     for session_row in session_rows:
         rows = await DB.fetch_all(
             """
@@ -302,6 +448,11 @@ async def recommend_load_decision(
         )
         if rows:
             history.append(rows)
+        else:
+            sessions_dropped += 1
+
+    if sessions_dropped:
+        signals.append(f"sessions_dropped:{sessions_dropped}")
 
     if not history:
         missing_context.append("comparable_sets")
@@ -315,6 +466,11 @@ async def recommend_load_decision(
             confidence=55,
             data_completeness=45,
         )
+
+    # Which identity answered. Constant today (only the canonical layer is
+    # reachable), but emitted now so consumers, audit fields and tests already
+    # agree on the vocabulary before per-machine identity exists.
+    signals.append(f"history_layer:{selection.layer}")
 
     latest = history[0]
     last_weight = float(latest[0]["weight"])
