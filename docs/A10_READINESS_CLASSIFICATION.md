@@ -8,7 +8,8 @@ inventing it, and is the input to the implementation.
 
 **Owner decision, superseding an earlier reading of this document.** A missing
 `training_limitations` is **`degraded_safety`**, not a hard blocker: the plan is
-built under existing conservative behaviour, the unknown stays explicitly
+built under conservative behaviour **that A10 must create** (§3 requirement 2 —
+no existing path produces caution from absence), the unknown stays explicitly
 unknown, the missing adaptation is disclosed, and activation requires explicit
 confirmation through the A9 boundary. What still blocks is **structural** — an
 input without which there is no plan object to degrade. See §3.
@@ -24,11 +25,31 @@ that has none". **That was wrong.** The axis exists: `questions.Question` carrie
 
 What is missing is *propagation*. `check_plan_readiness` reads those questions
 and returns a flat `list[str]` of **Hebrew display strings**
-(`onboarding.py:2676-2688`) **[V]**, discarding every score. Its single caller
-then treats any non-empty list as a hard block (`assistant.py:580-586`) **[V]**.
+(`onboarding.py:2676-2688`) **[V]**, discarding every score. Its only caller then
+treats any non-empty list as a hard block (`assistant.py:580-586`) **[V]**.
 
-So A10 propagates an existing scale rather than designing a new one. That is a
-materially smaller and safer change than the pre-flight assumed.
+**But the safety gate has four enforcement points, not one** *(corrected after
+review — the earlier "single caller" framing understated the change surface by
+roughly 4x)*:
+
+| Enforcer | Location |
+|---|---|
+| `check_plan_readiness` | `assistant.py:580` **[V]** |
+| `_block_plan_for_pending_safety` | `onboarding.py:696` and `:3077` **[V]** |
+| `_require_readiness(…, "safety")` | `planning.py:1253` (candidate build) **[V]** |
+| `_require_readiness(…, "safety")` | `planning.py:1466` (activation) **[V]** |
+
+Relaxing only the first would be **silently overridden** by the other three: the
+free-text path would soften while the two onboarding build paths still hard-block
+and re-ask. `_block_plan_for_pending_safety`'s own docstring cites **LOG-015** and
+states the gate must block on *every* build path — so softening it is a
+deliberate tradeoff against a closed incident, not a detail. A10 must decide and
+record which of the four change.
+
+So A10 propagates an existing *scale* rather than designing one — but the change
+surface is four gates, not one, and the conservative *behaviour* the degraded
+path needs does not yet exist. Smaller than the pre-flight assumed on the
+severity axis; larger on both of these.
 
 ---
 
@@ -87,11 +108,32 @@ user to confirm before anything is activated.
    answer is stored as `KIND_GAP` and `pending_safety_questions` counts a
    `KIND_GAP` fact as unanswered (`questions.py:523`) **[V]**. That is the state
    to preserve, not a new one to invent.
-2. **Use the existing conservative behaviour.** `client_training_profile_from_facts`
-   already handles `limitations is None` (`training_intelligence.py:349`) **[V]**,
-   and `adapt_exercises` has no pain regions to work with, so nothing is
-   prescribed *because* a limitation was assumed away. A10 adds no new
-   conservative path — it relies on the one that exists.
+2. **A conservative path must be BUILT — it does not exist.** *(Corrected after
+   adversarial review; the original claim here was false and would have made the
+   whole design rest on a false premise.)*
+
+   `client_training_profile_from_facts` does handle `limitations is None`
+   (`training_intelligence.py:348-359`) **[V]**, but for a legacy user with no
+   `active_pain` and no `medical_avoidance` — **exactly the population A10 serves**
+   — the fallback produces `""`, which flows to empty tuples. Measured:
+
+   ```
+   injuries=()  pain_areas=()  movement_limitations=()  medical_flags=()
+   active_pain_regions([]) -> {}
+   ```
+
+   `adapt_exercises` therefore receives **no constraints and loads every joint
+   freely**. That is not conservative — it is a silent assumption of "no
+   limitations", the precise thing requirement 1 forbids.
+
+   The only textual difference from a user who typed "no limitations" is the
+   literal `'none'` they supplied; behaviourally the plans are identical.
+
+   **Consequence for A10:** it must introduce a real conservative path — a plan
+   built under *unknown* limitations must differ from one built under *known-none*.
+   This is a genuine NEW mechanism, and under §2a it requires recorded evidence:
+   the evidence is the measurement above, showing no existing path produces
+   caution from absence.
 3. **Disclose the missing adaptation.** The plan must state that no
    injury/limitation information was available and that exercises were **not**
    adapted for pain. Generic "some info is missing" is insufficient: the user has
@@ -200,10 +242,10 @@ it with a disclosure would be worse than refusing.
 
 **No fact is a hard safety blocker.** Two are structurally blocking — without
 them there is no plan object to degrade. The remaining six already have
-conservative handling in the builder, which is why a degraded plan is achievable
-**without inventing a single new default or a new unknown state**: `KIND_GAP`
-already models "asked and not answered", and `limitations is None` already falls
-back rather than assuming "none".
+conservative handling in the builder. `KIND_GAP` already models "asked and not
+answered" **[V]**, so the unknown *state* needs no invention — but the
+conservative *behaviour* does: see §3 requirement 2. A10 reuses the state and
+builds the caution.
 
 ### Reuse assessment
 
