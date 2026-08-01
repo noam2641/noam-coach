@@ -379,6 +379,41 @@ path added later cannot silently skip it.
 Both are covered by deliberate breakage: reverting the profile flag, dropping it
 from the payload, and removing the disclosure at either call site each fail.
 
+### Requirement 3 does not yet cover the fact-only build path — stated, not hidden
+
+There are **two plan systems**, and the confirmation gate reaches only one.
+
+| Path | Storage | Reaches `_validate_plan_for_activation`? |
+|---|---|---|
+| `callback_plans.py:1681` → `planning.activate_plan` | `plan_versions` row | **Yes** — confirmation enforced |
+| `onboarding.build_weekly_plan` (3 render paths) | governed fact only | **No** |
+
+Proven by `ast` inspection of `build_weekly_plan`: `activate_plan` is never
+called, there is no `INSERT INTO plan_versions`, and it writes
+`active_workout_plan` directly under
+`authorize_governed_fact_write("build_weekly_plan writes a fact-only plan
+(superseded by A10)")` **[V]**. With no plan row behind it, there is nothing for
+an approval to reference and no activation call to gate.
+
+So on the free-text and onboarding paths a safety-degraded plan currently gets
+**conservative behaviour and disclosure, but not the confirmation tap**. That is
+a real reduction against the three-protection design and is recorded here rather
+than described as complete.
+
+It is deliberately **not** patched by adding a second confirmation mechanism to
+the fact-only writer. That writer is already marked superseded, its own comment
+names the fix ("routing free-text plan building through the canonical
+pipeline"), and bolting an approval onto a path with no plan row would duplicate
+the mechanism the reuse rule exists to prevent — the incomplete mechanism is a
+candidate for upgrade, not a licence to duplicate. Retiring it is A11b's scope,
+where `build_weekly_plan` is already being rewritten; A10 leaves the
+authorization comment in place so the write stays visible.
+
+**Net effect today:** the LOG-015 block is replaced on every path by behaviour
+that is strictly more informative than silence, and fully replaced by all three
+protections on the `plan_versions` path. No path activates a degraded plan
+*silently* — every one of them discloses.
+
 ### Implementation constraints carried forward
 
 * Route the write through **A9's `plan_mutations`** boundary — no new writer.

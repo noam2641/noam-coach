@@ -727,3 +727,53 @@ def test_every_plan_render_path_routes_through_the_disclosure() -> None:
         "degraded plan would render as if fully adapted:\n  "
         + "\n  ".join(offenders)
     )
+
+
+def test_the_fact_only_build_path_is_still_ungated_and_that_is_recorded() -> None:
+    """Pins a KNOWN, DOCUMENTED gap so it cannot be forgotten or silently widen.
+
+    Two plan systems exist. `callback_plans.py` activates through
+    `planning.activate_plan`, so the A10 confirmation gate applies. But
+    `onboarding.build_weekly_plan` writes the governed fact directly with no
+    `plan_versions` row — there is no activation call to gate and no plan row
+    for an approval to reference — so a degraded plan on that path gets
+    conservative behaviour and disclosure, but no confirmation tap.
+
+    This test does NOT assert that the gap is acceptable. It asserts the shape
+    of the gap, so that:
+      * if someone routes `build_weekly_plan` through the canonical pipeline
+        (A11b's scope), this test fails and must be deleted along with the
+        caveat in `docs/A10_READINESS_CLASSIFICATION.md`;
+      * if someone adds a SECOND fact-only writer, `test_governed_fact_write_
+        authorization` catches it.
+
+    A silent gap is what turns a stated tradeoff into a defect.
+    """
+    import ast
+    from pathlib import Path as _Path
+
+    source = (_Path(__file__).resolve().parents[1]
+              / "noam_coach/bot/onboarding.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    fn = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef))
+        and n.name == "build_weekly_plan"
+    )
+    body = ast.get_source_segment(source, fn) or ""
+    called = {
+        n.func.attr if isinstance(n.func, ast.Attribute) else getattr(n.func, "id", "")
+        for n in ast.walk(fn) if isinstance(n, ast.Call)
+    }
+
+    assert "activate_plan" not in called, (
+        "build_weekly_plan now activates through the canonical pipeline -- the "
+        "A10 confirmation gate reaches it. DELETE this test and the "
+        "'Requirement 3 does not yet cover' section of "
+        "docs/A10_READINESS_CLASSIFICATION.md."
+    )
+    assert "INSERT INTO plan_versions" not in body
+    assert "authorize_governed_fact_write" in body, (
+        "the fact-only write must stay explicitly authorized and visible, not "
+        "become a silently permitted one"
+    )
