@@ -2352,6 +2352,17 @@ async def render_candidate_list(target: Any, user_id: int, plan_type: str) -> No
         ]
     else:
         lines = [f"<b>שלוש הצעות {_plan_type_label(plan_type)}</b>", ""]
+        # A10: this is the screen the user chooses from, and the button below is
+        # the confirmation tap. If the plans were built without safety
+        # information, the disclosure belongs HERE -- disclosing only after the
+        # tap would be informing someone about a decision they already made.
+        from noam_coach.services import plan_readiness as _pr
+
+        with suppress(Exception):
+            _assessment = await _pr.assess_plan_readiness(DB, user_id)
+            _disclosure = _pr.disclosure_lines(_assessment)
+            if _disclosure:
+                lines.extend([*_disclosure, ""])
     rows = []
     for index, candidate in enumerate(candidates, start=1):
         lines.append(_format_candidate(candidate, index))

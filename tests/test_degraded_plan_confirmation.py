@@ -972,3 +972,186 @@ async def test_the_fallback_shape_renders_but_can_never_activate(
         "SELECT plan_id FROM active_plans WHERE user_id=1 AND plan_type='workout'"
     )
     assert active is None
+
+
+# ---------------------------------------------------------------------------
+# The rest of the A10 contract: what free text actually delivers
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_free_text_frequency_days_time_and_duration_reach_the_candidate(
+    tmp_path, monkeypatch
+) -> None:
+    """D-1: free text is not an independent plan-creation path.
+
+    The intent a user expresses in free text -- how many days, which days, what
+    time, how long -- must survive into the stored candidate. If it did not,
+    routing through the pipeline would have quietly discarded what the user
+    said, which is worse than the fact-only path it replaced.
+    """
+    from noam_coach.bot import onboarding
+
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    monkeypatch.setattr(onboarding, "DB", db, raising=False)
+    await _answer_everything_but_safety(db)
+    await user_model.set_fact(
+        db, 1, "session_minutes", 45,
+        kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
+    )
+    await _defer_safety(db)
+
+    plan = await onboarding.build_weekly_plan(1, 3)
+
+    stored = await db.fetch_one(
+        "SELECT payload FROM plan_versions WHERE id=?", (plan["plan_id"],)
+    )
+    payload = json.loads(stored["payload"])
+    sessions = payload["sessions"]
+
+    assert payload["frequency"] == 3, "the requested frequency must reach the candidate"
+    assert len(sessions) == 3
+    # Weekdays: the user's confirmed availability (mon,wed,fri -> 0,2,4).
+    assert sorted(s["weekday"] for s in sessions) == [0, 2, 4], (
+        "the user's chosen training days must reach the candidate"
+    )
+    for session in sessions:
+        assert session.get("time"), "each session must carry a time"
+        assert session.get("minutes") == 45, (
+            "the user's session duration must reach the candidate"
+        )
+
+
+@pytest.mark.asyncio
+async def test_the_candidate_carries_concrete_exercises_not_a_template_code(
+    tmp_path, monkeypatch
+) -> None:
+    """The stored candidate must BE the plan, not a pointer to a template.
+
+    The retired fact-only shape carried `code` and left the renderer to expand
+    it from the global `PLANS` template -- which is why substitutions were
+    invisible and why A11b's renderer rewrite was blocked. The stored payload
+    must carry the exercises themselves, already adapted, so the plan a user
+    confirms is the plan that was stored.
+    """
+    from noam_coach.bot import onboarding
+
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    monkeypatch.setattr(onboarding, "DB", db, raising=False)
+    await _answer_everything_but_safety(db)
+    await _defer_safety(db)
+
+    plan = await onboarding.build_weekly_plan(1, 3)
+    stored = await db.fetch_one(
+        "SELECT payload FROM plan_versions WHERE id=?", (plan["plan_id"],)
+    )
+    sessions = json.loads(stored["payload"])["sessions"]
+
+    for session in sessions:
+        exercises = session.get("exercises") or []
+        assert exercises, (
+            "a stored session with no exercises is a template pointer, not a "
+            "plan -- and activation refuses it outright"
+        )
+        for exercise in exercises:
+            assert exercise.get("id"), "each exercise must be concrete"
+            assert exercise.get("sets"), "each exercise must carry a prescription"
+
+
+@pytest.mark.asyncio
+async def test_the_three_gap_classes_stay_distinct_end_to_end(
+    tmp_path, monkeypatch
+) -> None:
+    """blocking_integrity / degraded_personalization / degraded_safety must not
+    collapse into each other on the real path.
+
+    Collapsing them is the original defect: every gap became a hard block, so a
+    user missing one optional answer got the same silence as one missing a
+    structural input.
+    """
+    from noam_coach.bot import onboarding
+
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    monkeypatch.setattr(onboarding, "DB", db, raising=False)
+
+    # 1. blocking_integrity: nothing answered -> no candidate is produced.
+    blocked = await onboarding.build_weekly_plan(1, 3)
+    assert not blocked.get("plan_id"), (
+        "a structural gap must not produce an activatable candidate"
+    )
+
+    # 2. degraded_safety: everything but the safety fact -> a candidate, and
+    #    confirmation is required.
+    await _answer_everything_but_safety(db)
+    await _defer_safety(db)
+    degraded = await onboarding.build_weekly_plan(1, 3)
+    assert degraded.get("plan_id"), "a safety gap must still produce a plan"
+    assessment = await pr.assess_plan_readiness(db, 1)
+    assert assessment.safety_unknown is True
+    assert assessment.needs_confirmation is True
+    assert pr.disclosure_lines(assessment), "safety-degraded must disclose"
+
+    # 3. degraded_personalization: answered safety -> no confirmation demanded.
+    await user_model.set_fact(
+        db, 1, "training_limitations", "none",
+        kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
+    )
+    tailored = await pr.assess_plan_readiness(db, 1)
+    assert tailored.safety_unknown is False
+    assert tailored.needs_confirmation is False, (
+        "a merely-less-tailored plan must not demand a tap, or the tap stops "
+        "meaning anything where it matters"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_choice_screen_discloses_before_the_confirmation_tap(
+    tmp_path, monkeypatch
+) -> None:
+    """Disclosure must precede the decision, not follow it.
+
+    `render_candidate_list` is the screen the user chooses from, and its
+    buttons ARE the confirmation tap (`planv2:select:<id>`). Disclosing only
+    after the tap would inform someone about a decision they had already made.
+    """
+    from noam_coach.bot import onboarding
+
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    monkeypatch.setattr(onboarding, "DB", db, raising=False)
+    await _answer_everything_but_safety(db)
+    await _defer_safety(db)
+    await onboarding.build_weekly_plan(1, 3)
+
+    sent: list[str] = []
+    buttons: list[str] = []
+
+    async def _capture(target, text, markup=None, **_kw):
+        sent.append(text)
+        for row in getattr(markup, "inline_keyboard", []) or []:
+            for btn in row:
+                buttons.append(getattr(btn, "callback_data", "") or "")
+
+    # `safe_edit` is runtime_bound and re-syncs from the facade on every call,
+    # so patching the onboarding attribute alone is overwritten. Patch the
+    # owning module too -- the same trap that made A9's audit tests pass
+    # locally and fail in CI.
+    import coach_bot
+    from noam_coach.bot import ui as _ui
+
+    monkeypatch.setattr(_ui, "safe_edit", _capture, raising=False)
+    monkeypatch.setattr(coach_bot, "safe_edit", _capture, raising=False)
+    monkeypatch.setattr(onboarding, "safe_edit", _capture, raising=False)
+
+    await onboarding.render_candidate_list(object(), 1, "workout")
+
+    body = "\n".join(sent)
+    assert body, "the choice screen must render"
+    assert "כאב" in body or "פציעה" in body, (
+        "the choice screen must disclose that limitations could not be applied, "
+        "before the user taps"
+    )
+    assert any(b.startswith("planv2:select:") for b in buttons), (
+        "the confirmation tap must be reachable from this screen"
+    )
