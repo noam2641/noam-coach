@@ -426,6 +426,42 @@ The orphan guard checks the prefix only, so it would still pass while the
 callback died in the handler. Keep part-2 numeric, or register the prefix as
 router-owned.
 
+### Ownership gap surfaced by A12 planning — assigned to A11b
+
+A12's reuse assessment found a requirement with **no owner**, which would have
+fallen through the seam between two items.
+
+**The substitution audit records no reason.** `callback_session.py:686-693`
+passes only `source` and `target` **[V]**. A12's consecutive-substitution
+detector needs to know *why* a swap happened — "the machine was occupied" and
+"it hurt" are not the same pattern, and promoting the wrong one is how a
+one-off becomes a permanent plan change.
+
+Two further facts make this more than an omission:
+
+* `("approve_substitution", "exercise")` is **not registered** in
+  `_AUDIT_ALLOWLIST` **[V]**, so it falls through to scalar-only. A `reason`
+  added without registering the pair would survive only if scalar, and a list
+  would vanish **silently** — the failure mode §2a exists to prevent.
+* The file is **A11b-owned**. A12 must not edit it.
+
+**Assigned to A11b**, which already owns `callback_session.py` for the
+alternatives re-ranking. A11b adds the bounded `reason` and registers the
+allowlist pair; A12 consumes it. Recorded here so the requirement is owned
+rather than discovered late by whichever item touches the file second.
+
+### Transport constraint confirmed by A12 (verified independently)
+
+`deliver_proactive_message` is called from **four** modules, all job or
+scheduler contexts — `runtime.py`, `health_jobs.py`, `morning_policy.py` and the
+`coach_bot` facade re-export. **Zero callback handlers** **[V]**.
+
+`claim_job_delivery` defers non-urgent messages while a flow is active **[V]**,
+and a workout *is* an active flow — so a workout-moment proposal sent through
+that pipeline is **silently dropped**, returning `False` with no exception. The
+two-transport split is therefore not a preference but a requirement: direct
+render at workout moments, the pipeline only for unsolicited proposals.
+
 ### Risk and value
 
 **Riskiest: A10.** Not the largest, but the only one carrying a product-judgment
