@@ -2,10 +2,16 @@
 
 **Read-only analysis. Verified against `develop` @ `08fe3d1`. No code changed.**
 
-A10 must let a legacy user receive a *degraded* plan instead of silence, while
-safety-critical gaps still block. That needs a severity axis. This document
-establishes one from the code rather than inventing it, and is the input to the
-implementation.
+A10 must let a legacy user receive a *degraded* plan instead of silence. That
+needs a severity axis. This document establishes one from the code rather than
+inventing it, and is the input to the implementation.
+
+**Owner decision, superseding an earlier reading of this document.** A missing
+`training_limitations` is **`degraded_safety`**, not a hard blocker: the plan is
+built under existing conservative behaviour, the unknown stays explicitly
+unknown, the missing adaptation is disclosed, and activation requires explicit
+confirmation through the A9 boundary. What still blocks is **structural** — an
+input without which there is no plan object to degrade. See §3.
 
 ---
 
