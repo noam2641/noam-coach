@@ -729,51 +729,208 @@ def test_every_plan_render_path_routes_through_the_disclosure() -> None:
     )
 
 
-def test_the_fact_only_build_path_is_still_ungated_and_that_is_recorded() -> None:
-    """Pins a KNOWN, DOCUMENTED gap so it cannot be forgotten or silently widen.
+# ---------------------------------------------------------------------------
+# The invariant, on the path that previously could not honour it
+#
+#   degraded proposal -> conservative behaviour -> disclosure
+#   -> explicit confirmation -> activation through A9 only
+#
+# `build_weekly_plan` used to write the governed fact directly with no
+# `plan_versions` row. There was no candidate to hold and no activation call to
+# gate, so an unconfirmed activation was structurally unavoidable. These tests
+# assert it is now structurally impossible.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_building_a_weekly_plan_proposes_and_does_not_activate(
+    tmp_path, monkeypatch
+) -> None:
+    """The heart of the contract: build must not activate."""
+    from noam_coach.bot import onboarding
 
-    Two plan systems exist. `callback_plans.py` activates through
-    `planning.activate_plan`, so the A10 confirmation gate applies. But
-    `onboarding.build_weekly_plan` writes the governed fact directly with no
-    `plan_versions` row — there is no activation call to gate and no plan row
-    for an approval to reference — so a degraded plan on that path gets
-    conservative behaviour and disclosure, but no confirmation tap.
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    monkeypatch.setattr(onboarding, "DB", db, raising=False)
+    await _answer_everything_but_safety(db)
+    await _defer_safety(db)
 
-    This test does NOT assert that the gap is acceptable. It asserts the shape
-    of the gap, so that:
-      * if someone routes `build_weekly_plan` through the canonical pipeline
-        (A11b's scope), this test fails and must be deleted along with the
-        caveat in `docs/A10_READINESS_CLASSIFICATION.md`;
-      * if someone adds a SECOND fact-only writer, `test_governed_fact_write_
-        authorization` catches it.
+    plan = await onboarding.build_weekly_plan(1, 3)
 
-    A silent gap is what turns a stated tradeoff into a defect.
+    assert plan.get("plan_id"), "the built plan must be backed by a plan_versions row"
+    row = await db.fetch_one(
+        "SELECT status FROM plan_versions WHERE id=?", (plan["plan_id"],)
+    )
+    assert row["status"] == "candidate", "building must produce a CANDIDATE"
+
+    assert await user_model.get_value(db, 1, "active_workout_plan") is None, (
+        "no governed fact may be written before confirmation -- this is the "
+        "direct write A10 retired"
+    )
+    active = await db.fetch_one(
+        "SELECT plan_id FROM active_plans WHERE user_id=1 AND plan_type='workout'"
+    )
+    assert active is None, "no plan may become active before the user confirms"
+
+
+@pytest.mark.asyncio
+async def test_the_built_plan_carries_real_exercises(tmp_path, monkeypatch) -> None:
+    """Routing through the canonical pipeline is what makes the gate possible.
+
+    The old shape carried only `weekday/time/code/name`, which
+    `_validate_plan_for_activation` rejects for having no exercises and no
+    minutes -- so it could never have been activated through the gate even in
+    principle. Real exercises are a precondition for the contract, not a bonus.
     """
-    import ast
-    from pathlib import Path as _Path
+    from noam_coach.bot import onboarding
 
-    source = (_Path(__file__).resolve().parents[1]
-              / "noam_coach/bot/onboarding.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    fn = next(
-        n for n in ast.walk(tree)
-        if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef))
-        and n.name == "build_weekly_plan"
-    )
-    body = ast.get_source_segment(source, fn) or ""
-    called = {
-        n.func.attr if isinstance(n.func, ast.Attribute) else getattr(n.func, "id", "")
-        for n in ast.walk(fn) if isinstance(n, ast.Call)
-    }
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    monkeypatch.setattr(onboarding, "DB", db, raising=False)
+    await _answer_everything_but_safety(db)
+    await _defer_safety(db)
 
-    assert "activate_plan" not in called, (
-        "build_weekly_plan now activates through the canonical pipeline -- the "
-        "A10 confirmation gate reaches it. DELETE this test and the "
-        "'Requirement 3 does not yet cover' section of "
-        "docs/A10_READINESS_CLASSIFICATION.md."
+    session = (await onboarding.build_weekly_plan(1, 3))["sessions"][0]
+
+    assert session.get("exercises"), "sessions must carry exercises"
+    assert session.get("minutes"), "sessions must carry a duration"
+    assert session.get("time"), (
+        "sessions must carry a time -- repair_workout_payload supplies it, and "
+        "without it activation refuses with missing=['weekly_availability']"
     )
-    assert "INSERT INTO plan_versions" not in body
-    assert "authorize_governed_fact_write" in body, (
-        "the fact-only write must stay explicitly authorized and visible, not "
-        "become a silently permitted one"
+
+
+@pytest.mark.asyncio
+async def test_ignoring_the_proposal_never_activates(tmp_path, monkeypatch) -> None:
+    """A user who is shown a plan and never taps keeps whatever they had."""
+    from noam_coach.bot import onboarding
+
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    monkeypatch.setattr(onboarding, "DB", db, raising=False)
+    await _answer_everything_but_safety(db)
+    await _defer_safety(db)
+
+    await onboarding.build_weekly_plan(1, 3)
+    await onboarding.build_weekly_plan(1, 3)  # shown again, still no tap
+
+    active = await db.fetch_one(
+        "SELECT plan_id FROM active_plans WHERE user_id=1 AND plan_type='workout'"
     )
+    assert active is None
+    assert await user_model.get_value(db, 1, "active_workout_plan") is None
+
+
+@pytest.mark.asyncio
+async def test_an_existing_active_plan_survives_an_unconfirmed_proposal(
+    tmp_path, monkeypatch
+) -> None:
+    """Proposing must not disturb what the user is currently training from.
+
+    The old direct write replaced the active plan outright, so a user who asked
+    to see options lost the plan they were mid-week on.
+    """
+    from noam_coach.bot import onboarding
+
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    monkeypatch.setattr(onboarding, "DB", db, raising=False)
+    await _answer_everything_but_safety(db)
+    await _defer_safety(db)
+
+    # An existing active plan, activated the legitimate way.
+    first = await onboarding.build_weekly_plan(1, 3)
+    approval_id = await pr.propose_degraded_plan(db, 1, first["plan_id"], _SAFETY_UNKNOWN)
+    assert await pr.confirm_degraded_plan(db, 1, approval_id) == pr.OUTCOME_CONFIRMED
+    before = await db.fetch_one(
+        "SELECT plan_id FROM active_plans WHERE user_id=1 AND plan_type='workout'"
+    )
+    assert before["plan_id"] == first["plan_id"]
+
+    # A new proposal, not confirmed.
+    await onboarding.build_weekly_plan(1, 3)
+
+    after = await db.fetch_one(
+        "SELECT plan_id FROM active_plans WHERE user_id=1 AND plan_type='workout'"
+    )
+    assert after["plan_id"] == before["plan_id"], (
+        "an unconfirmed proposal must leave the active plan exactly as it was"
+    )
+
+
+@pytest.mark.asyncio
+async def test_confirmation_activates_exactly_once_through_a9(
+    tmp_path, monkeypatch
+) -> None:
+    """End to end on the previously-ungated path, including the double tap."""
+    from noam_coach.bot import onboarding
+
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    monkeypatch.setattr(onboarding, "DB", db, raising=False)
+    await _answer_everything_but_safety(db)
+    await _defer_safety(db)
+
+    plan = await onboarding.build_weekly_plan(1, 3)
+    approval_id = await pr.propose_degraded_plan(db, 1, plan["plan_id"], _SAFETY_UNKNOWN)
+
+    assert await pr.confirm_degraded_plan(db, 1, approval_id) == pr.OUTCOME_CONFIRMED
+    assert await pr.confirm_degraded_plan(db, 1, approval_id) == pr.OUTCOME_ALREADY_DECIDED
+    assert await pr.confirm_degraded_plan(db, 1, approval_id) == pr.OUTCOME_ALREADY_DECIDED
+
+    row = await db.fetch_one(
+        "SELECT status FROM plan_versions WHERE id=?", (plan["plan_id"],)
+    )
+    assert row["status"] == "active"
+
+    # Exactly one active row, and the governed fact now mirrors Tier-1.
+    actives = await db.fetch_all(
+        "SELECT plan_id FROM active_plans WHERE user_id=1 AND plan_type='workout'"
+    )
+    assert len(actives) == 1
+    fact = await user_model.get_value(db, 1, "active_workout_plan")
+    assert fact and fact.get("plan_id") == plan["plan_id"], (
+        "the fact must be the derived mirror of the activated row, not an "
+        "independently authored copy"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_stale_approval_for_a_superseded_candidate_cannot_activate(
+    tmp_path, monkeypatch
+) -> None:
+    """An old keyboard must not activate a plan the user has moved past.
+
+    `save_candidates` marks previous candidates `superseded`. A user who was
+    shown plan A, asked for a rebuild, and then tapped the OLD message's button
+    must not get plan A: they are looking at plan B. `activate_plan` refuses a
+    non-candidate/active row, so the A9 boundary reports this rather than
+    activating a stale proposal.
+    """
+    from noam_coach.bot import onboarding
+
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    monkeypatch.setattr(onboarding, "DB", db, raising=False)
+    await _answer_everything_but_safety(db)
+    await _defer_safety(db)
+
+    first = await onboarding.build_weekly_plan(1, 3)
+    stale_approval = await pr.propose_degraded_plan(
+        db, 1, first["plan_id"], _SAFETY_UNKNOWN
+    )
+
+    # A newer proposal supersedes the first candidate.
+    await onboarding.build_weekly_plan(1, 3)
+    row = await db.fetch_one(
+        "SELECT status FROM plan_versions WHERE id=?", (first["plan_id"],)
+    )
+    assert row["status"] == "superseded", "the rebuild must supersede the old candidate"
+
+    outcome = await pr.confirm_degraded_plan(db, 1, stale_approval)
+
+    assert outcome != pr.OUTCOME_CONFIRMED, (
+        "a stale tap must not activate a superseded candidate"
+    )
+    active = await db.fetch_one(
+        "SELECT plan_id FROM active_plans WHERE user_id=1 AND plan_type='workout'"
+    )
+    assert active is None, "no plan may become active from a stale approval"

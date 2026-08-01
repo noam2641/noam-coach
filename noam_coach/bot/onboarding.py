@@ -2782,27 +2782,69 @@ async def build_weekly_plan(user_id: int, frequency: int) -> dict[str, Any]:
         source=user_model.SOURCE_USER,
         confirmed=True,
     )
-    # Authorized under protest, and deliberately recorded as such: this path
-    # writes the mirror WITHOUT a plan_versions row behind it, so the fact is
-    # the only copy and there is nothing to derive it from. That is the defect
-    # A10 removes by routing free-text plan building through the canonical
-    # pipeline. Until then the authorization keeps the write visible rather
-    # than silently permitted -- the reason string is the audit trail.
-    with user_model.authorize_governed_fact_write(
-        "build_weekly_plan writes a fact-only plan (superseded by A10)"
-    ):
-        await user_model.set_fact(
-            DB,
-            user_id,
-            "active_workout_plan",
-            plan,
-            kind=user_model.KIND_FACT,
-            source=user_model.SOURCE_SYSTEM,
-            confidence=0.85 if availability.confirmed else 0.65,
-            confirmed=True,
-            affects=("workout_schedule",),
+    # A10: this function used to write `active_workout_plan` directly, under a
+    # temporary A4 authorization, with NO `plan_versions` row behind it -- the
+    # fact was the only copy, nothing could derive it, and the plan became
+    # active the instant it was built. That made an unconfirmed activation
+    # unavoidable on this path: there was no candidate to hold and no
+    # activation call to gate.
+    #
+    # It now proposes through the canonical pipeline instead. `generate_
+    # candidates` builds exercise-bearing sessions and applies
+    # `repair_workout_payload` (which supplies the session time this shape
+    # lacked), `save_candidates` stores them as `candidate` rows, and nothing
+    # becomes active until the user taps -- at which point activation runs
+    # through A9. No governed-fact write remains here.
+    proposed = await _propose_weekly_plan(user_id, plan, frequency)
+    return proposed if proposed is not None else plan
+
+
+async def _propose_weekly_plan(
+    user_id: int,
+    fallback: dict[str, Any],
+    frequency: int,
+) -> dict[str, Any] | None:
+    """Store the weekly plan as a CANDIDATE and return its payload to render.
+
+    Returns None when the canonical pipeline cannot produce a plan, in which
+    case the caller renders the locally-built shape. That fallback renders but
+    does **not** activate -- with the direct fact write gone, there is no path
+    on which an unconfirmed plan can become active. A user who cannot be
+    proposed a real plan sees one and is asked to complete what is missing,
+    which is the pre-A10 behaviour minus the silent activation.
+    """
+    import planning
+
+    try:
+        candidates = await planning.generate_candidates(DB, user_id, "workout")
+    except planning.PlanningBlockedError as exc:
+        # Readiness/quality refusal: surface nothing here, the caller's gates
+        # already explain it. Never fall through to a write.
+        LOGGER.info(
+            "weekly_plan_proposal_blocked user_id=%s missing=%d",
+            user_id, len(getattr(exc, "missing", None) or ()),
         )
-    return plan
+        return None
+    except Exception:
+        LOGGER.exception("weekly_plan_proposal_failed user_id=%s", user_id)
+        return None
+
+    if not candidates:
+        return None
+
+    # Prefer a candidate matching the frequency the user asked for; the
+    # pipeline may offer several strategies.
+    chosen = next(
+        (c for c in candidates if (c.payload or {}).get("frequency") == frequency),
+        candidates[0],
+    )
+    payload = dict(chosen.payload or {})
+    payload["plan_id"] = chosen.id
+    # Carry the fields the local shape provided that the pipeline does not, so
+    # the three render paths keep the text they had.
+    for key in ("days_source", "availability_confirmed", "structure", "method"):
+        payload.setdefault(key, fallback.get(key))
+    return payload
 
 
 @runtime_bound(RUNTIME_NAMES)

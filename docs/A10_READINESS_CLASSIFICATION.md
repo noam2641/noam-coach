@@ -321,13 +321,15 @@ Evidence for NEW:             SAFETY_UNKNOWN only. Measured: with no training_li
                               byte-identical to a user who answered "none". No existing
                               path produces caution from absence, so the distinction had
                               to be created rather than reused.
-Superseded paths retired:     none. (Corrected: the plan said A10 would retire
-                              build_weekly_plan's independent fact write and drop
-                              onboarding.py from _ALLOWED_FACT_WRITER_FILES. It did NOT.
-                              That write is the plan-BUILDING mirror, untouched by the
-                              degraded-safety flow; retiring it is A11b's scope, where
-                              build_weekly_plan is already being rewritten. Claiming it
-                              here would have been a retirement recorded but not made.)
+Superseded paths retired:     build_weekly_plan's independent governed-fact write, and
+                              onboarding.py dropped from _ALLOWED_FACT_WRITER_FILES --
+                              exactly as the plan required. (An earlier revision of this
+                              line claimed the retirement belonged to A11b. That was
+                              wrong: the fact-only writer did not merely lack a
+                              confirmation gate, it made one impossible, so retiring it
+                              IS the A10 deliverable. Corrected after owner review.)
+                              A4's test_build_weekly_plan_is_marked_a_temporary_owner
+                              retired with it, replaced by its inverse guard.
 Post-implementation search:   done. Confirmed on the final diff:
                               - no new set_fact / authorize_governed_fact_write /
                                 INSERT INTO plan_versions -- activation goes through A9;
@@ -342,6 +344,16 @@ Post-implementation search:   done. Confirmed on the final diff:
                               - KIND_GAP reused to separate "never asked" from "asked and
                                 deferred" -- the distinction already written by record_gap
                                 and discarded by pending_safety_questions' single bucket.
+                              Re-run after the routing change:
+                              - exactly ONE governed-fact writer remains in production
+                                (planning.py:1656) -- grep for
+                                authorize_governed_fact_write returns that line alone;
+                              - ZERO new callback prefixes: confirmation extends the
+                                existing planv2:select: tap rather than adding a second
+                                confirm flow beside it;
+                              - build_weekly_plan reuses generate_candidates /
+                                save_candidates / repair_workout_payload -- no new
+                                builder, no new persistence, no new repair path.
 ```
 
 **One mechanism was extended rather than reused as-is.** `_require_readiness`
@@ -379,40 +391,59 @@ path added later cannot silently skip it.
 Both are covered by deliberate breakage: reverting the profile flag, dropping it
 from the payload, and removing the disclosure at either call site each fail.
 
-### Requirement 3 does not yet cover the fact-only build path — stated, not hidden
+### Requirement 3 initially missed the fact-only build path — now closed
 
-There are **two plan systems**, and the confirmation gate reaches only one.
+The first attempt at A10 delivered confirmation on the `plan_versions` path only,
+and proposed deferring the rest to A11b. That was wrong on both counts, and the
+owner rejected it: disclosure without confirmation is still a contract
+violation, and the acceptance criteria assign the retirement to A10.
 
-| Path | Storage | Reaches `_validate_plan_for_activation`? |
-|---|---|---|
-| `callback_plans.py:1681` → `planning.activate_plan` | `plan_versions` row | **Yes** — confirmation enforced |
-| `onboarding.build_weekly_plan` (3 render paths) | governed fact only | **No** |
+**What was actually wrong.** `onboarding.build_weekly_plan` wrote
+`active_workout_plan` directly, under a temporary A4 authorization, with **no
+`plan_versions` row behind it**. The fact was the only copy, nothing could
+derive it, and the plan became active the instant it was built. So an
+unconfirmed activation was not an oversight on that path — it was structurally
+unavoidable: there was no candidate to hold and no activation call to gate.
 
-Proven by `ast` inspection of `build_weekly_plan`: `activate_plan` is never
-called, there is no `INSERT INTO plan_versions`, and it writes
-`active_workout_plan` directly under
-`authorize_governed_fact_write("build_weekly_plan writes a fact-only plan
-(superseded by A10)")` **[V]**. With no plan row behind it, there is nothing for
-an approval to reference and no activation call to gate.
+**Why the deferral was wrong.** The claim was that routing needed A11b's payload
+work. The plan document says the opposite at §3.7: A11b's renderer fix "is only
+possible once A10 delivers real exercises by routing through the canonical
+pipeline." The dependency runs A10 → A11b. Measurement confirmed it:
+`generate_candidates` already produces exercise-bearing sessions and already
+applies `repair_workout_payload`, which supplies the session time the thin shape
+lacked (`planning.py:1001`, `"18:00"`). Nothing in A11b was required.
 
-So on the free-text and onboarding paths a safety-degraded plan currently gets
-**conservative behaviour and disclosure, but not the confirmation tap**. That is
-a real reduction against the three-protection design and is recorded here rather
-than described as complete.
+**The fix.** `build_weekly_plan` now proposes through the canonical pipeline via
+`_propose_weekly_plan`: `generate_candidates` → `save_candidates` → a
+`candidate` row. It writes no governed fact at all. Confirmation runs through
+the **existing** `planv2:select:` tap, extended to record the approval and
+activate through A9 rather than a second confirm callback beside it.
 
-It is deliberately **not** patched by adding a second confirmation mechanism to
-the fact-only writer. That writer is already marked superseded, its own comment
-names the fix ("routing free-text plan building through the canonical
-pipeline"), and bolting an approval onto a path with no plan row would duplicate
-the mechanism the reuse rule exists to prevent — the incomplete mechanism is a
-candidate for upgrade, not a licence to duplicate. Retiring it is A11b's scope,
-where `build_weekly_plan` is already being rewritten; A10 leaves the
-authorization comment in place so the write stays visible.
+Measured after the change, for a user with limitations deferred:
 
-**Net effect today:** the LOG-015 block is replaced on every path by behaviour
-that is strictly more informative than silence, and fully replaced by all three
-protections on the `plan_versions` path. No path activates a degraded plan
-*silently* — every one of them discloses.
+| Step | Result |
+|---|---|
+| `build_weekly_plan(1, 3)` | returns `plan_id`, sessions carry exercises |
+| governed fact | **`None`** — no direct write |
+| `active_plans` | **`None`** — nothing active |
+| `plan_versions.status` | `candidate` |
+| after confirm | `confirmed`, status `active`, fact mirrors `plan_id` |
+| second/third tap | `already_decided`, exactly one active row |
+
+`planning.activate_plan` is once again the **sole** writer of the governed fact,
+and `noam_coach/bot/onboarding.py` is removed from
+`_ALLOWED_FACT_WRITER_FILES`. One writer is what makes the gate enforceable — a
+second could always route around it.
+
+A4 anticipated this precisely: its
+`test_build_weekly_plan_is_marked_a_temporary_owner` said "when that lands, this
+test fails and is deleted as part of the same change". It did, and it was,
+replaced by `test_build_weekly_plan_no_longer_writes_the_governed_fact` — the
+inverse guard.
+
+**Net effect:** on every path, a degraded plan is proposed as a candidate,
+disclosed, and activated only through A9 after an explicit tap. No plan system
+or compatibility fact becomes active before that confirmation.
 
 ### Implementation constraints carried forward
 

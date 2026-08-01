@@ -199,6 +199,31 @@ sites, both of which run the dedicated safety gate immediately after.
 `_SAFETY_FACTS` is pinned equal to the safety profile's `required` set by a test,
 so the general gate can only skip a fact the safety gate still enforces.
 
+**A10 second correction: the retirement belongs to A10, not A11b.** A first
+attempt delivered confirmation on the `plan_versions` path only and proposed
+deferring `build_weekly_plan`'s retirement to A11b, on the reasoning that
+routing needed A11b's payload work. **That was wrong**, and §3.7 of this
+document already said so: A11b's renderer fix "is only possible once A10
+delivers real exercises by routing through the canonical pipeline." The
+dependency runs A10 → A11b.
+
+Measurement confirmed it. `generate_candidates` already builds exercise-bearing
+sessions and already applies `repair_workout_payload`, which supplies the
+session time the thin shape lacked (`planning.py:1001`). Nothing in A11b was
+required — routing was a wiring change, not a payload change.
+
+The deeper point: the fact-only writer was not merely *missing* a confirmation
+gate, it made one **impossible**. With no `plan_versions` row there was no
+candidate to hold and no activation call to gate, so the plan went live the
+instant it was built. Retiring that writer is what makes the invariant
+enforceable, which is why it could never have been deferred to a later item.
+
+`planning.activate_plan` is now the sole writer of `active_workout_plan`, and
+`noam_coach/bot/onboarding.py` is removed from `_ALLOWED_FACT_WRITER_FILES`.
+Confirmation reuses the existing `planv2:select:` tap rather than adding a
+second confirm callback. A11b inherits a `build_weekly_plan` that returns a real
+stored plan — the precondition its renderer rewrite was always waiting on.
+
 **A7 correction to this document.** The A7 row said `training_limitations`
 "never" expires. It does — `expires_after_days=30`. The defect was the
 **mismatch** with the 14-day `medical_constraints` TTL, leaving a 16-day window
