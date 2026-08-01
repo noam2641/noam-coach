@@ -212,7 +212,7 @@ FACT_REGISTRY: dict[str, FactSpec] = {
         "אחוז שומן",
         "measured",
         ("calorie_target", "trend_tracking"),
-        expires_after_days=30,
+        expires_after_days=14,
     ),
     "avg_steps": FactSpec(
         "avg_steps",
@@ -537,7 +537,23 @@ FACT_REGISTRY: dict[str, FactSpec] = {
         "reported",
         ("exercise_selection", "safety"),
         required_for=("safety",),
-        expires_after_days=30,
+        # Matches PAIN_CONSTRAINT_TTL_DAYS. These two lifetimes describe the
+        # same thing from either side -- the constraint rows are the safety
+        # record, this fact is what planning reads -- and they were 14 and 30.
+        # That left a 16-day window where the runtime had stopped treating a
+        # region as painful while planning still asserted an active limitation,
+        # with no path to clear it.
+        #
+        # 14 is the safe direction to align on: it can only make the fact
+        # expire SOONER, and an expired safety fact re-asks the question rather
+        # than assuming an answer. Aligning at 30 would have kept a stale
+        # limitation constraining exercise selection for two extra weeks.
+        #
+        # Written as a literal, not imported from training_intelligence: this
+        # module deliberately imports nothing from the project, and a leaf
+        # module is what lets everything else import it without a cycle. A
+        # guard test asserts the two values stay equal.
+        expires_after_days=14,
     ),
     # --- internal system state (never shown in profile) ---
     "onboarding_stage": FactSpec(
