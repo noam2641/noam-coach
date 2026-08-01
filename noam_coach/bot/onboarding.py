@@ -697,7 +697,12 @@ async def advance_after_answer(target: Any, user_id: int) -> None:
             return
         plan = await build_weekly_plan(user_id, freq)
         await message.reply_text(
-            format_weekly_plan(plan, pain_regions=await active_pain_regions_for(user_id)),
+            await _with_safety_disclosure(
+                user_id,
+                format_weekly_plan(
+                    plan, pain_regions=await active_pain_regions_for(user_id)
+                ),
+            ),
             reply_markup=InlineKeyboardMarkup(
                 [
                     [button("🏋️ התחל אימון", "menu:workout")],
@@ -2637,6 +2642,26 @@ async def ask_deferred_for_plan(target: Any, user_id: int, frequency: int) -> bo
 
 
 @runtime_bound(RUNTIME_NAMES)
+async def _with_safety_disclosure(user_id: int, plan_text: str) -> str:
+    """Prefix the A10 disclosure when the plan was built without safety info.
+
+    Both onboarding build paths became REACHABLE with limitations unknown once
+    `_block_plan_for_pending_safety` stopped blocking a deferred question.
+    Rendering the plan unchanged would hand the user a degraded plan that looks
+    exactly like an adapted one -- which is precisely the protection that has to
+    replace the LOG-015 block, not accompany its removal.
+
+    Shared by both call sites so the disclosure cannot drift between them.
+    """
+    from noam_coach.services import plan_readiness
+
+    assessment = await plan_readiness.assess_plan_readiness(DB, user_id)
+    lines = plan_readiness.disclosure_lines(assessment)
+    if not lines:
+        return plan_text
+    return "\n".join(lines) + "\n\n" + plan_text
+
+
 async def _block_plan_for_pending_safety(target: Any, user_id: int) -> bool:
     """Safety gate for the onboarding build paths.
 
@@ -2651,6 +2676,17 @@ async def _block_plan_for_pending_safety(target: Any, user_id: int) -> bool:
     pending = await questions.pending_safety_questions(DB, user_id)
     if not pending:
         return False
+
+    # A10: LOG-015 blocked on *any* unanswered safety question, so a user who
+    # deferred once was never offered a plan again -- silence, not safety. The
+    # block is kept for a question never asked, and replaced for one already
+    # asked and deferred by conservative build + disclosure + confirmation
+    # (`plan_readiness.propose_degraded_plan`). Returning False here lets the
+    # caller build; it does NOT let it activate.
+    from noam_coach.services import plan_readiness
+    if await plan_readiness.safety_gate_decision(DB, user_id) == plan_readiness.GATE_DEGRADE:
+        return False
+
     q = pending[0]
     await set_pending(user_id, q.id)
     rows: list[list[Any]] = []
@@ -2679,8 +2715,11 @@ async def check_plan_readiness(user_id: int) -> list[str]:
     Empty list means the user is ready for a workout plan.
     """
     gaps: list[str] = []
-    pending = await questions.pending_safety_questions(DB, user_id)
-    if pending:
+    # A10: a deferred safety question is no longer a hard gap. It degrades the
+    # plan (conservative build + disclosure + confirmation) rather than blocking
+    # it, so only a question never asked is reported here.
+    from noam_coach.services import plan_readiness
+    if await plan_readiness.safety_gate_decision(DB, user_id) == plan_readiness.GATE_ASK:
         gaps.append("שאלות בטיחות לא נענו")
     goal = await user_model.get_value(DB, user_id, "primary_goal")
     if goal is None:
@@ -3078,7 +3117,12 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
             return True
         plan = await build_weekly_plan(user_id, frequency)
         await message.reply_text(
-            format_weekly_plan(plan, pain_regions=await active_pain_regions_for(user_id)),
+            await _with_safety_disclosure(
+                user_id,
+                format_weekly_plan(
+                    plan, pain_regions=await active_pain_regions_for(user_id)
+                ),
+            ),
             reply_markup=InlineKeyboardMarkup(
                 [
                     [button("🏋️ התחל אימון", "menu:workout")],

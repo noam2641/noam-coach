@@ -229,3 +229,67 @@ def test_class_names_carry_no_medical_detail() -> None:
         lowered = value.lower()
         for leak in ("knee", "shoulder", "back", "elbow", "pain", "injur"):
             assert leak not in lowered, f"{value} leaks a medical detail"
+
+
+# ---------------------------------------------------------------------------
+# The sentinel must reach the BUILT PLAN, not just exist as a constant
+# ---------------------------------------------------------------------------
+def test_the_built_profile_distinguishes_unknown_from_known_none() -> None:
+    """The measured defect, asserted where it actually occurred.
+
+    `client_training_profile_from_facts` produced `injuries=()` for BOTH a user
+    who answered "none" and a user who had never been asked. `adapt_exercises`
+    then loaded every joint freely in both cases, so a plan built under
+    uncertainty was byte-identical to one built under confirmed safety.
+
+    Testing `SAFETY_UNKNOWN` as a standalone constant does not cover this: the
+    constant can be perfectly correct while no builder consults it.
+    """
+    unknown = training_intelligence.client_training_profile_from_facts({})
+    known_none = training_intelligence.client_training_profile_from_facts(
+        {"training_limitations": {"value": "none"}}
+    )
+
+    assert unknown.safety_unknown is True, (
+        "never asked must be marked unknown at the profile level"
+    )
+    assert known_none.safety_unknown is False, (
+        "an answered 'none' is knowledge, not an unknown -- conflating them "
+        "would put a warning in front of users who answered correctly"
+    )
+    assert unknown.injuries == (), (
+        "the empty tuple is exactly what made the two states look identical -- "
+        "it is still empty, which is why the flag has to carry the difference"
+    )
+    assert unknown.safety_unknown != known_none.safety_unknown, (
+        "these two states must not be indistinguishable again"
+    )
+
+
+def test_real_pain_is_known_not_unknown() -> None:
+    """A user with active pain has a KNOWN state, via the existing fallback.
+
+    Marking them unknown would attach a "we could not adapt" disclosure to a
+    plan that was in fact adapted — training the user to ignore the warning.
+    """
+    profile = training_intelligence.client_training_profile_from_facts(
+        {"active_pain": {"value": "knee"}}
+    )
+    assert profile.safety_unknown is False
+    assert profile.pain_areas, "the existing pain fallback must still populate"
+
+
+def test_the_stored_profile_records_that_it_was_built_under_uncertainty() -> None:
+    """`public_payload` is an explicit allowlist, so a new field is dropped
+    unless it is added — and a plan stored without this cannot later be told
+    apart from one built with confirmed safety."""
+    payload = training_intelligence.client_training_profile_from_facts(
+        {}
+    ).public_payload()
+
+    assert payload["safety_unknown"] is True
+    assert payload["injuries"] == [], (
+        "the empty list is retained; the flag is what disambiguates it"
+    )
+    # Bounded boolean only — never the limitation text.
+    assert isinstance(payload["safety_unknown"], bool)

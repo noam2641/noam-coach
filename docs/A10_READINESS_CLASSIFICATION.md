@@ -28,9 +28,9 @@ and returns a flat `list[str]` of **Hebrew display strings**
 (`onboarding.py:2676-2688`) **[V]**, discarding every score. Its only caller then
 treats any non-empty list as a hard block (`assistant.py:580-586`) **[V]**.
 
-**But the safety gate has four enforcement points, not one** *(corrected after
-review — the earlier "single caller" framing understated the change surface by
-roughly 4x)*:
+**But the safety gate has five enforcement points, not one** *(first corrected
+after review from "single caller" to four; corrected again **during
+implementation**, when a fifth was found by measurement — see below)*:
 
 | Enforcer | Location |
 |---|---|
@@ -38,16 +38,35 @@ roughly 4x)*:
 | `_block_plan_for_pending_safety` | `onboarding.py:696` and `:3077` **[V]** |
 | `_require_readiness(…, "safety")` | `planning.py:1253` (candidate build) **[V]** |
 | `_require_readiness(…, "safety")` | `planning.py:1466` (activation) **[V]** |
+| `_require_readiness(…, "workout")` | `planning.py:1252` and `:1464` **[V]** |
 
-Relaxing only the first would be **silently overridden** by the other three: the
+The fifth was invisible to a search for `"safety"`. `training_limitations` is a
+member of **both** `READINESS_PROFILES["workout"].required` and
+`READINESS_PROFILES["safety"].required` (`user_model.py:713-727`) **[V]**, so the
+*workout* gate refuses on the safety fact one line before the safety gate is
+reached. With only the four known gates changed, the degraded path was
+unreachable while appearing fully implemented — the build was still refused,
+just by a different profile.
+
+Measured directly: with every other workout fact answered and
+`training_limitations` recorded as `KIND_GAP`, `compute_readiness(…, "workout")`
+returns `ready=False missing=['training_limitations']`, and `activate_plan`
+raises `PlanningBlockedError(missing=['training_limitations'])` **[V]**.
+
+Resolved by `_require_readiness(…, ignore=_SAFETY_FACTS)` at the two workout
+sites, which both run the dedicated safety gate immediately afterwards.
+`_SAFETY_FACTS` is pinned equal to the safety profile's `required` set by
+`test_the_ignore_set_matches_the_safety_profile_exactly`, so a fact can only be
+skipped by the general gate while the safety gate still enforces it.
+
+Relaxing only the first gate would be **silently overridden** by the others: the
 free-text path would soften while the two onboarding build paths still hard-block
 and re-ask. `_block_plan_for_pending_safety`'s own docstring cites **LOG-015** and
 states the gate must block on *every* build path — so softening it is a
-deliberate tradeoff against a closed incident, not a detail. A10 must decide and
-record which of the four change.
+deliberate tradeoff against a closed incident, not a detail.
 
 So A10 propagates an existing *scale* rather than designing one — but the change
-surface is four gates, not one, and the conservative *behaviour* the degraded
+surface is five gates, not one, and the conservative *behaviour* the degraded
 path needs does not yet exist. Smaller than the pre-flight assumed on the
 severity axis; larger on both of these.
 
@@ -295,11 +314,70 @@ Traced:                       check_plan_readiness -> assistant.py:580 (sole cal
                               pre-screen's 2; _validate_plan_for_activation enforces both
 Decision:                     EXTEND -- propagate the existing scores; reuse KIND_GAP;
                               reuse the existing conservative paths; write via A9
-Evidence for NEW:             none required; no new mechanism proposed
-Superseded paths retired:     build_weekly_plan's independent fact write (A10 removes it
-                              and drops onboarding.py from _ALLOWED_FACT_WRITER_FILES)
-Post-implementation search:   pending
+Evidence for NEW:             SAFETY_UNKNOWN only. Measured: with no training_limitations,
+                              no active_pain and no medical_avoidance,
+                              client_training_profile_from_facts yields injuries=(),
+                              pain_areas=(), movement_limitations=(), medical_flags=() --
+                              byte-identical to a user who answered "none". No existing
+                              path produces caution from absence, so the distinction had
+                              to be created rather than reused.
+Superseded paths retired:     none. (Corrected: the plan said A10 would retire
+                              build_weekly_plan's independent fact write and drop
+                              onboarding.py from _ALLOWED_FACT_WRITER_FILES. It did NOT.
+                              That write is the plan-BUILDING mirror, untouched by the
+                              degraded-safety flow; retiring it is A11b's scope, where
+                              build_weekly_plan is already being rewritten. Claiming it
+                              here would have been a retirement recorded but not made.)
+Post-implementation search:   done. Confirmed on the final diff:
+                              - no new set_fact / authorize_governed_fact_write /
+                                INSERT INTO plan_versions -- activation goes through A9;
+                              - no new table, approval type or idempotency rule --
+                                decide_approval's WHERE status='pending' is the single
+                                claim, and the post-claim re-read was REMOVED rather than
+                                kept as a second divergent rule;
+                              - no new logger or audit mechanism -- LOGGER and write_audit
+                                reused; planning.py borrows plan_readiness.LOGGER rather
+                                than declaring its own;
+                              - _ALLOWED_FACT_WRITER_FILES unchanged (empty diff);
+                              - KIND_GAP reused to separate "never asked" from "asked and
+                                deferred" -- the distinction already written by record_gap
+                                and discarded by pending_safety_questions' single bucket.
 ```
+
+**One mechanism was extended rather than reused as-is.** `_require_readiness`
+gained an `ignore=` parameter instead of A10 adding a parallel gate beside it.
+That keeps one refusal path, one message and one `missing` payload; a second
+gate would have been a duplicate of the thing it was meant to soften.
+
+### Two protections were declared before they were wired
+
+Both were caught by asking "which runtime code reads this?" rather than by a
+failing test — the tests passed in both cases, because each asserted the
+mechanism in isolation rather than at the point where the user is affected.
+
+**Requirement 1 (conservative behaviour).** `SAFETY_UNKNOWN`,
+`is_safety_unknown` and `conservative_limitations_value` were defined, exported
+and tested, and three source comments described plans being "built with
+`SAFETY_UNKNOWN`". A repository-wide search found **no runtime consumer** — the
+constant was inert, and `client_training_profile_from_facts` still collapsed
+unknown into known-none exactly as measured. Fixed by adding
+`ClientTrainingProfile.safety_unknown`, set from `limitations is None` and
+cleared when the existing `active_pain` / `medical_avoidance` fallback yields a
+real signal, then added to `public_payload` (an explicit allowlist, so a new
+field is otherwise dropped and the *stored* plan keeps the same ambiguity at
+rest). Verified: `{}` → `safety_unknown=True injuries=()`;
+`training_limitations="none"` → `False`; `active_pain="knee"` → `False`.
+
+**Requirement 2 (disclosure).** Softening the gates made three plan-render paths
+reachable with limitations unknown, and all three rendered `format_weekly_plan`
+unchanged — a degraded plan would have looked identical to an adapted one. Fixed
+by `onboarding._with_safety_disclosure` (shared by both onboarding paths) and the
+equivalent prefix in `assistant.py`, plus an `ast`-based guard asserting every
+`format_weekly_plan` call site routes through the disclosure, so a *fourth* build
+path added later cannot silently skip it.
+
+Both are covered by deliberate breakage: reverting the profile flag, dropping it
+from the payload, and removing the disclosure at either call site each fail.
 
 ### Implementation constraints carried forward
 

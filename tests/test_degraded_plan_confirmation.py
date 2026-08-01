@@ -1,0 +1,729 @@
+"""A degraded plan is proposed, disclosed and confirmed — never auto-activated.
+
+LOG-015 made an unanswered safety question block plan building on **every**
+path. That protection was real, and A10 removes the block. It must therefore be
+replaced by something at least as protective, not merely deleted.
+
+The replacement is three protections that together are strictly more
+informative than a refusal:
+
+1. **conservative behaviour** — the plan is built under `SAFETY_UNKNOWN`, so
+   the unknown is carried forward instead of read as "no limitations";
+2. **disclosure** — the user is told *which* adaptation is missing;
+3. **confirmation** — nothing is activated without a deliberate tap.
+
+`test_the_log015_protection_is_replaced_not_removed` asserts all three at once
+and fails if any single one is dropped. That test is the reason removing the
+block is a trade rather than an erosion, and it should be the last thing anyone
+deletes.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+
+import pytest
+
+import planning
+import user_model
+from db import Database
+from helpers import utc_now
+from noam_coach.services import plan_mutations
+from noam_coach.services import plan_readiness as pr
+
+
+async def _db(tmp_path: Path) -> Database:
+    db = Database(str(tmp_path / "degraded.db"))
+    await db.init()
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(1,'A',NULL,?)",
+        (utc_now(),),
+    )
+    return db
+
+
+def _bind(monkeypatch: pytest.MonkeyPatch, db: Database) -> None:
+    """`write_audit`/`create_approval` resolve DB from the facade via runtime_bound."""
+    import coach_bot
+    from noam_coach.services import core as core_services
+
+    monkeypatch.setattr(coach_bot, "DB", db, raising=False)
+    monkeypatch.setattr(core_services, "DB", db, raising=False)
+
+
+def _payload() -> dict:
+    return {
+        "frequency": 1,
+        "sessions": [
+            {
+                "index": 0, "weekday": 0, "time": "18:00", "minutes": 45,
+                "code": "A", "name": "A",
+                "exercises": [
+                    {"id": eid, "name": eid.title(), "sets": 3, "rmin": 8,
+                     "rmax": 12, "rest": 90, "inc": 2.5, "weight": 40.0,
+                     "muscle": "chest", "cues": [], "alts": []}
+                    for eid in ("bench", "incline_db", "fly", "pushdown")
+                ],
+            }
+        ],
+    }
+
+
+async def _candidate(db: Database) -> int:
+    plan_id = await db.execute(
+        "INSERT INTO plan_versions("
+        "  user_id, plan_type, title, strategy, fit_score, status, payload, created_at"
+        ") VALUES(1, 'workout', 'A', 'balanced', 0.8, 'candidate', ?, ?)",
+        (json.dumps(_payload(), ensure_ascii=False), utc_now()),
+    )
+    return int(plan_id)
+
+
+_SAFETY_UNKNOWN = pr.ReadinessAssessment(degraded_safety=("training_limitations",))
+
+
+# ---------------------------------------------------------------------------
+# The LOG-015 replacement — the load-bearing test
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_the_log015_protection_is_replaced_not_removed(
+    tmp_path, monkeypatch
+) -> None:
+    """All three protections, asserted together.
+
+    LOG-015's block is gone. If any ONE of conservative behaviour, disclosure or
+    confirmation is also gone, the user is worse off than under the block — so
+    this fails if any single one is removed. Do not split it into three passing
+    tests: the point is that they are only adequate *together*.
+    """
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    plan_id = await _candidate(db)
+
+    # 1. Conservative behaviour: the unknown is carried, not read as none.
+    assert _SAFETY_UNKNOWN.safety_unknown is True
+    assert pr.is_safety_unknown(pr.conservative_limitations_value()) is True
+    assert pr.is_safety_unknown("") is False
+
+    # 2. Disclosure: specific about WHICH adaptation is missing.
+    lines = pr.disclosure_lines(_SAFETY_UNKNOWN)
+    assert lines, "a degraded-safety plan must disclose something"
+    disclosure = " ".join(lines)
+    assert "כאב" in disclosure or "פציעה" in disclosure, (
+        "the disclosure must name the missing adaptation, not say "
+        "'some information is missing'"
+    )
+
+    # 3. Confirmation: proposed, and NOT active.
+    approval_id = await pr.propose_degraded_plan(db, 1, plan_id, _SAFETY_UNKNOWN)
+    assert approval_id, "a safety-degraded plan must require confirmation"
+
+    row = await db.fetch_one("SELECT status FROM plan_versions WHERE id=?", (plan_id,))
+    assert row["status"] == "candidate", (
+        "proposing must NOT activate -- that is the whole protection"
+    )
+    active = await db.fetch_one(
+        "SELECT plan_id FROM active_plans WHERE user_id=1 AND plan_type='workout'"
+    )
+    assert active is None, "no active plan may be created without confirmation"
+
+
+# ---------------------------------------------------------------------------
+# Proposal
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_a_plan_without_safety_gaps_needs_no_confirmation(
+    tmp_path, monkeypatch
+) -> None:
+    """Confirmation is for the safety-unknown case only.
+
+    Demanding a tap for a merely-less-tailored plan would train the user to tap
+    through warnings, which is how a real warning stops being read.
+    """
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    plan_id = await _candidate(db)
+
+    tailoring_only = pr.ReadinessAssessment(degraded_personalization=("equipment",))
+    approval_id = await pr.propose_degraded_plan(db, 1, plan_id, tailoring_only)
+
+    assert approval_id is None
+
+
+@pytest.mark.asyncio
+async def test_the_proposal_audit_is_structured_and_carries_no_medical_text(
+    tmp_path, monkeypatch
+) -> None:
+    """Bounded scalars only. A limitation string names a body part."""
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    plan_id = await _candidate(db)
+
+    await pr.propose_degraded_plan(db, 1, plan_id, _SAFETY_UNKNOWN)
+
+    row = await db.fetch_one(
+        "SELECT details FROM audit WHERE user_id=1 AND action=?", (pr.AUDIT_ACTION,)
+    )
+    assert row is not None, "a proposal must leave an audit trail"
+    details = json.loads(row["details"])
+
+    assert details["outcome"] == pr.OUTCOME_PROPOSED
+    assert details["safety_unknown"] is True or details["safety_unknown"] == 1
+    assert details["gap_count"] == 1
+
+    serialized = json.dumps(details, ensure_ascii=False)
+    for leak in ("כאב", "פציעה", "knee", "shoulder", "elbow", "bench"):
+        assert leak not in serialized, f"{leak!r} must not reach an audit row"
+
+
+@pytest.mark.asyncio
+async def test_the_proposal_log_carries_counts_not_medical_text(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    plan_id = await _candidate(db)
+
+    with caplog.at_level(logging.INFO):
+        await pr.propose_degraded_plan(db, 1, plan_id, _SAFETY_UNKNOWN)
+
+    emitted = "\n".join(r.message for r in caplog.records)
+    assert "degraded_plan_proposed" in emitted
+    assert "user_id=1" in emitted
+    for leak in ("כאב", "פציעה", "training_limitations"):
+        assert leak not in emitted
+
+
+# ---------------------------------------------------------------------------
+# Confirmation
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_confirmation_activates_through_the_a9_boundary(
+    tmp_path, monkeypatch
+) -> None:
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    plan_id = await _candidate(db)
+
+    async def _ok(*_a, **_k):
+        return {}
+
+    monkeypatch.setattr(planning, "_require_readiness", _ok)
+
+    approval_id = await pr.propose_degraded_plan(db, 1, plan_id, _SAFETY_UNKNOWN)
+    outcome = await pr.confirm_degraded_plan(db, 1, approval_id)
+
+    assert outcome == pr.OUTCOME_CONFIRMED
+    row = await db.fetch_one("SELECT status FROM plan_versions WHERE id=?", (plan_id,))
+    assert row["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_a_double_tap_cannot_activate_twice(tmp_path, monkeypatch) -> None:
+    """Idempotency by reuse, not by a new lock.
+
+    `decide_approval` updates `WHERE status='pending'`, so the second claim
+    changes no row. Reusing that is why A10 needed no lock of its own.
+    """
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    plan_id = await _candidate(db)
+
+    async def _ok(*_a, **_k):
+        return {}
+
+    monkeypatch.setattr(planning, "_require_readiness", _ok)
+
+    approval_id = await pr.propose_degraded_plan(db, 1, plan_id, _SAFETY_UNKNOWN)
+    first = await pr.confirm_degraded_plan(db, 1, approval_id)
+    second = await pr.confirm_degraded_plan(db, 1, approval_id)
+
+    assert first == pr.OUTCOME_CONFIRMED
+    assert second == pr.OUTCOME_ALREADY_DECIDED, (
+        "a stale or double tap must not activate a second time"
+    )
+
+    rows = await db.fetch_all(
+        "SELECT id FROM plan_versions WHERE user_id=1 AND status='active'"
+    )
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_stale_approval_id_is_refused(tmp_path, monkeypatch) -> None:
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+
+    outcome = await pr.confirm_degraded_plan(db, 1, "does-not-exist")
+
+    assert outcome == pr.OUTCOME_ALREADY_DECIDED
+
+
+@pytest.mark.asyncio
+async def test_another_users_approval_cannot_be_confirmed(
+    tmp_path, monkeypatch
+) -> None:
+    """`fetch_approval` scopes on user_id -- reused, not re-implemented."""
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(2,'B',NULL,?)",
+        (utc_now(),),
+    )
+    plan_id = await _candidate(db)
+    approval_id = await pr.propose_degraded_plan(db, 1, plan_id, _SAFETY_UNKNOWN)
+
+    outcome = await pr.confirm_degraded_plan(db, 2, approval_id)
+
+    assert outcome == pr.OUTCOME_ALREADY_DECIDED
+    row = await db.fetch_one("SELECT status FROM plan_versions WHERE id=?", (plan_id,))
+    assert row["status"] == "candidate"
+
+
+@pytest.mark.asyncio
+async def test_a_blocked_activation_is_reported_not_silently_swallowed(
+    tmp_path, monkeypatch
+) -> None:
+    """Safety-critical gaps still block at activation.
+
+    Confirming a degraded plan does not buy a pass on the readiness gate -- it
+    only covers the *safety-unknown* case the user explicitly accepted.
+    """
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    plan_id = await _candidate(db)
+
+    async def _blocked(_db, _user_id, _profile):
+        raise planning.PlanningBlockedError("missing", missing=["weekly_availability"])
+
+    monkeypatch.setattr(planning, "_require_readiness", _blocked)
+
+    approval_id = await pr.propose_degraded_plan(db, 1, plan_id, _SAFETY_UNKNOWN)
+    outcome = await pr.confirm_degraded_plan(db, 1, approval_id)
+
+    assert outcome == pr.OUTCOME_BLOCKED
+    row = await db.fetch_one("SELECT status FROM plan_versions WHERE id=?", (plan_id,))
+    assert row["status"] == "candidate"
+
+
+# ---------------------------------------------------------------------------
+# The boundary extension
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_activation_reuses_the_a9_boundary_rather_than_writing_directly(
+    tmp_path,
+) -> None:
+    """A10 must not become a second plan writer.
+
+    Asserted against source with docstrings stripped: the module explains the
+    rule it must not break, so a raw text scan would flag its own prose.
+    """
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(pr))
+    code = "\n".join(
+        ast.unparse(node)
+        for node in tree.body
+        if not (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        )
+    )
+
+    assert "plan_mutations" in code, "activation must route through the A9 boundary"
+    for forbidden in ("INSERT INTO plan_versions", "UPDATE plan_versions",
+                      "INSERT INTO active_plans", "set_fact",
+                      "authorize_governed_fact_write"):
+        assert forbidden not in code, (
+            f"{forbidden!r} in A10; it must not write plans or the governed fact"
+        )
+
+
+@pytest.mark.asyncio
+async def test_an_already_active_plan_confirms_as_no_change(
+    tmp_path, monkeypatch
+) -> None:
+    """Already live is a success, not a failure."""
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    plan_id = await _candidate(db)
+    await db.execute(
+        "UPDATE plan_versions SET status='active' WHERE id=?", (plan_id,)
+    )
+
+    outcome = await plan_mutations.activate_proposed_plan(
+        db, 1, plan_id, reason="test"
+    )
+
+    assert outcome.outcome == plan_mutations.OUTCOME_NO_CHANGE
+    assert outcome.is_failure is False
+
+
+# ---------------------------------------------------------------------------
+# The four enforcement points
+#
+# LOG-015 was enforced in four places, and A10 changes the answer in all four.
+# A fix applied to three of them would leave a path that still goes silent, so
+# each is pinned separately rather than trusting the shared helper.
+# ---------------------------------------------------------------------------
+async def _defer_safety(db: Database) -> None:
+    """Record the safety question as ASKED AND DEFERRED, via the real writer."""
+    await user_model.record_gap(
+        db, 1, "training_limitations",
+        why_matters="A10 test: asked and deferred",
+    )
+
+
+#: Everything the workout profile requires EXCEPT the safety fact.
+#:
+#: The population A10 serves is a user who answered everything else and deferred
+#: only the limitation question. A fixture missing the other facts would be
+#: blocked by `blocking_integrity` gaps and would prove nothing about the safety
+#: axis -- which is exactly the confusion A10's classification exists to prevent.
+_OTHER_WORKOUT_FACTS = {
+    "primary_goal": "strength",
+    "training_days_per_week": 3,
+    "session_minutes": 45,
+    "training_location": "gym",
+    "equipment": "full_gym",
+    "strength_experience": "intermediate",
+    "weekly_availability": "mon,wed,fri",
+}
+
+
+async def _answer_everything_but_safety(db: Database) -> None:
+    for key, value in _OTHER_WORKOUT_FACTS.items():
+        await user_model.set_fact(
+            db, 1, key, value,
+            kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
+        )
+
+
+@pytest.mark.asyncio
+async def test_never_asked_still_blocks_but_deferred_degrades(
+    tmp_path, monkeypatch
+) -> None:
+    """The distinction the whole change rests on.
+
+    LOG-015 collapsed these two into one "unanswered" bucket and blocked both.
+    Blocking the first is right; blocking the second is the silence defect.
+    """
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+
+    assert await pr.safety_gate_decision(db, 1) == pr.GATE_ASK, (
+        "a question never asked must still block -- that protection is kept"
+    )
+
+    await _defer_safety(db)
+    assert await pr.safety_gate_decision(db, 1) == pr.GATE_DEGRADE, (
+        "a question already asked and deferred must degrade, not block again"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_answered_safety_question_proceeds_normally(
+    tmp_path, monkeypatch
+) -> None:
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    await user_model.set_fact(
+        db, 1, "training_limitations", "none",
+        kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
+    )
+    assert await pr.safety_gate_decision(db, 1) == pr.GATE_PROCEED
+
+
+@pytest.mark.asyncio
+async def test_the_gate_fails_closed_when_it_cannot_read(monkeypatch) -> None:
+    """An unreadable state is not evidence that the user has no limitations.
+
+    Fail-open here would be the same class of defect as reporting a query
+    failure as "no history": an infrastructure fault stated as a fact.
+    """
+
+    class _Broken:
+        async def fetch_all(self, *_a, **_k):
+            raise RuntimeError("database is locked")
+
+        async def fetch_one(self, *_a, **_k):
+            raise RuntimeError("database is locked")
+
+    assert await pr.safety_gate_decision(_Broken(), 1) == pr.GATE_ASK, (
+        "a failed read must take the STRICTER branch, not the permissive one"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gate_1_check_plan_readiness_stops_reporting_a_deferred_gap(
+    tmp_path, monkeypatch
+) -> None:
+    """Enforcement point 1: `onboarding.check_plan_readiness`."""
+    from noam_coach.bot import onboarding
+
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    monkeypatch.setattr(onboarding, "DB", db, raising=False)
+    await user_model.set_fact(
+        db, 1, "primary_goal", "strength",
+        kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
+    )
+
+    assert "שאלות בטיחות לא נענו" in await onboarding.check_plan_readiness(1)
+
+    await _defer_safety(db)
+    assert "שאלות בטיחות לא נענו" not in await onboarding.check_plan_readiness(1), (
+        "a deferred safety question must no longer read as a hard readiness gap"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gate_2_the_onboarding_build_block_releases_once_deferred(
+    tmp_path, monkeypatch
+) -> None:
+    """Enforcement points 2 and 3: both `_block_plan_for_pending_safety` sites.
+
+    One helper serves both call sites, so pinning the helper pins both -- but
+    the helper is asserted to still ASK when the question was never put.
+    """
+    from noam_coach.bot import onboarding
+
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    monkeypatch.setattr(onboarding, "DB", db, raising=False)
+
+    asked: list[str] = []
+
+    class _Target:
+        async def reply_text(self, text, **_kw):
+            asked.append(text)
+
+    monkeypatch.setattr(onboarding, "set_pending", _noop_pending, raising=False)
+
+    blocked = await onboarding._block_plan_for_pending_safety(_Target(), 1)
+    assert blocked is True, "never asked -> must still block and ask"
+    assert asked, "the blocking path must actually surface the question"
+
+    await _defer_safety(db)
+    asked.clear()
+    blocked = await onboarding._block_plan_for_pending_safety(_Target(), 1)
+    assert blocked is False, "deferred -> the build proceeds (conservatively)"
+    assert not asked, "a deferred question must not be re-asked on every build"
+
+
+async def _noop_pending(*_a, **_kw) -> None:
+    return None
+
+
+@pytest.mark.asyncio
+async def test_gate_4_activation_refuses_a_degraded_plan_without_confirmation(
+    tmp_path, monkeypatch
+) -> None:
+    """Enforcement point 4: `_validate_plan_for_activation`.
+
+    This is the one gate that must NOT become permissive. Building under an
+    unknown is allowed; activating under one without an explicit tap is not.
+    """
+    import planning
+
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    await _answer_everything_but_safety(db)
+    await _defer_safety(db)
+    plan_id = await _candidate(db)
+
+    outcome = await plan_mutations.activate_proposed_plan(
+        db, 1, plan_id, reason="test_no_confirmation"
+    )
+    assert outcome.outcome == plan_mutations.OUTCOME_BLOCKED, (
+        "an unknown limitation must still block ACTIVATION without confirmation"
+    )
+    row = await db.fetch_one("SELECT status FROM plan_versions WHERE id=?", (plan_id,))
+    assert row["status"] == "candidate", "the plan must not have gone live"
+
+    # The same plan, once explicitly approved, is allowed through.
+    assert await planning._degraded_plan_confirmed(db, 1, plan_id) is False
+    approval_id = await pr.propose_degraded_plan(db, 1, plan_id, _SAFETY_UNKNOWN)
+    assert await pr.confirm_degraded_plan(db, 1, approval_id) == pr.OUTCOME_CONFIRMED
+    row = await db.fetch_one("SELECT status FROM plan_versions WHERE id=?", (plan_id,))
+    assert row["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_approving_one_plan_does_not_authorise_a_different_one(
+    tmp_path, monkeypatch
+) -> None:
+    """Confirmation is scoped to the plan the user actually saw."""
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    await _answer_everything_but_safety(db)
+    await _defer_safety(db)
+    approved_id = await _candidate(db)
+    other_id = await _candidate(db)
+
+    approval_id = await pr.propose_degraded_plan(db, 1, approved_id, _SAFETY_UNKNOWN)
+    await pr.confirm_degraded_plan(db, 1, approval_id)
+
+    assert await planning._degraded_plan_confirmed(db, 1, approved_id) is True
+    assert await planning._degraded_plan_confirmed(db, 1, other_id) is False, (
+        "approving one plan must not silently authorise another"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_ignore_set_matches_the_safety_profile_exactly() -> None:
+    """Pins the premise behind `_require_readiness(..., ignore=...)`.
+
+    Skipping a fact in the general gate is only safe because the safety gate
+    enforces that exact fact immediately afterwards. If the safety profile ever
+    gains or loses a member, the skip stops being covered and silently becomes a
+    hole -- so the two sets must stay identical rather than merely overlapping.
+    """
+    assert planning._SAFETY_FACTS == frozenset(
+        user_model.READINESS_PROFILES["safety"].required
+    ), (
+        "a fact skipped by the general readiness gate must be one the safety "
+        "gate still enforces"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_audit_allowlist_drops_an_unlisted_medical_field(
+    tmp_path, monkeypatch
+) -> None:
+    """Registration must CONSTRAIN, not merely describe.
+
+    Every field A10 audits is a bounded scalar, so the unregistered
+    `_scalar_only` fallback would have preserved them anyway — and a test that
+    only checked "the expected fields are present" would pass identically with
+    no registration at all. What registration buys is the opposite guarantee:
+    a field nobody vetted is dropped. A limitation string is exactly the kind of
+    scalar the fallback would have waved through.
+    """
+    from noam_coach.services import core as core_services
+
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    plan_id = await _candidate(db)
+
+    await core_services.write_audit(
+        1, pr.AUDIT_ACTION, pr.AUDIT_ENTITY, plan_id,
+        outcome=pr.OUTCOME_PROPOSED,
+        gap_count=1,
+        limitation_detail="כאב בברך ימין",  # must never be stored
+    )
+
+    row = await db.fetch_one(
+        "SELECT details FROM audit WHERE user_id=1 AND action=? "
+        "ORDER BY id DESC LIMIT 1",
+        (pr.AUDIT_ACTION,),
+    )
+    details = json.loads(row["details"])
+
+    assert details["gap_count"] == 1, "vetted fields must survive"
+    assert "limitation_detail" not in details, (
+        "an unlisted field must be dropped by the allowlist, not stored because "
+        "it happened to be a scalar"
+    )
+    assert "ברך" not in json.dumps(details, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# The disclosure must reach the USER, not just exist as a function
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_the_disclosure_is_actually_rendered_with_the_plan(
+    tmp_path, monkeypatch
+) -> None:
+    """Requirement 2, asserted where the user would see it.
+
+    Softening the gates made these build paths reachable with limitations
+    unknown. If the plan then renders unchanged, the degraded plan is
+    indistinguishable from a fully adapted one and the LOG-015 block was
+    removed for nothing. Asserting `disclosure_lines()` returns text does NOT
+    cover this — the helper can be correct while no caller uses it.
+    """
+    from noam_coach.bot import onboarding
+
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    monkeypatch.setattr(onboarding, "DB", db, raising=False)
+    await _answer_everything_but_safety(db)
+    await _defer_safety(db)
+
+    rendered = await onboarding._with_safety_disclosure(1, "PLAN BODY")
+
+    assert "PLAN BODY" in rendered, "the plan itself must still be shown"
+    assert rendered != "PLAN BODY", (
+        "a plan built without safety adaptation must not render identically to "
+        "an adapted one"
+    )
+    assert "כאב" in rendered or "פציעה" in rendered, (
+        "the disclosure must name the missing adaptation specifically"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_fully_answered_user_sees_no_warning(tmp_path, monkeypatch) -> None:
+    """The disclosure must not become background noise.
+
+    A warning shown to everyone is one nobody reads, which would quietly undo
+    the protection for the users who actually need it.
+    """
+    from noam_coach.bot import onboarding
+
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    monkeypatch.setattr(onboarding, "DB", db, raising=False)
+    await _answer_everything_but_safety(db)
+    await user_model.set_fact(
+        db, 1, "training_limitations", "none",
+        kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
+    )
+
+    assert await onboarding._with_safety_disclosure(1, "PLAN BODY") == "PLAN BODY"
+
+
+def test_every_plan_render_path_routes_through_the_disclosure() -> None:
+    """Structural guard: a fourth build path must not silently skip disclosure.
+
+    The behavioural test above pins the helper. This pins the *call sites*,
+    because the failure mode here is additive: someone adds a new build path,
+    renders `format_weekly_plan` directly, and every existing test still passes
+    while that one path delivers an undisclosed degraded plan.
+
+    Parsed with `ast` rather than grepped so this file's own prose about
+    `format_weekly_plan` cannot satisfy or trip the check.
+    """
+    import ast
+    from pathlib import Path as _Path
+
+    root = _Path(__file__).resolve().parents[1]
+    offenders: list[str] = []
+
+    for rel in ("noam_coach/bot/onboarding.py", "noam_coach/bot/assistant.py"):
+        source = (root / rel).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+                continue
+            if node.func.id != "format_weekly_plan":
+                continue
+            # The rendered text must be consumed by the disclosure wrapper, or
+            # be assigned to a name that a nearby disclosure block prefixes.
+            segment = ast.get_source_segment(source, node) or ""
+            line = node.lineno
+            window = "\n".join(source.splitlines()[max(0, line - 12): line + 14])
+            if "_with_safety_disclosure" in window or "disclosure_lines" in window:
+                continue
+            offenders.append(f"{rel}:{line} {segment[:60]}")
+
+    assert not offenders, (
+        "these plan renders do not pass through the A10 safety disclosure, so a "
+        "degraded plan would render as if fully adapted:\n  "
+        + "\n  ".join(offenders)
+    )

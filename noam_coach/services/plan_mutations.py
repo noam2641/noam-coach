@@ -364,6 +364,76 @@ async def _audit(
         )
 
 
+
+async def activate_proposed_plan(
+    db: Any,
+    user_id: int,
+    plan_id: int,
+    *,
+    reason: str,
+) -> MutationOutcome:
+    """Activate a plan the user has explicitly approved.
+
+    Added BESIDE the realignment operation rather than as a second boundary --
+    A9's published contract requires later items to extend this module, never to
+    introduce a writer elsewhere. A10 is the first item to take it up.
+
+    The activation itself is `planning.activate_plan`, so supersession, the
+    governed fact mirror (which A4 authorizes only there), the readiness gates
+    and the existing telemetry all behave exactly as for any other plan. This
+    function adds the outcome vocabulary and the audit, nothing else.
+
+    Deliberately does not re-check approval state: the caller owns the approval
+    lifecycle and its `WHERE status='pending'` claim. Duplicating that check
+    here would create a second, divergent idempotency rule.
+    """
+    try:
+        row = await db.fetch_one(
+            "SELECT id, status FROM plan_versions WHERE id=? AND user_id=?",
+            (plan_id, user_id),
+        )
+    except Exception:
+        LOGGER.exception(
+            "plan_activate_failed user_id=%s plan_id=%s stage=read reason=%s",
+            user_id, plan_id, REASON_INTERNAL,
+        )
+        return MutationOutcome(OUTCOME_FAILED, reason=REASON_INTERNAL, plan_id=plan_id)
+
+    if not row:
+        return MutationOutcome(OUTCOME_NO_PLAN, plan_id=plan_id)
+    if str(row.get("status")) == "active":
+        # Already live -- a success, not a failure. Distinguishing this is what
+        # stops a double tap from reading as an error.
+        return MutationOutcome(OUTCOME_NO_CHANGE, plan_id=plan_id)
+
+    try:
+        await planning.activate_plan(db, user_id, plan_id)
+    except planning.PlanningBlockedError as exc:
+        missing = tuple(str(m) for m in (getattr(exc, "missing", None) or ()))
+        blocked_reason = REASON_QUALITY if _looks_like_quality(missing) else REASON_READINESS
+        await _audit(user_id, OUTCOME_BLOCKED, blocked_reason, plan_id, None, "", "")
+        LOGGER.info(
+            "plan_activate_blocked user_id=%s plan_id=%s reason=%s missing=%d",
+            user_id, plan_id, blocked_reason, len(missing),
+        )
+        return MutationOutcome(
+            OUTCOME_BLOCKED, reason=blocked_reason, plan_id=plan_id, missing=missing
+        )
+    except Exception:
+        LOGGER.exception(
+            "plan_activate_failed user_id=%s plan_id=%s stage=activate reason=%s",
+            user_id, plan_id, REASON_INTERNAL,
+        )
+        await _audit(user_id, OUTCOME_FAILED, REASON_INTERNAL, plan_id, None, "", "")
+        return MutationOutcome(OUTCOME_FAILED, reason=REASON_INTERNAL, plan_id=plan_id)
+
+    await _audit(user_id, OUTCOME_REALIGNED, None, plan_id, plan_id, "", "")
+    LOGGER.info(
+        "plan_activated user_id=%s plan_id=%s reason=%s", user_id, plan_id, reason
+    )
+    return MutationOutcome(OUTCOME_REALIGNED, plan_id=plan_id, new_plan_id=plan_id)
+
+
 __all__ = [
     "MutationOutcome",
     "OUTCOME_BLOCKED",
@@ -376,5 +446,6 @@ __all__ = [
     "REASON_QUALITY",
     "REASON_READINESS",
     "REASON_UNEXPRESSIBLE",
+    "activate_proposed_plan",
     "realign_saved_plan_to_weekdays",
 ]
