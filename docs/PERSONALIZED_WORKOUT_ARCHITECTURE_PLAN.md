@@ -104,7 +104,15 @@ into permanent identity and destroying the information `NULL` currently carries.
 | **A5** | **COMPLETE** | `71e0106` | #67 | proven, exit 0 |
 | **A11a** | **COMPLETE** | `6acc172` | #69 | proven, exit 0 |
 | **A9** | **COMPLETE** | `4345993` | #70 | proven, exit 0 |
-| A7, A8, A10, A11b, A12, A13 | not started | — | — | — |
+| **A7** | **COMPLETE** | `6de87f9` | #71 | proven, exit 0 |
+| A8, A10, A11b, A12, A13 | not started | — | — | — |
+
+**A7 correction to this document.** The A7 row said `training_limitations`
+"never" expires. It does — `expires_after_days=30`. The defect was the
+**mismatch** with the 14-day `medical_constraints` TTL, leaving a 16-day window
+where planning asserted a limitation the runtime had already stopped honouring.
+Now aligned at 14, the safe direction: an expired safety fact re-asks the
+question rather than assuming an answer.
 
 ### A9 contracts for A10, A11b and A12
 
@@ -281,7 +289,7 @@ default that makes it indistinguishable from the first.
 | **A4** | Write governance: AST guard + runtime assertion | Governance | — | The guard is a regex blind to writes, and `[^,]+` fails on any call whose first two arguments contain a comma **[V]**. Two ungoverned `set_fact` writers exist | A new writer fails CI; a non-constant key fails CI; `getattr` spelling and raw SQL covered; runtime contextvar assertion complements the static guard. **Must also publish the contract A6 depends on**: the permitted owners of an `active_workout_plan` write, which wrappers are legitimate, how the runtime assertion detects an indirect call, and a test that verifies the protection by breaking it deliberately |
 | **A5** | Ladder-ready history reads | Load | — | **Four** exercise-keyed readers, not three **[V]**; no equipment/machine/gym/brand column exists anywhere in the schema **[V]**; a query failure was indistinguishable from "never trained" **[V]** | **DONE** — one `HistorySelection` contract; `no_history` vs `history_unavailable` kept distinct and logged with ids only; layer reported on every decision; guards pin that every exercise-keyed history SELECT keys on `exercise_id` and none on `exercise_name` |
 | **A6** | Pre-activation `editparams_menu:` route | Identity | A4 | The plan-review wizard mints the legacy callback before activation **[V]**; with no active plan the user edits template parameters believing they edit their plan. Harm **[H]** | Harm test fails first, then passes. If it cannot be made to fail, the item closes as documentation. **The route must go through the managed interface — a green CI is not sufficient, and adding A6 to any allowlist to satisfy A4's guard is forbidden** |
-| **A7** | Pain persistence semantics | Runtime | A1 | `medical_constraints` expires after 14 days; `training_limitations` never does **[V]**, and the mirror concatenates strings — a one-time report becomes a permanent limitation | Four states distinguished (temporary event / active / confirmed / historical); expiry clears the planning fact; non-pain limitations survive; recompute, not append |
+| **A7** | Pain persistence semantics — **DONE** | Runtime | A1 | `medical_constraints` expires after 14 days; `training_limitations` never does **[V]**, and the mirror concatenates strings — a one-time report becomes a permanent limitation | Four states distinguished (temporary event / active / confirmed / historical); expiry clears the planning fact; non-pain limitations survive; recompute, not append |
 | **A8** | Substitution occurrence correctness | Slot | A2 | `alts.index(alt)` is a value-based lookup **[V]**; re-ranking mutates the list, so a stale callback substitutes a valid-but-wrong exercise | A mutated list causes a stale callback to be rejected, never misapplied. Keyed on alternative id plus occurrence identity |
 | **A9** | Mutation boundary + saved-plan reconciliation (**W1-44**) — **DONE** | Governance | A4 | An availability correction deliberately leaves the plan contradicting it **[V]**, and the reply reports success with no hint of the divergence | The corrected day is removed after approval; the divergence is named before it; an in-flight session defers the swap; audit rows are recoverable |
 | **A10** | Free-text intent + degraded plan | Governance | A9 | Only a frequency integer survives parsing **[V]**; exercise-less plans become active with no readiness gate | Weekdays, time and duration all land; a legacy user below full readiness receives a degraded plan with explicit disclosure and a completion CTA, never silence; safety-critical gaps still block. **Must also retire A4's temporary authorization**: remove `noam_coach/bot/onboarding.py` from `_ALLOWED_FACT_WRITER_FILES`, delete the `authorize_governed_fact_write` block in `build_weekly_plan`, and delete `test_build_weekly_plan_is_marked_a_temporary_owner`. After A10 the writer allowlist contains `planning.py` only, and a reintroduced independent mirror write must fail CI |
