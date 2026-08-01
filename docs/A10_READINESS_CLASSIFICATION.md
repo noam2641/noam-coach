@@ -388,6 +388,17 @@ equivalent prefix in `assistant.py`, plus an `ast`-based guard asserting every
 `format_weekly_plan` call site routes through the disclosure, so a *fourth* build
 path added later cannot silently skip it.
 
+A **fourth surface** was then found by tracing user reachability rather than by a
+failing test: `render_candidate_list` is the screen the user actually chooses
+from, and its buttons *are* the confirmation tap (`planv2:select:<id>`, built via
+`conversation.encode_callback` — which is why a literal grep for the prefix found
+no producer). It carried no disclosure, so a user picking between three
+safety-degraded plans was told nothing until after committing. Disclosing only
+after the tap informs someone about a decision they have already made, so the
+disclosure now precedes the choice. Every existing test passed while this was
+true: they asserted the helper and the three render paths, all of which were
+correct.
+
 Both are covered by deliberate breakage: reverting the profile flag, dropping it
 from the payload, and removing the disclosure at either call site each fail.
 
