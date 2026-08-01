@@ -177,7 +177,52 @@ into permanent identity and destroying the information `NULL` currently carries.
 | **A11a** | **COMPLETE** | `6acc172` | #69 | proven, exit 0 |
 | **A9** | **COMPLETE** | `4345993` | #70 | proven, exit 0 |
 | **A7** | **COMPLETE** | `6de87f9` | #71 | proven, exit 0 |
-| A8, A10, A11b, A12, A13 | not started | — | — | — |
+| **A10** | validated, merge pending | — | — | — |
+| A8, A11b, A12, A13 | not started | — | — | — |
+
+**A10 correction to this document.** The pre-flight and the classification both
+recorded the safety gate as having **four** enforcement points. It has **five**.
+`training_limitations` is required by the `"workout"` readiness profile as well
+as the `"safety"` one (`user_model.py:713-727`), so `_require_readiness(…,
+"workout")` refuses on the safety fact one line *before* the safety gate runs at
+both `planning.py:1252` and `:1464`. A search for `"safety"` could not find it.
+
+This mattered more than a miscount: with only the four known gates changed, the
+degraded path was **unreachable while appearing fully implemented** — every test
+of the new flow passed, and a real user was still refused a plan, by a different
+profile. It was caught by measuring an end-to-end activation rather than by
+reading the gates, which is the argument for building the fixture as a real user
+(every workout fact answered, the safety fact deferred) instead of an empty one.
+
+Resolved with `_require_readiness(…, ignore=_SAFETY_FACTS)` at the two workout
+sites, both of which run the dedicated safety gate immediately after.
+`_SAFETY_FACTS` is pinned equal to the safety profile's `required` set by a test,
+so the general gate can only skip a fact the safety gate still enforces.
+
+**A10 second correction: the retirement belongs to A10, not A11b.** A first
+attempt delivered confirmation on the `plan_versions` path only and proposed
+deferring `build_weekly_plan`'s retirement to A11b, on the reasoning that
+routing needed A11b's payload work. **That was wrong**, and §3.7 of this
+document already said so: A11b's renderer fix "is only possible once A10
+delivers real exercises by routing through the canonical pipeline." The
+dependency runs A10 → A11b.
+
+Measurement confirmed it. `generate_candidates` already builds exercise-bearing
+sessions and already applies `repair_workout_payload`, which supplies the
+session time the thin shape lacked (`planning.py:1001`). Nothing in A11b was
+required — routing was a wiring change, not a payload change.
+
+The deeper point: the fact-only writer was not merely *missing* a confirmation
+gate, it made one **impossible**. With no `plan_versions` row there was no
+candidate to hold and no activation call to gate, so the plan went live the
+instant it was built. Retiring that writer is what makes the invariant
+enforceable, which is why it could never have been deferred to a later item.
+
+`planning.activate_plan` is now the sole writer of `active_workout_plan`, and
+`noam_coach/bot/onboarding.py` is removed from `_ALLOWED_FACT_WRITER_FILES`.
+Confirmation reuses the existing `planv2:select:` tap rather than adding a
+second confirm callback. A11b inherits a `build_weekly_plan` that returns a real
+stored plan — the precondition its renderer rewrite was always waiting on.
 
 **A7 correction to this document.** The A7 row said `training_limitations`
 "never" expires. It does — `expires_after_days=30`. The defect was the

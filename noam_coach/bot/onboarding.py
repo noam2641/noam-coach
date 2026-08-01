@@ -697,7 +697,12 @@ async def advance_after_answer(target: Any, user_id: int) -> None:
             return
         plan = await build_weekly_plan(user_id, freq)
         await message.reply_text(
-            format_weekly_plan(plan, pain_regions=await active_pain_regions_for(user_id)),
+            await _with_safety_disclosure(
+                user_id,
+                format_weekly_plan(
+                    plan, pain_regions=await active_pain_regions_for(user_id)
+                ),
+            ),
             reply_markup=InlineKeyboardMarkup(
                 [
                     [button("🏋️ התחל אימון", "menu:workout")],
@@ -2347,6 +2352,17 @@ async def render_candidate_list(target: Any, user_id: int, plan_type: str) -> No
         ]
     else:
         lines = [f"<b>שלוש הצעות {_plan_type_label(plan_type)}</b>", ""]
+        # A10: this is the screen the user chooses from, and the button below is
+        # the confirmation tap. If the plans were built without safety
+        # information, the disclosure belongs HERE -- disclosing only after the
+        # tap would be informing someone about a decision they already made.
+        from noam_coach.services import plan_readiness as _pr
+
+        with suppress(Exception):
+            _assessment = await _pr.assess_plan_readiness(DB, user_id)
+            _disclosure = _pr.disclosure_lines(_assessment)
+            if _disclosure:
+                lines.extend([*_disclosure, ""])
     rows = []
     for index, candidate in enumerate(candidates, start=1):
         lines.append(_format_candidate(candidate, index))
@@ -2637,6 +2653,26 @@ async def ask_deferred_for_plan(target: Any, user_id: int, frequency: int) -> bo
 
 
 @runtime_bound(RUNTIME_NAMES)
+async def _with_safety_disclosure(user_id: int, plan_text: str) -> str:
+    """Prefix the A10 disclosure when the plan was built without safety info.
+
+    Both onboarding build paths became REACHABLE with limitations unknown once
+    `_block_plan_for_pending_safety` stopped blocking a deferred question.
+    Rendering the plan unchanged would hand the user a degraded plan that looks
+    exactly like an adapted one -- which is precisely the protection that has to
+    replace the LOG-015 block, not accompany its removal.
+
+    Shared by both call sites so the disclosure cannot drift between them.
+    """
+    from noam_coach.services import plan_readiness
+
+    assessment = await plan_readiness.assess_plan_readiness(DB, user_id)
+    lines = plan_readiness.disclosure_lines(assessment)
+    if not lines:
+        return plan_text
+    return "\n".join(lines) + "\n\n" + plan_text
+
+
 async def _block_plan_for_pending_safety(target: Any, user_id: int) -> bool:
     """Safety gate for the onboarding build paths.
 
@@ -2651,6 +2687,17 @@ async def _block_plan_for_pending_safety(target: Any, user_id: int) -> bool:
     pending = await questions.pending_safety_questions(DB, user_id)
     if not pending:
         return False
+
+    # A10: LOG-015 blocked on *any* unanswered safety question, so a user who
+    # deferred once was never offered a plan again -- silence, not safety. The
+    # block is kept for a question never asked, and replaced for one already
+    # asked and deferred by conservative build + disclosure + confirmation
+    # (`plan_readiness.propose_degraded_plan`). Returning False here lets the
+    # caller build; it does NOT let it activate.
+    from noam_coach.services import plan_readiness
+    if await plan_readiness.safety_gate_decision(DB, user_id) == plan_readiness.GATE_DEGRADE:
+        return False
+
     q = pending[0]
     await set_pending(user_id, q.id)
     rows: list[list[Any]] = []
@@ -2679,8 +2726,11 @@ async def check_plan_readiness(user_id: int) -> list[str]:
     Empty list means the user is ready for a workout plan.
     """
     gaps: list[str] = []
-    pending = await questions.pending_safety_questions(DB, user_id)
-    if pending:
+    # A10: a deferred safety question is no longer a hard gap. It degrades the
+    # plan (conservative build + disclosure + confirmation) rather than blocking
+    # it, so only a question never asked is reported here.
+    from noam_coach.services import plan_readiness
+    if await plan_readiness.safety_gate_decision(DB, user_id) == plan_readiness.GATE_ASK:
         gaps.append("שאלות בטיחות לא נענו")
     goal = await user_model.get_value(DB, user_id, "primary_goal")
     if goal is None:
@@ -2743,27 +2793,69 @@ async def build_weekly_plan(user_id: int, frequency: int) -> dict[str, Any]:
         source=user_model.SOURCE_USER,
         confirmed=True,
     )
-    # Authorized under protest, and deliberately recorded as such: this path
-    # writes the mirror WITHOUT a plan_versions row behind it, so the fact is
-    # the only copy and there is nothing to derive it from. That is the defect
-    # A10 removes by routing free-text plan building through the canonical
-    # pipeline. Until then the authorization keeps the write visible rather
-    # than silently permitted -- the reason string is the audit trail.
-    with user_model.authorize_governed_fact_write(
-        "build_weekly_plan writes a fact-only plan (superseded by A10)"
-    ):
-        await user_model.set_fact(
-            DB,
-            user_id,
-            "active_workout_plan",
-            plan,
-            kind=user_model.KIND_FACT,
-            source=user_model.SOURCE_SYSTEM,
-            confidence=0.85 if availability.confirmed else 0.65,
-            confirmed=True,
-            affects=("workout_schedule",),
+    # A10: this function used to write `active_workout_plan` directly, under a
+    # temporary A4 authorization, with NO `plan_versions` row behind it -- the
+    # fact was the only copy, nothing could derive it, and the plan became
+    # active the instant it was built. That made an unconfirmed activation
+    # unavoidable on this path: there was no candidate to hold and no
+    # activation call to gate.
+    #
+    # It now proposes through the canonical pipeline instead. `generate_
+    # candidates` builds exercise-bearing sessions and applies
+    # `repair_workout_payload` (which supplies the session time this shape
+    # lacked), `save_candidates` stores them as `candidate` rows, and nothing
+    # becomes active until the user taps -- at which point activation runs
+    # through A9. No governed-fact write remains here.
+    proposed = await _propose_weekly_plan(user_id, plan, frequency)
+    return proposed if proposed is not None else plan
+
+
+async def _propose_weekly_plan(
+    user_id: int,
+    fallback: dict[str, Any],
+    frequency: int,
+) -> dict[str, Any] | None:
+    """Store the weekly plan as a CANDIDATE and return its payload to render.
+
+    Returns None when the canonical pipeline cannot produce a plan, in which
+    case the caller renders the locally-built shape. That fallback renders but
+    does **not** activate -- with the direct fact write gone, there is no path
+    on which an unconfirmed plan can become active. A user who cannot be
+    proposed a real plan sees one and is asked to complete what is missing,
+    which is the pre-A10 behaviour minus the silent activation.
+    """
+    import planning
+
+    try:
+        candidates = await planning.generate_candidates(DB, user_id, "workout")
+    except planning.PlanningBlockedError as exc:
+        # Readiness/quality refusal: surface nothing here, the caller's gates
+        # already explain it. Never fall through to a write.
+        LOGGER.info(
+            "weekly_plan_proposal_blocked user_id=%s missing=%d",
+            user_id, len(getattr(exc, "missing", None) or ()),
         )
-    return plan
+        return None
+    except Exception:
+        LOGGER.exception("weekly_plan_proposal_failed user_id=%s", user_id)
+        return None
+
+    if not candidates:
+        return None
+
+    # Prefer a candidate matching the frequency the user asked for; the
+    # pipeline may offer several strategies.
+    chosen = next(
+        (c for c in candidates if (c.payload or {}).get("frequency") == frequency),
+        candidates[0],
+    )
+    payload = dict(chosen.payload or {})
+    payload["plan_id"] = chosen.id
+    # Carry the fields the local shape provided that the pipeline does not, so
+    # the three render paths keep the text they had.
+    for key in ("days_source", "availability_confirmed", "structure", "method"):
+        payload.setdefault(key, fallback.get(key))
+    return payload
 
 
 @runtime_bound(RUNTIME_NAMES)
@@ -3078,7 +3170,12 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
             return True
         plan = await build_weekly_plan(user_id, frequency)
         await message.reply_text(
-            format_weekly_plan(plan, pain_regions=await active_pain_regions_for(user_id)),
+            await _with_safety_disclosure(
+                user_id,
+                format_weekly_plan(
+                    plan, pain_regions=await active_pain_regions_for(user_id)
+                ),
+            ),
             reply_markup=InlineKeyboardMarkup(
                 [
                     [button("🏋️ התחל אימון", "menu:workout")],

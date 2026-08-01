@@ -482,8 +482,33 @@ def _nutrition_candidate(
     )
 
 
-async def _require_readiness(db: Any, user_id: int, profile_name: str) -> dict[str, Any]:
+#: Facts the dedicated safety gate owns, so the general readiness gate must not
+#: refuse on them first. Kept in sync with the "safety" profile by a test.
+_SAFETY_FACTS = frozenset({"training_limitations"})
+
+
+async def _require_readiness(
+    db: Any,
+    user_id: int,
+    profile_name: str,
+    *,
+    ignore: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    """Refuse when the profile's required facts are missing.
+
+    `ignore` exists because `training_limitations` is required by BOTH the
+    "workout" and "safety" profiles. Every site that passes it also runs the
+    dedicated safety gate immediately afterwards, so without this the workout
+    gate would refuse first and the safety decision would never be reached --
+    the degraded path would be unreachable while looking implemented. It is
+    never used to drop a fact that has no other gate enforcing it.
+    """
     readiness = await user_model.compute_readiness(db, user_id, profile_name)
+    missing = [key for key in readiness["missing"] if key not in ignore]
+    if missing:
+        readiness = {**readiness, "ready": False, "missing": missing}
+    elif readiness["missing"]:
+        readiness = {**readiness, "ready": True, "missing": []}
     if not readiness["ready"]:
         labels = [FACT_LABELS.get(key, key) for key in readiness["missing"]]
         raise PlanningBlockedError(
@@ -491,6 +516,73 @@ async def _require_readiness(db: Any, user_id: int, profile_name: str) -> dict[s
             missing=list(readiness["missing"]),
         )
     return readiness
+
+
+async def _require_safety_readiness(
+    db: Any,
+    user_id: int,
+    *,
+    allow_degraded: bool,
+) -> None:
+    """The safety gate, with the two states LOG-015 collapsed kept apart.
+
+    Wraps `_require_readiness(db, user_id, "safety")` rather than replacing it,
+    so the refusal, its message and its `missing` payload are unchanged wherever
+    they still apply. What A10 adds is the one case that must not refuse: a
+    safety question already asked and deferred, where refusing again is the
+    silence defect rather than a protection.
+
+    `allow_degraded` is never a blanket bypass -- at build time it permits a
+    plan to be *constructed* under `SAFETY_UNKNOWN`, and at activation time it
+    is true only when an explicit approval for that plan exists.
+    """
+    if not allow_degraded:
+        await _require_readiness(db, user_id, "safety")
+        return
+
+    from noam_coach.services import plan_readiness
+
+    decision = await plan_readiness.safety_gate_decision(db, user_id)
+    if decision == plan_readiness.GATE_DEGRADE:
+        return  # built/activated conservatively, disclosed, and confirmed
+    await _require_readiness(db, user_id, "safety")
+
+
+async def _degraded_plan_confirmed(db: Any, user_id: int, plan_id: Any) -> bool:
+    """True when the user explicitly approved THIS plan despite the unknown.
+
+    Reuses the `approvals` row A10 already writes as the confirmation record,
+    rather than threading a flag through `activate_plan`'s signature: the
+    approval is the durable evidence of the tap, and reading it here means a
+    forged call cannot claim confirmation that was never given.
+
+    Scoped to the exact `plan_id`, so approving one plan does not silently
+    authorise a different one.
+    """
+    if plan_id is None:
+        return False
+    from noam_coach.services import plan_readiness
+    try:
+        rows = await db.fetch_all(
+            "SELECT payload FROM approvals "
+            "WHERE user_id=? AND kind=? AND status='approved'",
+            (user_id, plan_readiness.APPROVAL_KIND_DEGRADED_PLAN),
+        )
+    except Exception:
+        # `planning` declares no logger of its own; reuse the one that owns this
+        # policy rather than introducing a second logging mechanism here.
+        plan_readiness.LOGGER.exception(
+            "degraded_confirmation_read_failed user_id=%s", user_id
+        )
+        return False  # fail closed: unreadable approval is not an approval
+    for row in rows or []:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if int(payload.get("plan_id") or 0) == int(plan_id):
+            return True
+    return False
 
 
 async def build_nutrition_candidates(db: Any, user_id: int) -> list[PlanCandidate]:
@@ -1249,8 +1341,15 @@ def _workout_strategy_score(
 
 
 async def build_workout_candidates(db: Any, user_id: int) -> list[PlanCandidate]:
-    await _require_readiness(db, user_id, "workout")
-    await _require_readiness(db, user_id, "safety")
+    # A10: `training_limitations` is deferred to the safety gate below, which
+    # is the only place that can tell "never asked" from "asked and deferred".
+    await _require_readiness(db, user_id, "workout", ignore=_SAFETY_FACTS)
+    # A10: building is allowed while limitations are unknown, because refusing
+    # is what produced silence. Safety is preserved downstream instead of here:
+    # the plan is built with SAFETY_UNKNOWN, the gap is disclosed, and
+    # `_validate_plan_for_activation` still refuses to ACTIVATE it without an
+    # explicit confirmation. Only a question never asked blocks the build.
+    await _require_safety_readiness(db, user_id, allow_degraded=True)
     facts = await collect_facts(db, user_id)
 
     # REC-PROGRAM-04-01: Use resolved availability as the authoritative source
@@ -1461,9 +1560,22 @@ async def _validate_plan_for_activation(
     if row.get("status") not in {"candidate", "active"}:
         raise PlanningBlockedError("אפשר להפעיל רק תוכנית מועמדת פעילה")
     if plan_type in {"nutrition", "workout"}:
-        await _require_readiness(db, user_id, plan_type)
+        # Same deferral as at build time: for a workout the safety fact is
+        # decided by the gate immediately below, which additionally requires an
+        # explicit approval before it will let an unknown through.
+        await _require_readiness(
+            db, user_id, plan_type,
+            ignore=_SAFETY_FACTS if plan_type == "workout" else frozenset(),
+        )
     if plan_type == "workout":
-        await _require_readiness(db, user_id, "safety")
+        # A10: activation is the point where the degraded path must NOT be
+        # silently permissive. `allow_degraded=False` means an unknown
+        # limitation still refuses here -- unless the user has explicitly
+        # approved this specific plan, which is what lifts the refusal.
+        await _require_safety_readiness(
+            db, user_id,
+            allow_degraded=await _degraded_plan_confirmed(db, user_id, row.get("id")),
+        )
         payload = json.loads(row.get("payload") or "{}")
         sessions = payload.get("sessions") or []
         if not sessions:

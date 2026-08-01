@@ -196,10 +196,15 @@ _GOVERNED_FACT_KEY = "active_workout_plan"
 #: Do NOT add an entry here to make a new route pass. Route the write through an
 #: existing owner instead. Broadening this set to satisfy CI is the precise
 #: failure mode this guard exists to prevent.
+#: A10 removed `noam_coach/bot/onboarding.py` from this set. `build_weekly_plan`
+#: wrote `active_workout_plan` with no `plan_versions` row behind it, under a
+#: temporary authorization whose own reason string said "superseded by A10". It
+#: now proposes a candidate through the canonical pipeline instead, so
+#: `planning.activate_plan` is once again the sole writer of the governed fact --
+#: which is what makes an activation gate possible at all.
 _ALLOWED_FACT_WRITER_FILES = frozenset(
     {
         "planning.py",
-        "noam_coach/bot/onboarding.py",
     }
 )
 

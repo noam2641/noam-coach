@@ -332,6 +332,20 @@ _AUDIT_ALLOWLIST: dict[tuple[str, str], dict[str, Any]] = {
         "before_days": _pass("before_days"),
         "after_days": _pass("after_days"),
     },
+    # Degraded-safety plan proposal/confirmation (A10). Every field here is
+    # already a bounded scalar, so the `_scalar_only` fallback would preserve
+    # them -- but only incidentally. Registering the pair makes that a stated
+    # guarantee: it pins WHICH fields are allowed, so a later field carrying a
+    # limitation string or a body region is dropped by rule rather than
+    # surviving because nobody re-checked the fallback. The user's answer and
+    # the affected body part must never reach an audit row.
+    ("propose_degraded_plan", "plan"): {
+        "outcome": _pass("outcome"),
+        "safety_unknown": _pass("safety_unknown"),
+        "gap_count": _pass("gap_count"),
+        "approval_id": _pass("approval_id"),
+        "mutation_outcome": _pass("mutation_outcome"),
+    },
     # Goal approvals: keep the bounded targets; DROP the `explanation` prose.
     ("approve", "goal"): {
         "calories": _pass("calories"),

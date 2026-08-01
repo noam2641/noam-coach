@@ -600,6 +600,16 @@ async def _handle_plan_text_action(ctx: FreeTextContext) -> bool:
             plan_text = format_weekly_plan(
                 plan, pain_regions=await active_pain_regions_for(ctx.user_id)
             )
+            # A10: this path is now REACHABLE with limitations unknown, because
+            # `check_plan_readiness` no longer blocks on a deferred safety
+            # question. Building silently here would deliver the degraded plan
+            # without the disclosure that justifies replacing the LOG-015 block
+            # -- the plan would look identical to a fully adapted one.
+            from noam_coach.services import plan_readiness as _pr
+            _assessment = await _pr.assess_plan_readiness(DB, ctx.user_id)
+            _disclosure = _pr.disclosure_lines(_assessment)
+            if _disclosure:
+                plan_text = "\n".join(_disclosure) + "\n\n" + plan_text
             if split_freq is not None and frequency == split_freq:
                 if frequency >= 4:
                     plan_text = "בניתי לך תוכנית ABC + Full Body מותאמת ל־4 ימים — בלי להוריד יום אימון שהזנת:\n\n" + plan_text

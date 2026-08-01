@@ -86,6 +86,13 @@ class ClientTrainingProfile:
     pain_areas: tuple[str, ...] = ()
     movement_limitations: tuple[str, ...] = ()
     medical_flags: tuple[str, ...] = ()
+    #: A10: True when we do not KNOW whether the user has limitations, as
+    #: distinct from knowing they have none. Both previously produced empty
+    #: tuples above, so a plan built under uncertainty was indistinguishable
+    #: from one built under a confirmed "no limitations" -- and every joint was
+    #: loaded freely on that basis. Consumers must branch on this rather than
+    #: inferring safety from an empty `injuries`.
+    safety_unknown: bool = False
     sleep_quality: Any = None
     average_steps: Any = None
     stress_level: Any = None
@@ -112,6 +119,11 @@ class ClientTrainingProfile:
             "pain_areas": list(self.pain_areas),
             "movement_limitations": list(self.movement_limitations),
             "medical_flags": list(self.medical_flags),
+            # A10: a bounded boolean, never the limitation text. Without it the
+            # stored profile cannot say whether those empty lists above mean
+            # "no limitations" or "never asked" -- the same conflation at rest
+            # that the flag fixes in memory.
+            "safety_unknown": self.safety_unknown,
             "sleep_quality": self.sleep_quality,
             "average_steps": self.average_steps,
             "stress_level": self.stress_level,
@@ -346,6 +358,11 @@ def client_training_profile_from_facts(
         _fact_value(facts, "training_location"),
     )
     limitations = _fact_value(facts, "training_limitations")
+    # A10: absence here is UNKNOWN, not "none". Measured before the fix: with no
+    # training_limitations, no active_pain and no medical_avoidance this yielded
+    # injuries=(), pain_areas=(), movement_limitations=(), medical_flags=() --
+    # byte-identical to an answered "none".
+    safety_unknown = limitations is None
     if limitations is None:
         limitations = " ".join(
             str(value or "")
@@ -355,6 +372,10 @@ def client_training_profile_from_facts(
             )
             if value
         )
+    # Any real signal (active pain, a medical avoidance) means the state is
+    # known after all -- only a genuinely empty fallback is an unknown.
+    if safety_unknown and str(limitations).strip():
+        safety_unknown = False
     pain = pain_regions(limitations, None)
     medical = _tuple_value(limitations)
     return ClientTrainingProfile(
@@ -376,6 +397,7 @@ def client_training_profile_from_facts(
         pain_areas=tuple(sorted(pain)),
         movement_limitations=medical,
         medical_flags=medical,
+        safety_unknown=safety_unknown,
         sleep_quality=_fact_value(facts, "sleep_quality"),
         average_steps=_fact_value(facts, "average_steps"),
         stress_level=_fact_value(facts, "stress_level"),

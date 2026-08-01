@@ -28,9 +28,9 @@ and returns a flat `list[str]` of **Hebrew display strings**
 (`onboarding.py:2676-2688`) **[V]**, discarding every score. Its only caller then
 treats any non-empty list as a hard block (`assistant.py:580-586`) **[V]**.
 
-**But the safety gate has four enforcement points, not one** *(corrected after
-review — the earlier "single caller" framing understated the change surface by
-roughly 4x)*:
+**But the safety gate has five enforcement points, not one** *(first corrected
+after review from "single caller" to four; corrected again **during
+implementation**, when a fifth was found by measurement — see below)*:
 
 | Enforcer | Location |
 |---|---|
@@ -38,16 +38,35 @@ roughly 4x)*:
 | `_block_plan_for_pending_safety` | `onboarding.py:696` and `:3077` **[V]** |
 | `_require_readiness(…, "safety")` | `planning.py:1253` (candidate build) **[V]** |
 | `_require_readiness(…, "safety")` | `planning.py:1466` (activation) **[V]** |
+| `_require_readiness(…, "workout")` | `planning.py:1252` and `:1464` **[V]** |
 
-Relaxing only the first would be **silently overridden** by the other three: the
+The fifth was invisible to a search for `"safety"`. `training_limitations` is a
+member of **both** `READINESS_PROFILES["workout"].required` and
+`READINESS_PROFILES["safety"].required` (`user_model.py:713-727`) **[V]**, so the
+*workout* gate refuses on the safety fact one line before the safety gate is
+reached. With only the four known gates changed, the degraded path was
+unreachable while appearing fully implemented — the build was still refused,
+just by a different profile.
+
+Measured directly: with every other workout fact answered and
+`training_limitations` recorded as `KIND_GAP`, `compute_readiness(…, "workout")`
+returns `ready=False missing=['training_limitations']`, and `activate_plan`
+raises `PlanningBlockedError(missing=['training_limitations'])` **[V]**.
+
+Resolved by `_require_readiness(…, ignore=_SAFETY_FACTS)` at the two workout
+sites, which both run the dedicated safety gate immediately afterwards.
+`_SAFETY_FACTS` is pinned equal to the safety profile's `required` set by
+`test_the_ignore_set_matches_the_safety_profile_exactly`, so a fact can only be
+skipped by the general gate while the safety gate still enforces it.
+
+Relaxing only the first gate would be **silently overridden** by the others: the
 free-text path would soften while the two onboarding build paths still hard-block
 and re-ask. `_block_plan_for_pending_safety`'s own docstring cites **LOG-015** and
 states the gate must block on *every* build path — so softening it is a
-deliberate tradeoff against a closed incident, not a detail. A10 must decide and
-record which of the four change.
+deliberate tradeoff against a closed incident, not a detail.
 
 So A10 propagates an existing *scale* rather than designing one — but the change
-surface is four gates, not one, and the conservative *behaviour* the degraded
+surface is five gates, not one, and the conservative *behaviour* the degraded
 path needs does not yet exist. Smaller than the pre-flight assumed on the
 severity axis; larger on both of these.
 
@@ -295,11 +314,147 @@ Traced:                       check_plan_readiness -> assistant.py:580 (sole cal
                               pre-screen's 2; _validate_plan_for_activation enforces both
 Decision:                     EXTEND -- propagate the existing scores; reuse KIND_GAP;
                               reuse the existing conservative paths; write via A9
-Evidence for NEW:             none required; no new mechanism proposed
-Superseded paths retired:     build_weekly_plan's independent fact write (A10 removes it
-                              and drops onboarding.py from _ALLOWED_FACT_WRITER_FILES)
-Post-implementation search:   pending
+Evidence for NEW:             SAFETY_UNKNOWN only. Measured: with no training_limitations,
+                              no active_pain and no medical_avoidance,
+                              client_training_profile_from_facts yields injuries=(),
+                              pain_areas=(), movement_limitations=(), medical_flags=() --
+                              byte-identical to a user who answered "none". No existing
+                              path produces caution from absence, so the distinction had
+                              to be created rather than reused.
+Superseded paths retired:     build_weekly_plan's independent governed-fact write, and
+                              onboarding.py dropped from _ALLOWED_FACT_WRITER_FILES --
+                              exactly as the plan required. (An earlier revision of this
+                              line claimed the retirement belonged to A11b. That was
+                              wrong: the fact-only writer did not merely lack a
+                              confirmation gate, it made one impossible, so retiring it
+                              IS the A10 deliverable. Corrected after owner review.)
+                              A4's test_build_weekly_plan_is_marked_a_temporary_owner
+                              retired with it, replaced by its inverse guard.
+Post-implementation search:   done. Confirmed on the final diff:
+                              - no new set_fact / authorize_governed_fact_write /
+                                INSERT INTO plan_versions -- activation goes through A9;
+                              - no new table, approval type or idempotency rule --
+                                decide_approval's WHERE status='pending' is the single
+                                claim, and the post-claim re-read was REMOVED rather than
+                                kept as a second divergent rule;
+                              - no new logger or audit mechanism -- LOGGER and write_audit
+                                reused; planning.py borrows plan_readiness.LOGGER rather
+                                than declaring its own;
+                              - _ALLOWED_FACT_WRITER_FILES unchanged (empty diff);
+                              - KIND_GAP reused to separate "never asked" from "asked and
+                                deferred" -- the distinction already written by record_gap
+                                and discarded by pending_safety_questions' single bucket.
+                              Re-run after the routing change:
+                              - exactly ONE governed-fact writer remains in production
+                                (planning.py:1656) -- grep for
+                                authorize_governed_fact_write returns that line alone;
+                              - ZERO new callback prefixes: confirmation extends the
+                                existing planv2:select: tap rather than adding a second
+                                confirm flow beside it;
+                              - build_weekly_plan reuses generate_candidates /
+                                save_candidates / repair_workout_payload -- no new
+                                builder, no new persistence, no new repair path.
 ```
+
+**One mechanism was extended rather than reused as-is.** `_require_readiness`
+gained an `ignore=` parameter instead of A10 adding a parallel gate beside it.
+That keeps one refusal path, one message and one `missing` payload; a second
+gate would have been a duplicate of the thing it was meant to soften.
+
+### Two protections were declared before they were wired
+
+Both were caught by asking "which runtime code reads this?" rather than by a
+failing test — the tests passed in both cases, because each asserted the
+mechanism in isolation rather than at the point where the user is affected.
+
+**Requirement 1 (conservative behaviour).** `SAFETY_UNKNOWN`,
+`is_safety_unknown` and `conservative_limitations_value` were defined, exported
+and tested, and three source comments described plans being "built with
+`SAFETY_UNKNOWN`". A repository-wide search found **no runtime consumer** — the
+constant was inert, and `client_training_profile_from_facts` still collapsed
+unknown into known-none exactly as measured. Fixed by adding
+`ClientTrainingProfile.safety_unknown`, set from `limitations is None` and
+cleared when the existing `active_pain` / `medical_avoidance` fallback yields a
+real signal, then added to `public_payload` (an explicit allowlist, so a new
+field is otherwise dropped and the *stored* plan keeps the same ambiguity at
+rest). Verified: `{}` → `safety_unknown=True injuries=()`;
+`training_limitations="none"` → `False`; `active_pain="knee"` → `False`.
+
+**Requirement 2 (disclosure).** Softening the gates made three plan-render paths
+reachable with limitations unknown, and all three rendered `format_weekly_plan`
+unchanged — a degraded plan would have looked identical to an adapted one. Fixed
+by `onboarding._with_safety_disclosure` (shared by both onboarding paths) and the
+equivalent prefix in `assistant.py`, plus an `ast`-based guard asserting every
+`format_weekly_plan` call site routes through the disclosure, so a *fourth* build
+path added later cannot silently skip it.
+
+A **fourth surface** was then found by tracing user reachability rather than by a
+failing test: `render_candidate_list` is the screen the user actually chooses
+from, and its buttons *are* the confirmation tap (`planv2:select:<id>`, built via
+`conversation.encode_callback` — which is why a literal grep for the prefix found
+no producer). It carried no disclosure, so a user picking between three
+safety-degraded plans was told nothing until after committing. Disclosing only
+after the tap informs someone about a decision they have already made, so the
+disclosure now precedes the choice. Every existing test passed while this was
+true: they asserted the helper and the three render paths, all of which were
+correct.
+
+Both are covered by deliberate breakage: reverting the profile flag, dropping it
+from the payload, and removing the disclosure at either call site each fail.
+
+### Requirement 3 initially missed the fact-only build path — now closed
+
+The first attempt at A10 delivered confirmation on the `plan_versions` path only,
+and proposed deferring the rest to A11b. That was wrong on both counts, and the
+owner rejected it: disclosure without confirmation is still a contract
+violation, and the acceptance criteria assign the retirement to A10.
+
+**What was actually wrong.** `onboarding.build_weekly_plan` wrote
+`active_workout_plan` directly, under a temporary A4 authorization, with **no
+`plan_versions` row behind it**. The fact was the only copy, nothing could
+derive it, and the plan became active the instant it was built. So an
+unconfirmed activation was not an oversight on that path — it was structurally
+unavoidable: there was no candidate to hold and no activation call to gate.
+
+**Why the deferral was wrong.** The claim was that routing needed A11b's payload
+work. The plan document says the opposite at §3.7: A11b's renderer fix "is only
+possible once A10 delivers real exercises by routing through the canonical
+pipeline." The dependency runs A10 → A11b. Measurement confirmed it:
+`generate_candidates` already produces exercise-bearing sessions and already
+applies `repair_workout_payload`, which supplies the session time the thin shape
+lacked (`planning.py:1001`, `"18:00"`). Nothing in A11b was required.
+
+**The fix.** `build_weekly_plan` now proposes through the canonical pipeline via
+`_propose_weekly_plan`: `generate_candidates` → `save_candidates` → a
+`candidate` row. It writes no governed fact at all. Confirmation runs through
+the **existing** `planv2:select:` tap, extended to record the approval and
+activate through A9 rather than a second confirm callback beside it.
+
+Measured after the change, for a user with limitations deferred:
+
+| Step | Result |
+|---|---|
+| `build_weekly_plan(1, 3)` | returns `plan_id`, sessions carry exercises |
+| governed fact | **`None`** — no direct write |
+| `active_plans` | **`None`** — nothing active |
+| `plan_versions.status` | `candidate` |
+| after confirm | `confirmed`, status `active`, fact mirrors `plan_id` |
+| second/third tap | `already_decided`, exactly one active row |
+
+`planning.activate_plan` is once again the **sole** writer of the governed fact,
+and `noam_coach/bot/onboarding.py` is removed from
+`_ALLOWED_FACT_WRITER_FILES`. One writer is what makes the gate enforceable — a
+second could always route around it.
+
+A4 anticipated this precisely: its
+`test_build_weekly_plan_is_marked_a_temporary_owner` said "when that lands, this
+test fails and is deleted as part of the same change". It did, and it was,
+replaced by `test_build_weekly_plan_no_longer_writes_the_governed_fact` — the
+inverse guard.
+
+**Net effect:** on every path, a degraded plan is proposed as a candidate,
+disclosed, and activated only through A9 after an explicit tap. No plan system
+or compatibility fact becomes active before that confirmation.
 
 ### Implementation constraints carried forward
 

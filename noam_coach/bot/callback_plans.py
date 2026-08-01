@@ -1677,8 +1677,47 @@ async def handle_plan_callback(query: Any, user_id: int, data: str) -> bool:
             "SELECT 1 FROM plan_versions WHERE id=? AND user_id=? AND status='active'",
             (plan_id, user_id),
         )
+        # A10: this tap IS the explicit confirmation for a safety-degraded
+        # plan. Rather than adding a second confirm callback beside it, the
+        # existing one records the approval first and activates through A9 --
+        # so the same button means the same thing, and the approval row is the
+        # durable evidence `_validate_plan_for_activation` reads.
+        #
+        # `confirm_degraded_plan` is idempotent by `WHERE status='pending'`, so
+        # a stale keyboard, a double tap or a replayed callback claims nothing
+        # a second time. A user who never taps gets no activation at all: the
+        # plan stays a candidate.
+        from noam_coach.services import plan_readiness as _pr
+
+        degraded_outcome: str | None = None
         try:
-            selected = await planning.activate_plan(DB, user_id, plan_id)
+            assessment = await _pr.assess_plan_readiness(DB, user_id)
+            if assessment.needs_confirmation:
+                approval_id = await _pr.propose_degraded_plan(
+                    DB, user_id, plan_id, assessment
+                )
+                if approval_id:
+                    degraded_outcome = await _pr.confirm_degraded_plan(
+                        DB, user_id, approval_id
+                    )
+        except Exception:
+            # Fail CLOSED and loudly. Falling through leaves `degraded_outcome`
+            # None, so `activate_plan` runs and its safety gate refuses without
+            # an approval -- the user is not activated by accident. But a
+            # swallowed exception here would surface as a readiness message
+            # with no trace of the real cause, so it is logged rather than
+            # suppressed.
+            LOGGER.exception(
+                "degraded_confirmation_failed user_id=%s plan_id=%s", user_id, plan_id
+            )
+        try:
+            if degraded_outcome == _pr.OUTCOME_CONFIRMED:
+                # Already activated through A9 by the confirmation above. Read
+                # the row back so the rest of this handler -- the event, the
+                # announcement, the keyboard -- runs unchanged.
+                selected = await planning.get_plan(DB, user_id, plan_id)
+            else:
+                selected = await planning.activate_plan(DB, user_id, plan_id)
         except planning.PlanningBlockedError as exc:
             # Low readiness / missing data must not silently fail — explain it.
             labels = [planning.FACT_LABELS.get(k, k) for k in (getattr(exc, "missing", None) or [])]

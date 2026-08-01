@@ -332,7 +332,9 @@ async def test_a_blocked_readiness_gate_is_reported_not_bypassed(
     db = await _db(tmp_path)
     await _active_plan(db, [5])
 
-    async def _blocked(_db, _user_id, profile):
+    async def _blocked(_db, _user_id, profile, **_kw):
+        # `**_kw` absorbs A10's `ignore=` without asserting on it: this test is
+        # about how a block is REPORTED, not about which facts are gated.
         raise planning.PlanningBlockedError("missing", missing=["training_limitations"])
 
     monkeypatch.setattr(planning, "_require_readiness", _blocked)

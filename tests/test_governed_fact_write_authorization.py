@@ -170,12 +170,17 @@ async def test_a_dynamic_key_is_caught_at_runtime(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 # The legitimate owners still work
 # ---------------------------------------------------------------------------
-def test_both_owners_authorize_their_mirror_write() -> None:
+def test_the_sole_owner_authorizes_its_mirror_write() -> None:
     """Every governed write in production sits inside an authorization.
 
-    Asserted against source rather than by driving each flow: `activate_plan`
-    is behind a readiness gate and `build_weekly_plan` behind an availability
-    resolver, so exercising them here would test those gates, not this one.
+    A10 retired the second owner: `build_weekly_plan` no longer writes the
+    mirror at all, so `planning.activate_plan` is the only writer left. One
+    writer is what makes the activation gate enforceable -- a second one could
+    always route around it.
+
+    Asserted against source rather than by driving the flow: `activate_plan` is
+    behind a readiness gate, so exercising it here would test that gate, not
+    this one.
     What matters for A4 is the structural property -- a governed write is
     never reached without an owner claiming it -- and that is visible in the
     source and enforced at runtime by the tests above.
@@ -184,7 +189,7 @@ def test_both_owners_authorize_their_mirror_write() -> None:
     from pathlib import Path as _Path
 
     root = _Path(__file__).resolve().parents[1]
-    for relative in ("planning.py", "noam_coach/bot/onboarding.py"):
+    for relative in ("planning.py",):
         source = (root / relative).read_text(encoding="utf-8")
         tree = ast.parse(source)
 
@@ -361,29 +366,55 @@ async def test_concurrent_tasks_are_isolated(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# The temporary owner must stay temporary
+# The temporary owner is gone, and must stay gone
 # ---------------------------------------------------------------------------
-def test_build_weekly_plan_is_marked_a_temporary_owner() -> None:
-    """onboarding.py writes the mirror with no plan_versions row behind it.
+def test_build_weekly_plan_no_longer_writes_the_governed_fact() -> None:
+    """A10 retired the temporary owner. This is the inverse of the test that
+    guarded it while it existed.
 
-    That is the defect A10 removes by routing free-text plan building through
-    the canonical pipeline. The authorization keeps the write visible rather
-    than silently permitted, but a comment alone decays -- so the reason string
-    must name A10, making the debt greppable and its removal a deliberate act.
+    `build_weekly_plan` used to write `active_workout_plan` directly with no
+    `plan_versions` row behind it -- the fact was the only copy, nothing could
+    derive it, and the plan became active the instant it was built. That made
+    an unconfirmed activation structurally unavoidable on that path: there was
+    no candidate to hold and no activation call to gate.
 
-    A10's acceptance criteria include removing onboarding.py from the writer
-    allowlist. When that lands, this test fails and is deleted as part of the
-    same change: the debt cannot quietly become permanent.
+    It now proposes a candidate through the canonical pipeline, so
+    `planning.activate_plan` is once again the SOLE writer of the governed
+    fact. Restoring a direct write here would restore pre-confirmation
+    activation with it, which is why this is asserted at the source level
+    rather than left to the allowlist alone.
     """
+    import ast
     from pathlib import Path as _Path
 
     root = _Path(__file__).resolve().parents[1]
     source = (root / "noam_coach" / "bot" / "onboarding.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
 
-    assert "authorize_governed_fact_write" in source
-    assert "A10" in source, (
-        "the temporary authorization in onboarding.py must name the item that "
-        "removes it, or it becomes permanent by inertia"
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+        if name != "set_fact":
+            continue
+        # set_fact(db, user_id, key, value, ...) -- key is third positional,
+        # or a `key=` keyword.
+        key = next(
+            (kw.value for kw in node.keywords if kw.arg == "key"),
+            node.args[2] if len(node.args) > 2 else None,
+        )
+        if isinstance(key, ast.Constant) and key.value in user_model.GOVERNED_FACT_KEYS:
+            offenders.append(f"onboarding.py:{node.lineno} writes {key.value!r}")
+
+    assert not offenders, (
+        "onboarding.py must not write a governed fact again -- route it through "
+        "planning.activate_plan, which is the only writer an activation gate "
+        "can enforce: " + "; ".join(offenders)
+    )
+    assert "authorize_governed_fact_write" not in source, (
+        "the temporary A4 authorization must be removed with the write it "
+        "authorized, not left behind to re-enable one silently"
     )
 
 
