@@ -279,6 +279,95 @@ Three states must stay distinguishable, and must not collapse into one branch:
 The third case needs an explicit signal (raise, or log-and-flag), never a `.get()`
 default that makes it indistinguishable from the first.
 
+## 3.7 Wave 2 pre-flight — A10, A11b, A12 ownership and merge order
+
+The wave diagram in §7 draws A10, A11b and A12 as three parallel children of A9.
+**On file surface they are not**, by the same standard §3.6 applied to batch 2:
+dependency graphs being independent does not make file surfaces independent, and
+a merge conflict in a shared file costs the same as a logical dependency.
+Verified at `f039b3f`.
+
+### Pairwise intersections
+
+| Pair | Shared | Severity |
+|---|---|---|
+| **A10 ∩ A11b** | `onboarding.py`, `plan_mutations.py`, `core.py`, `planning.py` | **Severe — see below** |
+| A10 ∩ A12 | `plan_mutations.py`, `core.py` | Low, mechanical |
+| A11b ∩ A12 | `callback_session.py`, `plan_mutations.py`, `core.py` | Moderate — identity coupling |
+
+### A10 ∩ A11b is a dependency, not just an overlap
+
+Three layers, each verified:
+
+1. **File adjacency.** `build_weekly_plan` ends at `onboarding.py:2766`;
+   `format_weekly_plan` begins at `:2800`. One function apart, same module.
+2. **Call-site adjacency.** `assistant.py:597-601` invokes both consecutively on
+   the same object, inside `_handle_plan_text_action` — A10's primary edit target.
+   A10 is rewriting the function that contains A11b's call site.
+3. **Payload contract — the real coupling.** `format_weekly_plan:2848-2849` reads
+   `PLANS.get(code)` *because* `build_weekly_plan` produces sessions carrying only
+   `weekday/time/code/name` and no exercises. A11b's fix is to render from the
+   stored plan instead — **which is only possible once A10 delivers real
+   exercises** by routing through the canonical pipeline.
+
+If A11b landed first, its renderer would have to special-case the exercise-less
+shape A10 is about to delete: dead code on arrival, and a second rendering branch
+in the file this programme exists to unify.
+
+### Chains
+
+```
+CHAIN 1 (strict serial)      A10  ──►  A11b
+CHAIN 2 (parallel)           A12, merging after A11b
+```
+
+**A10 leads** for the same reason A5 led A11a: producer before consumer.
+Rebasing a renderer onto a changed producer is safe; the reverse is not. A10 is
+also on the critical path (A4 → A9 → A10) and retires A4's temporary
+authorization — every day `build_weekly_plan` keeps its escape hatch, the
+governance guard has a known live exception.
+
+**A12 runs parallel** with one rule: its two-consecutive-substitution detector
+reads an identity A11b redefines. If A12 starts immediately, build the ledger,
+migration and transports in parallel — zero overlap — and defer only the
+detection predicate until A11b's slot identity is fixed.
+
+### Shared surfaces, and why they are tolerable
+
+**All three** add an operation to `plan_mutations.py` and a key to
+`_AUDIT_ALLOWLIST`. Both are additive: new top-level functions, new dict entries.
+Conflicts are confined to the `__all__` list and the constants block — mechanical,
+unlike the `onboarding.py` adjacency. The `_AUDIT_ALLOWLIST` conflict **fails
+safe**: a lost entry falls through to scalar-only rather than leaking data. But
+each item must assert its audit row's **contents**, because an unregistered pair
+drops list-valued details silently and a lost entry would pass a
+row-exists-only test.
+
+**No migration collision** — only A12 needs one, claiming 17 at merge time.
+
+**No callback-prefix collision in this trio** — only A12 mints. The real prefix
+contention is A8 ∩ A12, outside this wave.
+
+One caveat for A11b: if it keeps the `sub:` prefix but changes what the second
+colon-part means, it silently falls out of `_SESSION_SCOPED_PREFIXES` handling.
+The orphan guard checks the prefix only, so it would still pass while the
+callback died in the handler. Keep part-2 numeric, or register the prefix as
+router-owned.
+
+### Risk and value
+
+**Riskiest: A10.** Not the largest, but the only one carrying a product-judgment
+requirement rather than a mechanical one. "Degraded but shippable" versus
+"blocked" is a line that does not exist today: `check_plan_readiness` returns a
+flat gap list with **no severity dimension at all**, and any non-empty list is a
+hard block. A10 must introduce a severity axis into a structure that has none —
+and must not repeat A9's `_looks_like_quality` trap, where one exception type
+carried two operator meanings separated by fragile token matching.
+
+**Most downstream value: A12.** WAVE 3 is explicitly blocked on it, and its
+ledger is generic suppression infrastructure any future proposal type reuses.
+A10 unblocks more *user-visible* value today; A12 unblocks more *work*.
+
 ## 4. Track A — Workout architecture
 
 | ID | Task | Domain | Depends | Justification | Acceptance criteria |
@@ -367,11 +456,15 @@ WAVE 2                      A9 ──> A8
                      mutation boundary
                          + W1-44
                              │
-               ┌─────────────┼─────────────┐
-               v             v             v
-              A10          A11b           A12
-         free-text +    slot minting   proposal ledger
-         degraded plan
+               ┌─────────────┴─────────────┐
+               v                           v
+        A10 ──► A11b                      A12
+   free-text +   slot minting        proposal ledger
+   degraded plan                     (merges after A11b)
+
+   NOTE: A10 and A11b are drawn as siblings above by dependency, but they
+   are SERIAL by file surface and payload contract -- see §3.7. A11b's
+   renderer fix is only possible once A10 delivers real exercises.
   A7 pain semantics ── requires A1
 
 WAVE 3 — deferred (needs A12 + sessions as a learning source)
