@@ -751,8 +751,18 @@ def _schedule_sessions(
     # split per frequency — this is what actually differentiates the three
     # workout-plan candidates beyond their marketing copy.
     split = split_override if split_override is not None else SPLIT_BY_FREQUENCY[frequency]
+    from noam_coach.services import workout_slots
+
     sessions = []
     for index, (slot, code) in enumerate(zip(selected, split, strict=True)):
+        exercises = copy.deepcopy(PLANS[code]["exercises"])
+        # A11b: mint slot identity HERE -- on the template copy, before
+        # `adapt_exercises` runs. The ordinal is the template's, so a
+        # regenerated plan with the same split reproduces the same ids by
+        # construction rather than by carrying state between builds. Minting
+        # after adaptation would key identity on a position that removal and
+        # backfill have already moved.
+        workout_slots.assign_slot_ids(exercises, code)
         sessions.append(
             {
                 "index": index,
@@ -762,7 +772,7 @@ def _schedule_sessions(
                 "minutes": int(slot.get("minutes") or default_minutes),
                 "code": code,
                 "name": PLANS[code]["name"],
-                "exercises": copy.deepcopy(PLANS[code]["exercises"]),
+                "exercises": exercises,
             }
         )
     return sessions, assumed
@@ -1006,15 +1016,25 @@ def repair_workout_payload(payload: dict[str, Any], *, default_minutes: int = 45
         if minutes < 20 or minutes > 150:
             session["minutes"] = max(20, min(150, minutes or default_minutes))
 
-        # Drop duplicate exercises (by id), keeping the first occurrence.
+        # Drop duplicate exercises, keeping the first occurrence.
+        #
+        # A11b: dedupe on SLOT identity when the entries carry one. Two slots
+        # may legitimately be implemented by the same exercise -- a programme
+        # that presses twice a week is not a defect -- and the old id-only rule
+        # deleted the second, which is a silent slot deletion. Keying on
+        # `(slot_id or id)` keeps the cosmetic-duplicate repair for legacy
+        # payloads while making a genuine duplicate SLOT the only thing that
+        # collapses.
         seen: set[str] = set()
         deduped: list[dict[str, Any]] = []
         for exercise in session.get("exercises") or []:
             exercise_id = str(exercise.get("id") or "").strip()
-            if exercise_id and exercise_id in seen:
+            slot_id = str(exercise.get("slot_id") or "").strip()
+            dedupe_key = slot_id or exercise_id
+            if dedupe_key and dedupe_key in seen:
                 continue
-            if exercise_id:
-                seen.add(exercise_id)
+            if dedupe_key:
+                seen.add(dedupe_key)
             # Clamp obviously invalid prescriptions.
             try:
                 sets = int(exercise.get("sets") or 0)

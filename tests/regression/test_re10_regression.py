@@ -409,6 +409,13 @@ _ROUTER_OWNED_PREFIXES = {
 # and are legitimately handled by the final session-scoped fallback.
 _SESSION_SCOPED_PREFIXES = {
     "split", "sub", "restadd", "wdone", "wpause", "wcancel",
+    # A11b: these 17 are minted through `session_action_data(...)` and were
+    # therefore INVISIBLE to the literal-prefix scanner -- the guard passed
+    # while covering none of them. Each was verified dispatched by
+    # `action == "<name>"` in callback_session.py before being listed here.
+    "setok", "different", "occupied", "loadwhy", "reps", "rir",
+    "splitw", "splitr", "splitrir", "pain", "painloc", "painlevel",
+    "skip", "finish", "ready", "undoset", "reopen",
     # Effort reported from the rest screen. Session-scoped like `restadd`, but
     # it carries a trailing set id + effort token because it names the set it
     # describes rather than resolving "the most recent set" at tap time.
@@ -452,3 +459,115 @@ def test_no_orphan_callback_prefixes() -> None:
         "Add them to a router family in callback_router.py and to the "
         "_ROUTER_OWNED_PREFIXES/_SESSION_SCOPED_PREFIXES set in this test."
     )
+
+
+def _extract_session_action_names() -> set[str]:
+    """Every action minted through `session_action_data(...)`.
+
+    The literal-prefix scanner above cannot see these. It matches
+    ``button("label", "prefix:...")`` — a string literal containing a colon —
+    but a session action is built as ``session_action_data("sub", session, ...)``
+    where the prefix is a bare word and the colons are added inside the helper.
+
+    So `sub` was listed in `_SESSION_SCOPED_PREFIXES` while being **invisible**
+    to the guard that set exists to feed: the allowlist entry was inert, and a
+    new session action could be added, dispatched nowhere, and still pass. A11b
+    changes the `sub:` grammar, which is exactly the situation the guard was
+    supposed to cover.
+
+    Parsed with `ast` so a mention in a docstring or comment cannot satisfy it.
+    """
+    import ast
+
+    root = Path(__file__).resolve().parents[2] / "noam_coach" / "bot"
+    names: set[str] = set()
+    for path in sorted(root.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            called = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if called != "session_action_data":
+                continue
+            if not node.args:
+                continue
+            first = node.args[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                names.add(first.value)
+    return names
+
+
+def test_every_session_action_is_dispatched() -> None:
+    """The half of the callback surface the literal scanner cannot reach.
+
+    Fails if a session action is minted but not registered — the same defect
+    class as an orphan prefix, on the path the orphan guard is blind to.
+    """
+    minted = _extract_session_action_names()
+    assert minted, "the scanner found no session actions — it has stopped working"
+
+    known = _ROUTER_OWNED_PREFIXES | _SESSION_SCOPED_PREFIXES
+    unknown = minted - known
+    assert not unknown, (
+        f"session actions minted but not dispatched: {sorted(unknown)}. "
+        "Add each to _SESSION_SCOPED_PREFIXES here and confirm "
+        "handle_session_action_callback handles it."
+    )
+
+
+def test_every_session_action_is_session_scoped() -> None:
+    """A minted session action must also be in `SESSION_SCOPED_ACTIONS`.
+
+    That set is what triggers the staleness check in
+    `handle_session_action_callback`. An action outside it is dispatched but
+    never checked for freshness, so a tap on a stale keyboard applies to the
+    wrong step — silently, because the handler still finds a valid session.
+    """
+    from noam_coach.bot.ui import SESSION_SCOPED_ACTIONS
+
+    #: Deliberately exempt, each verified against its handler. Named here with
+    #: a reason so an exemption is a decision, not an omission nobody noticed.
+    exempt = {
+        # Reverses the LAST logged set. Its whole purpose is to act after the
+        # screen has moved on, so a current-step check would reject exactly the
+        # taps it exists to serve (`callback_session.py:270`).
+        "undoset",
+        # Acts on a FINISHED session, and refuses when another is already
+        # active. "Is this the current step" is meaningless for a session that
+        # has ended (`callback_session.py:1310`).
+        "reopen",
+    }
+
+    minted = _extract_session_action_names()
+    unscoped = minted - set(SESSION_SCOPED_ACTIONS) - exempt
+    assert not unscoped, (
+        f"session actions minted but not in SESSION_SCOPED_ACTIONS: "
+        f"{sorted(unscoped)} — these are dispatched without a staleness check."
+    )
+
+
+def test_a_substitution_callback_cannot_be_read_as_a_version() -> None:
+    """The `v<digits>` grammar collision, pinned on the real minted shape.
+
+    `strict_extract_version` inspects the LAST TWO fields. A11b puts the
+    exercise id and the reason code there, so if an exercise were ever named
+    `v12` the router would read it as a flow version and refuse the tap as
+    stale — a substitution that silently stops working.
+    """
+    import conversation
+    from noam_coach.services.callback_grammar import install_callback_grammar
+
+    install_callback_grammar()
+
+    for data in (
+        "sub:5:0:1:hack_squat:pain",
+        "sub:5:0:1:leg_press:equipment",
+        "sub:5:0:1:rdl:unspecified",
+    ):
+        assert conversation.extract_version(data) is None, (
+            f"{data!r} parses as carrying a flow version; the router would "
+            "refuse this tap as stale"
+        )
+        assert conversation.extract_flow_id(data) is None, data
+        assert len(data.encode("utf-8")) <= 64, f"{data!r} exceeds Telegram's limit"

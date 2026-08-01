@@ -43,6 +43,12 @@ SLOT_STATE_MAPPED = "mapped"
 SLOT_STATE_UNMAPPED = "unmapped"
 SLOT_STATE_BLOCKED = "blocked"
 
+#: Not a member of the vocabulary -- the answer for a state that IS present but
+#: is not one of the known values. Deliberately not in `KNOWN_SLOT_STATES`, so
+#: it can never be written into a payload or accepted on read; it exists only as
+#: the classifier's way of saying "this declared something I do not recognise".
+SLOT_STATE_UNKNOWN = "unknown"
+
 #: Reserved: accepted on read, not yet produced or rendered.
 SLOT_STATE_SUGGESTED = "suggested"
 SLOT_STATE_CALIBRATING = "calibrating"
@@ -86,16 +92,25 @@ def slot_id_of(entry: Any) -> str | None:
 def slot_state_of(entry: Any) -> str:
     """The declared state of a plan entry.
 
-    Defaults to `mapped` because that is what every legacy entry is: an exercise
-    the user is expected to perform. Defaulting to `unmapped` would reclassify
-    every existing plan as incomplete.
+    Defaults to `mapped` when the key is **absent**, because that is what every
+    legacy entry is: an exercise the user is expected to perform. Defaulting to
+    `unmapped` would reclassify every existing plan as incomplete.
+
+    An **explicitly present but unrecognised** state is a different situation
+    and returns `SLOT_STATE_UNKNOWN` (A11b correction). Before, any unknown
+    string silently became `mapped`: a version skew or a typo turned into a
+    plausible-looking exercise the user would be told to perform, which is the
+    silent-fallback failure this module exists to prevent. Absence is legacy;
+    a wrong value is a defect, and the two must not share an answer.
     """
     if not isinstance(entry, dict):
+        return SLOT_STATE_MAPPED
+    if "slot_state" not in entry:
         return SLOT_STATE_MAPPED
     state = entry.get("slot_state")
     if isinstance(state, str) and state in KNOWN_SLOT_STATES:
         return state
-    return SLOT_STATE_MAPPED
+    return SLOT_STATE_UNKNOWN
 
 
 def classify_entry(entry: Any) -> str:
@@ -109,6 +124,13 @@ def classify_entry(entry: Any) -> str:
         return ENTRY_MALFORMED
 
     state = slot_state_of(entry)
+    if state == SLOT_STATE_UNKNOWN:
+        # A11b: an explicitly declared state we do not recognise is a defect,
+        # not a legacy entry. Classifying it `malformed` keeps it OUT of the
+        # performable set and INSIDE the observability counter, so a version
+        # skew surfaces as a logged malformed count instead of quietly becoming
+        # an exercise the user is told to perform.
+        return ENTRY_MALFORMED
     if state == SLOT_STATE_BLOCKED:
         return ENTRY_BLOCKED
     if state in (SLOT_STATE_UNMAPPED, SLOT_STATE_SUGGESTED):
@@ -148,6 +170,150 @@ def planned_sets_of(entry: Any) -> int:
         return max(0, int(entry.get("sets") or 0))
     except (TypeError, ValueError):
         return 0
+
+
+# ---------------------------------------------------------------------------
+# Minting (A11b)
+#
+# The reconciliation rule, and the evidence for it.
+#
+# A slot id must survive REAL regeneration -- the user asks for a new plan and
+# the pipeline builds one from scratch. A random uuid copied along during a
+# mutation would look stable in a substitution test and be worthless here: a
+# regenerated plan mints new randomness and every slot identity is lost, which
+# is precisely the defect recorded as "No identity survives regeneration".
+#
+# So the id is DERIVED, not random, from the professional need itself:
+#
+#     <session_code>:<template_ordinal>
+#
+# Evidence that this is stable:
+#
+# * `exercise_plans.PLANS[code]["exercises"]` is a static, literal, ordered list
+#   -- measured deterministic across reads. Session code `A` is always "chest +
+#   triceps", and its ordinal 0 is always the primary horizontal press.
+# * `_schedule_sessions` copies that template verbatim (`copy.deepcopy(
+#   PLANS[code]["exercises"])`), so ordinal N of a freshly built session is
+#   ordinal N of the template.
+# * Regenerating with the same split therefore reproduces the same ids by
+#   construction, with no state carried between builds.
+#
+# Why it is NOT keyed on `exercise_id`: substitution changes the exercise while
+# the need persists -- that is the whole point of a slot. Why not on the current
+# list position: adaptation removes and backfills entries, so post-adaptation
+# position drifts. The ids are therefore minted from the TEMPLATE ordinal,
+# BEFORE `adapt_exercises` runs, and travel with the entry dict afterwards.
+#
+# Known limit, stated rather than hidden: if the split changes (3-day A/B/C to
+# 4-day A/B/C/F), a session that did not exist before has no prior identity to
+# preserve. That is correct -- a new session is a new professional need, not a
+# renamed old one.
+# ---------------------------------------------------------------------------
+#: Separator between the session code and the ordinal. Chosen because ":" is
+#: already the callback field separator, so a slot id must never be embedded
+#: raw in callback data -- see `slot_token_of`.
+_SLOT_ID_SEP = ":"
+
+#: Max ordinal. A session with more entries than this is not a plan.
+_MAX_SLOT_ORDINAL = 99
+
+
+def mint_slot_id(session_code: Any, template_ordinal: Any) -> str | None:
+    """The stable slot id for a template position, or None if unmintable.
+
+    Returns None rather than inventing an id when the inputs cannot express a
+    professional need: minting a placeholder would create an identity that
+    means nothing and collides with every other unmintable entry.
+    """
+    code = str(session_code or "").strip()
+    if not code or _SLOT_ID_SEP in code:
+        return None
+    try:
+        ordinal = int(template_ordinal)
+    except (TypeError, ValueError):
+        return None
+    if not 0 <= ordinal <= _MAX_SLOT_ORDINAL:
+        return None
+    return f"{code}{_SLOT_ID_SEP}{ordinal}"
+
+
+def is_valid_slot_id(value: Any) -> bool:
+    """True when `value` is a well-formed slot id.
+
+    Validation is a real check, not a truthiness test: an id that does not
+    round-trip through `mint_slot_id` cannot be reconciled against a regenerated
+    plan, so accepting it would reintroduce the identity loss silently.
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    code, separator, ordinal = value.partition(_SLOT_ID_SEP)
+    if not separator:
+        return False
+    return mint_slot_id(code, ordinal) == value
+
+
+def slot_token_of(entry: Any) -> str | None:
+    """A slot id encoded for use inside callback data.
+
+    `:` is the callback field separator, so a raw slot id would silently add a
+    field and shift every later one. The token replaces it with `-`, which is
+    absent from session codes and from the ordinal.
+
+    The token is also deliberately unable to match the version grammar
+    (`^v\\d{1,9}$`): it always contains a `-`, so a slot token in the terminal
+    field can never be misread as a flow version.
+    """
+    slot_id = slot_id_of(entry)
+    if slot_id is None:
+        return None
+    return slot_id.replace(_SLOT_ID_SEP, "-")
+
+
+def slot_id_from_token(token: Any) -> str | None:
+    """Inverse of `slot_token_of`, rejecting anything that is not a slot id."""
+    if not isinstance(token, str) or not token:
+        return None
+    candidate = token.replace("-", _SLOT_ID_SEP, 1)
+    return candidate if is_valid_slot_id(candidate) else None
+
+
+def assign_slot_ids(exercises: Any, session_code: Any) -> int:
+    """Stamp slot ids onto a freshly built session, in place. Returns the count.
+
+    Called on the TEMPLATE copy, before adaptation, so the ordinal is the
+    template's. Never overwrites an existing valid id -- a repaired or migrated
+    payload keeps the identity it already had.
+    """
+    if not isinstance(exercises, list):
+        return 0
+    minted = 0
+    for ordinal, entry in enumerate(exercises):
+        if not isinstance(entry, dict):
+            continue
+        if is_valid_slot_id(entry.get("slot_id")):
+            continue
+        slot_id = mint_slot_id(session_code, ordinal)
+        if slot_id is None:
+            continue
+        entry["slot_id"] = slot_id
+        minted += 1
+    return minted
+
+
+def find_by_slot_id(exercises: Any, slot_id: Any) -> tuple[int, dict[str, Any]] | None:
+    """Locate an entry by slot identity. Returns (position, entry) or None.
+
+    This is what replaces `list.index(value)`: identity is matched, never
+    content and never position, so a reordered or re-ranked list resolves the
+    same slot -- or nothing at all, which is a stale callback rather than a
+    wrong exercise.
+    """
+    if not isinstance(exercises, list) or not is_valid_slot_id(slot_id):
+        return None
+    for position, entry in enumerate(exercises):
+        if isinstance(entry, dict) and entry.get("slot_id") == slot_id:
+            return position, entry
+    return None
 
 
 def observe_plan_entries(

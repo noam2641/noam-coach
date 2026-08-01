@@ -468,6 +468,60 @@ async def _handle_session_split_actions(
         return True
     return False
 
+# ---------------------------------------------------------------------------
+# Substitution identity and reason (A11b)
+#
+# Two facts drove this design, both measured:
+#
+# 1. `current["alts"].index(alt)` matched by VALUE. Two alternatives with equal
+#    content resolved to the same index, and a re-ranked list redirected a tap
+#    to a different-but-valid exercise. The bounds check at the handler passed,
+#    so the wrong substitution applied silently.
+# 2. The equipment path and the pain path minted BYTE-IDENTICAL callbacks. By
+#    the time the handler ran, "my knee hurts" and "the rack was busy" were
+#    indistinguishable -- so A12 could not tell a safety-driven change from a
+#    convenience one, and would promote the wrong pattern.
+#
+# Both are fixed at the minting site, because that is the only place where the
+# reason still exists and where the alternative's identity is unambiguous.
+# ---------------------------------------------------------------------------
+#: Bounded reason codes. Never free text, never a body region -- the region is
+#: already recorded on the medical_constraints row that the pain flow writes.
+SUB_REASON_PAIN = "pain"
+SUB_REASON_EQUIPMENT = "equipment"
+SUB_REASON_UNKNOWN = "unspecified"
+SUB_REASONS = frozenset({SUB_REASON_PAIN, SUB_REASON_EQUIPMENT, SUB_REASON_UNKNOWN})
+
+
+def _substitution_callback(
+    session: dict[str, Any],
+    current: dict[str, Any],
+    alternative: dict[str, Any],
+    reason: str,
+) -> str:
+    """Callback data for one substitution offer.
+
+    Grammar: `sub:<session_id>:<exercise_index>:<set_number>:<alt_id>:<reason>`
+
+    Three constraints the grammar has to respect, each verified:
+
+    * field 1 stays numeric, or `handle_session_action_callback` rejects the
+      callback before any handler sees it;
+    * the terminal fields must never match `^v\\d{1,9}$`, or the strict grammar
+      reads one as a flow version and the router refuses the tap as stale. The
+      reason codes are alphabetic, so the last field is structurally safe;
+    * total length stays under Telegram's 64-byte limit -- exercise ids are
+      short slugs, and this is asserted by test rather than assumed.
+    """
+    alt_id = str(alternative.get("id") or "")
+    return session_action_data(
+        "sub",
+        session,
+        alt_id,
+        reason if reason in SUB_REASONS else SUB_REASON_UNKNOWN,
+    )
+
+
 @runtime_bound(RUNTIME_NAMES)
 async def _pain_safe_alternatives(
     user_id: int, current: dict[str, Any], *, fallback_when_all_blocked: bool = True
@@ -640,30 +694,58 @@ async def _handle_session_adjustment_actions(
 
     if action == "occupied":
         safe_alts = await _pain_safe_alternatives(user_id, current)
-        # Keep each alt's ORIGINAL index into current["alts"] in the callback
-        # data — the "sub" handler looks alternatives up by that index, and
-        # safe_alts may be a filtered subset in a different order.
-        indexed_alts = [
-            (current["alts"].index(alt), alt) for alt in safe_alts[:3]
-        ]
+        # A11b: identity, not position. `current["alts"].index(alt)` matched by
+        # VALUE, so two alternatives with equal content collapsed to the first
+        # index and a re-ranked list redirected the tap to a different — valid,
+        # therefore undetectable — exercise. The callback now carries the
+        # alternative's own id, resolved by identity at tap time.
         buttons = []
-        for position, (original_index, alt) in enumerate(indexed_alts, start=1):
+        for position, alt in enumerate(safe_alts[:3], start=1):
             alt_muscle = EXERCISE_MUSCLES.get(alt["id"], current.get("muscle", ""))
             label = f"{position}. {alt['name']}"
             if alt_muscle:
                 label += f" ({alt_muscle})"
-            buttons.append([button(label, session_action_data("sub", session, original_index))])
+            buttons.append([
+                button(
+                    label,
+                    _substitution_callback(session, current, alt, SUB_REASON_EQUIPMENT),
+                )
+            ])
         buttons.append([button("דלג", session_action_data("skip", session))])
         await safe_edit(query, "<b>שלוש חלופות</b>", InlineKeyboardMarkup(buttons))
         return True
 
     if action == "sub":
-        alternative_index = int(session_action_arg(parts))
-        if not 0 <= alternative_index < len(current["alts"]):
+        from noam_coach.services import workout_slots
+
+        # A11b: resolve by IDENTITY. The old code read a position out of the
+        # callback and indexed into `current["alts"]`, checking only that the
+        # number was in range -- so a re-ranked list of the same length applied
+        # a different exercise than the one the user tapped. Matching on the
+        # alternative's own id means a list that no longer offers it yields
+        # nothing, which is a stale callback: refused, never redirected.
+        alt_id = str(session_action_arg(parts))
+        try:
+            sub_reason = str(session_action_arg(parts, 1))
+        except ValueError:
+            # A keyboard minted before A11b carries no reason field. Accept the
+            # tap -- refusing would strand an in-flight workout -- and record
+            # the reason as unspecified rather than guessing one.
+            sub_reason = SUB_REASON_UNKNOWN
+        if sub_reason not in SUB_REASONS:
+            sub_reason = SUB_REASON_UNKNOWN
+        alternative = next(
+            (
+                alt
+                for alt in (current.get("alts") or [])
+                if isinstance(alt, dict) and str(alt.get("id") or "") == alt_id
+            ),
+            None,
+        )
+        if alternative is None:
             await safe_answer_callback(query, "החלופה אינה זמינה", show_alert=False)
             await show_session(query, user_id, session_id)
             return True
-        alternative = current["alts"][alternative_index]
         replacement = dict(current)
         replacement.update(
             id=alternative["id"],
@@ -690,6 +772,24 @@ async def _handle_session_adjustment_actions(
             session_id,
             source=current["id"],
             target=alternative["id"],
+            # A11b: the reason A12 needs, carried from the button that knew it.
+            # Bounded code only -- the body region lives on the
+            # medical_constraints row the pain flow already writes, and must not
+            # be duplicated into an audit row.
+            reason=sub_reason,
+            # Slot identity, so a pattern can be keyed on the professional need
+            # rather than on whichever exercise happened to implement it.
+            slot_id=workout_slots.slot_id_of(current) or "",
+        )
+        # A11b: say which plan this changed. The swap is written to the SESSION
+        # snapshot, so it applies to today's workout and the saved plan is
+        # untouched -- deliberately, because `sessions.plan` is what makes a
+        # live workout immune to plan edits. Without this line the user cannot
+        # tell whether next week is fixed too, and would reasonably assume it is.
+        await safe_answer_callback(
+            query,
+            "החלפתי לאימון הזה. התוכנית הקבועה לא השתנתה.",
+            show_alert=False,
         )
         await show_session(query, user_id, session_id)
         return True
@@ -930,10 +1030,13 @@ async def _handle_session_safety_actions(
             current,
             fallback_when_all_blocked=False,
         )
-        indexed_alts = [
-            (current["alts"].index(alt), alt) for alt in safe_alts[:3]
-        ]
-        if not indexed_alts:
+        # A11b: identity, not position -- see the equipment path above. The
+        # stakes are higher here: the filter exists so a painful movement is not
+        # swapped for another painful one, yet the old index pointed into the
+        # UNFILTERED list, so a re-rank could resolve an alternative that was
+        # never pain-screened.
+        offered_alts = list(safe_alts[:3])
+        if not offered_alts:
             await safe_edit(
                 query,
                 "אין לי חלופה מספיק בטוחה לפי הכאב שדיווחת. עדיף לדלג על התרגיל או לסיים את האימון.",
@@ -948,7 +1051,7 @@ async def _handle_session_safety_actions(
             )
             return True
         buttons = []
-        for original_index, alt in indexed_alts:
+        for alt in offered_alts:
             alt_muscle = EXERCISE_MUSCLES.get(
                 alt["id"],
                 current.get("muscle", ""),
@@ -958,7 +1061,9 @@ async def _handle_session_safety_actions(
                 [
                     button(
                         label,
-                        session_action_data("sub", session, original_index),
+                        _substitution_callback(
+                            session, current, alt, SUB_REASON_PAIN
+                        ),
                     )
                 ]
             )

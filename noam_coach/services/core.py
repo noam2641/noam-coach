@@ -346,6 +346,22 @@ _AUDIT_ALLOWLIST: dict[tuple[str, str], dict[str, Any]] = {
         "approval_id": _pass("approval_id"),
         "mutation_outcome": _pass("mutation_outcome"),
     },
+    # Exercise substitution (A11b, consumed by A12). `reason` is a bounded code
+    # -- `pain` / `equipment` / `unspecified` -- never free text and never a
+    # body region: the region is already on the medical_constraints row the pain
+    # flow writes, and duplicating it here would put medical detail in a second
+    # store with weaker guarantees. `slot_id` is an internal identifier so a
+    # pattern can be keyed on the professional need rather than on whichever
+    # exercise implements it today. Registering the pair is what makes those
+    # bounds a RULE: before this, the pair was unregistered and every field
+    # survived only by being a scalar, so a later field carrying a limitation
+    # string would have been stored without anyone noticing.
+    ("approve_substitution", "exercise"): {
+        "source": _pass("source"),
+        "target": _pass("target"),
+        "reason": _pass("reason"),
+        "slot_id": _pass("slot_id"),
+    },
     # Goal approvals: keep the bounded targets; DROP the `explanation` prose.
     ("approve", "goal"): {
         "calories": _pass("calories"),

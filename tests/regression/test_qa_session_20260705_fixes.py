@@ -367,7 +367,11 @@ async def test_choosing_substitution_replaces_exercise_and_writes_audit(
     monkeypatch.setattr(callback_session_bot, "write_audit", fake_write_audit)
 
     query = _FakeQuery()
-    data = coach_bot.session_action_data("sub", session, 0)
+    # A11b: the callback names the alternative by ID, not by list position, and
+    # carries the bounded reason the button knew. Position `0` used to mean
+    # "whatever is first in alts right now" -- a re-rank silently substituted a
+    # different exercise.
+    data = coach_bot.session_action_data("sub", session, "hack_squat", "equipment")
     await callback_session_bot.handle_session_action_callback(
         query, context=None, user_id=1, data=data
     )
@@ -379,3 +383,13 @@ async def test_choosing_substitution_replaces_exercise_and_writes_audit(
 
     assert audit_calls, "approve_substitution audit event must be written"
     assert audit_calls[-1][0][1] == "approve_substitution"
+    # A11b: assert the DETAILS, not only the action name. The previous version
+    # checked the name alone, so a reason added and then silently dropped by the
+    # audit allowlist would have left this test green.
+    details = audit_calls[-1][1]
+    assert details["source"] == "leg_press"
+    assert details["target"] == "hack_squat"
+    assert details["reason"] == "equipment", (
+        "the reason must survive from the button that knew it -- A12 cannot "
+        "tell a safety-driven change from a convenience one without it"
+    )

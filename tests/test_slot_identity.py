@@ -1,0 +1,993 @@
+"""A slot is the professional need, not the exercise that implements it (A11b).
+
+A11a landed the vocabulary and the reader helpers and deliberately wrote
+nothing. This file covers what A11b adds: minting an identity that survives
+regeneration, resolving substitutions by that identity instead of by list
+position, and carrying a bounded reason so A12 can tell a safety-driven change
+from a convenience one.
+
+The defect that motivates the identity work is measurable, not theoretical.
+`current["alts"].index(alt)` matched by VALUE, so:
+
+    alts = [A, B, A']        # A' has content equal to A
+    safe = [alts[2], alts[1]]
+    [alts.index(x) for x in safe]  ->  [0, 1]   # expected [2, 1]
+
+The user taps the third alternative and receives the first. The bounds check in
+the handler passes, so nothing surfaces: a valid-but-wrong exercise is applied
+silently. That is why identity is matched here and position never is.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+import planning
+import user_model
+from db import Database
+from helpers import utc_now
+from noam_coach.services import plan_mutations
+from noam_coach.services import workout_slots as slots
+
+_WORKOUT_FACTS = {
+    "primary_goal": "strength",
+    "training_days_per_week": 3,
+    "session_minutes": 45,
+    "training_location": "gym",
+    "equipment": "full_gym",
+    "strength_experience": "intermediate",
+    "weekly_availability": "mon,wed,fri",
+    "training_limitations": "none",
+}
+
+
+async def _db(tmp_path: Path) -> Database:
+    db = Database(str(tmp_path / "slots.db"))
+    await db.init()
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(1,'A',NULL,?)",
+        (utc_now(),),
+    )
+    return db
+
+
+def _bind(monkeypatch: pytest.MonkeyPatch, db: Database) -> None:
+    import coach_bot
+    from noam_coach.services import core as core_services
+
+    monkeypatch.setattr(coach_bot, "DB", db, raising=False)
+    monkeypatch.setattr(core_services, "DB", db, raising=False)
+
+
+async def _ready_user(db: Database) -> None:
+    for key, value in _WORKOUT_FACTS.items():
+        await user_model.set_fact(
+            db, 1, key, value,
+            kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Identity — the property the whole item rests on
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_slot_identity_survives_real_regeneration(tmp_path, monkeypatch) -> None:
+    """Not "a copied id stays equal to itself" — a genuinely fresh build.
+
+    A random uuid carried along during a mutation would pass a substitution
+    test and fail here, because regeneration mints new randomness and every
+    identity is lost. That is the recorded defect: "No identity survives
+    regeneration". The id is derived from `(session_code, template_ordinal)`,
+    so a second pipeline run reproduces it by construction with no state
+    carried between builds.
+    """
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    await _ready_user(db)
+
+    first = await planning.generate_candidates(db, 1, "workout")
+    second = await planning.generate_candidates(db, 1, "workout")
+
+    def _ids(candidates):
+        return [
+            [e.get("slot_id") for e in session["exercises"]]
+            for session in candidates[0].payload["sessions"]
+        ]
+
+    assert _ids(first) == _ids(second), (
+        "regenerating must reproduce the same slot ids; if this fails the "
+        "identity is not derived from the professional need"
+    )
+    assert all(
+        slots.is_valid_slot_id(slot_id)
+        for session in _ids(first)
+        for slot_id in session
+    )
+
+
+def test_identity_is_not_keyed_on_the_exercise_or_the_position() -> None:
+    """Substitution changes the exercise; adaptation changes the position.
+
+    Keying on either would destroy identity in exactly the case the slot model
+    exists to survive.
+    """
+    entries = [
+        {"slot_id": "A:0", "id": "bench"},
+        {"slot_id": "A:1", "id": "fly"},
+    ]
+    # Substituted: same slot, different exercise.
+    entries[0]["id"] = "db_press"
+    assert slots.find_by_slot_id(entries, "A:0")[1]["id"] == "db_press"
+    # Reordered: same slot, different position.
+    entries.reverse()
+    found = slots.find_by_slot_id(entries, "A:0")
+    assert found is not None and found[0] == 1, "identity must follow the entry"
+
+
+def test_two_slots_may_share_one_exercise_without_collision() -> None:
+    """A legitimate programme repeats an exercise across sessions.
+
+    Keying identity on `exercise_id` would merge them, and a substitution in one
+    session would silently change the other.
+    """
+    entries = [
+        {"slot_id": "A:0", "id": "bench"},
+        {"slot_id": "F:2", "id": "bench"},
+    ]
+    first = slots.find_by_slot_id(entries, "A:0")
+    second = slots.find_by_slot_id(entries, "F:2")
+
+    assert first is not None and second is not None
+    assert first[0] != second[0], "two slots sharing an exercise must stay distinct"
+
+
+def test_an_unmintable_slot_yields_none_rather_than_a_placeholder() -> None:
+    """A placeholder id would collide with every other unmintable entry."""
+    assert slots.mint_slot_id("", 0) is None
+    assert slots.mint_slot_id("A", "x") is None
+    assert slots.mint_slot_id("A", -1) is None
+    assert slots.mint_slot_id("A:B", 0) is None, "a code containing the separator"
+
+
+def test_slot_id_validation_is_a_real_check() -> None:
+    """An id that does not round-trip cannot be reconciled against a rebuild."""
+    assert slots.is_valid_slot_id("A:0") is True
+    for bad in ("", "A", "bench", "A:x", "A:999", ":0", None, 7, "A:0:1"):
+        assert slots.is_valid_slot_id(bad) is False, bad
+
+
+def test_assign_never_overwrites_an_existing_identity() -> None:
+    """A repaired or migrated payload keeps the identity it already had."""
+    entries = [{"slot_id": "F:9", "id": "bench"}, {"id": "fly"}]
+    minted = slots.assign_slot_ids(entries, "A")
+
+    assert entries[0]["slot_id"] == "F:9", "an existing valid id is preserved"
+    assert entries[1]["slot_id"] == "A:1"
+    assert minted == 1
+
+
+# ---------------------------------------------------------------------------
+# The three absences stay distinguishable (A11a contract, extended)
+# ---------------------------------------------------------------------------
+def test_absent_state_is_legacy_and_unknown_state_is_malformed() -> None:
+    """The A11b correction, and the reason for it.
+
+    An ABSENT `slot_state` is a legacy entry: valid, common, renders normally.
+    An unrecognised state that is explicitly PRESENT is a defect — a version
+    skew or a typo — and used to silently become `mapped`, turning corrupt data
+    into an exercise the user was told to perform.
+    """
+    assert slots.slot_state_of({"id": "bench"}) == slots.SLOT_STATE_MAPPED
+    assert slots.classify_entry({"id": "bench"}) == slots.ENTRY_LEGACY_NO_SLOT
+
+    assert slots.slot_state_of({"id": "bench", "slot_state": "garbage"}) == (
+        slots.SLOT_STATE_UNKNOWN
+    )
+    assert slots.classify_entry({"id": "bench", "slot_state": "garbage"}) == (
+        slots.ENTRY_MALFORMED
+    ), "an unknown declared state must never render as a normal exercise"
+
+
+def test_the_unknown_marker_can_never_be_written_into_a_payload() -> None:
+    """It is a classifier answer, not a vocabulary member."""
+    assert slots.SLOT_STATE_UNKNOWN not in slots.KNOWN_SLOT_STATES
+    assert slots.SLOT_STATE_UNKNOWN not in slots.SHIPPED_SLOT_STATES
+    assert slots.SLOT_STATE_UNKNOWN not in slots.RESERVED_SLOT_STATES
+
+
+def test_a_malformed_entry_is_not_performable_and_contributes_no_sets() -> None:
+    entry = {"id": "bench", "slot_state": "garbage", "sets": 3}
+    assert slots.is_performable(entry) is False
+    assert slots.planned_sets_of(entry) == 0
+
+
+def test_the_four_states_remain_four(caplog) -> None:
+    """legacy / unmapped / blocked / malformed must not collapse into one."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        counts = slots.observe_plan_entries(
+            [
+                {"id": "bench"},                                  # legacy
+                {"slot_id": "A:1"},                               # unmapped
+                {"slot_id": "A:2", "id": "fly", "slot_state": "blocked"},
+                {"slot_id": "A:3", "id": "x", "slot_state": "??"},  # malformed
+            ],
+            user_id=1,
+            session_id=1,
+            context="test",
+        )
+
+    assert counts[slots.ENTRY_LEGACY_NO_SLOT] == 1
+    assert counts[slots.ENTRY_UNMAPPED] == 1
+    assert counts[slots.ENTRY_BLOCKED] == 1
+    assert counts[slots.ENTRY_MALFORMED] == 1
+    assert any("malformed" in r.message for r in caplog.records), (
+        "a malformed entry must stay observable, not merely be counted"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Callback tokens
+# ---------------------------------------------------------------------------
+def test_a_slot_token_cannot_be_read_as_a_version() -> None:
+    """`:` is the field separator and `^v\\d{1,9}$` is the version grammar.
+
+    A raw slot id in callback data would add a field and shift every later one;
+    a token shaped like a version would be read as one and the router would
+    refuse the tap as stale.
+    """
+    import re
+
+    token = slots.slot_token_of({"slot_id": "A:3"})
+    assert token == "A-3"
+    assert ":" not in token
+    assert re.match(r"^v\d{1,9}$", token) is None
+    assert slots.slot_id_from_token(token) == "A:3"
+
+
+def test_a_token_that_is_not_a_slot_id_is_refused() -> None:
+    for bad in ("", "bench", "v123", "A-x", None):
+        assert slots.slot_id_from_token(bad) is None, bad
+
+
+# ---------------------------------------------------------------------------
+# The A9 boundary
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_a_saved_substitution_creates_a_new_version(tmp_path, monkeypatch) -> None:
+    """Copy-on-write: the active payload is never edited in place."""
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    await _ready_user(db)
+
+    candidates = await planning.generate_candidates(db, 1, "workout")
+    plan_id = candidates[0].id
+    await planning.activate_plan(db, 1, plan_id)
+
+    before = await db.fetch_one(
+        "SELECT payload FROM plan_versions WHERE id=?", (plan_id,)
+    )
+    session = json.loads(before["payload"])["sessions"][0]
+    slot_id = session["exercises"][0]["slot_id"]
+
+    outcome = await plan_mutations.substitute_slot_in_saved_plan(
+        db, 1, slot_id, "replacement_exercise", reason="pain"
+    )
+
+    assert outcome.outcome == plan_mutations.OUTCOME_REALIGNED
+    assert outcome.plan_id != plan_id, "a new version, not an edit"
+
+    unchanged = await db.fetch_one(
+        "SELECT payload FROM plan_versions WHERE id=?", (plan_id,)
+    )
+    assert unchanged["payload"] == before["payload"], (
+        "the superseded version must survive byte-identical, or a completed "
+        "session can no longer be explained against the plan that was live"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_slot_is_refused_not_applied_by_position(
+    tmp_path, monkeypatch
+) -> None:
+    """A stale offer must find nothing rather than hit whatever moved there."""
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    await _ready_user(db)
+
+    candidates = await planning.generate_candidates(db, 1, "workout")
+    await planning.activate_plan(db, 1, candidates[0].id)
+
+    outcome = await plan_mutations.substitute_slot_in_saved_plan(
+        db, 1, "Z:42", "anything", reason="pain"
+    )
+
+    assert outcome.outcome == plan_mutations.OUTCOME_BLOCKED
+    assert outcome.reason == plan_mutations.REASON_UNKNOWN_SLOT
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_slot_id_never_reaches_the_plan(tmp_path, monkeypatch) -> None:
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+
+    outcome = await plan_mutations.substitute_slot_in_saved_plan(
+        db, 1, "not-a-slot", "anything", reason="pain"
+    )
+    assert outcome.outcome == plan_mutations.OUTCOME_BLOCKED
+    assert outcome.reason == plan_mutations.REASON_UNKNOWN_SLOT
+
+
+@pytest.mark.asyncio
+async def test_substituting_the_same_exercise_reports_no_change(
+    tmp_path, monkeypatch
+) -> None:
+    """Idempotent: a repeated tap is a success, not a new version each time."""
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    await _ready_user(db)
+
+    candidates = await planning.generate_candidates(db, 1, "workout")
+    await planning.activate_plan(db, 1, candidates[0].id)
+    active = await planning.get_active_plan(db, 1, "workout")
+    entry = active["payload"]["sessions"][0]["exercises"][0]
+
+    outcome = await plan_mutations.substitute_slot_in_saved_plan(
+        db, 1, entry["slot_id"], entry["id"], reason="pain"
+    )
+
+    assert outcome.outcome == plan_mutations.OUTCOME_NO_CHANGE
+    assert outcome.is_failure is False
+
+
+@pytest.mark.asyncio
+async def test_the_slot_survives_the_substitution(tmp_path, monkeypatch) -> None:
+    """The need persists; only the implementation changes."""
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    await _ready_user(db)
+
+    candidates = await planning.generate_candidates(db, 1, "workout")
+    await planning.activate_plan(db, 1, candidates[0].id)
+    active = await planning.get_active_plan(db, 1, "workout")
+    slot_id = active["payload"]["sessions"][0]["exercises"][0]["slot_id"]
+    original_id = active["payload"]["sessions"][0]["exercises"][0]["id"]
+
+    await plan_mutations.substitute_slot_in_saved_plan(
+        db, 1, slot_id, "swapped_in", reason="pain"
+    )
+
+    updated = await planning.get_active_plan(db, 1, "workout")
+    found = slots.find_by_slot_id(
+        updated["payload"]["sessions"][0]["exercises"], slot_id
+    )
+    assert found is not None, "the slot must still exist after a substitution"
+    assert found[1]["id"] == "swapped_in"
+    assert found[1]["original_id"] == original_id, (
+        "the slot remembers what it originally implemented"
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_slot_is_deleted_by_a_substitution(tmp_path, monkeypatch) -> None:
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    await _ready_user(db)
+
+    candidates = await planning.generate_candidates(db, 1, "workout")
+    await planning.activate_plan(db, 1, candidates[0].id)
+    active = await planning.get_active_plan(db, 1, "workout")
+
+    def _all_slots(payload):
+        return sorted(
+            e.get("slot_id")
+            for s in payload["sessions"]
+            for e in s["exercises"]
+        )
+
+    before = _all_slots(active["payload"])
+    await plan_mutations.substitute_slot_in_saved_plan(
+        db, 1, before[0], "swapped_in", reason="pain"
+    )
+    after = _all_slots((await planning.get_active_plan(db, 1, "workout"))["payload"])
+
+    assert before == after, "a substitution must never add or remove a slot"
+
+
+def test_repair_cannot_silently_delete_a_slot() -> None:
+    """`repair_workout_payload` dedupes by exercise id.
+
+    Two slots legitimately sharing one exercise must both survive — dropping
+    one would delete a professional need to fix a cosmetic duplicate.
+    """
+    payload = {
+        "sessions": [
+            {
+                "code": "A",
+                "weekday": 0,
+                "time": "18:00",
+                "minutes": 45,
+                "exercises": [
+                    {"slot_id": "A:0", "id": "bench", "sets": 3, "rmin": 8, "rmax": 12},
+                    {"slot_id": "A:1", "id": "bench", "sets": 3, "rmin": 8, "rmax": 12},
+                ],
+            }
+        ]
+    }
+    repaired = planning.repair_workout_payload(payload)
+    surviving = [e.get("slot_id") for e in repaired["sessions"][0]["exercises"]]
+
+    assert surviving == ["A:0", "A:1"], (
+        "repair deduped two distinct slots that share an exercise; a slot is a "
+        "need, and two needs may be met by the same movement"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The active-session snapshot (owner decision: do NOT block; prove continuity)
+#
+# `REASON_ACTIVE_SESSION` was declared and never returned. It is removed rather
+# than implemented, because the protection it named already exists in a better
+# form: `sessions.plan` snapshots the payload at session start, so a live
+# workout is decoupled from the saved plan by construction. Blocking would have
+# refused a legitimate correction to defend against a corruption that cannot
+# occur. These tests are the evidence for that decision.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_a_live_session_continues_on_its_own_snapshot(
+    tmp_path, monkeypatch
+) -> None:
+    """The current workout is unaffected by a saved-plan substitution."""
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    await _ready_user(db)
+
+    candidates = await planning.generate_candidates(db, 1, "workout")
+    await planning.activate_plan(db, 1, candidates[0].id)
+    active = await planning.get_active_plan(db, 1, "workout")
+    session_payload = active["payload"]["sessions"][0]
+    slot_id = session_payload["exercises"][0]["slot_id"]
+    original_id = session_payload["exercises"][0]["id"]
+
+    # A workout starts: the plan is snapshotted onto the session row.
+    session_id = await db.execute(
+        "INSERT INTO sessions(user_id, code, name, plan, status, exercise_index, "
+        "set_number, started_at) VALUES(1, ?, ?, ?, 'active', 0, 1, ?)",
+        (
+            session_payload.get("code") or "A",
+            session_payload.get("name") or "A",
+            json.dumps(session_payload, ensure_ascii=False),
+            utc_now(),
+        ),
+    )
+
+    outcome = await plan_mutations.substitute_slot_in_saved_plan(
+        db, 1, slot_id, "swapped_in", reason="pain"
+    )
+    assert outcome.outcome == plan_mutations.OUTCOME_REALIGNED
+
+    live = await db.fetch_one("SELECT plan FROM sessions WHERE id=?", (session_id,))
+    live_first = json.loads(live["plan"])["exercises"][0]
+
+    assert live_first["id"] == original_id, (
+        "the in-progress workout must continue on the exercise it started with; "
+        "changing it mid-session would move the ground under the user"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_next_session_receives_the_new_mapping(tmp_path, monkeypatch) -> None:
+    """The change is not lost — it applies from the next session onward."""
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    await _ready_user(db)
+
+    candidates = await planning.generate_candidates(db, 1, "workout")
+    await planning.activate_plan(db, 1, candidates[0].id)
+    active = await planning.get_active_plan(db, 1, "workout")
+    slot_id = active["payload"]["sessions"][0]["exercises"][0]["slot_id"]
+
+    await plan_mutations.substitute_slot_in_saved_plan(
+        db, 1, slot_id, "swapped_in", reason="pain"
+    )
+
+    # A session started AFTER the change snapshots the corrected plan.
+    updated = await planning.get_active_plan(db, 1, "workout")
+    next_session = updated["payload"]["sessions"][0]
+    found = slots.find_by_slot_id(next_session["exercises"], slot_id)
+
+    assert found is not None and found[1]["id"] == "swapped_in", (
+        "the next session must train the substituted exercise, or the change "
+        "silently did nothing"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_governed_fact_mirrors_the_new_version(tmp_path, monkeypatch) -> None:
+    """Activation goes through A9 -> activate_plan, the sole A4-authorized writer."""
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    await _ready_user(db)
+
+    candidates = await planning.generate_candidates(db, 1, "workout")
+    await planning.activate_plan(db, 1, candidates[0].id)
+    active = await planning.get_active_plan(db, 1, "workout")
+    slot_id = active["payload"]["sessions"][0]["exercises"][0]["slot_id"]
+
+    outcome = await plan_mutations.substitute_slot_in_saved_plan(
+        db, 1, slot_id, "swapped_in", reason="pain"
+    )
+
+    fact = await user_model.get_value(db, 1, "active_workout_plan")
+    assert fact and fact.get("plan_id") == outcome.plan_id, (
+        "the governed fact must mirror the NEW version, not the superseded one"
+    )
+
+
+def test_a11b_adds_no_writer_of_its_own() -> None:
+    """Source scan: the A11b operation must route through A9, not around it.
+
+    Parsed with `ast` and stripped of docstrings, so this file's own prose
+    about `INSERT INTO plan_versions` cannot trip or satisfy the check.
+    """
+    import ast
+
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "noam_coach" / "services" / "plan_mutations.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
+            if (
+                node.body
+                and isinstance(node.body[0], ast.Expr)
+                and isinstance(node.body[0].value, ast.Constant)
+                and isinstance(node.body[0].value.value, str)
+            ):
+                node.body = node.body[1:]
+    code = ast.unparse(tree)
+
+    assert "authorize_governed_fact_write" not in code, (
+        "A11b must not wrap A4's authorization around itself; activation goes "
+        "through planning.activate_plan, the sole authorized owner"
+    )
+    assert code.count("INSERT INTO plan_versions") <= 1, (
+        "copy-on-write has exactly one insert site (_insert_corrected_version)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Rendering — the surface where a substitution was previously invisible
+# ---------------------------------------------------------------------------
+def _render(plan: dict) -> str:
+    from noam_coach.bot.onboarding import format_weekly_plan
+
+    return format_weekly_plan(plan)
+
+
+def test_the_renderer_shows_the_stored_exercise_not_the_template() -> None:
+    """The defect this rewrite exists to close.
+
+    `format_weekly_plan` read `PLANS.get(code)["exercises"]` and ignored the
+    stored payload entirely, so a substitution made for pain simply did not
+    appear on the screen where the user decides what to train. The plan said
+    one thing and the surface showed another.
+    """
+    plan = {
+        "frequency": 1,
+        "structure": "A/B/C",
+        "sessions": [
+            {
+                "weekday": 0,
+                "time": "18:00",
+                "name": "אימון A",
+                "code": "A",
+                "exercises": [
+                    {
+                        "slot_id": "A:0",
+                        "id": "swapped_in",
+                        "name": "SUBSTITUTED EXERCISE",
+                        "sets": 3, "rmin": 8, "rmax": 12, "rest": 90,
+                    }
+                ],
+            }
+        ],
+    }
+
+    rendered = _render(plan)
+
+    assert "SUBSTITUTED EXERCISE" in rendered, (
+        "the stored exercise must be rendered; reading the global template "
+        "here is what made every substitution invisible"
+    )
+
+
+def test_a_canonical_plan_never_falls_back_to_the_template() -> None:
+    """The fallback is for legacy fact-only payloads only.
+
+    A canonical plan carries its exercises, so it must not reach the template
+    branch. Proven by rendering a canonical-shaped session whose stored
+    exercises are deliberately unlike anything in `PLANS`.
+    """
+    from exercise_plans import PLANS
+
+    template_names = {
+        str(ex.get("name") or "")
+        for entry in PLANS.values()
+        for ex in entry.get("exercises", [])
+    }
+
+    plan = {
+        "frequency": 1,
+        "structure": "A/B/C",
+        "sessions": [
+            {
+                "weekday": 0, "time": "18:00", "name": "אימון A", "code": "A",
+                "exercises": [
+                    {
+                        "slot_id": "A:0", "id": "only_this",
+                        "name": "ONLY THIS ONE", "sets": 3,
+                        "rmin": 8, "rmax": 12, "rest": 90,
+                    }
+                ],
+            }
+        ],
+    }
+
+    rendered = _render(plan)
+    leaked = [name for name in template_names if name and name in rendered]
+
+    assert "ONLY THIS ONE" in rendered
+    assert not leaked, (
+        f"template exercises leaked into a canonical render: {leaked[:3]} -- "
+        "the stored payload must be the only source"
+    )
+
+
+def test_a_legacy_fact_only_session_still_renders() -> None:
+    """The narrowly justified fallback.
+
+    A10 retired the writer that produced these, so no NEW plan takes this
+    branch -- but payloads already in the database carry `code`/`name` and no
+    exercises, and must not render as an empty day.
+    """
+    plan = {
+        "frequency": 1,
+        "structure": "A/B/C",
+        "sessions": [
+            {"weekday": 0, "time": "18:00", "name": "אימון A", "code": "A"}
+        ],
+    }
+
+    rendered = _render(plan)
+
+    assert "אימון A" in rendered
+    assert rendered.count("1.") >= 1, "a legacy session must still list exercises"
+
+
+def test_unmapped_blocked_and_malformed_each_render_distinctly() -> None:
+    """D-2: a slot without an implementation is a state every surface renders.
+
+    Skipping them would renumber the list and hide that a professional need
+    exists but is unfilled; rendering all three the same way would collapse
+    "not chosen yet", "withheld for your safety" and "this data is broken" into
+    one indistinguishable blank.
+    """
+    plan = {
+        "frequency": 1,
+        "structure": "A/B/C",
+        "sessions": [
+            {
+                "weekday": 0, "time": "18:00", "name": "אימון A", "code": "A",
+                "exercises": [
+                    {"slot_id": "A:0", "slot_state": "unmapped"},
+                    {"slot_id": "A:1", "id": "fly", "slot_state": "blocked"},
+                    {"slot_id": "A:2", "id": "x", "slot_state": "garbage"},
+                ],
+            }
+        ],
+    }
+
+    rendered = _render(plan)
+
+    assert "⬜" in rendered, "an unmapped slot must be shown, not skipped"
+    assert "🛡️" in rendered, "a blocked slot must say it is protective"
+    assert "⚠️" in rendered, "a malformed entry must stay visible"
+    # And they must not be the same message.
+    assert rendered.count("⬜") == 1
+    assert rendered.count("🛡️") == 1
+
+
+def test_a_malformed_entry_does_not_crash_the_renderer() -> None:
+    """A non-dict entry used to reach `ex.get(...)` and raise."""
+    plan = {
+        "frequency": 1,
+        "structure": "A/B/C",
+        "sessions": [
+            {
+                "weekday": 0, "time": "18:00", "name": "אימון A", "code": "A",
+                "exercises": ["not a dict", None, 42],
+            }
+        ],
+    }
+
+    rendered = _render(plan)
+    assert "אימון A" in rendered
+    assert rendered.count("⚠️") == 3
+
+
+def test_the_in_session_swap_says_the_saved_plan_is_unchanged() -> None:
+    """The UX half of the snapshot decision.
+
+    An in-workout substitution writes the SESSION snapshot, not the saved plan
+    — that is what keeps a live workout immune to plan edits. But a user who
+    swaps an exercise reasonably assumes next week is fixed too, and nothing
+    told them otherwise. Asserted at the source, because the alternative is a
+    full callback round-trip that would test the fake query more than the copy.
+    """
+    import ast
+
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "noam_coach" / "bot" / "callback_session.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+
+    messages: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        called = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+        if called != "safe_answer_callback":
+            continue
+        for arg in node.args:
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                messages.append(arg.value)
+
+    assert any("התוכנית הקבועה לא השתנתה" in m for m in messages), (
+        "after an in-session swap the user must be told the saved plan is "
+        "unchanged, or they will assume the change carries to next week"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Discriminating tests
+#
+# Added after deliberate breakage found four protections that no test could
+# distinguish from their broken form. Each of these fails when the guarded
+# behaviour is reverted, which the previous tests did not -- they used fixtures
+# where identity and position happened to agree, so "resolve by position"
+# returned the right answer for the wrong reason.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_a_re_ranked_alternative_list_resolves_by_identity_not_position(
+    tmp_path, monkeypatch
+) -> None:
+    """The `.index(alt)` defect, in the one shape that exposes it.
+
+    The alternative the user taps is deliberately NOT first, so resolving by
+    position returns a different -- valid, therefore silent -- exercise. A test
+    whose target sits at position 0 cannot tell the two implementations apart.
+    """
+    import coach_bot
+    from noam_coach.bot import callback_session as cs_bot
+    from noam_coach.bot import ui as ui_bot
+
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    monkeypatch.setattr(cs_bot, "DB", db, raising=False)
+    monkeypatch.setattr(ui_bot, "DB", db, raising=False)
+
+    plan = {
+        "name": "A",
+        "exercises": [
+            {
+                "id": "leg_press", "name": "Leg press", "sets": 3,
+                "rmin": 8, "rmax": 12, "inc": 5, "weight": 100,
+                "muscle": "legs", "cues": [],
+                "alts": [
+                    {"id": "first_alt", "name": "First", "weight": 40},
+                    {"id": "second_alt", "name": "Second", "weight": 50},
+                    {"id": "third_alt", "name": "Third", "weight": 60},
+                ],
+            }
+        ],
+    }
+    session_id = await db.execute(
+        "INSERT INTO sessions(user_id, code, name, plan, status, exercise_index, "
+        "set_number, started_at) VALUES(1,'A','A',?,'active',0,1,?)",
+        (json.dumps(plan, ensure_ascii=False), utc_now()),
+    )
+    session = dict(await db.fetch_one("SELECT * FROM sessions WHERE id=?", (session_id,)))
+
+    class _Q:
+        async def edit_message_text(self, *a, **k) -> None: ...
+        async def answer(self, *a, **k) -> None: ...
+
+    # Tap the THIRD alternative. Position-based resolution would apply the first.
+    await cs_bot.handle_session_action_callback(
+        _Q(), context=None, user_id=1,
+        data=coach_bot.session_action_data("sub", session, "third_alt", "equipment"),
+    )
+
+    refreshed = await db.fetch_one("SELECT plan FROM sessions WHERE id=?", (session_id,))
+    applied = json.loads(refreshed["plan"])["exercises"][0]["id"]
+
+    assert applied == "third_alt", (
+        f"tapped the third alternative and got {applied!r} -- resolution is "
+        "still positional, so a re-ranked list applies the wrong exercise"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_alternative_id_is_refused(tmp_path, monkeypatch) -> None:
+    """A stale keyboard names an alternative the list no longer offers."""
+    import coach_bot
+    from noam_coach.bot import callback_session as cs_bot
+    from noam_coach.bot import ui as ui_bot
+
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    monkeypatch.setattr(cs_bot, "DB", db, raising=False)
+    monkeypatch.setattr(ui_bot, "DB", db, raising=False)
+
+    plan = {
+        "name": "A",
+        "exercises": [
+            {
+                "id": "leg_press", "name": "Leg press", "sets": 3, "rmin": 8,
+                "rmax": 12, "inc": 5, "weight": 100, "muscle": "legs",
+                "cues": [], "alts": [{"id": "only_alt", "name": "Only", "weight": 40}],
+            }
+        ],
+    }
+    session_id = await db.execute(
+        "INSERT INTO sessions(user_id, code, name, plan, status, exercise_index, "
+        "set_number, started_at) VALUES(1,'A','A',?,'active',0,1,?)",
+        (json.dumps(plan, ensure_ascii=False), utc_now()),
+    )
+    session = dict(await db.fetch_one("SELECT * FROM sessions WHERE id=?", (session_id,)))
+
+    class _Q:
+        async def edit_message_text(self, *a, **k) -> None: ...
+        async def answer(self, *a, **k) -> None: ...
+
+    await cs_bot.handle_session_action_callback(
+        _Q(), context=None, user_id=1,
+        data=coach_bot.session_action_data("sub", session, "vanished_alt", "pain"),
+    )
+
+    refreshed = await db.fetch_one("SELECT plan FROM sessions WHERE id=?", (session_id,))
+    assert json.loads(refreshed["plan"])["exercises"][0]["id"] == "leg_press", (
+        "a stale alternative must be refused, never resolved to whatever is "
+        "at that position now"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_superseded_version_is_not_mutated_in_place(
+    tmp_path, monkeypatch
+) -> None:
+    """Copy-on-write, asserted where a shallow reference would show.
+
+    The earlier test compared the old row to a snapshot taken from the same
+    object, so an in-place edit compared equal to itself. This reads the row
+    back from the database and asserts the OLD version still names the OLD
+    exercise.
+    """
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    await _ready_user(db)
+
+    candidates = await planning.generate_candidates(db, 1, "workout")
+    original_plan_id = candidates[0].id
+    await planning.activate_plan(db, 1, original_plan_id)
+
+    active = await planning.get_active_plan(db, 1, "workout")
+    entry = active["payload"]["sessions"][0]["exercises"][0]
+    slot_id, original_exercise = entry["slot_id"], entry["id"]
+
+    await plan_mutations.substitute_slot_in_saved_plan(
+        db, 1, slot_id, "swapped_in", reason="pain"
+    )
+
+    old_row = await db.fetch_one(
+        "SELECT payload, status FROM plan_versions WHERE id=?", (original_plan_id,)
+    )
+    old_entry = slots.find_by_slot_id(
+        json.loads(old_row["payload"])["sessions"][0]["exercises"], slot_id
+    )
+
+    assert old_entry is not None
+    assert old_entry[1]["id"] == original_exercise, (
+        "the superseded version was edited in place; a completed session can "
+        "no longer be explained against the plan that was live when it ran"
+    )
+    assert old_row["status"] != "active"
+
+
+def test_the_two_reason_paths_mint_different_callbacks() -> None:
+    """Pain and equipment must stay distinguishable at the button.
+
+    Before A11b both paths minted byte-identical callbacks, so the reason was
+    destroyed before any handler ran and A12 could not tell a safety-driven
+    change from a convenience one. Asserted on the minted strings, because a
+    test of the audit alone passes when both sides write the same constant.
+    """
+    from noam_coach.bot.callback_session import (
+        SUB_REASON_EQUIPMENT,
+        SUB_REASON_PAIN,
+        _substitution_callback,
+    )
+
+    session = {"id": 5, "exercise_index": 0, "set_number": 1}
+    current = {"id": "leg_press"}
+    alt = {"id": "hack_squat"}
+
+    pain = _substitution_callback(session, current, alt, SUB_REASON_PAIN)
+    equipment = _substitution_callback(session, current, alt, SUB_REASON_EQUIPMENT)
+
+    assert pain != equipment, (
+        "the two reason paths mint identical callbacks -- the distinction is "
+        "destroyed at the button, exactly as it was before A11b"
+    )
+    assert pain.endswith(":pain")
+    assert equipment.endswith(":equipment")
+
+
+def test_an_unrecognised_reason_is_coerced_not_stored() -> None:
+    from noam_coach.bot.callback_session import (
+        SUB_REASON_UNKNOWN,
+        _substitution_callback,
+    )
+
+    minted = _substitution_callback(
+        {"id": 5, "exercise_index": 0, "set_number": 1},
+        {"id": "a"}, {"id": "b"}, "free text that is not a code",
+    )
+    assert minted.endswith(":" + SUB_REASON_UNKNOWN), (
+        "free text must never reach callback data"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_audit_allowlist_registration_actually_constrains(
+    tmp_path, monkeypatch
+) -> None:
+    """Registration must CONSTRAIN, not merely describe.
+
+    Every field A11b audits is a bounded scalar, so the unregistered
+    `_scalar_only` fallback preserves them anyway -- which is why deregistering
+    the pair broke no test. What registration buys is the opposite guarantee: a
+    field nobody vetted is dropped. A limitation string is exactly the kind of
+    scalar the fallback would wave through.
+    """
+    from noam_coach.services import core as core_services
+
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+
+    await core_services.write_audit(
+        1, "approve_substitution", "exercise", 99,
+        source="leg_press", target="hack_squat", reason="pain", slot_id="A:0",
+        limitation_detail="\u05db\u05d0\u05d1 \u05d1\u05d1\u05e8\u05da",
+    )
+
+    row = await db.fetch_one(
+        "SELECT details FROM audit WHERE user_id=1 AND action='approve_substitution'"
+    )
+    details = json.loads(row["details"])
+
+    assert details["reason"] == "pain", "vetted fields must survive"
+    assert details["slot_id"] == "A:0"
+    assert "limitation_detail" not in details, (
+        "an unlisted field must be dropped BY RULE, not stored because it "
+        "happened to be a scalar"
+    )
+    assert "\u05d1\u05e8\u05da" not in json.dumps(details, ensure_ascii=False)

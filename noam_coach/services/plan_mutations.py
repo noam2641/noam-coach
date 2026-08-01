@@ -62,8 +62,14 @@ OUTCOME_FAILED = "failed"
 REASON_READINESS = "readiness_missing"
 REASON_QUALITY = "plan_quality"
 REASON_UNEXPRESSIBLE = "not_expressible_as_remap"
-REASON_ACTIVE_SESSION = "active_session_in_progress"
 REASON_INTERNAL = "internal_error"
+# `REASON_ACTIVE_SESSION` was declared here and never returned by any path --
+# a protection that existed only as a name. Removed by A11b rather than
+# implemented, because the protection it described is real and already lives
+# elsewhere: `sessions.plan` snapshots the plan at session start, so a live
+# workout continues on the payload it began with no matter how the saved plan
+# changes underneath it. A blocking condition here would have refused a
+# legitimate correction to defend against a corruption that cannot occur.
 
 
 @dataclass(frozen=True)
@@ -293,6 +299,8 @@ async def _insert_corrected_version(
     active: dict[str, Any],
     payload: dict[str, Any],
     reason: str,
+    *,
+    assumption_prefix: str = "realigned",
 ) -> int:
     """Insert the corrected plan as a candidate and return its id.
 
@@ -305,7 +313,9 @@ async def _insert_corrected_version(
     assumptions = active.get("assumptions") or []
     if isinstance(assumptions, str):
         assumptions = json.loads(assumptions or "[]")
-    assumptions = list(assumptions) + [f"realigned:{reason}"]
+    # A11b generalised the prefix: the note records WHICH operation produced
+    # this version, and "realigned:slot_substituted" would have been a lie.
+    assumptions = list(assumptions) + [f"{assumption_prefix}:{reason}"]
 
     plan_id = await db.execute(
         """
@@ -363,6 +373,116 @@ async def _audit(
             user_id, plan_id, outcome,
         )
 
+
+
+#: A11b: the slot the caller named is not in the saved plan. Distinct from
+#: `no_plan` (there is no plan at all) and from `no_change` (the slot is
+#: already implemented by that exercise) -- collapsing them would report a
+#: stale callback as a successful no-op.
+REASON_UNKNOWN_SLOT = "slot_not_in_plan"
+
+
+async def substitute_slot_in_saved_plan(
+    db: Any,
+    user_id: int,
+    slot_id: str,
+    replacement_exercise_id: str,
+    *,
+    reason: str,
+) -> MutationOutcome:
+    """Persist a substitution against the SAVED plan, by slot identity.
+
+    Added beside the existing operations, per A9's contract: later items extend
+    this module and never introduce a writer elsewhere. This is the third.
+
+    Copy-on-write, like every operation here: the active version is never
+    edited, a new candidate carries the change, and activation runs through
+    `activate_plan` so the governed-fact mirror stays A4-authorized. An
+    in-progress workout is unaffected -- `sessions.plan` snapshotted the payload
+    at session start, so the change lands from the NEXT session onward.
+
+    Resolution is by slot identity, never by list position, so a plan whose
+    exercises were re-ranked between the offer and the tap either finds the same
+    professional slot or finds nothing.
+    """
+    from noam_coach.services import workout_slots
+
+    if not workout_slots.is_valid_slot_id(slot_id):
+        return MutationOutcome(
+            OUTCOME_BLOCKED, reason=REASON_UNKNOWN_SLOT, missing=(str(slot_id),)
+        )
+
+    try:
+        active = await planning.get_active_plan(db, user_id, "workout")
+    except Exception:
+        LOGGER.exception(
+            "slot_substitution_failed user_id=%s stage=read reason=%s",
+            user_id, REASON_INTERNAL,
+        )
+        return MutationOutcome(OUTCOME_FAILED, reason=REASON_INTERNAL)
+
+    if not active:
+        return MutationOutcome(OUTCOME_NO_PLAN)
+
+    # Defensive, not load-bearing, and measured as such: `get_active_plan`
+    # decodes the payload from JSON on every call, so this dict is already a
+    # fresh object and mutating it cannot reach the stored row. The copy stays
+    # because that is a property of the reader, not a contract -- a future
+    # cached reader would make in-place edits reach the database silently.
+    # Deliberate breakage confirmed removing it changes no observable
+    # behaviour today, so no test asserts it; the comment is the record.
+    payload = copy.deepcopy(active.get("payload") or {})
+    target = None
+    for session in payload.get("sessions") or []:
+        if not isinstance(session, dict):
+            continue
+        found = workout_slots.find_by_slot_id(session.get("exercises"), slot_id)
+        if found is not None:
+            target = found[1]
+            break
+
+    if target is None:
+        # A stale offer, or a slot from a superseded plan. Refusing is the whole
+        # point of identity-based resolution: the alternative is applying the
+        # change to whatever now occupies that position.
+        return MutationOutcome(
+            OUTCOME_BLOCKED, reason=REASON_UNKNOWN_SLOT, plan_id=int(active["id"])
+        )
+
+    if str(target.get("id") or "") == str(replacement_exercise_id):
+        return MutationOutcome(OUTCOME_NO_CHANGE, plan_id=int(active["id"]))
+
+    # The slot keeps its identity; only the implementation changes. That is the
+    # distinction the whole slot model exists to express.
+    target["original_id"] = target.get("original_id") or target.get("id")
+    target["id"] = str(replacement_exercise_id)
+
+    try:
+        new_plan_id = await _insert_corrected_version(
+            db, user_id, active, payload, reason,
+            assumption_prefix="slot_substituted",
+        )
+        await planning.activate_plan(db, user_id, new_plan_id)
+    except planning.PlanningBlockedError as exc:
+        missing = tuple(str(m) for m in (getattr(exc, "missing", None) or ()))
+        blocked_reason = REASON_QUALITY if _looks_like_quality(missing) else REASON_READINESS
+        LOGGER.info(
+            "slot_substitution_blocked user_id=%s slot=%s reason=%s",
+            user_id, slot_id, blocked_reason,
+        )
+        return MutationOutcome(OUTCOME_BLOCKED, reason=blocked_reason, missing=missing)
+    except Exception:
+        LOGGER.exception(
+            "slot_substitution_failed user_id=%s stage=write reason=%s",
+            user_id, REASON_INTERNAL,
+        )
+        return MutationOutcome(OUTCOME_FAILED, reason=REASON_INTERNAL)
+
+    LOGGER.info(
+        "slot_substituted user_id=%s slot=%s new_plan_id=%s reason=%s",
+        user_id, slot_id, new_plan_id, reason,
+    )
+    return MutationOutcome(OUTCOME_REALIGNED, plan_id=new_plan_id)
 
 
 async def activate_proposed_plan(
@@ -441,11 +561,12 @@ __all__ = [
     "OUTCOME_NO_CHANGE",
     "OUTCOME_NO_PLAN",
     "OUTCOME_REALIGNED",
-    "REASON_ACTIVE_SESSION",
     "REASON_INTERNAL",
     "REASON_QUALITY",
     "REASON_READINESS",
     "REASON_UNEXPRESSIBLE",
+    "REASON_UNKNOWN_SLOT",
     "activate_proposed_plan",
     "realign_saved_plan_to_weekdays",
+    "substitute_slot_in_saved_plan",
 ]
