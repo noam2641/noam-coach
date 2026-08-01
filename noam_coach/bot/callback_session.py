@@ -487,12 +487,18 @@ async def _handle_session_split_actions(
 # ---------------------------------------------------------------------------
 #: Bounded reason codes. Never free text, never a body region -- the region is
 #: already recorded on the medical_constraints row that the pain flow writes.
+#: The version grammar `strict_extract_version` matches in the terminal two
+#: callback fields. An alternative token of this shape would be read as a flow
+#: version and the tap refused as stale.
+_VERSION_SHAPED = re.compile(r"^v\d{1,9}$")
+
 SUB_REASON_PAIN = "pain"
 SUB_REASON_EQUIPMENT = "equipment"
 SUB_REASON_UNKNOWN = "unspecified"
 SUB_REASONS = frozenset({SUB_REASON_PAIN, SUB_REASON_EQUIPMENT, SUB_REASON_UNKNOWN})
 
 
+@runtime_bound(RUNTIME_NAMES)
 def _substitution_callback(
     session: dict[str, Any],
     current: dict[str, Any],
@@ -514,6 +520,14 @@ def _substitution_callback(
       short slugs, and this is asserted by test rather than assumed.
     """
     alt_id = str(alternative.get("id") or "")
+    # No exercise id matches `^v\d{1,9}$` today (checked across the catalog and
+    # every template), but that is an accident of the current data, not a
+    # guarantee. If one ever did, `strict_extract_version` would read it as a
+    # flow version and the router would refuse every tap on that alternative as
+    # stale -- a substitution that silently stops working for one exercise.
+    # Prefixing makes the token structurally unable to match.
+    if _VERSION_SHAPED.match(alt_id):
+        alt_id = f"x{alt_id}"
     return session_action_data(
         "sub",
         session,
@@ -725,6 +739,9 @@ async def _handle_session_adjustment_actions(
         # alternative's own id means a list that no longer offers it yields
         # nothing, which is a stale callback: refused, never redirected.
         alt_id = str(session_action_arg(parts))
+        # Undo the minting-site escape for a version-shaped exercise id.
+        if alt_id.startswith("x") and _VERSION_SHAPED.match(alt_id[1:]):
+            alt_id = alt_id[1:]
         try:
             sub_reason = str(session_action_arg(parts, 1))
         except ValueError:

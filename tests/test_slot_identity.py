@@ -115,15 +115,15 @@ def test_identity_is_not_keyed_on_the_exercise_or_the_position() -> None:
     exists to survive.
     """
     entries = [
-        {"slot_id": "A:0", "id": "bench"},
-        {"slot_id": "A:1", "id": "fly"},
+        {"slot_id": "A#0:bench", "slot_key": "bench", "id": "bench"},
+        {"slot_id": "A#0:fly", "slot_key": "fly", "id": "fly"},
     ]
     # Substituted: same slot, different exercise.
     entries[0]["id"] = "db_press"
-    assert slots.find_by_slot_id(entries, "A:0")[1]["id"] == "db_press"
+    assert slots.find_by_slot_id(entries, "A#0:bench")[1]["id"] == "db_press"
     # Reordered: same slot, different position.
     entries.reverse()
-    found = slots.find_by_slot_id(entries, "A:0")
+    found = slots.find_by_slot_id(entries, "A#0:bench")
     assert found is not None and found[0] == 1, "identity must follow the entry"
 
 
@@ -134,11 +134,11 @@ def test_two_slots_may_share_one_exercise_without_collision() -> None:
     session would silently change the other.
     """
     entries = [
-        {"slot_id": "A:0", "id": "bench"},
-        {"slot_id": "F:2", "id": "bench"},
+        {"slot_id": "A#0:press_primary", "id": "bench"},
+        {"slot_id": "A#1:press_primary", "id": "bench"},
     ]
-    first = slots.find_by_slot_id(entries, "A:0")
-    second = slots.find_by_slot_id(entries, "F:2")
+    first = slots.find_by_slot_id(entries, "A#0:press_primary")
+    second = slots.find_by_slot_id(entries, "A#1:press_primary")
 
     assert first is not None and second is not None
     assert first[0] != second[0], "two slots sharing an exercise must stay distinct"
@@ -146,26 +146,32 @@ def test_two_slots_may_share_one_exercise_without_collision() -> None:
 
 def test_an_unmintable_slot_yields_none_rather_than_a_placeholder() -> None:
     """A placeholder id would collide with every other unmintable entry."""
-    assert slots.mint_slot_id("", 0) is None
-    assert slots.mint_slot_id("A", "x") is None
-    assert slots.mint_slot_id("A", -1) is None
-    assert slots.mint_slot_id("A:B", 0) is None, "a code containing the separator"
+    assert slots.mint_slot_id("", "bench") is None
+    assert slots.mint_slot_id("A#0", "") is None
+    assert slots.mint_slot_id("A", "bench") is None, "occurrence must carry #N"
+    assert slots.mint_slot_id("A#x", "bench") is None, "occurrence must round-trip"
+    assert slots.mint_slot_id("A#0", "a:b") is None, "key containing the separator"
+    assert slots.mint_session_occurrence("A", -1) is None
+    assert slots.mint_session_occurrence("A:B", 0) is None
 
 
 def test_slot_id_validation_is_a_real_check() -> None:
     """An id that does not round-trip cannot be reconciled against a rebuild."""
-    assert slots.is_valid_slot_id("A:0") is True
-    for bad in ("", "A", "bench", "A:x", "A:999", ":0", None, 7, "A:0:1"):
+    assert slots.is_valid_slot_id("A#0:bench") is True
+    for bad in (
+        "", "A", "bench", "A:0", "A#0", ":bench", "A#x:bench", "A#-1:bench",
+        None, 7, "A#0:a:b",
+    ):
         assert slots.is_valid_slot_id(bad) is False, bad
 
 
 def test_assign_never_overwrites_an_existing_identity() -> None:
     """A repaired or migrated payload keeps the identity it already had."""
-    entries = [{"slot_id": "F:9", "id": "bench"}, {"id": "fly"}]
-    minted = slots.assign_slot_ids(entries, "A")
+    entries = [{"slot_id": "F#0:squat", "id": "bench"}, {"id": "fly"}]
+    minted = slots.assign_slot_ids(entries, "A#0")
 
-    assert entries[0]["slot_id"] == "F:9", "an existing valid id is preserved"
-    assert entries[1]["slot_id"] == "A:1"
+    assert entries[0]["slot_id"] == "F#0:squat", "an existing valid id is preserved"
+    assert entries[1]["slot_id"] == "A#0:fly", "falls back to the seed exercise id"
     assert minted == 1
 
 
@@ -212,9 +218,9 @@ def test_the_four_states_remain_four(caplog) -> None:
         counts = slots.observe_plan_entries(
             [
                 {"id": "bench"},                                  # legacy
-                {"slot_id": "A:1"},                               # unmapped
-                {"slot_id": "A:2", "id": "fly", "slot_state": "blocked"},
-                {"slot_id": "A:3", "id": "x", "slot_state": "??"},  # malformed
+                {"slot_id": "A#0:fly"},                           # unmapped
+                {"slot_id": "A#0:row", "id": "row", "slot_state": "blocked"},
+                {"slot_id": "A#0:x", "id": "x", "slot_state": "??"},  # malformed
             ],
             user_id=1,
             session_id=1,
@@ -242,15 +248,15 @@ def test_a_slot_token_cannot_be_read_as_a_version() -> None:
     """
     import re
 
-    token = slots.slot_token_of({"slot_id": "A:3"})
-    assert token == "A-3"
+    token = slots.slot_token_of({"slot_id": "A#0:bench"})
+    assert token == "A#0-bench"
     assert ":" not in token
     assert re.match(r"^v\d{1,9}$", token) is None
-    assert slots.slot_id_from_token(token) == "A:3"
+    assert slots.slot_id_from_token(token) == "A#0:bench"
 
 
 def test_a_token_that_is_not_a_slot_id_is_refused() -> None:
-    for bad in ("", "bench", "v123", "A-x", None):
+    for bad in ("", "bench", "v123", "A-x", "A#0", None):
         assert slots.slot_id_from_token(bad) is None, bad
 
 
@@ -412,8 +418,10 @@ def test_repair_cannot_silently_delete_a_slot() -> None:
                 "time": "18:00",
                 "minutes": 45,
                 "exercises": [
-                    {"slot_id": "A:0", "id": "bench", "sets": 3, "rmin": 8, "rmax": 12},
-                    {"slot_id": "A:1", "id": "bench", "sets": 3, "rmin": 8, "rmax": 12},
+                    {"slot_id": "A#0:press_primary", "id": "bench",
+                     "sets": 3, "rmin": 8, "rmax": 12},
+                    {"slot_id": "A#0:press_accessory", "id": "bench",
+                     "sets": 3, "rmin": 8, "rmax": 12},
                 ],
             }
         ]
@@ -421,7 +429,7 @@ def test_repair_cannot_silently_delete_a_slot() -> None:
     repaired = planning.repair_workout_payload(payload)
     surviving = [e.get("slot_id") for e in repaired["sessions"][0]["exercises"]]
 
-    assert surviving == ["A:0", "A:1"], (
+    assert surviving == ["A#0:press_primary", "A#0:press_accessory"], (
         "repair deduped two distinct slots that share an exercise; a slot is a "
         "need, and two needs may be met by the same movement"
     )
@@ -589,7 +597,7 @@ def test_the_renderer_shows_the_stored_exercise_not_the_template() -> None:
                 "code": "A",
                 "exercises": [
                     {
-                        "slot_id": "A:0",
+                        "slot_id": "A#0:bench",
                         "id": "swapped_in",
                         "name": "SUBSTITUTED EXERCISE",
                         "sets": 3, "rmin": 8, "rmax": 12, "rest": 90,
@@ -630,7 +638,7 @@ def test_a_canonical_plan_never_falls_back_to_the_template() -> None:
                 "weekday": 0, "time": "18:00", "name": "אימון A", "code": "A",
                 "exercises": [
                     {
-                        "slot_id": "A:0", "id": "only_this",
+                        "slot_id": "A#0:bench", "id": "only_this",
                         "name": "ONLY THIS ONE", "sets": 3,
                         "rmin": 8, "rmax": 12, "rest": 90,
                     }
@@ -685,9 +693,9 @@ def test_unmapped_blocked_and_malformed_each_render_distinctly() -> None:
             {
                 "weekday": 0, "time": "18:00", "name": "אימון A", "code": "A",
                 "exercises": [
-                    {"slot_id": "A:0", "slot_state": "unmapped"},
-                    {"slot_id": "A:1", "id": "fly", "slot_state": "blocked"},
-                    {"slot_id": "A:2", "id": "x", "slot_state": "garbage"},
+                    {"slot_id": "A#0:bench", "slot_state": "unmapped"},
+                    {"slot_id": "A#0:fly", "id": "fly", "slot_state": "blocked"},
+                    {"slot_id": "A#0:x", "id": "x", "slot_state": "garbage"},
                 ],
             }
         ],
@@ -975,7 +983,8 @@ async def test_the_audit_allowlist_registration_actually_constrains(
 
     await core_services.write_audit(
         1, "approve_substitution", "exercise", 99,
-        source="leg_press", target="hack_squat", reason="pain", slot_id="A:0",
+        source="leg_press", target="hack_squat", reason="pain",
+        slot_id="A#0:leg_press",
         limitation_detail="\u05db\u05d0\u05d1 \u05d1\u05d1\u05e8\u05da",
     )
 
@@ -985,9 +994,384 @@ async def test_the_audit_allowlist_registration_actually_constrains(
     details = json.loads(row["details"])
 
     assert details["reason"] == "pain", "vetted fields must survive"
-    assert details["slot_id"] == "A:0"
+    assert details["slot_id"] == "A#0:leg_press"
     assert "limitation_detail" not in details, (
         "an unlisted field must be dropped BY RULE, not stored because it "
         "happened to be a scalar"
     )
     assert "\u05d1\u05e8\u05da" not in json.dumps(details, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# The six identity cases
+#
+# The first scheme was `<session_code>:<template_ordinal>`. Two identical
+# `generate_candidates` runs agreed, which looked like proof and was not: it
+# tested DETERMINISM while missing UNIQUENESS entirely. Measured on a 6-day
+# plan, whose split is `['A','B','C','A','B','C']`, **10 of 20 slot ids were
+# duplicates** -- every slot in the second half collided with its counterpart
+# in the first.
+#
+# The rule is now `<session_occurrence>:<slot_key>`:
+#
+#   * `session_occurrence` is the code's Nth appearance in the split (`A#0`,
+#     `A#1`) -- not the weekday, which the user changes freely and which A9
+#     realignment moves, and not the array index of the session.
+#   * `slot_key` is DECLARED on the template by `exercise_plans.exercise(...)`,
+#     defaulting to the seed exercise id -- not the current `id`, which
+#     substitution changes, and not a position, which reordering renames.
+#
+# Each test below fails under the old scheme.
+# ---------------------------------------------------------------------------
+async def _plan_for(tmp_path, monkeypatch, *, frequency: int, days: str, name: str):
+    """A generated plan for a given split, on its own database."""
+    db = Database(str(tmp_path / f"{name}.db"))
+    await db.init()
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(1,'A',NULL,?)",
+        (utc_now(),),
+    )
+    _bind(monkeypatch, db)
+    facts = dict(
+        _WORKOUT_FACTS, training_days_per_week=frequency, weekly_availability=days
+    )
+    for key, value in facts.items():
+        await user_model.set_fact(
+            db, 1, key, value,
+            kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
+        )
+    return db, await planning.generate_candidates(db, 1, "workout")
+
+
+def _every_slot_id(payload) -> list[str]:
+    return [e.get("slot_id") for s in payload["sessions"] for e in s["exercises"]]
+
+
+@pytest.mark.asyncio
+async def test_case_1_repeated_session_codes_produce_no_duplicate_slot_id(
+    tmp_path, monkeypatch
+) -> None:
+    """A 6-day split trains `['A','B','C','A','B','C']`.
+
+    Under the ordinal scheme this produced 10 duplicate ids out of 20, so the
+    two appearances of session A were one indistinguishable slot set. A
+    substitution in week-half one would have resolved into week-half two.
+    """
+    _, candidates = await _plan_for(
+        tmp_path, monkeypatch, frequency=6,
+        days="sun,mon,tue,wed,thu,fri", name="six",
+    )
+
+    for candidate in candidates:
+        codes = [s["code"] for s in candidate.payload["sessions"]]
+        ids = _every_slot_id(candidate.payload)
+        assert len(codes) != len(set(codes)), (
+            "this fixture must actually repeat a session code, or it proves "
+            "nothing about the collision"
+        )
+        assert len(ids) == len(set(ids)), (
+            f"duplicate slot ids in a {codes} plan: "
+            f"{len(ids) - len(set(ids))} of {len(ids)}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_case_6_every_slot_id_is_unique_across_the_whole_payload(
+    tmp_path, monkeypatch
+) -> None:
+    """Uniqueness is a property of the PLAN, not of one session."""
+    for frequency, days in ((2, "mon,thu"), (3, "mon,wed,fri"),
+                            (5, "sun,mon,tue,wed,thu")):
+        _, candidates = await _plan_for(
+            tmp_path, monkeypatch, frequency=frequency,
+            days=days, name=f"f{frequency}",
+        )
+        for candidate in candidates:
+            ids = _every_slot_id(candidate.payload)
+            assert ids, "a plan must carry slot ids"
+            assert all(slots.is_valid_slot_id(i) for i in ids)
+            assert len(ids) == len(set(ids)), (
+                f"frequency {frequency}: {len(ids) - len(set(ids))} duplicates"
+            )
+
+
+@pytest.mark.asyncio
+async def test_case_2_reordering_sessions_preserves_slot_identity(
+    tmp_path, monkeypatch
+) -> None:
+    """Identity travels with the session, not with its position in the list."""
+    _, candidates = await _plan_for(
+        tmp_path, monkeypatch, frequency=6,
+        days="sun,mon,tue,wed,thu,fri", name="reorder",
+    )
+    payload = candidates[0].payload
+
+    def _by_occurrence(p):
+        return {
+            s["session_occurrence"]: sorted(e["slot_id"] for e in s["exercises"])
+            for s in p["sessions"]
+        }
+
+    before = _by_occurrence(payload)
+    payload["sessions"].reverse()
+    assert _by_occurrence(payload) == before, (
+        "reordering sessions renamed slots; identity is still positional"
+    )
+
+
+def test_case_3_reordering_template_exercises_preserves_slot_identity() -> None:
+    """The sharpest case, and the one an ordinal key cannot survive.
+
+    The same professional needs, listed in a different order, must keep their
+    identities. Under `<code>:<ordinal>` every slot after the moved one is
+    renamed -- silently reassigning an identity to a DIFFERENT need, which is
+    worse than losing it.
+    """
+    template = [
+        {"slot_key": "horizontal_press", "id": "bench"},
+        {"slot_key": "incline_press", "id": "incline_db"},
+        {"slot_key": "chest_isolation", "id": "fly"},
+    ]
+
+    forward = [dict(e) for e in template]
+    slots.assign_slot_ids(forward, "A#0")
+
+    reordered = [dict(e) for e in reversed(template)]
+    slots.assign_slot_ids(reordered, "A#0")
+
+    assert {e["slot_key"]: e["slot_id"] for e in forward} == {
+        e["slot_key"]: e["slot_id"] for e in reordered
+    }, "reordering the template reassigned identities to different needs"
+
+
+def test_case_4_two_needs_sharing_one_exercise_stay_distinct() -> None:
+    """A programme may press twice; that is two needs, not one duplicated."""
+    entries = [
+        {"slot_key": "press_primary", "id": "bench"},
+        {"slot_key": "press_accessory", "id": "bench"},
+    ]
+    slots.assign_slot_ids(entries, "A#0")
+
+    assert entries[0]["slot_id"] != entries[1]["slot_id"]
+    assert slots.find_by_slot_id(entries, entries[0]["slot_id"])[0] == 0
+    assert slots.find_by_slot_id(entries, entries[1]["slot_id"])[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_case_5_identity_matches_across_independent_databases(
+    tmp_path, monkeypatch
+) -> None:
+    """No state is carried between builds -- not even a database.
+
+    Two runs against the SAME database could agree by reading something the
+    first run left behind. Separate databases remove that possibility, so
+    agreement can only come from the rule being derived.
+    """
+    _, first = await _plan_for(
+        tmp_path, monkeypatch, frequency=6,
+        days="sun,mon,tue,wed,thu,fri", name="db_one",
+    )
+    _, second = await _plan_for(
+        tmp_path, monkeypatch, frequency=6,
+        days="sun,mon,tue,wed,thu,fri", name="db_two",
+    )
+
+    assert _every_slot_id(first[0].payload) == _every_slot_id(second[0].payload), (
+        "identity differs between independent builds; it is not derived from "
+        "the professional need"
+    )
+
+
+@pytest.mark.asyncio
+async def test_identity_does_not_depend_on_the_weekday(tmp_path, monkeypatch) -> None:
+    """A9 realignment moves sessions between days without changing what they
+    train, so weekday must not participate in identity."""
+    _, candidates = await _plan_for(
+        tmp_path, monkeypatch, frequency=3, days="mon,wed,fri", name="weekday",
+    )
+    payload = candidates[0].payload
+
+    before = sorted(_every_slot_id(payload))
+    for session in payload["sessions"]:
+        session["weekday"] = (session["weekday"] + 3) % 7
+
+    assert sorted(_every_slot_id(payload)) == before
+
+
+def test_the_declared_slot_key_is_unique_within_every_template_session() -> None:
+    """The premise the whole scheme rests on.
+
+    If a template session ever declared the same `slot_key` twice, two needs
+    would share one identity and a substitution would hit both. Pinned here so
+    a future template edit fails loudly rather than colliding silently.
+    """
+    from exercise_plans import PLANS
+
+    for code, entry in PLANS.items():
+        keys = [e.get("slot_key") for e in entry.get("exercises", [])]
+        assert all(keys), f"{code}: every template slot must declare a slot_key"
+        assert len(keys) == len(set(keys)), (
+            f"{code}: duplicate slot_key {keys} -- two needs would share one id"
+        )
+
+
+@pytest.mark.asyncio
+async def test_weekday_does_not_participate_in_minting(tmp_path, monkeypatch) -> None:
+    """Weekday-independence asserted at the MINTING site.
+
+    Mutating weekdays on an already-built payload proves nothing: the ids were
+    minted before the mutation, so they cannot change. The property that
+    matters is that the minting input never contains a weekday, which is what
+    makes rescheduling and A9 realignment safe.
+
+    Asserted two ways: the occurrence recorded on each session must count
+    appearances of its code (`A#0`, `A#1`), never encode a day; and a plan whose
+    sessions fall on high weekdays must still mint `#0`-based occurrences.
+    """
+    _, candidates = await _plan_for(
+        tmp_path, monkeypatch, frequency=6,
+        days="sun,mon,tue,wed,thu,fri", name="mint_wk",
+    )
+    payload = candidates[0].payload
+
+    seen: dict[str, int] = {}
+    for session in payload["sessions"]:
+        code = session["code"]
+        expected = slots.mint_session_occurrence(code, seen.get(code, 0))
+        seen[code] = seen.get(code, 0) + 1
+        assert session["session_occurrence"] == expected, (
+            f"session on weekday {session['weekday']} carries "
+            f"{session['session_occurrence']!r}, expected {expected!r} -- the "
+            "occurrence is not counting code appearances"
+        )
+
+    # No occurrence may encode a weekday that is not also a valid appearance
+    # count. With 6 sessions over codes A/B/C every occurrence is #0 or #1,
+    # while the weekdays run 0..5 -- so a weekday-keyed scheme cannot produce
+    # this set.
+    occurrences = {s["session_occurrence"].split("#")[1] for s in payload["sessions"]}
+    weekdays = {str(s["weekday"]) for s in payload["sessions"]}
+    assert occurrences == {"0", "1"}, occurrences
+    assert occurrences != weekdays, (
+        "occurrences match the weekdays exactly; identity may be weekday-keyed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a9_realignment_preserves_slot_identity(tmp_path, monkeypatch) -> None:
+    """The same property, through the real mutation that moves sessions.
+
+    A9's `realign_saved_plan_to_weekdays` exists to move a plan onto different
+    days. It must not silently reassign every slot on the way.
+    """
+    db, candidates = await _plan_for(
+        tmp_path, monkeypatch, frequency=3, days="mon,wed,fri", name="realign",
+    )
+    await planning.activate_plan(db, 1, candidates[0].id)
+    before = sorted(
+        _every_slot_id((await planning.get_active_plan(db, 1, "workout"))["payload"])
+    )
+
+    outcome = await plan_mutations.realign_saved_plan_to_weekdays(
+        db, 1, [1, 3, 5], reason="test_realign"
+    )
+    assert outcome.outcome in (
+        plan_mutations.OUTCOME_REALIGNED,
+        plan_mutations.OUTCOME_NO_CHANGE,
+    ), f"realignment did not run: {outcome.outcome}/{outcome.reason}"
+
+    after = sorted(
+        _every_slot_id((await planning.get_active_plan(db, 1, "workout"))["payload"])
+    )
+    assert after == before, (
+        "A9 realignment changed slot identities; moving a session between days "
+        "must not change what it trains"
+    )
+
+
+def test_reserved_states_are_never_performable() -> None:
+    """"Accepted on read" must not mean "silently normal".
+
+    `calibrating`, `retired` and `temporarily_unavailable` fell through the
+    classifier to the id check and came back `ok`, so a RETIRED slot was
+    performable and counted its sets -- the user would have been told to train
+    a slot that was explicitly withdrawn. They are declared states without a
+    producer, not exercises.
+    """
+    for state in sorted(slots.RESERVED_SLOT_STATES):
+        entry = {
+            "slot_state": state, "id": "bench", "sets": 3,
+            "slot_id": "A#0:bench",
+        }
+        assert slots.classify_entry(entry) != slots.ENTRY_OK, state
+        assert slots.is_performable(entry) is False, (
+            f"a {state!r} slot is performable -- the user would be told to "
+            "train it"
+        )
+        assert slots.planned_sets_of(entry) == 0, state
+
+
+def test_shipped_states_keep_their_distinct_classifications() -> None:
+    """The reserved-state fix must not blur the three shipped states."""
+    base = {"id": "bench", "sets": 3, "slot_id": "A#0:bench"}
+
+    assert slots.classify_entry({**base, "slot_state": "mapped"}) == slots.ENTRY_OK
+    assert slots.classify_entry({**base, "slot_state": "blocked"}) == slots.ENTRY_BLOCKED
+    assert slots.classify_entry({**base, "slot_state": "unmapped"}) == (
+        slots.ENTRY_UNMAPPED
+    )
+    # And the two non-state cases stay distinct from all of them.
+    assert slots.classify_entry({"id": "bench", "sets": 3}) == (
+        slots.ENTRY_LEGACY_NO_SLOT
+    )
+    assert slots.classify_entry({**base, "slot_state": "zzz"}) == slots.ENTRY_MALFORMED
+
+
+def test_a_version_shaped_exercise_id_cannot_break_the_callback() -> None:
+    """`^v\\d{1,9}$` is the version grammar, matched in the terminal two fields.
+
+    No exercise id in the catalog or any template matches it today -- checked
+    across all 56 -- but that is an accident of the current data, not a
+    guarantee. If one ever did, `strict_extract_version` would read it as a
+    flow version and the router would refuse EVERY tap on that alternative as
+    stale: a substitution that silently stops working for one exercise, with
+    nothing in the logs naming the cause.
+    """
+    import conversation
+    from noam_coach.bot import callback_session as cs_bot
+    from noam_coach.services.callback_grammar import install_callback_grammar
+
+    install_callback_grammar()
+    session = {"id": 5, "exercise_index": 0, "set_number": 1}
+
+    for alt_id in ("v123", "v9", "v999999999"):
+        minted = cs_bot._substitution_callback(
+            session, {"id": "x"}, {"id": alt_id}, cs_bot.SUB_REASON_PAIN
+        )
+        assert conversation.extract_version(minted) is None, (
+            f"{minted!r} parses as carrying a flow version -- the router would "
+            "refuse this tap as stale"
+        )
+        assert conversation.extract_flow_id(minted) is None, minted
+        assert minted.split(":")[1].isdigit(), (
+            "parts[1] must stay numeric or the callback is rejected before any "
+            "handler sees it"
+        )
+        assert len(minted.encode("utf-8")) <= 64
+
+
+def test_every_minted_substitution_callback_fits_telegrams_limit() -> None:
+    """64 bytes, asserted on the longest real ids rather than assumed."""
+    from noam_coach.bot import callback_session as cs_bot
+    from training_intelligence import CATALOG
+
+    session = {"id": 9999999, "exercise_index": 99, "set_number": 99}
+    longest = max(CATALOG.keys(), key=len) if CATALOG else "long_exercise_id"
+
+    for reason in sorted(cs_bot.SUB_REASONS):
+        minted = cs_bot._substitution_callback(
+            session, {"id": "x"}, {"id": longest}, reason
+        )
+        assert len(minted.encode("utf-8")) <= 64, (
+            f"{minted!r} is {len(minted.encode())} bytes"
+        )

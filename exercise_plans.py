@@ -49,9 +49,26 @@ def exercise(
     cues: list[str],
     alternatives: list[tuple[str, str, float]],
     muscle: str = "",
+    slot_key: str = "",
 ) -> dict[str, Any]:
+    """Build one template exercise.
+
+    `slot_key` (A11b) names the PROFESSIONAL NEED this position expresses --
+    "the horizontal press in session A" -- as distinct from `id`, which names
+    whichever exercise implements it today. It defaults to the seed exercise id
+    because that is what the need was originally specified as, but the two
+    diverge the moment a substitution happens: `id` becomes the replacement and
+    `slot_key` does not move.
+
+    It is DECLARED rather than derived. A positional key would renumber every
+    later slot when the template is reordered, silently reassigning identities
+    to different needs; a key derived from `muscle` is not unique within a
+    session (`A` and `U1` each repeat one). Declaring it is what makes template
+    reordering a no-op for identity.
+    """
     return {
         "id": exercise_id,
+        "slot_key": slot_key or exercise_id,
         "name": name,
         "sets": sets,
         "rmin": reps_min,

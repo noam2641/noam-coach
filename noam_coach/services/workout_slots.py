@@ -135,6 +135,15 @@ def classify_entry(entry: Any) -> str:
         return ENTRY_BLOCKED
     if state in (SLOT_STATE_UNMAPPED, SLOT_STATE_SUGGESTED):
         return ENTRY_UNMAPPED
+    if state in RESERVED_SLOT_STATES:
+        # A11b: the remaining reserved states (`calibrating`, `retired`,
+        # `temporarily_unavailable`) fell through to the id check and came back
+        # `ok` -- so a RETIRED slot was performable and the user would have been
+        # told to train it. They have no producer yet, but "accepted on read"
+        # must mean "not treated as a normal exercise", not "silently normal".
+        # Reported as unmapped: a slot that exists without an implementation the
+        # user should perform, which is exactly what each of them describes.
+        return ENTRY_UNMAPPED
 
     exercise_id = entry.get("id")
     if not isinstance(exercise_id, str) or not exercise_id:
@@ -218,23 +227,59 @@ _SLOT_ID_SEP = ":"
 _MAX_SLOT_ORDINAL = 99
 
 
-def mint_slot_id(session_code: Any, template_ordinal: Any) -> str | None:
-    """The stable slot id for a template position, or None if unmintable.
+def mint_session_occurrence(session_code: Any, occurrence: Any) -> str | None:
+    """Identity for one appearance of a session within a plan.
 
-    Returns None rather than inventing an id when the inputs cannot express a
-    professional need: minting a placeholder would create an identity that
-    means nothing and collides with every other unmintable entry.
+    A session code is NOT unique inside a plan. Measured: `SPLIT_BY_FREQUENCY`
+    yields `['F','F']` at 2 days, `['A','B','C','A','B','C']` at 6, and the
+    consistency override yields `['F','F','F']` at 3. Keying a slot on the code
+    alone made HALF the slot ids in a 6-day plan duplicates -- 10 of 20 --
+    which is the collision this occurrence counter closes.
+
+    The counter is the code's Nth appearance in the split, not the weekday and
+    not the array index of the session: weekday is a scheduling decision the
+    user changes freely, and A9's realignment moves sessions between days
+    without touching what they train.
     """
     code = str(session_code or "").strip()
-    if not code or _SLOT_ID_SEP in code:
+    if not code or _SLOT_ID_SEP in code or "#" in code:
         return None
     try:
-        ordinal = int(template_ordinal)
+        nth = int(occurrence)
     except (TypeError, ValueError):
         return None
-    if not 0 <= ordinal <= _MAX_SLOT_ORDINAL:
+    if not 0 <= nth <= _MAX_SLOT_ORDINAL:
         return None
-    return f"{code}{_SLOT_ID_SEP}{ordinal}"
+    return f"{code}#{nth}"
+
+
+def mint_slot_id(session_occurrence: Any, slot_key: Any) -> str | None:
+    """The stable id for one professional need, or None if unmintable.
+
+    `<session_occurrence>:<slot_key>` -- e.g. `A#0:bench`, `A#1:bench` for the
+    two appearances of session A in a 6-day split.
+
+    Neither component is positional. `slot_key` is DECLARED on the template
+    (`exercise_plans.exercise(...)`), so reordering the template's exercises
+    reassigns nothing; the occurrence counts appearances of a code, so
+    reordering the sessions moves the same identity with its session.
+
+    Returns None rather than inventing an id: a placeholder would collide with
+    every other unmintable entry, which is worse than having no identity.
+    """
+    occurrence = str(session_occurrence or "").strip()
+    if not occurrence or _SLOT_ID_SEP in occurrence:
+        return None
+    # The occurrence must itself round-trip, or a malformed one (`A#`, `A#x`,
+    # `A#-1`) would produce a slot id that validates and reconciles against
+    # nothing.
+    code, _, nth = occurrence.partition("#")
+    if mint_session_occurrence(code, nth) != occurrence:
+        return None
+    key = str(slot_key or "").strip()
+    if not key or _SLOT_ID_SEP in key or "#" in key:
+        return None
+    return f"{occurrence}{_SLOT_ID_SEP}{key}"
 
 
 def is_valid_slot_id(value: Any) -> bool:
@@ -246,10 +291,10 @@ def is_valid_slot_id(value: Any) -> bool:
     """
     if not isinstance(value, str) or not value:
         return False
-    code, separator, ordinal = value.partition(_SLOT_ID_SEP)
+    occurrence, separator, key = value.partition(_SLOT_ID_SEP)
     if not separator:
         return False
-    return mint_slot_id(code, ordinal) == value
+    return mint_slot_id(occurrence, key) == value
 
 
 def slot_token_of(entry: Any) -> str | None:
@@ -270,29 +315,40 @@ def slot_token_of(entry: Any) -> str | None:
 
 
 def slot_id_from_token(token: Any) -> str | None:
-    """Inverse of `slot_token_of`, rejecting anything that is not a slot id."""
+    """Inverse of `slot_token_of`, rejecting anything that is not a slot id.
+
+    Only the FIRST `-` is restored, because a slot key may legitimately contain
+    one (`lat_pull-fb` style ids exist in the catalog) while the separator
+    appears exactly once by construction.
+    """
     if not isinstance(token, str) or not token:
         return None
     candidate = token.replace("-", _SLOT_ID_SEP, 1)
     return candidate if is_valid_slot_id(candidate) else None
 
 
-def assign_slot_ids(exercises: Any, session_code: Any) -> int:
+def assign_slot_ids(exercises: Any, session_occurrence: Any) -> int:
     """Stamp slot ids onto a freshly built session, in place. Returns the count.
 
-    Called on the TEMPLATE copy, before adaptation, so the ordinal is the
-    template's. Never overwrites an existing valid id -- a repaired or migrated
-    payload keeps the identity it already had.
+    Called on the TEMPLATE copy, before adaptation, so `slot_key` is the one the
+    template declared. Never overwrites an existing valid id -- a repaired or
+    migrated payload keeps the identity it already had.
+
+    An entry with no declared `slot_key` falls back to its seed exercise id,
+    which is what `exercise_plans.exercise(...)` would have declared anyway. It
+    is NOT given a positional key: that would make reordering rename slots,
+    which is the failure this scheme exists to avoid.
     """
     if not isinstance(exercises, list):
         return 0
     minted = 0
-    for ordinal, entry in enumerate(exercises):
+    for entry in exercises:
         if not isinstance(entry, dict):
             continue
         if is_valid_slot_id(entry.get("slot_id")):
             continue
-        slot_id = mint_slot_id(session_code, ordinal)
+        slot_key = entry.get("slot_key") or entry.get("id")
+        slot_id = mint_slot_id(session_occurrence, slot_key)
         if slot_id is None:
             continue
         entry["slot_id"] = slot_id

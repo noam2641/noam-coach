@@ -754,15 +754,24 @@ def _schedule_sessions(
     from noam_coach.services import workout_slots
 
     sessions = []
+    # A session code repeats within a plan -- `['A','B','C','A','B','C']` at 6
+    # days -- so the code alone cannot identify a session. Counting appearances
+    # gives each one a stable occurrence: `A#0`, `A#1`. Measured before this
+    # existed: 10 of 20 slot ids in a 6-day plan were duplicates.
+    code_occurrences: dict[str, int] = {}
     for index, (slot, code) in enumerate(zip(selected, split, strict=True)):
+        occurrence_index = code_occurrences.get(code, 0)
+        code_occurrences[code] = occurrence_index + 1
+        session_occurrence = workout_slots.mint_session_occurrence(
+            code, occurrence_index
+        )
         exercises = copy.deepcopy(PLANS[code]["exercises"])
         # A11b: mint slot identity HERE -- on the template copy, before
-        # `adapt_exercises` runs. The ordinal is the template's, so a
-        # regenerated plan with the same split reproduces the same ids by
-        # construction rather than by carrying state between builds. Minting
-        # after adaptation would key identity on a position that removal and
-        # backfill have already moved.
-        workout_slots.assign_slot_ids(exercises, code)
+        # `adapt_exercises` runs, so the key is the one the template DECLARED
+        # rather than a position that removal and backfill have moved. A
+        # regenerated plan reproduces the same ids by construction, with no
+        # state carried between builds.
+        workout_slots.assign_slot_ids(exercises, session_occurrence)
         sessions.append(
             {
                 "index": index,
@@ -771,6 +780,11 @@ def _schedule_sessions(
                 "time": slot.get("start") or slot.get("time") or default_start,
                 "minutes": int(slot.get("minutes") or default_minutes),
                 "code": code,
+                # A11b: which appearance of `code` this session is. Stored so
+                # the session keeps its identity when A9 realigns weekdays or
+                # the list is reordered -- neither of which changes what the
+                # session trains.
+                "session_occurrence": session_occurrence,
                 "name": PLANS[code]["name"],
                 "exercises": exercises,
             }
