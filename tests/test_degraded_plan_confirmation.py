@@ -934,3 +934,41 @@ async def test_a_stale_approval_for_a_superseded_candidate_cannot_activate(
         "SELECT plan_id FROM active_plans WHERE user_id=1 AND plan_type='workout'"
     )
     assert active is None, "no plan may become active from a stale approval"
+
+
+@pytest.mark.asyncio
+async def test_the_fallback_shape_renders_but_can_never_activate(
+    tmp_path, monkeypatch
+) -> None:
+    """When the canonical pipeline cannot build, the local shape still renders.
+
+    This is the one branch where `build_weekly_plan` returns something that is
+    NOT backed by a `plan_versions` row. It must therefore be inert: no
+    `plan_id` to tap, no governed fact, nothing active. The user sees a plan
+    and is asked to complete what is missing -- the pre-A10 behaviour minus the
+    silent activation that used to accompany it.
+
+    Without this test the fallback is the obvious place for the retired writer
+    to creep back in, because it is the path where "we could not propose"
+    historically meant "so write it directly".
+    """
+    from noam_coach.bot import onboarding
+
+    db = await _db(tmp_path)
+    _bind(monkeypatch, db)
+    monkeypatch.setattr(onboarding, "DB", db, raising=False)
+    # No workout facts at all: the pipeline refuses on blocking-integrity gaps.
+    plan = await onboarding.build_weekly_plan(1, 3)
+
+    assert plan.get("sessions"), "the user must still be shown something"
+    assert not plan.get("plan_id"), (
+        "the fallback must not claim a plan_versions row it does not have"
+    )
+    assert await user_model.get_value(db, 1, "active_workout_plan") is None, (
+        "the fallback must not write the governed fact -- this is exactly where "
+        "the retired direct writer would creep back in"
+    )
+    active = await db.fetch_one(
+        "SELECT plan_id FROM active_plans WHERE user_id=1 AND plan_type='workout'"
+    )
+    assert active is None
