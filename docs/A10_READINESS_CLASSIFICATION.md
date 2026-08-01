@@ -164,7 +164,38 @@ readiness gap. See §4.
 | Fact | Evidence |
 |---|---|
 | **`weekly_availability`** | `_validate_plan_for_activation` rejects any session missing `time` or `minutes`, raising with `missing=["weekly_availability"]` (`planning.py:1471-1479`) **[V]** |
-| **`training_days_per_week`** | No default at `planning.py:167` **[V]**; without it there is no session count to build |
+| **`training_days_per_week`** | Required by `READINESS_PROFILES["workout"]` (`user_model.py:717`) **[V]**, so `_require_readiness` refuses activation without it — measured below |
+
+**Citation corrected after review, conclusion re-verified and upheld.** An
+earlier draft cited `planning.py:167` as proof of "no default". That line is
+inside `build_goal_proposal` — the **nutrition** path **[V]** — and is irrelevant
+to building a workout. The reviewer was right about the citation.
+
+The conclusion nonetheless holds, for a different and stronger reason. The
+workout builder does *not* read the fact: it derives frequency from
+`resolve_availability`, which defaults to `_DEFAULT_DAYS_PER_WEEK = 3`
+(`availability.py:60`) **[V]**. Measured with no fact present:
+
+```
+resolve_availability(...).max_days_per_week -> 3
+```
+
+So a plan *object* can be built. But the fact is in the workout profile's
+`required` tuple **[V]**, and readiness measured on a user with no facts returns:
+
+```
+ready   : False
+missing : [... 'training_days_per_week' ...]
+```
+
+`_require_readiness("workout")` therefore refuses at `planning.py:1252` and again
+at `:1464` **[V]**. Building a plan that activation is certain to reject is not a
+degraded outcome — it is a wasted one, and the user is told nothing either way.
+
+**Classification: `blocking_integrity` is upheld.** Not because no plan can be
+constructed, but because no plan can be *activated*. If A10 later chooses to
+relax the readiness profile itself, this becomes degradable — that is a separate
+decision with its own evidence, not an artefact of this classification.
 
 **Why they block.** Not a safety matter — a structural one. Without them there is
 no plan *object* to produce, so "degraded" has nothing to degrade. Activation
