@@ -177,7 +177,7 @@ into permanent identity and destroying the information `NULL` currently carries.
 | **A11a** | **COMPLETE** | `6acc172` | #69 | proven, exit 0 |
 | **A9** | **COMPLETE** | `4345993` | #70 | proven, exit 0 |
 | **A7** | **COMPLETE** | `6de87f9` | #71 | proven, exit 0 |
-| **A10** | validated, merge pending | — | — | — |
+| **A10** | **COMPLETE** | `4627e05` | #74 | proven, exit 0 |
 | A8, A11b, A12, A13 | not started | — | — | — |
 
 **A10 correction to this document.** The pre-flight and the classification both
