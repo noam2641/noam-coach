@@ -1690,7 +1690,7 @@ async def handle_plan_callback(query: Any, user_id: int, data: str) -> bool:
         from noam_coach.services import plan_readiness as _pr
 
         degraded_outcome: str | None = None
-        with suppress(Exception):
+        try:
             assessment = await _pr.assess_plan_readiness(DB, user_id)
             if assessment.needs_confirmation:
                 approval_id = await _pr.propose_degraded_plan(
@@ -1700,6 +1700,16 @@ async def handle_plan_callback(query: Any, user_id: int, data: str) -> bool:
                     degraded_outcome = await _pr.confirm_degraded_plan(
                         DB, user_id, approval_id
                     )
+        except Exception:
+            # Fail CLOSED and loudly. Falling through leaves `degraded_outcome`
+            # None, so `activate_plan` runs and its safety gate refuses without
+            # an approval -- the user is not activated by accident. But a
+            # swallowed exception here would surface as a readiness message
+            # with no trace of the real cause, so it is logged rather than
+            # suppressed.
+            LOGGER.exception(
+                "degraded_confirmation_failed user_id=%s plan_id=%s", user_id, plan_id
+            )
         try:
             if degraded_outcome == _pr.OUTCOME_CONFIRMED:
                 # Already activated through A9 by the confirmation above. Read
