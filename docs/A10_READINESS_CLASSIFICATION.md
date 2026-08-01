@@ -54,7 +54,9 @@ free-text path produces silence today.
 Derived from three verified properties per fact: its `safety` score, whether the
 builder has a **safe default**, and what the plan loses without it.
 
-### `blocking_safety` — must never degrade
+### `degraded_safety` — a plan is possible, but only under explicit confirmation
+
+**Product decision, superseding the earlier `blocking_safety` classification.**
 
 | Fact | Evidence |
 |---|---|
@@ -66,20 +68,48 @@ lives in `PLAN_QUESTIONS`, affects `menu_planning`, and is gated on
 `when=lambda ctx: ctx.get("planning_nutrition")`. It never gates a workout plan.
 Noted so a later reader does not mistake its absence here for an oversight.
 
-**Why it blocks.** It is the sole input to pain-aware exercise selection. Absent,
-the builder cannot know a movement is contraindicated, and would prescribe it.
-`_validate_plan_for_activation` already requires the `safety` profile
-(`planning.py:1466`) **[V]**, so this is enforced twice.
+**Why this is not a hard blocker.** Refusing outright is what produces silence
+for a legacy user, and silence is not safer — it just moves the failure
+somewhere the user cannot see. The safer construction is to build under
+conservative assumptions, say plainly what could not be adapted, and require the
+user to confirm before anything is activated.
 
-**A safe degraded plan is not possible.** There is no conservative default for
-"does this person have an injury" — assuming "none" is precisely the unsafe
-assumption. A7 aligned this fact's TTL to 14 days for the same reason: an
-expired safety answer re-asks rather than assumes.
+**Four requirements, each load-bearing:**
 
-- **Message**: state that the safety question must be answered before any plan,
-  and why — one sentence, no list of everything else missing.
-- **CTA**: the safety question itself, answerable inline.
-- **Audit**: `outcome=blocked`, `reason=safety_gap_unanswered`.
+1. **Preserve an explicit unknown state.** Absent must remain *absent* — never
+   coerced to "no limitations". The distinction is already modelled: a deferred
+   answer is stored as `KIND_GAP` and `pending_safety_questions` counts a
+   `KIND_GAP` fact as unanswered (`questions.py:523`) **[V]**. That is the state
+   to preserve, not a new one to invent.
+2. **Use the existing conservative behaviour.** `client_training_profile_from_facts`
+   already handles `limitations is None` (`training_intelligence.py:349`) **[V]**,
+   and `adapt_exercises` has no pain regions to work with, so nothing is
+   prescribed *because* a limitation was assumed away. A10 adds no new
+   conservative path — it relies on the one that exists.
+3. **Disclose the missing adaptation.** The plan must state that no
+   injury/limitation information was available and that exercises were **not**
+   adapted for pain. Generic "some info is missing" is insufficient: the user has
+   to know which adaptation is absent to judge the risk.
+4. **Require explicit confirmation before activation**, through the A9 boundary.
+   The plan is generated and shown; it becomes active only on a deliberate tap.
+
+**Why confirmation rather than silent activation.** §2.3 of the specification
+requires no permanent change without approval, and this is the one gap where the
+cost of a wrong assumption is physical. Confirmation is also what makes the
+unknown state honest — the user is told what is missing *and* chooses anyway,
+rather than being handed a plan that silently assumed they are uninjured.
+
+- **Message**: the plan, plus an explicit line that no limitation information was
+  available and exercises were not adapted for pain.
+- **CTA**: two actions — answer the safety question now (upgrades the plan), or
+  confirm and activate as-is.
+- **Audit**: `outcome=degraded_safety_pending_confirmation`, then
+  `reason=safety_unknown_confirmed` on activation. Never the answer itself, and
+  never a medical detail.
+
+**What still blocks.** A *stated* limitation that cannot be honoured is a
+different matter and is not covered here: that is a plan-quality defect, not a
+readiness gap. See §4.
 
 ### `blocking_integrity` — the plan would be structurally invalid
 
@@ -155,16 +185,42 @@ it with a disclosure would be worse than refusing.
 
 ## 5. Summary
 
-| Class | Facts | Degradable |
-|---|---|---|
-| `blocking_safety` | `training_limitations` | **No** |
-| `blocking_integrity` | `weekly_availability`, `training_days_per_week` | **No** |
-| `degraded_personalization` | `session_minutes`, `strength_experience`, `equipment`, `training_location`, `primary_goal` | Yes, with disclosure |
-| `informational` | `workout_window`, `training_preferences`, `performance_goal` | N/A |
+| Class | Facts | Degradable | Activation |
+|---|---|---|---|
+| `degraded_safety` | `training_limitations` | Yes, under disclosure | **Explicit confirmation required** |
+| `blocking_integrity` | `weekly_availability`, `training_days_per_week` | **No** | Blocked |
+| `degraded_personalization` | `session_minutes`, `strength_experience`, `equipment`, `training_location`, `primary_goal` | Yes, with disclosure | Normal |
+| `informational` | `workout_window`, `training_preferences`, `performance_goal` | N/A | Normal |
 
-**Only one fact is safety-blocking.** Two more are structurally blocking. The
-remaining five already have conservative defaults in the builder — which is why a
-degraded plan is achievable without inventing a single new default.
+**No fact is a hard safety blocker.** Two are structurally blocking — without
+them there is no plan object to degrade. The remaining six already have
+conservative handling in the builder, which is why a degraded plan is achievable
+**without inventing a single new default or a new unknown state**: `KIND_GAP`
+already models "asked and not answered", and `limitations is None` already falls
+back rather than assuming "none".
+
+### Reuse assessment
+
+```
+Requirement:                 severity axis; unknown state; conservative fallback
+Existing mechanisms searched: questions.Question scores; KIND_GAP; READINESS_PROFILES;
+                              client_training_profile_from_facts; plan_mutations (A9)
+Found:                        Question.safety/plan_impact/... (questions.py:52-56)
+                              KIND_GAP as unanswered (questions.py:523)
+                              limitations-is-None fallback (training_intelligence.py:349)
+                              builder defaults (planning.py:165, :986, :1013)
+                              equipment fallback (training_intelligence.py:406)
+                              A9 boundary for the write (plan_mutations.py)
+Traced:                       check_plan_readiness -> assistant.py:580 (sole caller);
+                              READINESS_PROFILES["workout"] requires 8 facts vs the
+                              pre-screen's 2; _validate_plan_for_activation enforces both
+Decision:                     EXTEND -- propagate the existing scores; reuse KIND_GAP;
+                              reuse the existing conservative paths; write via A9
+Evidence for NEW:             none required; no new mechanism proposed
+Superseded paths retired:     build_weekly_plan's independent fact write (A10 removes it
+                              and drops onboarding.py from _ALLOWED_FACT_WRITER_FILES)
+Post-implementation search:   pending
+```
 
 ### Implementation constraints carried forward
 
