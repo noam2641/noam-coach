@@ -47,6 +47,78 @@ by that model.
 
 ---
 
+## 2a. Cross-cutting governance: REUSE BEFORE BUILD
+
+**Binding on every remaining item — A8, A10, A11b, A12, A13 and all later work.**
+
+Before adding or designing any new code path, helper, service, abstraction,
+table, migration, state model, callback, flow, audit event, logging mechanism,
+guard, API, background job or UI component, the assigned agent performs a
+repository-wide reuse check.
+
+This rule exists because this programme has already paid for its absence, twice
+over, in both directions:
+
+* **Duplication nearly shipped.** A5 was scoped as "three history readers" and a
+  full sweep found **six across five functions**. Building a fourth reader
+  without that sweep would have added to the problem the item existed to fix.
+* **Duplication nearly shipped again.** C10 claimed mid-workout pain never
+  reached `training_limitations`. The mirror already existed. Scoping that work
+  would have produced a **second, conflicting write of the same fact**.
+* **The mechanism already existed.** A10's classification assumed no severity
+  axis existed and one had to be invented. `questions.Question` has carried
+  `safety` / `plan_impact` / `urgency` / `uncertainty` / `burden` all along; the
+  real defect was that `check_plan_readiness` discarded them.
+
+### The check
+
+1. Search code, tests **and** the authoritative documents for functionality that
+   already solves all or part of the requirement.
+2. Trace what is found end to end: production callers, writers and readers, data
+   model, tests, logging/audit/observability, runtime registration and routing,
+   and known limitations.
+3. Prefer extending, repairing, consolidating or generalising the existing
+   mechanism over a parallel implementation.
+4. **An incomplete existing mechanism is a candidate for upgrade, not permission
+   to duplicate it.**
+5. Introduce something new only on concrete evidence that the existing
+   architecture cannot safely or cleanly support the requirement.
+6. Record that evidence in the task plan and the PR.
+7. Retire or migrate superseded paths — never leave two competing mechanisms in
+   production.
+8. Upgrade all existing callers, tests, logging and documentation **together**
+   with the shared mechanism.
+9. Re-run the search **after** implementation to confirm no duplicate or
+   abandoned path remains.
+
+### How it is enforced
+
+* Every task plan and every PR report carries a **Reuse assessment** section.
+* The agent completes it **before writing code**.
+* The Work Manager verifies it **independently** before approving implementation
+  or merge — an agent's assessment is a proposal with evidence, never acceptance.
+* A proposed new mechanism without that evidence **stops the task and returns it
+  to planning**.
+* Load-bearing reuse claims are verified by deliberate breakage or
+  characterization tests, consistent with the standing rule that a guard must be
+  seen to fail.
+
+### Reuse assessment template
+
+```
+## Reuse assessment
+Requirement:
+Existing mechanisms searched:      (code / tests / docs — what was searched for)
+Found:                             (with file:line)
+Traced:                            (callers, writers, readers, tests, observability)
+Decision:                          EXTEND | REPAIR | GENERALISE | NEW
+Evidence for NEW:                  (required when the decision is NEW)
+Superseded paths retired:
+Post-implementation search:        (confirms no duplicate remains)
+```
+
+---
+
 ## 3. Reconciliation ledger
 
 Recorded so the reasoning survives, and so no future session re-derives disproven work.
@@ -353,6 +425,42 @@ colon-part means, it silently falls out of `_SESSION_SCOPED_PREFIXES` handling.
 The orphan guard checks the prefix only, so it would still pass while the
 callback died in the handler. Keep part-2 numeric, or register the prefix as
 router-owned.
+
+### Ownership gap surfaced by A12 planning — assigned to A11b
+
+A12's reuse assessment found a requirement with **no owner**, which would have
+fallen through the seam between two items.
+
+**The substitution audit records no reason.** `callback_session.py:686-693`
+passes only `source` and `target` **[V]**. A12's consecutive-substitution
+detector needs to know *why* a swap happened — "the machine was occupied" and
+"it hurt" are not the same pattern, and promoting the wrong one is how a
+one-off becomes a permanent plan change.
+
+Two further facts make this more than an omission:
+
+* `("approve_substitution", "exercise")` is **not registered** in
+  `_AUDIT_ALLOWLIST` **[V]**, so it falls through to scalar-only. A `reason`
+  added without registering the pair would survive only if scalar, and a list
+  would vanish **silently** — the failure mode §2a exists to prevent.
+* The file is **A11b-owned**. A12 must not edit it.
+
+**Assigned to A11b**, which already owns `callback_session.py` for the
+alternatives re-ranking. A11b adds the bounded `reason` and registers the
+allowlist pair; A12 consumes it. Recorded here so the requirement is owned
+rather than discovered late by whichever item touches the file second.
+
+### Transport constraint confirmed by A12 (verified independently)
+
+`deliver_proactive_message` is called from **four** modules, all job or
+scheduler contexts — `runtime.py`, `health_jobs.py`, `morning_policy.py` and the
+`coach_bot` facade re-export. **Zero callback handlers** **[V]**.
+
+`claim_job_delivery` defers non-urgent messages while a flow is active **[V]**,
+and a workout *is* an active flow — so a workout-moment proposal sent through
+that pipeline is **silently dropped**, returning `False` with no exception. The
+two-transport split is therefore not a preference but a requirement: direct
+render at workout moments, the pipeline only for unsolicited proposals.
 
 ### Risk and value
 
