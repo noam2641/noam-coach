@@ -1189,3 +1189,67 @@ async def test_tapping_yes_after_declining_does_not_mutate(
         "a late yes overturned a recorded decline"
     )
     assert await _plan_version_count(db) == before
+
+
+@pytest.mark.asyncio
+async def test_a_decline_after_an_approval_keeps_the_longer_promise(
+    tmp_path, monkeypatch
+) -> None:
+    """The ordering rule, exercised through the LIFECYCLE path.
+
+    Deliberate breakage found this gap: the UPSERT existed twice -- once in
+    `record_cooldown`, once inline in `_finalize` -- and mutating one left the
+    other keeping the tests green. The SQL is now stated once, and this drives
+    it the way production does rather than calling the helper directly.
+    """
+    db = await _db(tmp_path, "lifecycle_order")
+    _bind(monkeypatch, db)
+    plan_id, signature, slot_id, source = await _active_plan(db)
+
+    # An approval promises 365 days.
+    approval_id = await _proposal(db, plan_id, signature, slot_id, source)
+    subject = sp.subject_of(signature, slot_id, "promoted_target")
+    assert await sp.approve(db, 1, approval_id) == sp.STATUS_APPROVED
+    row = await db.fetch_one(
+        "SELECT suppress_until FROM substitution_cooldowns WHERE user_id=1", ()
+    )
+    long_promise = str(row["suppress_until"])
+
+    # A later decline on the same subject promises only 56.
+    await db.execute(
+        "INSERT INTO approvals(id, user_id, kind, payload, status, created_at) "
+        "VALUES('later', 1, ?, ?, 'pending', ?)",
+        (sp.APPROVAL_KIND, json.dumps({"subject": subject}), utc_now()),
+    )
+    assert await sp.decline(db, 1, "later") == sp.STATUS_DECLINED
+
+    row = await db.fetch_one(
+        "SELECT suppress_until, decided_as, approval_id FROM substitution_cooldowns "
+        "WHERE user_id=1", ()
+    )
+    assert str(row["suppress_until"]) == long_promise, (
+        "the lifecycle path shortened a promise already made"
+    )
+    assert str(row["decided_as"]) == sp.STATUS_APPROVED, (
+        "the winning promise lost its provenance to a shorter later decision"
+    )
+    assert str(row["approval_id"]) == approval_id
+
+
+def test_the_cooldown_upsert_is_defined_exactly_once() -> None:
+    """Two copies of a rule drift, and this one did.
+
+    Deliberate breakage mutated the `record_cooldown` copy while the lifecycle
+    used an inline duplicate in `_finalize`, so the mutation survived with every
+    test green. Stating it once is what makes a single mutation observable.
+    """
+    from pathlib import Path as _Path
+
+    root = _Path(__file__).resolve().parents[1]
+    source = (root / "noam_coach" / "services" / "substitution_patterns.py").read_text(
+        encoding="utf-8"
+    )
+    assert source.count("suppress_until = MAX(") == 1, (
+        "the cooldown UPSERT is defined more than once; a mutation in one copy "
+        "will be masked by the other"
+    )

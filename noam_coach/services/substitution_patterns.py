@@ -360,26 +360,7 @@ async def record_cooldown(
     until = utc_iso(current + dt.timedelta(days=days))
 
     await db.execute(
-        """
-        INSERT INTO substitution_cooldowns(
-            user_id, subject, suppress_until, decided_as, approval_id,
-            decided_at, created_at, updated_at
-        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id, subject) DO UPDATE SET
-            decided_as = CASE
-                WHEN excluded.suppress_until > substitution_cooldowns.suppress_until
-                THEN excluded.decided_as ELSE substitution_cooldowns.decided_as END,
-            approval_id = CASE
-                WHEN excluded.suppress_until > substitution_cooldowns.suppress_until
-                THEN excluded.approval_id ELSE substitution_cooldowns.approval_id END,
-            decided_at = CASE
-                WHEN excluded.suppress_until > substitution_cooldowns.suppress_until
-                THEN excluded.decided_at ELSE substitution_cooldowns.decided_at END,
-            suppress_until = MAX(
-                substitution_cooldowns.suppress_until, excluded.suppress_until
-            ),
-            updated_at = excluded.updated_at
-        """,
+        _COOLDOWN_UPSERT,
         (user_id, subject, until, decided_as, approval_id, stamp, stamp, stamp),
     )
 
@@ -423,6 +404,36 @@ async def claim_status(
     return int(changed) == 1
 
 
+#: The one cooldown UPSERT. Stated ONCE because a rule written twice drifts:
+#: deliberate breakage mutated one copy and the tests stayed green, since the
+#: lifecycle path used the other.
+#:
+#: `MAX()` keeps the longest promise, and the CASE arms move `decided_as`,
+#: `approval_id` and `decided_at` together with it. Splitting them would let a
+#: 56-day decline landing after a 365-day approval leave the row claiming a
+#: decline is the reason for a year-long suppression.
+_COOLDOWN_UPSERT = """
+    INSERT INTO substitution_cooldowns(
+        user_id, subject, suppress_until, decided_as, approval_id,
+        decided_at, created_at, updated_at
+    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(user_id, subject) DO UPDATE SET
+        decided_as = CASE
+            WHEN excluded.suppress_until > substitution_cooldowns.suppress_until
+            THEN excluded.decided_as ELSE substitution_cooldowns.decided_as END,
+        approval_id = CASE
+            WHEN excluded.suppress_until > substitution_cooldowns.suppress_until
+            THEN excluded.approval_id ELSE substitution_cooldowns.approval_id END,
+        decided_at = CASE
+            WHEN excluded.suppress_until > substitution_cooldowns.suppress_until
+            THEN excluded.decided_at ELSE substitution_cooldowns.decided_at END,
+        suppress_until = MAX(
+            substitution_cooldowns.suppress_until, excluded.suppress_until
+        ),
+        updated_at = excluded.updated_at
+"""
+
+
 async def _finalize(
     db: Any,
     approval_id: str,
@@ -458,26 +469,7 @@ async def _finalize(
                 return False
             if subject:
                 await conn.execute(
-                    """
-                    INSERT INTO substitution_cooldowns(
-                        user_id, subject, suppress_until, decided_as, approval_id,
-                        decided_at, created_at, updated_at
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(user_id, subject) DO UPDATE SET
-                        decided_as = CASE
-                            WHEN excluded.suppress_until > substitution_cooldowns.suppress_until
-                            THEN excluded.decided_as ELSE substitution_cooldowns.decided_as END,
-                        approval_id = CASE
-                            WHEN excluded.suppress_until > substitution_cooldowns.suppress_until
-                            THEN excluded.approval_id ELSE substitution_cooldowns.approval_id END,
-                        decided_at = CASE
-                            WHEN excluded.suppress_until > substitution_cooldowns.suppress_until
-                            THEN excluded.decided_at ELSE substitution_cooldowns.decided_at END,
-                        suppress_until = MAX(
-                            substitution_cooldowns.suppress_until, excluded.suppress_until
-                        ),
-                        updated_at = excluded.updated_at
-                    """,
+                    _COOLDOWN_UPSERT,
                     (user_id, subject, until, become, approval_id, stamp, stamp, stamp),
                 )
     except Exception:
