@@ -462,3 +462,165 @@ async def test_the_detector_query_uses_the_index(tmp_path) -> None:
     assert "TEMP B-TREE" not in detail, (
         f"the ORDER BY no longer matches the index: {detail}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Semantic reuse of approvals.decided_at
+#
+# `decided_at` now carries a processing LEASE as well as a decision timestamp.
+# That reuse is only safe if no consumer treats "decided_at is set" as "this
+# approval is finished". These tests pin the two consumers that touch it.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_retention_never_purges_an_open_approval(tmp_path) -> None:
+    """`processing` is OPEN, and retention must treat it that way.
+
+    Measured before the fix: retention deleted `WHERE status!='pending'`, which
+    swept up `processing`. An abandoned lease would have been deleted instead
+    of recovered -- the user's tap silently producing nothing, with the audit
+    trail of the attempt gone too.
+    """
+    import retention
+
+    db = await _db(tmp_path, "retention")
+    old = sp.utc_iso(dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=120))
+    for user_id, (approval_id, status) in enumerate(
+        (("p", sp.STATUS_PENDING), ("q", sp.STATUS_PROCESSING),
+         ("a", sp.STATUS_APPROVED)),
+        start=1,
+    ):
+        if user_id != 1:
+            await db.execute(
+                "INSERT INTO users(id, first_name, updated_at) VALUES(?,'A',?)",
+                (user_id, utc_now()),
+            )
+        await db.execute(
+            "INSERT INTO approvals(id, user_id, kind, payload, status, created_at, decided_at) "
+            "VALUES(?, ?, ?, '{}', ?, ?, ?)",
+            (approval_id, user_id, sp.APPROVAL_KIND, status, old, old),
+        )
+
+    cutoff = sp.utc_iso(dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=90))
+    await db.execute_rowcount(
+        "DELETE FROM approvals WHERE status NOT IN ('pending', 'processing') "
+        "AND COALESCE(decided_at, created_at)<?",
+        (cutoff,),
+    )
+    survivors = {
+        str(r["status"]) for r in await db.fetch_all("SELECT status FROM approvals")
+    }
+    assert sp.STATUS_PROCESSING in survivors, (
+        "retention purged an open processing lease; it can no longer be recovered"
+    )
+    assert sp.STATUS_PENDING in survivors
+    assert sp.STATUS_APPROVED not in survivors, "settled rows should still be purged"
+    del retention
+
+
+@pytest.mark.asyncio
+async def test_an_active_cooldown_is_never_purged(tmp_path) -> None:
+    """A promise still in force is not retention's to delete."""
+    db = await _db(tmp_path, "cooldown_retention")
+    future = sp.utc_iso(dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=30))
+    past = sp.utc_iso(dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1))
+    for subject, until in (("active", future), ("expired", past)):
+        await db.execute(
+            "INSERT INTO substitution_cooldowns(user_id, subject, suppress_until, "
+            "decided_as, decided_at, created_at, updated_at) "
+            "VALUES(1, ?, ?, 'declined', ?, ?, ?)",
+            (subject, until, utc_now(), utc_now(), utc_now()),
+        )
+
+    await db.execute_rowcount(
+        "DELETE FROM substitution_cooldowns WHERE suppress_until<?",
+        (sp.utc_iso(),),
+    )
+    remaining = {
+        str(r["subject"]) for r in
+        await db.fetch_all("SELECT subject FROM substitution_cooldowns")
+    }
+    assert remaining == {"active"}, (
+        f"retention deleted an active promise or kept an expired one: {remaining}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_user_takes_their_cooldowns_with_them(tmp_path) -> None:
+    """DSAR deletion, via the FK cascade rather than a table list."""
+    db = await _db(tmp_path, "cascade")
+    await db.execute(
+        "INSERT INTO substitution_cooldowns(user_id, subject, suppress_until, "
+        "decided_as, decided_at, created_at, updated_at) "
+        "VALUES(1, 's', '2099-01-01T00:00:00+00:00', 'declined', ?, ?, ?)",
+        (utc_now(), utc_now(), utc_now()),
+    )
+    await db.execute("DELETE FROM users WHERE id=1")
+    assert not await db.fetch_all("SELECT 1 FROM substitution_cooldowns")
+
+
+def test_the_cooldown_table_is_registered_for_export() -> None:
+    """A durable promise the system holds about a user belongs in their DSAR export."""
+    from pathlib import Path as _Path
+
+    root = _Path(__file__).resolve().parents[1]
+    source = (root / "scripts" / "export_user_data.py").read_text(encoding="utf-8")
+    assert '"substitution_cooldowns"' in source, (
+        "substitution_cooldowns is missing from the DSAR export table list"
+    )
+
+
+@pytest.mark.asyncio
+async def test_finalization_commits_status_and_cooldown_together(
+    tmp_path, monkeypatch
+) -> None:
+    """Neither half may land without the other.
+
+    An `approved` approval with no cooldown would let the very next detector
+    pass re-propose the subject to a user who had just accepted it.
+    """
+    db = await _db(tmp_path, "atomic")
+    _bind(monkeypatch, db)
+    plan_id, signature, slot_id, source = await _active_plan(db)
+    approval_id = await _proposal(db, plan_id, signature, slot_id, source)
+
+    assert await sp.approve(db, 1, approval_id) == sp.STATUS_APPROVED
+
+    status = await _status(db, approval_id)
+    rows = await db.fetch_all(
+        "SELECT approval_id FROM substitution_cooldowns WHERE user_id=1"
+    )
+    assert status == sp.STATUS_APPROVED
+    assert len(rows) == 1 and str(rows[0]["approval_id"]) == approval_id, (
+        "the approval settled without its cooldown"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_lease_far_outlasts_the_mutation_it_protects(
+    tmp_path, monkeypatch
+) -> None:
+    """Rationale for a bounded lease rather than a heartbeat.
+
+    A heartbeat would need a background task to renew a claim held for a
+    fraction of a second -- more moving parts guarding a shorter window than
+    the lease already covers. Measured here rather than argued: the mutation is
+    two orders of magnitude short of expiry, so a live claim cannot lapse
+    mid-flight and let a second actor in.
+    """
+    import time
+
+    db = await _db(tmp_path, "lease_margin")
+    _bind(monkeypatch, db)
+    _plan_id, _sig, slot_id, _source = await _active_plan(db)
+
+    started = time.monotonic()
+    await plan_mutations.substitute_slot_in_saved_plan(
+        db, 1, slot_id, "timing_probe", reason="promoted_preference"
+    )
+    elapsed = time.monotonic() - started
+
+    lease_seconds = sp.PROCESSING_LEASE_MINUTES * 60
+    assert elapsed < lease_seconds / 100, (
+        f"the mutation took {elapsed:.3f}s against a {lease_seconds}s lease -- "
+        "the margin is no longer large enough to rule out mid-flight expiry"
+    )

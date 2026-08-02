@@ -423,6 +423,71 @@ async def claim_status(
     return int(changed) == 1
 
 
+async def _finalize(
+    db: Any,
+    approval_id: str,
+    user_id: int,
+    *,
+    become: str,
+    subject: str,
+    days: int,
+    now: dt.datetime | None = None,
+) -> bool:
+    """Commit the final status AND its cooldown together, or neither.
+
+    Two statements outside a transaction would leave a window in which the
+    approval reads `approved` while no promise exists -- and the next detector
+    pass would propose the same subject again, immediately, to a user who had
+    just answered it. `db.transaction()` issues BEGIN IMMEDIATE, so the pair is
+    atomic and the conditional UPDATE inside it still decides the single winner.
+
+    Returns whether THIS caller performed the finalization.
+    """
+    stamp = utc_iso(now)
+    until = utc_iso(
+        (now or dt.datetime.now(dt.timezone.utc)) + dt.timedelta(days=days)
+    )
+    try:
+        async with db.transaction() as conn:
+            cursor = await conn.execute(
+                "UPDATE approvals SET status=?, decided_at=? "
+                "WHERE id=? AND user_id=? AND status=?",
+                (become, stamp, approval_id, user_id, STATUS_PROCESSING),
+            )
+            if int(cursor.rowcount) != 1:
+                return False
+            if subject:
+                await conn.execute(
+                    """
+                    INSERT INTO substitution_cooldowns(
+                        user_id, subject, suppress_until, decided_as, approval_id,
+                        decided_at, created_at, updated_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(user_id, subject) DO UPDATE SET
+                        decided_as = CASE
+                            WHEN excluded.suppress_until > substitution_cooldowns.suppress_until
+                            THEN excluded.decided_as ELSE substitution_cooldowns.decided_as END,
+                        approval_id = CASE
+                            WHEN excluded.suppress_until > substitution_cooldowns.suppress_until
+                            THEN excluded.approval_id ELSE substitution_cooldowns.approval_id END,
+                        decided_at = CASE
+                            WHEN excluded.suppress_until > substitution_cooldowns.suppress_until
+                            THEN excluded.decided_at ELSE substitution_cooldowns.decided_at END,
+                        suppress_until = MAX(
+                            substitution_cooldowns.suppress_until, excluded.suppress_until
+                        ),
+                        updated_at = excluded.updated_at
+                    """,
+                    (user_id, subject, until, become, approval_id, stamp, stamp, stamp),
+                )
+    except Exception:
+        LOGGER.exception(
+            "substitution_finalize_failed user_id=%s status=%s", user_id, become
+        )
+        return False
+    return True
+
+
 async def reclaim_abandoned(
     db: Any,
     approval_id: str,
@@ -535,24 +600,25 @@ async def decline(db: Any, user_id: int, approval_id: str, *, now: dt.datetime |
     )
     if not row:
         return STATUS_STALE
-    if not await claim_status(
-        db, approval_id, user_id, expect=STATUS_PENDING, become=STATUS_DECLINED
-    ):
-        # Someone already decided this. Not an error -- the durable answer
-        # stands and no second cooldown is written.
-        return STATUS_DECLINED
-
     try:
         payload = json.loads(row["payload"] or "{}")
     except (TypeError, ValueError):
         payload = {}
     subject = str(payload.get("subject") or "")
-    if subject:
-        await record_cooldown(
-            db, user_id, subject,
-            decided_as=STATUS_DECLINED, approval_id=approval_id,
-            days=DECLINE_COOLDOWN_DAYS, now=now,
-        )
+
+    # A decline goes straight from `pending` to `declined` -- there is no
+    # mutation to protect, so no lease is needed. The status and the promise
+    # still commit together: a decline recorded without its cooldown would
+    # re-ask the question the user just refused.
+    if not await claim_status(
+        db, approval_id, user_id, expect=STATUS_PENDING, become=STATUS_PROCESSING
+    ):
+        # Someone already decided this. The durable answer stands.
+        return STATUS_DECLINED
+    await _finalize(
+        db, approval_id, user_id, become=STATUS_DECLINED,
+        subject=subject, days=DECLINE_COOLDOWN_DAYS, now=now,
+    )
     return STATUS_DECLINED
 
 
@@ -619,15 +685,10 @@ async def approve(db: Any, user_id: int, approval_id: str, *, now: dt.datetime |
     # completed work as stale, and the cooldown is never written. Checking the
     # applied state first turns that into the finalize-only path it should be.
     if await _already_applied(db, user_id, slot_id, target):
-        await claim_status(
-            db, approval_id, user_id, expect=STATUS_PROCESSING, become=STATUS_APPROVED
+        await _finalize(
+            db, approval_id, user_id, become=STATUS_APPROVED,
+            subject=subject, days=APPROVE_COOLDOWN_DAYS, now=now,
         )
-        if subject:
-            await record_cooldown(
-                db, user_id, subject,
-                decided_as=STATUS_APPROVED, approval_id=approval_id,
-                days=APPROVE_COOLDOWN_DAYS, now=now,
-            )
         LOGGER.info("substitution_promotion_finalized user_id=%s applied=already", user_id)
         return STATUS_APPROVED
 
@@ -655,15 +716,10 @@ async def approve(db: Any, user_id: int, approval_id: str, *, now: dt.datetime |
         # and only finalization was missing. Finalize; do not mutate again.
         plan_mutations.OUTCOME_NO_CHANGE,
     ):
-        await claim_status(
-            db, approval_id, user_id, expect=STATUS_PROCESSING, become=STATUS_APPROVED
+        await _finalize(
+            db, approval_id, user_id, become=STATUS_APPROVED,
+            subject=subject, days=APPROVE_COOLDOWN_DAYS, now=now,
         )
-        if subject:
-            await record_cooldown(
-                db, user_id, subject,
-                decided_as=STATUS_APPROVED, approval_id=approval_id,
-                days=APPROVE_COOLDOWN_DAYS, now=now,
-            )
         LOGGER.info(
             "substitution_promoted user_id=%s outcome=%s", user_id, outcome.outcome
         )
