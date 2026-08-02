@@ -765,8 +765,30 @@ def _schedule_sessions(
     # The keys come from the split DEFINITION instead, so reordering a split
     # moves a session without renaming it.
     session_keys = workout_slots.session_keys_for_split(split, declared_session_keys)
+    if len(session_keys) != len(split):
+        # FAIL CLOSED. A split whose declared keys do not match it is a
+        # CONFIGURATION defect, and building anyway is the worst of the
+        # options: measured, it saved candidates whose every entry carried
+        # `slot_id=None`, so identity-less slots reached stored plans and no
+        # later surface could tell them from a legacy payload.
+        #
+        # Refusing here means no fallback key is invented, no partial candidate
+        # is saved, and nothing is rendered or activated. The reason code is
+        # bounded and the counts are integers -- enough to locate the defect,
+        # with no split contents in the message.
+        # `planning` declares no logger; reuse the module that owns this
+        # policy rather than introducing a second logging mechanism.
+        workout_slots.LOGGER.error(
+            "split_session_key_mismatch codes=%d declared=%d",
+            len(split),
+            len(session_keys),
+        )
+        raise PlanningBlockedError(
+            "לא הצלחתי לבנות תוכנית אימון תקינה. בוא נשלים פרטים ונבנה מחדש.",
+            missing=["workout_plan_session_keys"],
+        )
     for index, (slot, code) in enumerate(zip(selected, split, strict=True)):
-        session_key = session_keys[index] if index < len(session_keys) else None
+        session_key = session_keys[index]
         session_occurrence = workout_slots.mint_session_occurrence(session_key)
         exercises = copy.deepcopy(PLANS[code]["exercises"])
         # A11b: mint slot identity HERE -- on the template copy, before

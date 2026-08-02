@@ -1959,3 +1959,109 @@ async def test_override_and_default_plans_do_not_share_session_identities(
             f"{candidate.strategy} shares session identities {identities & default_keys} "
             "with the default 3-day split"
         )
+
+
+# ---------------------------------------------------------------------------
+# Fail closed on a split/key configuration mismatch
+#
+# Measured BEFORE this guard existed: with 3 codes and 2 declared keys, the
+# error was logged and the build continued. Two of three candidates were SAVED
+# with `session_occurrence=None` and every entry carrying `slot_id=None` --
+# identity-less slots reaching stored plans, indistinguishable afterwards from
+# a legacy payload.
+#
+# Logging a defect while persisting its output is the worst of the options: the
+# damage is durable and the log is the only trace.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_a_split_key_mismatch_fails_closed(tmp_path, monkeypatch, caplog) -> None:
+    """No invented key, no partial candidate, nothing rendered or activated."""
+    import logging
+
+    import exercise_plans
+    import planning as _planning
+
+    db = Database(str(tmp_path / "mismatch.db"))
+    await db.init()
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(1,'A',NULL,?)",
+        (utc_now(),),
+    )
+    _bind(monkeypatch, db)
+    for key, value in _WORKOUT_FACTS.items():
+        await user_model.set_fact(
+            db, 1, key, value,
+            kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
+        )
+
+    # 3 codes, 2 declared keys. monkeypatch restores both bindings afterwards.
+    monkeypatch.setitem(exercise_plans.SESSION_KEYS_BY_FREQUENCY, 3, ["only", "two"])
+    monkeypatch.setitem(_planning.SESSION_KEYS_BY_FREQUENCY, 3, ["only", "two"])
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(_planning.PlanningBlockedError) as excinfo:
+            await _planning.generate_candidates(db, 1, "workout")
+
+    # 1. Observable, with bounded details.
+    emitted = "\n".join(r.message for r in caplog.records)
+    assert "split_session_key_mismatch" in emitted, (
+        f"the configuration defect must be observable; log was: {emitted[:200]}"
+    )
+    assert "codes=3" in emitted and "declared=0" in emitted, emitted
+    for leaked in ("abc1_a", "['A', 'B', 'C']", "only", "two"):
+        assert leaked not in emitted, (
+            f"{leaked!r} reached the log; details must be bounded counts"
+        )
+    assert "workout_plan_session_keys" in (getattr(excinfo.value, "missing", None) or []), (
+        "the refusal must carry a bounded reason code"
+    )
+
+    # 2. No candidate saved -- not even a partial one.
+    rows = await db.fetch_all("SELECT id, status FROM plan_versions WHERE user_id=1")
+    assert rows == [] or len(rows) == 0, (
+        f"{len(rows)} candidate rows were saved despite the configuration defect"
+    )
+
+    # 3. Nothing active, and no governed fact written.
+    active = await db.fetch_one(
+        "SELECT plan_id FROM active_plans WHERE user_id=1 AND plan_type='workout'"
+    )
+    assert active is None
+    assert await user_model.get_value(db, 1, "active_workout_plan") is None
+
+    # 4. No fallback identity was invented anywhere.
+    assert slots.session_keys_for_split(["A", "B", "C"], ["only", "two"]) == []
+
+
+@pytest.mark.asyncio
+async def test_a_mismatched_split_renders_nothing(tmp_path, monkeypatch) -> None:
+    """The refusal happens before any plan text exists to show."""
+    import exercise_plans
+    import planning as _planning
+
+    db = Database(str(tmp_path / "mismatch_render.db"))
+    await db.init()
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(1,'A',NULL,?)",
+        (utc_now(),),
+    )
+    _bind(monkeypatch, db)
+    from noam_coach.bot import onboarding
+
+    monkeypatch.setattr(onboarding, "DB", db, raising=False)
+    for key, value in _WORKOUT_FACTS.items():
+        await user_model.set_fact(
+            db, 1, key, value,
+            kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
+        )
+    monkeypatch.setitem(exercise_plans.SESSION_KEYS_BY_FREQUENCY, 3, ["only", "two"])
+    monkeypatch.setitem(_planning.SESSION_KEYS_BY_FREQUENCY, 3, ["only", "two"])
+
+    plan = await onboarding.build_weekly_plan(1, 3)
+
+    assert not plan.get("plan_id"), (
+        "a mismatched configuration produced an activatable plan id"
+    )
+    rows = await db.fetch_all("SELECT id FROM plan_versions WHERE user_id=1")
+    assert len(rows) == 0, f"{len(rows)} candidates stored despite the defect"
+    assert await user_model.get_value(db, 1, "active_workout_plan") is None
