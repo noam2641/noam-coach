@@ -80,6 +80,19 @@ APPROVE_COOLDOWN_DAYS = 365
 LOOKBACK_DAYS = 56
 MAX_ROWS = 200
 
+#: How long a `processing` claim is honoured before it is considered abandoned.
+#:
+#: `processing` is a LEASE, not a lock. A process that dies mid-mutation cannot
+#: release it, so without an expiry the approval would be stranded forever and
+#: the user's tap would never produce an answer. Twenty minutes matches the
+#: existing `proactive_claim_ttl_minutes` default, so the codebase has one
+#: notion of "a claim this old belongs to a process that is gone".
+#:
+#: The lease is carried by `approvals.decided_at`, which `claim_status` already
+#: stamps on every transition -- no schema change. Checked in this module rather
+#: than trusted from a read, because the reclaim must be a compare-and-set.
+PROCESSING_LEASE_MINUTES = 20
+
 _AUDIT_ACTION = "approve_substitution"
 
 
@@ -410,6 +423,42 @@ async def claim_status(
     return int(changed) == 1
 
 
+async def reclaim_abandoned(
+    db: Any,
+    approval_id: str,
+    user_id: int,
+    *,
+    now: dt.datetime | None = None,
+) -> bool:
+    """Atomically take over a `processing` row whose lease has expired.
+
+    This is what makes crash recovery real rather than asserted. After a crash
+    between the mutation and finalization the row is `processing`, and the
+    ordinary `pending -> processing` claim can never match it again -- so
+    without this the approval is stranded and the user's tap has no outcome.
+
+    The reclaim is a single conditional UPDATE, not a read-then-act: the
+    `decided_at < ?` predicate is evaluated by SQLite inside the same statement
+    that flips the row, so of two callers racing to recover the same approval
+    exactly one sees `rowcount == 1`. A read followed by a write would let both
+    read the same stale timestamp and both proceed.
+
+    Re-stamping `decided_at` renews the lease, so a recovery that itself dies is
+    recoverable in turn -- no row can be stranded permanently.
+    """
+    cutoff = utc_iso(
+        (now or dt.datetime.now(dt.timezone.utc))
+        - dt.timedelta(minutes=PROCESSING_LEASE_MINUTES)
+    )
+    changed = await db.execute_rowcount(
+        "UPDATE approvals SET decided_at=? "
+        "WHERE id=? AND user_id=? AND status=? AND decided_at IS NOT NULL "
+        "AND decided_at < ?",
+        (utc_iso(now), approval_id, user_id, STATUS_PROCESSING, cutoff),
+    )
+    return int(changed) == 1
+
+
 async def propose(
     db: Any,
     user_id: int,
@@ -526,11 +575,20 @@ async def approve(db: Any, user_id: int, approval_id: str, *, now: dt.datetime |
     if status not in (STATUS_PENDING, STATUS_PROCESSING):
         return status
 
-    if status == STATUS_PENDING and not await claim_status(
-        db, approval_id, user_id, expect=STATUS_PENDING, become=STATUS_PROCESSING
-    ):
-        # Lost the race. The winner owns the mutation.
-        return STATUS_PROCESSING
+    if status == STATUS_PENDING:
+        if not await claim_status(
+            db, approval_id, user_id, expect=STATUS_PENDING, become=STATUS_PROCESSING
+        ):
+            # Lost the race. The winner owns the mutation.
+            return STATUS_PROCESSING
+    else:
+        # Already `processing`. Either another caller is mid-mutation right now
+        # -- in which case this tap must not act -- or a process died and left
+        # the lease behind. Only an EXPIRED lease may be reclaimed, and only by
+        # the single caller whose conditional UPDATE matches.
+        if not await reclaim_abandoned(db, approval_id, user_id, now=now):
+            return STATUS_PROCESSING
+        LOGGER.info("substitution_promotion_recovered user_id=%s", user_id)
 
     try:
         payload = json.loads(row["payload"] or "{}")
@@ -550,11 +608,32 @@ async def approve(db: Any, user_id: int, approval_id: str, *, now: dt.datetime |
         )
         return STATUS_FAILED
 
+    from noam_coach.services import plan_mutations
+
+    # ALREADY APPLIED takes precedence over every staleness guard, and the
+    # ordering is load-bearing rather than cosmetic.
+    #
+    # Measured: the A9 boundary is copy-on-write, so a SUCCESSFUL mutation
+    # always activates a NEW plan version -- id 1 becomes id 4. On recovery the
+    # `expected_active_plan_id` guard therefore rejects the promotion's own
+    # completed work as stale, and the cooldown is never written. Checking the
+    # applied state first turns that into the finalize-only path it should be.
+    if await _already_applied(db, user_id, slot_id, target):
+        await claim_status(
+            db, approval_id, user_id, expect=STATUS_PROCESSING, become=STATUS_APPROVED
+        )
+        if subject:
+            await record_cooldown(
+                db, user_id, subject,
+                decided_as=STATUS_APPROVED, approval_id=approval_id,
+                days=APPROVE_COOLDOWN_DAYS, now=now,
+            )
+        LOGGER.info("substitution_promotion_finalized user_id=%s applied=already", user_id)
+        return STATUS_APPROVED
+
     # The split must still be the one the proposal was built against. Checked
     # here rather than inside A9's boundary because it is A12's contract, not
     # the mutation boundary's.
-    from noam_coach.services import plan_mutations
-
     active = await _active_plan_signature(db, user_id)
     if active is not None and expected_signature and active != expected_signature:
         await claim_status(
@@ -610,6 +689,32 @@ async def approve(db: Any, user_id: int, approval_id: str, *, now: dt.datetime |
     return STATUS_FAILED
 
 
+async def _already_applied(db: Any, user_id: int, slot_id: str, target: str) -> bool:
+    """True when the active plan's slot already holds the promoted exercise.
+
+    The crash-recovery discriminator. It reads the CURRENT active plan on
+    purpose -- unlike evidence classification, "is this change already in
+    effect" is a question about now, not about history.
+    """
+    try:
+        import planning
+        from noam_coach.services import workout_slots
+
+        active = await planning.get_active_plan(db, user_id, "workout")
+    except Exception:
+        LOGGER.exception("already_applied_check_failed user_id=%s", user_id)
+        return False
+    if not active:
+        return False
+    for session in (active.get("payload") or {}).get("sessions") or []:
+        if not isinstance(session, dict):
+            continue
+        found = workout_slots.find_by_slot_id(session.get("exercises"), slot_id)
+        if found is not None:
+            return str(found[1].get("id") or "") == str(target)
+    return False
+
+
 async def _active_plan_signature(db: Any, user_id: int) -> str | None:
     """Split signature of the CURRENT active workout plan, or None."""
     try:
@@ -630,6 +735,7 @@ __all__ = [
     "claim_status",
     "decline",
     "propose",
+    "reclaim_abandoned",
     "collect_evidence",
     "find_promotable",
     "is_suppressed",
@@ -640,6 +746,7 @@ __all__ = [
     "MAX_ROWS",
     "OPEN_STATUSES",
     "PROMOTABLE_REASONS",
+    "PROCESSING_LEASE_MINUTES",
     "PROMOTION_THRESHOLD",
     "STATUS_APPROVED",
     "STATUS_DECLINED",
