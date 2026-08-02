@@ -2104,3 +2104,50 @@ async def test_a_coincidental_target_under_another_split_is_stale(
         db, 1, slot_id, source, expected_signature="ffffffffffffffff"
     ), "a different split was accepted as already applied"
     del approval_id, plan_id
+
+
+@pytest.mark.asyncio
+async def test_the_first_real_set_defines_what_was_performed(
+    tmp_path, monkeypatch
+) -> None:
+    """Occurrence rules, pinned on the two that actually change the answer.
+
+    A split set writes a `telegram_split_secondary` row for its second half,
+    and a replayed callback can add another row later. Both are ordered around
+    the real set, so the slot's occurrence must be decided by the FIRST genuine
+    set -- otherwise the recorded history says the user trained something they
+    did not, and the streak is built on it.
+    """
+    db = await _db(tmp_path, "first_set_wins")
+    _bind(monkeypatch, db)
+    plan_id, signature = await _active_rt_plan(db, activate=False)
+    stamp = _days_ago(20)
+    await db.execute(
+        "INSERT INTO sessions(id, user_id, code, name, plan, status, "
+        "exercise_index, set_number, started_at, ended_at) "
+        "VALUES(101, 1, 'A', 'A', ?, 'completed', 0, 1, ?, ?)",
+        (json.dumps(_one_exercise_plan("hack_squat")), stamp, stamp),
+    )
+    # Ordered deliberately: a split-secondary FIRST, the real set second, a
+    # replay last. Only the middle row is what the user actually performed.
+    for exercise, source in (
+        ("leg_press", "telegram_split_secondary"),
+        ("hack_squat", "telegram_one_tap"),
+        ("leg_press", "telegram_one_tap"),
+    ):
+        await db.execute(
+            "INSERT INTO sets(session_id, exercise_id, exercise_name, set_number, "
+            "weight, reps, rir, source, exercise_index, created_at) "
+            "VALUES(101, ?, ?, 1, 60, 10, 2, ?, 0, ?)",
+            (exercise, exercise, source, stamp),
+        )
+    await _substitution_audit(db, 101, signature=signature, plan_id=plan_id)
+
+    evidence = await sp.collect_evidence(db, 1)
+    history = evidence["slot_history"].get(_RT_SLOT) or {}
+
+    assert len(history) == 1, "one session produced more than one occurrence"
+    assert history["101"][1] == "hack_squat", (
+        "the occurrence was decided by a split-secondary or a replayed set "
+        "rather than by the first real set"
+    )
