@@ -624,3 +624,60 @@ async def test_the_lease_far_outlasts_the_mutation_it_protects(
         f"the mutation took {elapsed:.3f}s against a {lease_seconds}s lease -- "
         "the margin is no longer large enough to rule out mid-flight expiry"
     )
+
+
+# ---------------------------------------------------------------------------
+# Transport
+# ---------------------------------------------------------------------------
+def test_every_lifecycle_outcome_has_its_own_user_facing_sentence() -> None:
+    """Collapsing outcomes into one "done" is the UI version of the data defect.
+
+    Telling a user their preference was saved when it was refused as stale is
+    exactly the confusion this item exists to prevent at the data layer; it
+    must not reappear at the surface. Asserted at the source because the
+    alternative is five callback round-trips testing the fake query harness
+    more than the copy.
+    """
+    from pathlib import Path as _Path
+
+    root = _Path(__file__).resolve().parents[1]
+    source = (root / "noam_coach" / "bot" / "callback_plans.py").read_text(
+        encoding="utf-8"
+    )
+    start = source.index('if data.startswith("planv2:promote:")')
+    block = source[start : start + 3000]
+
+    for status in (
+        "STATUS_APPROVED", "STATUS_PROCESSING", "STATUS_DECLINED", "STATUS_STALE",
+    ):
+        assert status in block, f"{status} has no explicit branch"
+    assert "else:" in block, "the failed outcome has no fallback branch"
+
+    # And the sentences must differ -- five branches saying the same thing is
+    # the collapse this test exists to prevent.
+    import re as _re
+
+    sentences = _re.findall(r'text = \(?\s*"([^"]+)"', block)
+    assert len(set(sentences)) >= 4, f"outcomes share wording: {sentences}"
+
+
+def test_the_promotion_callback_reuses_the_registered_planv2_family() -> None:
+    """No new top-level prefix, so no registration surface can be missed.
+
+    `planv2:` is already router-owned, already debounced and already covered by
+    the orphan guard. A brand-new prefix would have needed all three updated in
+    lockstep -- the exact failure mode A11b found when `sub` sat in an allowlist
+    while being invisible to the scanner.
+    """
+    from pathlib import Path as _Path
+
+    root = _Path(__file__).resolve().parents[1]
+    router = (root / "noam_coach" / "bot" / "callback_router.py").read_text(
+        encoding="utf-8"
+    )
+    guard = (root / "tests" / "regression" / "test_re10_regression.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert '"planv2:promote:"' in router, "the promotion prefix is not debounced"
+    assert '"planv2"' in guard, "planv2 is not registered with the orphan guard"

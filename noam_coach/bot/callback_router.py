@@ -170,6 +170,9 @@ _DEBOUNCE_PREFIXES = (
     # activate_plan/build_morning_menu_text guards for the non-debounce half
     # of this fix.
     "planv2:select:",
+    # A12: the promotion answer mutates the saved plan, so a double tap must
+    # be trimmed before it reaches the lifecycle claim.
+    "planv2:promote:",
     "menu:refresh_daily_menu",
     "menu:daily_menu",
 )

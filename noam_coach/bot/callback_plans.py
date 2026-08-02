@@ -1657,6 +1657,57 @@ async def handle_plan_callback(query: Any, user_id: int, data: str) -> bool:
         await render_workout_exercise_review(query, user_id, int(raw_id))
         return True
 
+    if data.startswith("planv2:promote:"):
+        # A12: the promotion answer. Deliberately inside the EXISTING `planv2:`
+        # family rather than a new top-level prefix -- `planv2:` is already
+        # router-owned, already debounced, and already covered by the orphan
+        # guard, so reusing it means no new registration surface can be missed.
+        #
+        # Every lifecycle outcome gets its own sentence. Collapsing them into
+        # one "done" would tell a user their preference was saved when it was
+        # refused as stale, which is the failure this whole item exists to
+        # avoid at the data layer -- it must not reappear at the UI layer.
+        from noam_coach.services import substitution_patterns as _sp
+
+        parts_p = data.split(":")
+        if len(parts_p) < 4:
+            return True
+        decision = parts_p[2]
+        approval_id = parts_p[3]
+        if decision not in ("yes", "no"):
+            return True
+
+        if decision == "no":
+            await _sp.decline(DB, user_id, approval_id)
+            await safe_edit(
+                query,
+                "בסדר, נשאיר את התוכנית כמו שהיא. לא אשאל על זה שוב בקרוב.",
+                home_keyboard(),
+            )
+            return True
+
+        outcome = await _sp.approve(DB, user_id, approval_id)
+
+        if outcome == _sp.STATUS_APPROVED:
+            text = "עודכן ✅ מהאימון הבא התוכנית תשתמש בתרגיל הזה."
+        elif outcome == _sp.STATUS_PROCESSING:
+            # A live claim is being worked by another tap right now. Saying
+            # "already done" would be a guess; saying nothing would look broken.
+            text = "רגע, אני עוד מעדכן את זה. תיכף יופיע."
+        elif outcome == _sp.STATUS_DECLINED:
+            text = "כבר עניתָ על זה קודם."
+        elif outcome == _sp.STATUS_STALE:
+            # The plan or the slot moved on. Honest about why nothing changed.
+            text = (
+                "התוכנית השתנתה מאז שהצעתי את זה, אז לא שיניתי כלום. "
+                "אם עדיין רלוונטי — אציע שוב."
+            )
+        else:
+            text = "לא הצלחתי לעדכן את התוכנית. נסה שוב מאוחר יותר."
+
+        await safe_edit(query, text, home_keyboard())
+        return True
+
     if data.startswith("planv2:select:"):
         parts_v2 = data.split(":")
         if len(parts_v2) < 3 or not parts_v2[2].isdigit():
