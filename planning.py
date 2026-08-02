@@ -1039,16 +1039,35 @@ def repair_workout_payload(payload: dict[str, Any], *, default_minutes: int = 45
         # `(slot_id or id)` keeps the cosmetic-duplicate repair for legacy
         # payloads while making a genuine duplicate SLOT the only thing that
         # collapses.
-        seen: set[str] = set()
+        # A11b: dedupe on BOTH axes, because they mean different things.
+        #
+        # A repeated slot id is a corrupt payload -- one professional need
+        # cannot appear twice in a session -- so the repeat is dropped.
+        #
+        # A repeated exercise id within one session is also dropped, and that
+        # rule is KEPT rather than relaxed: `workout_quality_issues` flags a
+        # duplicated exercise, and an unrepairable candidate is discarded whole
+        # by `_repair_workout_candidates`. Removing this rule silently reduced
+        # three offered strategies to one, because two candidates became
+        # unrepairable -- measured, not predicted.
+        #
+        # The slot model still holds: two slots may share an exercise across
+        # DIFFERENT sessions (`A#0:press_primary` and `A#1:press_primary` both
+        # implemented by `bench`), which this per-session loop never compares.
+        seen_slots: set[str] = set()
+        seen_exercises: set[str] = set()
         deduped: list[dict[str, Any]] = []
         for exercise in session.get("exercises") or []:
             exercise_id = str(exercise.get("id") or "").strip()
             slot_id = str(exercise.get("slot_id") or "").strip()
-            dedupe_key = slot_id or exercise_id
-            if dedupe_key and dedupe_key in seen:
+            if slot_id and slot_id in seen_slots:
                 continue
-            if dedupe_key:
-                seen.add(dedupe_key)
+            if exercise_id and exercise_id in seen_exercises:
+                continue
+            if slot_id:
+                seen_slots.add(slot_id)
+            if exercise_id:
+                seen_exercises.add(exercise_id)
             # Clamp obviously invalid prescriptions.
             try:
                 sets = int(exercise.get("sets") or 0)

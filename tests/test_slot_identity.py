@@ -404,19 +404,86 @@ async def test_no_slot_is_deleted_by_a_substitution(tmp_path, monkeypatch) -> No
     assert before == after, "a substitution must never add or remove a slot"
 
 
-def test_repair_cannot_silently_delete_a_slot() -> None:
-    """`repair_workout_payload` dedupes by exercise id.
+def test_repair_keeps_two_slots_that_share_an_exercise_across_sessions() -> None:
+    """A slot is a need; two needs may be met by the same movement.
 
-    Two slots legitimately sharing one exercise must both survive — dropping
-    one would delete a professional need to fix a cosmetic duplicate.
+    Keying repair's dedupe on `exercise_id` alone deleted the second, which is
+    a silent slot deletion. Across sessions -- a programme that presses on
+    Monday and again on Thursday -- both must survive.
     """
     payload = {
         "sessions": [
             {
-                "code": "A",
-                "weekday": 0,
-                "time": "18:00",
-                "minutes": 45,
+                "code": "A", "weekday": 0, "time": "18:00", "minutes": 45,
+                "session_occurrence": "A#0",
+                "exercises": [
+                    {"slot_id": "A#0:press", "id": "bench",
+                     "sets": 3, "rmin": 8, "rmax": 12},
+                ],
+            },
+            {
+                "code": "A", "weekday": 3, "time": "18:00", "minutes": 45,
+                "session_occurrence": "A#1",
+                "exercises": [
+                    {"slot_id": "A#1:press", "id": "bench",
+                     "sets": 3, "rmin": 8, "rmax": 12},
+                ],
+            },
+        ]
+    }
+    repaired = planning.repair_workout_payload(payload)
+    surviving = [
+        e.get("slot_id")
+        for s in repaired["sessions"]
+        for e in s["exercises"]
+    ]
+
+    assert surviving == ["A#0:press", "A#1:press"], (
+        "repair deleted a slot that shares an exercise with another session; "
+        "two needs may be met by the same movement"
+    )
+
+
+def test_repair_drops_a_repeated_slot_id_within_one_session() -> None:
+    """One professional need cannot appear twice in the same session.
+
+    That is a corrupt payload, not a legitimate repeat, so the duplicate is
+    removed rather than rendered twice.
+    """
+    payload = {
+        "sessions": [
+            {
+                "code": "A", "weekday": 0, "time": "18:00", "minutes": 45,
+                "exercises": [
+                    {"slot_id": "A#0:press", "id": "bench",
+                     "sets": 3, "rmin": 8, "rmax": 12},
+                    {"slot_id": "A#0:press", "id": "db_press",
+                     "sets": 3, "rmin": 8, "rmax": 12},
+                ],
+            }
+        ]
+    }
+    repaired = planning.repair_workout_payload(payload)
+    surviving = [e["slot_id"] for e in repaired["sessions"][0]["exercises"]]
+
+    assert surviving == ["A#0:press"]
+
+
+def test_repair_still_collapses_a_repeated_exercise_within_one_session() -> None:
+    """The pre-A11b rule, KEPT deliberately rather than relaxed.
+
+    `workout_quality_issues` flags a duplicated exercise and
+    `_repair_workout_candidates` discards an unrepairable candidate whole.
+    Relaxing this rule silently reduced three offered strategies to one --
+    measured, not predicted -- because two candidates became unrepairable.
+
+    So within a single session the exercise-id rule stands, and the slot model
+    is expressed across sessions instead (see the test above).
+    """
+    payload = {
+        "sessions": [
+            {
+                "code": "A", "weekday": 0, "time": "18:00", "minutes": 45,
                 "exercises": [
                     {"slot_id": "A#0:press_primary", "id": "bench",
                      "sets": 3, "rmin": 8, "rmax": 12},
@@ -427,11 +494,11 @@ def test_repair_cannot_silently_delete_a_slot() -> None:
         ]
     }
     repaired = planning.repair_workout_payload(payload)
-    surviving = [e.get("slot_id") for e in repaired["sessions"][0]["exercises"]]
+    surviving = [e["slot_id"] for e in repaired["sessions"][0]["exercises"]]
 
-    assert surviving == ["A#0:press_primary", "A#0:press_accessory"], (
-        "repair deduped two distinct slots that share an exercise; a slot is a "
-        "need, and two needs may be met by the same movement"
+    assert surviving == ["A#0:press_primary"], (
+        "a session listing the same exercise twice is a quality defect the "
+        "activation gate rejects; repair must still collapse it"
     )
 
 

@@ -498,7 +498,6 @@ SUB_REASON_UNKNOWN = "unspecified"
 SUB_REASONS = frozenset({SUB_REASON_PAIN, SUB_REASON_EQUIPMENT, SUB_REASON_UNKNOWN})
 
 
-@runtime_bound(RUNTIME_NAMES)
 def _substitution_callback(
     session: dict[str, Any],
     current: dict[str, Any],
@@ -519,6 +518,14 @@ def _substitution_callback(
     * total length stays under Telegram's 64-byte limit -- exercise ids are
       short slugs, and this is asserted by test rather than assumed.
     """
+    # Imported directly rather than resolved through `RUNTIME_NAMES`: the
+    # runtime binding reads the `coach_bot` facade, which is only populated
+    # once that module has been imported, so this helper raised NameError
+    # whenever it was reached before the facade was built. `session_action_data`
+    # is a plain function in `ui.py` with no runtime state, so a direct import
+    # is both simpler and order-independent.
+    from noam_coach.bot.ui import session_action_data
+
     alt_id = str(alternative.get("id") or "")
     # No exercise id matches `^v\d{1,9}$` today (checked across the catalog and
     # every template), but that is an accident of the current data, not a
