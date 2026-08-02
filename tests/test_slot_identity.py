@@ -1442,3 +1442,133 @@ def test_every_minted_substitution_callback_fits_telegrams_limit() -> None:
         assert len(minted.encode("utf-8")) <= 64, (
             f"{minted!r} is {len(minted.encode())} bytes"
         )
+
+
+# ---------------------------------------------------------------------------
+# Backfill inheritance
+#
+# `adapt_exercises` removes an exercise that loads a painful joint and appends a
+# replacement. The replacement FILLS the original professional need -- same
+# slot, different implementation -- so it must inherit that slot's identity.
+#
+# Measured before this was fixed: a knee-pain adaptation of session F removed
+# `leg_press` and appended `glute_bridge`, which was then minted
+# `F#0:glute_bridge` from its final list position. The slot's history was lost
+# and the swap looked like a brand-new need.
+# ---------------------------------------------------------------------------
+def _adapted_session_f():
+    """Session F adapted for knee pain: `leg_press` is removed and backfilled."""
+    import copy
+
+    import training_intelligence as ti
+    from exercise_plans import PLANS
+
+    entries = copy.deepcopy(PLANS["F"]["exercises"])
+    slots.assign_slot_ids(entries, "F#0")
+    original_ids = [e["id"] for e in entries]
+    adapted, _changes = ti.adapt_exercises(
+        entries,
+        equipment_value="full_gym",
+        location="gym",
+        pain_value="knee pain",
+        medical_avoidance="knee pain",
+        experience="intermediate",
+        pain_detail={},
+    )
+    return original_ids, adapted
+
+
+def test_a_backfilled_exercise_inherits_the_slot_it_fills() -> None:
+    """The discriminating case: inherited identity, not positional identity.
+
+    `glute_bridge` replaces `leg_press`, so it must carry `F#0:leg_press`. If it
+    were minted from its position it would carry `F#0:glute_bridge` -- a
+    different id for the same need, which is exactly the identity loss the slot
+    model exists to prevent.
+    """
+    original_ids, adapted = _adapted_session_f()
+
+    assert "leg_press" in original_ids, (
+        "the fixture must actually contain the exercise that gets removed"
+    )
+    replaced = [e for e in adapted if e["id"] != "leg_press" and e.get("original_id")]
+    assert replaced, (
+        "knee pain must actually trigger a backfill here, or this test proves "
+        "nothing"
+    )
+
+    entry = replaced[0]
+    assert entry["slot_id"] == "F#0:leg_press", (
+        f"the backfilled {entry['id']!r} carries {entry['slot_id']!r}; it must "
+        "inherit the identity of the need it fills, not be minted from its "
+        "list position"
+    )
+    assert entry["id"] != "leg_press", "the implementation did change"
+    assert entry["original_id"] == "leg_press", (
+        "the slot must remember what it originally implemented"
+    )
+
+
+def test_a_backfilled_exercise_is_not_minted_from_its_position() -> None:
+    """Stated as its own assertion, because the two are easy to confuse.
+
+    A positional mint would produce an id derived from the NEW exercise. No
+    surviving slot id may name the replacement.
+    """
+    _original_ids, adapted = _adapted_session_f()
+    slot_ids = [e.get("slot_id") for e in adapted if e.get("slot_id")]
+
+    for entry in adapted:
+        if entry.get("original_id"):
+            assert f"F#0:{entry['id']}" not in slot_ids, (
+                f"a slot id was minted from the replacement {entry['id']!r} "
+                "rather than inherited from the need it fills"
+            )
+
+
+def test_backfill_does_not_duplicate_a_slot_identity() -> None:
+    """Inheritance must not collide with a slot that already exists."""
+    _original_ids, adapted = _adapted_session_f()
+    slot_ids = [e.get("slot_id") for e in adapted if e.get("slot_id")]
+
+    assert slot_ids, "the adapted session must carry slot ids"
+    assert len(slot_ids) == len(set(slot_ids)), (
+        f"duplicate slot ids after backfill: {slot_ids}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_backfilled_slots_survive_into_the_stored_plan(
+    tmp_path, monkeypatch
+) -> None:
+    """End to end: a pain-adapted plan stores inherited identities, not new ones."""
+    db = Database(str(tmp_path / "backfill.db"))
+    await db.init()
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(1,'A',NULL,?)",
+        (utc_now(),),
+    )
+    _bind(monkeypatch, db)
+    for key, value in dict(_WORKOUT_FACTS, training_limitations="knee pain").items():
+        await user_model.set_fact(
+            db, 1, key, value,
+            kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
+        )
+
+    candidates = await planning.generate_candidates(db, 1, "workout")
+    ids = [
+        e.get("slot_id")
+        for c in candidates
+        for s in c.payload["sessions"]
+        for e in s["exercises"]
+    ]
+
+    assert ids and all(slots.is_valid_slot_id(i) for i in ids), (
+        "every stored entry must carry a valid slot id, including backfilled ones"
+    )
+    for candidate in candidates:
+        for session in candidate.payload["sessions"]:
+            session_ids = [e.get("slot_id") for e in session["exercises"]]
+            assert len(session_ids) == len(set(session_ids)), (
+                f"duplicate slot ids within one session: {session_ids}"
+            )
