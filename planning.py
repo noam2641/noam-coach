@@ -736,6 +736,7 @@ def _schedule_sessions(
     default_minutes: int,
     default_start: str | None = None,
     split_override: list[str] | None = None,
+    declared_session_keys: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     usable = [item for item in availability if item.get("available", True)]
     usable.sort(key=lambda item: int(item.get("weekday", 0)))
@@ -763,9 +764,7 @@ def _schedule_sessions(
     #
     # The keys come from the split DEFINITION instead, so reordering a split
     # moves a session without renaming it.
-    session_keys = workout_slots.session_keys_for_split(
-        split, SESSION_KEYS_BY_FREQUENCY.get(frequency) if split_override is None else None
-    )
+    session_keys = workout_slots.session_keys_for_split(split, declared_session_keys)
     for index, (slot, code) in enumerate(zip(selected, split, strict=True)):
         session_key = session_keys[index] if index < len(session_keys) else None
         session_occurrence = workout_slots.mint_session_occurrence(session_key)
@@ -815,6 +814,53 @@ _BALANCED_SPLIT_OVERRIDES: dict[int, list[str]] = {
 _PERFORMANCE_SPLIT_OVERRIDES: dict[int, list[str]] = {
     4: ["A", "B", "C", "F"],
 }
+
+#: A11b: the stable professional identity of each session in a STRATEGY
+#: OVERRIDE, declared per (strategy, frequency) exactly as
+#: `SESSION_KEYS_BY_FREQUENCY` does for the default splits.
+#:
+#: Without these, an override fell back to `<code>_<n>` -- a key counted while
+#: traversing, which is the very thing that made two sessions sharing a code
+#: swap identities when the order changed. The consistency 3-day override
+#: (`F/F/F`) is the sharpest case: three sessions, one code, and nothing but
+#: position to tell them apart.
+#:
+#: These keys are also deliberately NOT the default-frequency keys. A 3-day
+#: consistency plan trains three full-body days; a 3-day default plan trains
+#: A/B/C. They are different professional programmes, so their sessions must
+#: not share identities -- otherwise a substitution recorded against one would
+#: be attributed to the other after a strategy change.
+#:
+#: **Governance rule, binding on A12 and later work:** a declared key names
+#: what a session IS. Changing the professional meaning of a session REQUIRES
+#: changing its key; reusing a key for a different meaning silently rewrites
+#: the history of every pattern already keyed to it. Adding or reordering
+#: sessions is safe as long as each key stays attached to its own meaning.
+_SPLIT_OVERRIDE_SESSION_KEYS: dict[str, dict[int, list[str]]] = {
+    "consistency": {
+        3: ["cons_full_1", "cons_full_2", "cons_full_3"],
+        4: ["cons_fb_1", "cons_fb_2", "cons_fb_3", "cons_fb_4"],
+    },
+    "balanced": {
+        4: ["bal_upper_1", "bal_lower_1", "bal_upper_2", "bal_lower_2"],
+    },
+    "performance": {
+        4: ["perf_a", "perf_b", "perf_c", "perf_full"],
+    },
+}
+
+
+def _strategy_session_keys(strategy: str, frequency: int) -> list[str] | None:
+    """Declared session keys for a strategy override, or None if it has none.
+
+    Returns None only when the strategy/frequency pair has no override at all;
+    a pair that HAS an override but no declared keys is a configuration defect
+    and is surfaced by `test_every_split_producer_has_declared_session_keys`
+    rather than silently falling back to a positional key.
+    """
+    return _SPLIT_OVERRIDE_SESSION_KEYS.get(str(strategy or ""), {}).get(
+        int(frequency)
+    )
 
 
 def _strategy_split_override(strategy: str, frequency: int) -> list[str] | None:
@@ -1149,12 +1195,18 @@ def _workout_candidate(
             for d in resolved_preferred_days
         ]
     split_override = _strategy_split_override(strategy, frequency)
+    declared_session_keys = (
+        _strategy_session_keys(strategy, frequency)
+        if split_override is not None
+        else SESSION_KEYS_BY_FREQUENCY.get(frequency)
+    )
     sessions, assumed = _schedule_sessions(
         frequency,
         availability,
         default_minutes=minutes,
         default_start=resolved_preferred_time,
         split_override=split_override,
+        declared_session_keys=declared_session_keys,
     )
     _apply_strategy_volume(sessions, strategy)
     equipment_value = _fact_value(facts, "equipment")

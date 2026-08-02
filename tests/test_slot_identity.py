@@ -1711,3 +1711,251 @@ def test_a_slot_key_containing_the_token_separator_is_refused() -> None:
     token = slots.slot_token_of({"slot_id": "abc1_a:bench"})
     assert token == "abc1_a-bench"
     assert slots.slot_id_from_token(token) == "abc1_a:bench"
+
+
+# ---------------------------------------------------------------------------
+# Every split producer, including strategy overrides
+#
+# The declared keys initially covered only `SPLIT_BY_FREQUENCY`. Every strategy
+# override fell through to a `<code>_<n>` fallback counted while iterating --
+# the exact scheme that made two sessions sharing a code swap identities when
+# the order changed. Measured:
+#
+#     consistency f=3  ['F','F','F']  ->  ['F_0', 'F_1', 'F_2']
+#
+# Three sessions, one code, nothing but position separating them. The fallback
+# is now gone entirely; a producer without declared keys yields [] and is
+# reported as a configuration defect.
+# ---------------------------------------------------------------------------
+def _all_split_producers():
+    """(label, codes, declared_keys) for every producer of a split."""
+    import planning as _planning
+    from exercise_plans import SESSION_KEYS_BY_FREQUENCY, SPLIT_BY_FREQUENCY
+
+    producers = [
+        (f"default:{freq}", codes, SESSION_KEYS_BY_FREQUENCY.get(freq))
+        for freq, codes in sorted(SPLIT_BY_FREQUENCY.items())
+    ]
+    for strategy in ("consistency", "balanced", "performance"):
+        for freq in sorted(SPLIT_BY_FREQUENCY):
+            override = _planning._strategy_split_override(strategy, freq)
+            if override is None:
+                continue
+            producers.append(
+                (
+                    f"{strategy}:{freq}",
+                    override,
+                    _planning._strategy_session_keys(strategy, freq),
+                )
+            )
+    return producers
+
+
+def test_every_split_producer_has_declared_session_keys() -> None:
+    """Including every `split_override`, not just the default frequencies."""
+    producers = _all_split_producers()
+
+    assert any(":" in label and not label.startswith("default") for label, _c, _k in producers), (
+        "the scanner found no strategy overrides -- it has stopped working"
+    )
+
+    for label, codes, keys in producers:
+        assert keys is not None, (
+            f"{label}: split {codes} has no declared session keys, so identity "
+            "would fall back to something positional"
+        )
+        assert len(keys) == len(codes), (
+            f"{label}: {len(codes)} codes but {len(keys)} keys"
+        )
+
+
+def test_session_keys_are_unique_within_every_split() -> None:
+    for label, codes, keys in _all_split_producers():
+        assert keys and len(set(keys)) == len(keys), (
+            f"{label}: duplicate session key in {keys} -- two distinct sessions "
+            "would share one identity"
+        )
+        del codes
+
+
+def test_the_consistency_override_gets_its_own_full_body_identities() -> None:
+    """The sharpest override case, and the one the fallback handled worst.
+
+    A 3-day consistency plan trains three FULL-BODY days; a 3-day default plan
+    trains A/B/C. Different professional programmes, so their sessions must not
+    share identities -- otherwise a substitution recorded against one would be
+    attributed to the other after a strategy change.
+    """
+    import planning as _planning
+    from exercise_plans import SESSION_KEYS_BY_FREQUENCY
+
+    codes = _planning._strategy_split_override("consistency", 3)
+    keys = _planning._strategy_session_keys("consistency", 3)
+
+    assert codes == ["F", "F", "F"], codes
+    assert keys is not None and len(keys) == 3
+    assert len(set(keys)) == 3, f"three full-body days need three identities: {keys}"
+
+    default_keys = set(SESSION_KEYS_BY_FREQUENCY[3])
+    assert not (set(keys) & default_keys), (
+        f"the consistency override reuses default 3-day keys {default_keys & set(keys)} "
+        "-- a full-body day would inherit the identity of an A/B/C day"
+    )
+
+
+def test_no_split_producer_shares_identities_with_another() -> None:
+    """Two different programmes must not name the same professional session."""
+    seen: dict[str, str] = {}
+    for label, _codes, keys in _all_split_producers():
+        for key in keys or []:
+            if key in seen and not (
+                label.startswith("default") and seen[key].startswith("default")
+            ):
+                raise AssertionError(
+                    f"session key {key!r} is used by both {seen[key]} and {label}"
+                )
+            seen.setdefault(key, label)
+
+
+def test_there_is_no_positional_fallback() -> None:
+    """A mismatch must surface as a defect, never as invented identities."""
+    assert slots.session_keys_for_split(["F", "F", "F"], None) == []
+    assert slots.session_keys_for_split(["F", "F"], ["only_one"]) == []
+    assert slots.session_keys_for_split(["F", "F"], ["dup", "dup"]) == []
+    assert slots.session_keys_for_split(["F", "F"], ["ok", ""]) == []
+
+
+def test_reordering_a_split_with_its_keys_preserves_identity() -> None:
+    """Codes and keys move TOGETHER: the same session keeps its identity."""
+    codes = ["A", "B", "A"]
+    keys = ["heavy_a", "pull_b", "light_a"]
+
+    forward = dict(
+        zip(keys, slots.session_keys_for_split(codes, keys), strict=True)
+    )
+    reordered_codes = ["A", "A", "B"]
+    reordered_keys = ["light_a", "heavy_a", "pull_b"]
+    backward = dict(
+        zip(
+            reordered_keys,
+            slots.session_keys_for_split(reordered_codes, reordered_keys),
+            strict=True,
+        )
+    )
+
+    for meaning in ("heavy_a", "light_a", "pull_b"):
+        assert forward[meaning] == backward[meaning], (
+            f"{meaning} changed identity when the split was reordered"
+        )
+
+
+def test_reordering_only_the_codes_is_a_configuration_defect() -> None:
+    """Codes and keys that drift apart must be caught, not silently applied.
+
+    If the codes are reordered but the keys are not, `heavy_a` now labels a
+    different session. Nothing in the data can detect that from one split alone
+    -- which is why the governance rule is that changing a session's meaning
+    REQUIRES changing its key. This test pins the shape of the hazard so the
+    rule has a home in the suite.
+    """
+    keys = ["heavy_a", "pull_b", "light_a"]
+
+    original = list(zip(["A", "B", "A"], keys, strict=True))
+    codes_only = list(zip(["A", "A", "B"], keys, strict=True))
+
+    assert original != codes_only, (
+        "reordering only the codes re-pairs every key with a different session; "
+        "the pairing is the contract, so both must be edited together"
+    )
+    # And the pairing a caller actually sees must come from one definition.
+    assert [c for c, _k in original] == ["A", "B", "A"]
+    assert [k for _c, k in original] == keys
+
+
+def test_the_governance_rule_is_documented_for_a12() -> None:
+    """A declared key names what a session IS.
+
+    Reusing a key for a different meaning silently rewrites the history of
+    every pattern already keyed to it -- which is A12's whole input. The rule
+    must therefore live in the source, not only in a PR description.
+    """
+    from pathlib import Path as _Path
+
+    root = _Path(__file__).resolve().parents[1]
+    source = (root / "planning.py").read_text(encoding="utf-8")
+
+    assert "Governance rule" in source, (
+        "the session-key governance rule must be stated where the keys are "
+        "declared, or a later edit will not know it exists"
+    )
+    assert "A12" in source
+
+
+@pytest.mark.asyncio
+async def test_a_generated_override_plan_carries_its_declared_keys(
+    tmp_path, monkeypatch
+) -> None:
+    """The runtime path, not just the tables.
+
+    Declaring keys for every override is worthless if `_schedule_sessions` does
+    not receive them: the plan would still be built with the default-frequency
+    keys, and a full-body consistency session would carry an A/B/C identity.
+    Deliberate breakage found exactly this gap -- every table test passed while
+    planning ignored the override keys.
+
+    Each strategy is checked against the keys ITS OWN split declares.
+    """
+    import planning as _planning
+
+    _, candidates = await _plan_for(
+        tmp_path, monkeypatch, frequency=3, days="mon,wed,fri", name="override_rt",
+    )
+
+    checked = 0
+    for candidate in candidates:
+        override = _planning._strategy_split_override(candidate.strategy, 3)
+        if override is None:
+            continue
+        expected = _planning._strategy_session_keys(candidate.strategy, 3)
+        assert expected, f"{candidate.strategy}: no declared keys"
+
+        actual = [s["session_occurrence"] for s in candidate.payload["sessions"]]
+        assert actual == expected, (
+            f"{candidate.strategy} plan carries {actual}, expected its own "
+            f"declared keys {expected} -- the override keys are not reaching "
+            "the builder"
+        )
+        checked += 1
+
+    assert checked, (
+        "no strategy override was exercised at frequency 3; this test would "
+        "pass vacuously"
+    )
+
+
+@pytest.mark.asyncio
+async def test_override_and_default_plans_do_not_share_session_identities(
+    tmp_path, monkeypatch
+) -> None:
+    """A consistency full-body day must not inherit an A/B/C day's identity.
+
+    Otherwise a substitution recorded against one is attributed to the other
+    after a strategy change -- and A12 promotes a pattern the user expressed on
+    a different programme.
+    """
+    import planning as _planning
+    from exercise_plans import SESSION_KEYS_BY_FREQUENCY
+
+    _, candidates = await _plan_for(
+        tmp_path, monkeypatch, frequency=3, days="mon,wed,fri", name="override_mix",
+    )
+    default_keys = set(SESSION_KEYS_BY_FREQUENCY[3])
+
+    for candidate in candidates:
+        if _planning._strategy_split_override(candidate.strategy, 3) is None:
+            continue
+        identities = {s["session_occurrence"] for s in candidate.payload["sessions"]}
+        assert not (identities & default_keys), (
+            f"{candidate.strategy} shares session identities {identities & default_keys} "
+            "with the default 3-day split"
+        )

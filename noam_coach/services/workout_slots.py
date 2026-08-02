@@ -246,36 +246,43 @@ _TOKEN_SEP = "-"
 _MAX_SLOT_ORDINAL = 99
 
 
-def session_keys_for_split(split: Any, declared: Any = None) -> list[str]:
+def session_keys_for_split(split: Any, declared: Any) -> list[str]:
     """The stable professional key of every session in a split.
 
-    Prefers `declared` -- `exercise_plans.SESSION_KEYS_BY_FREQUENCY`, or a
-    strategy override's own key list -- because a declared key names what the
-    session IS and survives the split being reordered or rewritten.
+    `declared` comes from the split's own definition --
+    `exercise_plans.SESSION_KEYS_BY_FREQUENCY` for a default split, or
+    `planning._SPLIT_OVERRIDE_SESSION_KEYS` for a strategy override. A key
+    names what the session IS, so reordering a split moves a session without
+    renaming it.
 
-    Falls back to `<code>_<n>` where `n` counts appearances of that code **in
-    the split as defined**, not in traversal order. That is still a property of
-    the definition: for a given split literal the mapping is fixed, so two
-    strategies with different orders of the same codes produce keys that follow
-    their session rather than its position.
+    **There is deliberately no positional fallback.** An earlier version fell
+    back to `<code>_<n>`, counting appearances while iterating, and that
+    reintroduced the exact defect the declared keys exist to prevent: two
+    semantically distinct sessions sharing a code swap identities when the
+    order changes. Measured on the consistency 3-day override (`F/F/F`), where
+    three sessions share one code and nothing but position separated them.
 
-    The distinction that makes this necessary, measured: under a key recomputed
-    from traversal, two semantically distinct sessions sharing a code SWAP
-    identities when the order changes, so every slot in both is reattributed to
-    the other session's professional meaning.
+    A mismatch returns `[]` rather than inventing keys. The caller then mints
+    nothing, the entries stay identity-less -- a visible, classifiable state --
+    and `test_every_split_producer_has_declared_session_keys` fails. That is
+    the intended behaviour: a configuration defect must surface as a defect,
+    not as silently reassigned identities.
     """
     codes = [str(c) for c in (split or [])]
-    if isinstance(declared, (list, tuple)) and len(declared) == len(codes):
-        keys = [str(k).strip() for k in declared]
-        if all(keys) and len(set(keys)) == len(keys):
-            return keys
+    if not codes:
+        return []
+    if not isinstance(declared, (list, tuple)) or len(declared) != len(codes):
+        LOGGER.error(
+            "session_keys_missing_or_mismatched codes=%d declared=%s",
+            len(codes),
+            len(declared) if isinstance(declared, (list, tuple)) else "none",
+        )
+        return []
 
-    seen: dict[str, int] = {}
-    keys = []
-    for code in codes:
-        nth = seen.get(code, 0)
-        seen[code] = nth + 1
-        keys.append(f"{code}_{nth}")
+    keys = [str(k).strip() for k in declared]
+    if not all(keys) or len(set(keys)) != len(keys):
+        LOGGER.error("session_keys_invalid count=%d unique=%d", len(keys), len(set(keys)))
+        return []
     return keys
 
 
