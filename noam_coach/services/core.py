@@ -361,6 +361,24 @@ _AUDIT_ALLOWLIST: dict[tuple[str, str], dict[str, Any]] = {
         "target": _pass("target"),
         "reason": _pass("reason"),
         "slot_id": _pass("slot_id"),
+        # A12: historical provenance. `evidence_plan_id` is the plan version
+        # the substitution happened UNDER, and `split_signature` fingerprints
+        # that version's declared session keys. Together they let a detector
+        # group evidence without ever consulting the CURRENT active plan --
+        # which would silently merge events from a programme the user has since
+        # left. Both are bounded: an integer and a 16-char hex digest.
+        "evidence_plan_id": _pass("evidence_plan_id"),
+        "split_signature": _pass("split_signature"),
+    },
+    # A12: the promotion decision itself. Bounded codes and internal ids only;
+    # `subject` is a joined identity triple, never prose.
+    ("promote_substitution", "preference"): {
+        "outcome": _pass("outcome"),
+        "subject": _pass("subject"),
+        "slot_id": _pass("slot_id"),
+        "target": _pass("target"),
+        "occurrences": _pass("occurrences"),
+        "approval_id": _pass("approval_id"),
     },
     # Goal approvals: keep the bounded targets; DROP the `explanation` prose.
     ("approve", "goal"): {

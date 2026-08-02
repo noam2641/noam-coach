@@ -41,6 +41,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import secrets
 from typing import Any
 
 from config import LOGGER
@@ -370,8 +371,265 @@ async def record_cooldown(
     )
 
 
+# ---------------------------------------------------------------------------
+# Lifecycle
+#
+#   pending -> processing -> approved | declined | stale | failed
+#
+# `processing` exists so a crash has a recoverable state to be found in. Without
+# it, a process that died between mutating the plan and finalizing the approval
+# would leave a `pending` row indistinguishable from one nobody had tapped, and
+# a retry would apply the substitution a second time.
+#
+# Only the caller that observes `rowcount == 1` on a state transition may act.
+# That is the whole concurrency argument: SQLite serializes the UPDATE, so of
+# two racing taps exactly one changes the row and exactly one side effect
+# follows. `payload.subject` is a grouping value, NOT a database idempotency
+# key -- nothing enforces uniqueness on it, and calling it one would be false.
+# The database rules are the partial unique index (one open row per user) and
+# these conditional UPDATEs.
+# ---------------------------------------------------------------------------
+async def claim_status(
+    db: Any,
+    approval_id: str,
+    user_id: int,
+    *,
+    expect: str,
+    become: str,
+) -> bool:
+    """Move one approval between states, returning whether THIS caller won.
+
+    Conditional on both the id and the current status, so a replayed callback,
+    a double tap and a concurrent worker all resolve to exactly one winner.
+    """
+    changed = await db.execute_rowcount(
+        "UPDATE approvals SET status=?, decided_at=? "
+        "WHERE id=? AND user_id=? AND status=?",
+        (become, utc_iso(), approval_id, user_id, expect),
+    )
+    return int(changed) == 1
+
+
+async def propose(
+    db: Any,
+    user_id: int,
+    candidate: dict[str, Any],
+    *,
+    active_plan_id: int | None,
+    now: dt.datetime | None = None,
+) -> str | None:
+    """Create the pending proposal, or None when one must not be created.
+
+    Returns None when the subject is under an unexpired promise, when there is
+    no active plan to guard against, or when another open proposal already
+    exists -- the last of which is enforced by the database, not by this check:
+    the partial unique index raises on the INSERT if two callers race past the
+    read.
+
+    The whole create runs inside `db.transaction()`, which issues
+    BEGIN IMMEDIATE, so the supersede-then-insert pair cannot interleave with
+    another writer.
+    """
+    if active_plan_id is None:
+        return None
+    subject = str(candidate.get("subject") or "")
+    if not subject:
+        return None
+    if await is_suppressed(db, user_id, subject, now=now):
+        return None
+
+    payload = {
+        "subject": subject,
+        "split_signature": candidate["split_signature"],
+        "slot_id": candidate["slot_id"],
+        "target": candidate["target"],
+        "source": candidate["source"],
+        "occurrences": int(candidate["occurrences"]),
+        # The plan that was ACTIVE when the proposal was made -- guarded at
+        # approval. Deliberately not an evidence plan id: evidence may span
+        # several superseded versions, and applying a change to one of those
+        # would touch a plan the user never saw this proposal for.
+        "expected_active_plan_id": int(active_plan_id),
+    }
+
+    approval_id = secrets.token_urlsafe(8)
+    try:
+        async with db.transaction() as conn:
+            await conn.execute(
+                "UPDATE approvals SET status=? , decided_at=? "
+                "WHERE user_id=? AND kind=? AND status IN (?, ?)",
+                (STATUS_STALE, utc_iso(now), user_id, APPROVAL_KIND,
+                 STATUS_PENDING, STATUS_PROCESSING),
+            )
+            await conn.execute(
+                "INSERT INTO approvals(id, user_id, kind, payload, status, created_at) "
+                "VALUES(?, ?, ?, ?, ?, ?)",
+                (approval_id, user_id, APPROVAL_KIND,
+                 json.dumps(payload, ensure_ascii=False), STATUS_PENDING,
+                 utc_iso(now)),
+            )
+    except Exception:
+        LOGGER.exception("substitution_proposal_failed user_id=%s", user_id)
+        return None
+    LOGGER.info(
+        "substitution_proposed user_id=%s occurrences=%d", user_id,
+        payload["occurrences"],
+    )
+    return approval_id
+
+
+async def decline(db: Any, user_id: int, approval_id: str, *, now: dt.datetime | None = None) -> str:
+    """Record a refusal and suppress the subject for the D-5 window."""
+    row = await db.fetch_one(
+        "SELECT payload, status FROM approvals WHERE id=? AND user_id=?",
+        (approval_id, user_id),
+    )
+    if not row:
+        return STATUS_STALE
+    if not await claim_status(
+        db, approval_id, user_id, expect=STATUS_PENDING, become=STATUS_DECLINED
+    ):
+        # Someone already decided this. Not an error -- the durable answer
+        # stands and no second cooldown is written.
+        return STATUS_DECLINED
+
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    subject = str(payload.get("subject") or "")
+    if subject:
+        await record_cooldown(
+            db, user_id, subject,
+            decided_as=STATUS_DECLINED, approval_id=approval_id,
+            days=DECLINE_COOLDOWN_DAYS, now=now,
+        )
+    return STATUS_DECLINED
+
+
+async def approve(db: Any, user_id: int, approval_id: str, *, now: dt.datetime | None = None) -> str:
+    """Apply the promoted substitution, once, through the A9 boundary.
+
+    The claim is `pending -> processing`, so a crash mid-mutation leaves a row
+    that says so. Recovery is not a special path: re-entering calls the same
+    boundary, which reports `no_change` when the target is already applied --
+    finalizing without creating a second plan version.
+    """
+    row = await db.fetch_one(
+        "SELECT payload, status FROM approvals WHERE id=? AND user_id=?",
+        (approval_id, user_id),
+    )
+    if not row:
+        return STATUS_STALE
+
+    status = str(row["status"] or "")
+    if status not in (STATUS_PENDING, STATUS_PROCESSING):
+        return status
+
+    if status == STATUS_PENDING and not await claim_status(
+        db, approval_id, user_id, expect=STATUS_PENDING, become=STATUS_PROCESSING
+    ):
+        # Lost the race. The winner owns the mutation.
+        return STATUS_PROCESSING
+
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+
+    slot_id = str(payload.get("slot_id") or "")
+    target = str(payload.get("target") or "")
+    source = str(payload.get("source") or "")
+    expected_plan = payload.get("expected_active_plan_id")
+    expected_signature = str(payload.get("split_signature") or "")
+    subject = str(payload.get("subject") or "")
+
+    if not slot_id or not target or expected_plan is None:
+        await claim_status(
+            db, approval_id, user_id, expect=STATUS_PROCESSING, become=STATUS_FAILED
+        )
+        return STATUS_FAILED
+
+    # The split must still be the one the proposal was built against. Checked
+    # here rather than inside A9's boundary because it is A12's contract, not
+    # the mutation boundary's.
+    from noam_coach.services import plan_mutations
+
+    active = await _active_plan_signature(db, user_id)
+    if active is not None and expected_signature and active != expected_signature:
+        await claim_status(
+            db, approval_id, user_id, expect=STATUS_PROCESSING, become=STATUS_STALE
+        )
+        LOGGER.info("substitution_promotion_stale user_id=%s reason=split", user_id)
+        return STATUS_STALE
+
+    outcome = await plan_mutations.substitute_slot_in_saved_plan(
+        db, user_id, slot_id, target,
+        reason="promoted_preference",
+        expected_active_plan_id=int(expected_plan),
+        expected_source_exercise_id=source or None,
+    )
+
+    if outcome.outcome in (
+        plan_mutations.OUTCOME_REALIGNED,
+        # `no_change` is the crash-recovery case: the mutation already landed
+        # and only finalization was missing. Finalize; do not mutate again.
+        plan_mutations.OUTCOME_NO_CHANGE,
+    ):
+        await claim_status(
+            db, approval_id, user_id, expect=STATUS_PROCESSING, become=STATUS_APPROVED
+        )
+        if subject:
+            await record_cooldown(
+                db, user_id, subject,
+                decided_as=STATUS_APPROVED, approval_id=approval_id,
+                days=APPROVE_COOLDOWN_DAYS, now=now,
+            )
+        LOGGER.info(
+            "substitution_promoted user_id=%s outcome=%s", user_id, outcome.outcome
+        )
+        return STATUS_APPROVED
+
+    if outcome.outcome == plan_mutations.OUTCOME_BLOCKED:
+        # The plan or the slot moved on. Stale, not failed: nothing broke, the
+        # question simply no longer applies.
+        await claim_status(
+            db, approval_id, user_id, expect=STATUS_PROCESSING, become=STATUS_STALE
+        )
+        LOGGER.info(
+            "substitution_promotion_stale user_id=%s reason=%s", user_id, outcome.reason
+        )
+        return STATUS_STALE
+
+    await claim_status(
+        db, approval_id, user_id, expect=STATUS_PROCESSING, become=STATUS_FAILED
+    )
+    LOGGER.info(
+        "substitution_promotion_failed user_id=%s reason=%s", user_id, outcome.reason
+    )
+    return STATUS_FAILED
+
+
+async def _active_plan_signature(db: Any, user_id: int) -> str | None:
+    """Split signature of the CURRENT active workout plan, or None."""
+    try:
+        import planning
+
+        active = await planning.get_active_plan(db, user_id, "workout")
+    except Exception:
+        LOGGER.exception("active_plan_signature_failed user_id=%s", user_id)
+        return None
+    if not active:
+        return None
+    return signature_from_plan_payload(active.get("payload"))
+
+
 __all__ = [
     "APPROVAL_KIND",
+    "approve",
+    "claim_status",
+    "decline",
+    "propose",
     "collect_evidence",
     "find_promotable",
     "is_suppressed",

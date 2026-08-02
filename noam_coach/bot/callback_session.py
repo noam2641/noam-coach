@@ -543,6 +543,55 @@ def _substitution_callback(
     )
 
 
+def _snapshot_plan_id(snapshot: Any) -> int | None:
+    """The plan version a session was materialized from, or None.
+
+    `materialize_snapshot` freezes a `provenance` block into `sessions.plan` at
+    session start, so this is the plan that was live THEN -- immutable, and the
+    only honest answer for a historical event.
+
+    The legacy start path (`get_user_plan`) writes no provenance, so its
+    sessions return None. Those rows stay readable and simply never count as
+    promotion evidence, which is the correct outcome: without knowing which
+    plan a substitution happened under, it cannot be grouped safely.
+    """
+    if not isinstance(snapshot, dict):
+        return None
+    provenance = snapshot.get("provenance")
+    if not isinstance(provenance, dict):
+        return None
+    plan_id = provenance.get("plan_id")
+    try:
+        return int(plan_id) if plan_id is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+async def _snapshot_split_signature(snapshot: Any) -> str | None:
+    """Split signature of the plan version a session was materialized from.
+
+    Read from that stored plan version, never from the current active plan --
+    the two differ precisely when it matters, and using today's plan to
+    classify a historical event is the mistake this whole identity scheme
+    exists to prevent.
+    """
+    plan_id = _snapshot_plan_id(snapshot)
+    if plan_id is None:
+        return None
+    from noam_coach.services import substitution_patterns
+
+    try:
+        row = await DB.fetch_one(
+            "SELECT payload FROM plan_versions WHERE id=?", (plan_id,)
+        )
+    except Exception:
+        LOGGER.exception("snapshot_split_signature_failed plan_id=%s", plan_id)
+        return None
+    if not row:
+        return None
+    return substitution_patterns.signature_from_plan_payload(row["payload"])
+
+
 @runtime_bound(RUNTIME_NAMES)
 async def _pain_safe_alternatives(
     user_id: int, current: dict[str, Any], *, fallback_when_all_blocked: bool = True
@@ -803,7 +852,18 @@ async def _handle_session_adjustment_actions(
             reason=sub_reason,
             # Slot identity, so a pattern can be keyed on the professional need
             # rather than on whichever exercise happened to implement it.
-            slot_id=workout_slots.slot_id_of(current) or "",
+            #
+            # A12 correction: `None`, never `""`. `write_audit` omits None but
+            # STORES an empty string, so the previous `or ""` wrote a row whose
+            # slot_id looked present and joined to nothing. A detector treating
+            # that as a key would merge every legacy substitution into one
+            # phantom pattern.
+            slot_id=workout_slots.slot_id_of(current),
+            # A12: historical provenance, read from the session's own immutable
+            # snapshot rather than from the current active plan. A substitution
+            # made weeks ago happened under whatever plan was live then.
+            evidence_plan_id=_snapshot_plan_id(plan),
+            split_signature=await _snapshot_split_signature(plan),
         )
         # A11b: say which plan this changed. The swap is written to the SESSION
         # snapshot, so it applies to today's workout and the saved plan is
