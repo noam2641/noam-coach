@@ -2913,6 +2913,8 @@ def format_weekly_plan(
     read before training; the set card only appears once the exercise is
     already underway.
     """
+    from noam_coach.services import workout_slots
+
     structure = plan.get("structure") or "תוכנית אימונים"
     regions = pain_regions or {}
     lines = [
@@ -2937,10 +2939,47 @@ def format_weekly_plan(
         when = weekday_he(s["weekday"])
         at = f" · {s['time']}" if s.get("time") else ""
         code = str(s.get("code") or "")
-        template = PLANS.get(code, {})
-        exercises = template.get("exercises", [])[:5]
+        # A11b: render the STORED exercises. Reading `PLANS.get(code)` here is
+        # what made every substitution invisible -- the screen showed the
+        # template while the user's plan said something else, so a swap made
+        # for pain simply did not appear on the surface where they decide what
+        # to train.
+        #
+        # The template fallback survives for ONE population: a legacy fact-only
+        # plan whose sessions carry `code`/`name` and no exercises at all. A10
+        # retired the writer that produced those, so no NEW plan can take this
+        # branch; it exists for payloads already in the database.
+        stored = s.get("exercises")
+        if isinstance(stored, list) and stored:
+            entries = stored
+        else:
+            entries = PLANS.get(code, {}).get("exercises", [])
+        exercises = entries[:5]
         lines.append(f"<b>{i}. יום {when}{at} — {esc(str(s['name']))}</b>")
         for ex_index, ex in enumerate(exercises, start=1):
+            # A11b: a slot without an implementation is a first-class state, not
+            # an empty row to skip. Skipping it would renumber the list and hide
+            # that a professional need exists but is unfilled -- and a malformed
+            # entry would crash on `ex.get` below, or vanish silently, which is
+            # exactly the collapse A11a's three states exist to prevent.
+            entry_state = workout_slots.classify_entry(ex)
+            if entry_state == workout_slots.ENTRY_BLOCKED:
+                lines.append(
+                    f"  {ex_index}. 🛡️ <i>תרגיל הוסר זמנית בגלל כאב שדיווחת — "
+                    "נחזיר אותו כשתהיה מוכן.</i>"
+                )
+                continue
+            if entry_state == workout_slots.ENTRY_UNMAPPED:
+                lines.append(
+                    f"  {ex_index}. ⬜ <i>מקום פנוי בתוכנית — עוד לא נבחר תרגיל.</i>"
+                )
+                continue
+            if entry_state == workout_slots.ENTRY_MALFORMED:
+                # Observable, never silently dropped. The user sees a neutral
+                # placeholder; the defect is counted and logged by
+                # `observe_plan_entries` on the paths that call it.
+                lines.append(f"  {ex_index}. ⚠️ <i>שורה בתוכנית לא נקראה כראוי.</i>")
+                continue
             rest = int(ex.get("rest") or 0)
             rest_label = f"{rest // 60}:{rest % 60:02d}" if rest else "—"
             cue = ""

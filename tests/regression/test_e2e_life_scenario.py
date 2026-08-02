@@ -218,7 +218,8 @@ async def test_full_life_scenario_from_onboarding_to_meal_correction(
         query,
         context=None,
         user_id=1,
-        data=coach_bot.session_action_data("sub", session, 0),
+        # A11b: alternatives are named by id, never by list position.
+        data=coach_bot.session_action_data("sub", session, "hack_squat", "equipment"),
     )
     session = dict(await db.fetch_one("SELECT * FROM sessions WHERE id=?", (sid,)))
     plan_now = json.loads(session["plan"])

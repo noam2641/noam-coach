@@ -1057,6 +1057,17 @@ def adapt_exercises(
             )
             explanation_key = "modify" if same_movement else "replace"
             replacement["adaptation_note"] = ADAPTATION_EXPLANATIONS_HE[explanation_key]
+            # A11b: the replacement FILLS the original's professional need -- it
+            # is the same slot with a different implementation, which is the
+            # distinction the slot model exists to express. It must therefore
+            # inherit the original's identity rather than be minted a new one
+            # from its final list position: a slot substituted for pain would
+            # otherwise look like a brand-new need, losing its history and
+            # making the swap invisible to A12's pattern detection.
+            for inherited in ("slot_id", "slot_key"):
+                if original.get(inherited):
+                    replacement[inherited] = original[inherited]
+            replacement["original_id"] = original.get("original_id") or original.get("id")
             adapted.append(replacement)
             changes.append(
                 {

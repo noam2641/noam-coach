@@ -49,9 +49,26 @@ def exercise(
     cues: list[str],
     alternatives: list[tuple[str, str, float]],
     muscle: str = "",
+    slot_key: str = "",
 ) -> dict[str, Any]:
+    """Build one template exercise.
+
+    `slot_key` (A11b) names the PROFESSIONAL NEED this position expresses --
+    "the horizontal press in session A" -- as distinct from `id`, which names
+    whichever exercise implements it today. It defaults to the seed exercise id
+    because that is what the need was originally specified as, but the two
+    diverge the moment a substitution happens: `id` becomes the replacement and
+    `slot_key` does not move.
+
+    It is DECLARED rather than derived. A positional key would renumber every
+    later slot when the template is reordered, silently reassigning identities
+    to different needs; a key derived from `muscle` is not unique within a
+    session (`A` and `U1` each repeat one). Declaring it is what makes template
+    reordering a no-op for identity.
+    """
     return {
         "id": exercise_id,
+        "slot_key": slot_key or exercise_id,
         "name": name,
         "sets": sets,
         "rmin": reps_min,
@@ -439,6 +456,30 @@ SPLIT_BY_FREQUENCY: dict[int, list[str]] = {
     4: ["A", "B", "C", "F"],
     5: ["A", "B", "C", "F", "F"],
     6: ["A", "B", "C", "A", "B", "C"],  # A/B/C twice
+}
+
+#: A11b: the stable professional identity of each session IN a split.
+#:
+#: A session code is not unique within a split -- `['F','F']`, `['A','B','C',
+#: 'A','B','C']` -- so identity cannot be the code alone. It also cannot be the
+#: code's Nth appearance while traversing: measured, two semantically distinct
+#: sessions sharing a code SWAP identities when the split order changes, so
+#: every slot in both is reattributed to the other session's meaning.
+#:
+#: These keys are DECLARED against the split definition, so they are a property
+#: of the programme rather than of traversal order. Reordering a split moves a
+#: session; it does not rename it.
+#:
+#: A key names what the session IS -- "the first full-body day", "the second
+#: A/B/C rotation" -- and is parallel to `slot_key` one level down. Neither is
+#: derived from weekday, array position, or the exercise implementing it.
+SESSION_KEYS_BY_FREQUENCY: dict[int, list[str]] = {
+    1: ["full_1"],
+    2: ["full_1", "full_2"],
+    3: ["abc1_a", "abc1_b", "abc1_c"],
+    4: ["abc1_a", "abc1_b", "abc1_c", "full_1"],
+    5: ["abc1_a", "abc1_b", "abc1_c", "full_1", "full_2"],
+    6: ["abc1_a", "abc1_b", "abc1_c", "abc2_a", "abc2_b", "abc2_c"],
 }
 MIN_FREQUENCY = 1
 MAX_FREQUENCY = 6

@@ -20,6 +20,7 @@ from exercise_plans import (
     MAX_FREQUENCY,
     MIN_FREQUENCY,
     PLANS,
+    SESSION_KEYS_BY_FREQUENCY,
     SPLIT_BY_FREQUENCY,
     weekday_he,
 )
@@ -735,6 +736,7 @@ def _schedule_sessions(
     default_minutes: int,
     default_start: str | None = None,
     split_override: list[str] | None = None,
+    declared_session_keys: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     usable = [item for item in availability if item.get("available", True)]
     usable.sort(key=lambda item: int(item.get("weekday", 0)))
@@ -751,8 +753,50 @@ def _schedule_sessions(
     # split per frequency — this is what actually differentiates the three
     # workout-plan candidates beyond their marketing copy.
     split = split_override if split_override is not None else SPLIT_BY_FREQUENCY[frequency]
+    from noam_coach.services import workout_slots
+
     sessions = []
+    # A session code repeats within a plan -- `['A','B','C','A','B','C']` at 6
+    # days -- so the code alone cannot identify a session. Nor can the code's
+    # Nth appearance while iterating: measured, two semantically distinct
+    # sessions sharing a code SWAP identities when the split order changes, so
+    # every slot in both is reattributed to the other session's meaning.
+    #
+    # The keys come from the split DEFINITION instead, so reordering a split
+    # moves a session without renaming it.
+    session_keys = workout_slots.session_keys_for_split(split, declared_session_keys)
+    if len(session_keys) != len(split):
+        # FAIL CLOSED. A split whose declared keys do not match it is a
+        # CONFIGURATION defect, and building anyway is the worst of the
+        # options: measured, it saved candidates whose every entry carried
+        # `slot_id=None`, so identity-less slots reached stored plans and no
+        # later surface could tell them from a legacy payload.
+        #
+        # Refusing here means no fallback key is invented, no partial candidate
+        # is saved, and nothing is rendered or activated. The reason code is
+        # bounded and the counts are integers -- enough to locate the defect,
+        # with no split contents in the message.
+        # `planning` declares no logger; reuse the module that owns this
+        # policy rather than introducing a second logging mechanism.
+        workout_slots.LOGGER.error(
+            "split_session_key_mismatch codes=%d declared=%d",
+            len(split),
+            len(session_keys),
+        )
+        raise PlanningBlockedError(
+            "לא הצלחתי לבנות תוכנית אימון תקינה. בוא נשלים פרטים ונבנה מחדש.",
+            missing=["workout_plan_session_keys"],
+        )
     for index, (slot, code) in enumerate(zip(selected, split, strict=True)):
+        session_key = session_keys[index]
+        session_occurrence = workout_slots.mint_session_occurrence(session_key)
+        exercises = copy.deepcopy(PLANS[code]["exercises"])
+        # A11b: mint slot identity HERE -- on the template copy, before
+        # `adapt_exercises` runs, so the key is the one the template DECLARED
+        # rather than a position that removal and backfill have moved. A
+        # regenerated plan reproduces the same ids by construction, with no
+        # state carried between builds.
+        workout_slots.assign_slot_ids(exercises, session_occurrence)
         sessions.append(
             {
                 "index": index,
@@ -761,8 +805,14 @@ def _schedule_sessions(
                 "time": slot.get("start") or slot.get("time") or default_start,
                 "minutes": int(slot.get("minutes") or default_minutes),
                 "code": code,
+                # A11b: the session's stable professional key, declared against
+                # the split definition. Stored so the session keeps its identity
+                # when A9 realigns weekdays, when the list is reordered, or when
+                # the split is regenerated in a different order -- none of which
+                # changes what the session trains.
+                "session_occurrence": session_occurrence,
                 "name": PLANS[code]["name"],
-                "exercises": copy.deepcopy(PLANS[code]["exercises"]),
+                "exercises": exercises,
             }
         )
     return sessions, assumed
@@ -786,6 +836,53 @@ _BALANCED_SPLIT_OVERRIDES: dict[int, list[str]] = {
 _PERFORMANCE_SPLIT_OVERRIDES: dict[int, list[str]] = {
     4: ["A", "B", "C", "F"],
 }
+
+#: A11b: the stable professional identity of each session in a STRATEGY
+#: OVERRIDE, declared per (strategy, frequency) exactly as
+#: `SESSION_KEYS_BY_FREQUENCY` does for the default splits.
+#:
+#: Without these, an override fell back to `<code>_<n>` -- a key counted while
+#: traversing, which is the very thing that made two sessions sharing a code
+#: swap identities when the order changed. The consistency 3-day override
+#: (`F/F/F`) is the sharpest case: three sessions, one code, and nothing but
+#: position to tell them apart.
+#:
+#: These keys are also deliberately NOT the default-frequency keys. A 3-day
+#: consistency plan trains three full-body days; a 3-day default plan trains
+#: A/B/C. They are different professional programmes, so their sessions must
+#: not share identities -- otherwise a substitution recorded against one would
+#: be attributed to the other after a strategy change.
+#:
+#: **Governance rule, binding on A12 and later work:** a declared key names
+#: what a session IS. Changing the professional meaning of a session REQUIRES
+#: changing its key; reusing a key for a different meaning silently rewrites
+#: the history of every pattern already keyed to it. Adding or reordering
+#: sessions is safe as long as each key stays attached to its own meaning.
+_SPLIT_OVERRIDE_SESSION_KEYS: dict[str, dict[int, list[str]]] = {
+    "consistency": {
+        3: ["cons_full_1", "cons_full_2", "cons_full_3"],
+        4: ["cons_fb_1", "cons_fb_2", "cons_fb_3", "cons_fb_4"],
+    },
+    "balanced": {
+        4: ["bal_upper_1", "bal_lower_1", "bal_upper_2", "bal_lower_2"],
+    },
+    "performance": {
+        4: ["perf_a", "perf_b", "perf_c", "perf_full"],
+    },
+}
+
+
+def _strategy_session_keys(strategy: str, frequency: int) -> list[str] | None:
+    """Declared session keys for a strategy override, or None if it has none.
+
+    Returns None only when the strategy/frequency pair has no override at all;
+    a pair that HAS an override but no declared keys is a configuration defect
+    and is surfaced by `test_every_split_producer_has_declared_session_keys`
+    rather than silently falling back to a positional key.
+    """
+    return _SPLIT_OVERRIDE_SESSION_KEYS.get(str(strategy or ""), {}).get(
+        int(frequency)
+    )
 
 
 def _strategy_split_override(strategy: str, frequency: int) -> list[str] | None:
@@ -1006,15 +1103,44 @@ def repair_workout_payload(payload: dict[str, Any], *, default_minutes: int = 45
         if minutes < 20 or minutes > 150:
             session["minutes"] = max(20, min(150, minutes or default_minutes))
 
-        # Drop duplicate exercises (by id), keeping the first occurrence.
-        seen: set[str] = set()
+        # Drop duplicate exercises, keeping the first occurrence.
+        #
+        # A11b: dedupe on SLOT identity when the entries carry one. Two slots
+        # may legitimately be implemented by the same exercise -- a programme
+        # that presses twice a week is not a defect -- and the old id-only rule
+        # deleted the second, which is a silent slot deletion. Keying on
+        # `(slot_id or id)` keeps the cosmetic-duplicate repair for legacy
+        # payloads while making a genuine duplicate SLOT the only thing that
+        # collapses.
+        # A11b: dedupe on BOTH axes, because they mean different things.
+        #
+        # A repeated slot id is a corrupt payload -- one professional need
+        # cannot appear twice in a session -- so the repeat is dropped.
+        #
+        # A repeated exercise id within one session is also dropped, and that
+        # rule is KEPT rather than relaxed: `workout_quality_issues` flags a
+        # duplicated exercise, and an unrepairable candidate is discarded whole
+        # by `_repair_workout_candidates`. Removing this rule silently reduced
+        # three offered strategies to one, because two candidates became
+        # unrepairable -- measured, not predicted.
+        #
+        # The slot model still holds: two slots may share an exercise across
+        # DIFFERENT sessions (`A#0:press_primary` and `A#1:press_primary` both
+        # implemented by `bench`), which this per-session loop never compares.
+        seen_slots: set[str] = set()
+        seen_exercises: set[str] = set()
         deduped: list[dict[str, Any]] = []
         for exercise in session.get("exercises") or []:
             exercise_id = str(exercise.get("id") or "").strip()
-            if exercise_id and exercise_id in seen:
+            slot_id = str(exercise.get("slot_id") or "").strip()
+            if slot_id and slot_id in seen_slots:
                 continue
+            if exercise_id and exercise_id in seen_exercises:
+                continue
+            if slot_id:
+                seen_slots.add(slot_id)
             if exercise_id:
-                seen.add(exercise_id)
+                seen_exercises.add(exercise_id)
             # Clamp obviously invalid prescriptions.
             try:
                 sets = int(exercise.get("sets") or 0)
@@ -1091,12 +1217,18 @@ def _workout_candidate(
             for d in resolved_preferred_days
         ]
     split_override = _strategy_split_override(strategy, frequency)
+    declared_session_keys = (
+        _strategy_session_keys(strategy, frequency)
+        if split_override is not None
+        else SESSION_KEYS_BY_FREQUENCY.get(frequency)
+    )
     sessions, assumed = _schedule_sessions(
         frequency,
         availability,
         default_minutes=minutes,
         default_start=resolved_preferred_time,
         split_override=split_override,
+        declared_session_keys=declared_session_keys,
     )
     _apply_strategy_volume(sessions, strategy)
     equipment_value = _fact_value(facts, "equipment")
