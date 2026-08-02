@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -2151,3 +2152,45 @@ async def test_the_first_real_set_defines_what_was_performed(
         "the occurrence was decided by a split-secondary or a replayed set "
         "rather than by the first real set"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_duplicate_proposal_is_an_expected_path_not_an_error(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """A second proposal while one is open is ordinary, and must read that way.
+
+    The partial unique index would reject the INSERT anyway, so the RETURN
+    value is `None` either way -- which is exactly why this needs asserting on
+    the path rather than the result. Without the explicit check the duplicate
+    surfaces as a caught IntegrityError logged at ERROR with a stack trace, so
+    the single most common benign outcome would look like a fault and wake
+    somebody up.
+    """
+    db = await _db(tmp_path, "duplicate_proposal")
+    _bind(monkeypatch, db)
+    plan_id, signature = await _active_rt_plan(db)
+    for index, session_id in enumerate((101, 102)):
+        await _completed_workout(db, session_id, "hack_squat", days_ago=20 - index * 5)
+        await _substitution_audit(db, session_id, signature=signature, plan_id=plan_id)
+
+    candidate = await sp.find_promotable(db, 1)
+    assert candidate is not None
+    first = await sp.propose(db, 1, candidate, active_plan_id=plan_id)
+    assert first, "the fixture must produce the first proposal"
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        second = await sp.propose(db, 1, candidate, active_plan_id=plan_id)
+
+    assert second is None, "a second proposal was created over an open question"
+    assert not any(record.exc_info for record in caplog.records), (
+        "the duplicate proposal raised; it must be a checked, expected path"
+    )
+    assert not any(
+        "substitution_proposal_failed" in str(record.msg)
+        for record in caplog.records
+    ), "an ordinary duplicate proposal was logged as a failure"
+    assert any(
+        "reason=open_proposal" in str(record.msg) for record in caplog.records
+    ), "the skip was not reported as the expected open-proposal case"
