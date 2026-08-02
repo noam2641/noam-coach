@@ -18,7 +18,9 @@ timestamp and both proceed.
 from __future__ import annotations
 
 import datetime as dt
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -500,12 +502,19 @@ async def test_retention_never_purges_an_open_approval(tmp_path) -> None:
             (approval_id, user_id, sp.APPROVAL_KIND, status, old, old),
         )
 
-    cutoff = sp.utc_iso(dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=90))
-    await db.execute_rowcount(
-        "DELETE FROM approvals WHERE status NOT IN ('pending', 'processing') "
-        "AND COALESCE(decided_at, created_at)<?",
-        (cutoff,),
-    )
+    # Call PRODUCTION retention, not a copy of its SQL. The first version of
+    # this test inlined the DELETE and therefore asserted its own string:
+    # mutating retention.py changed nothing it observed, and the mutation
+    # survived.
+    import db as _db_module
+
+    monkeypatch_db = _db_module.DB
+    _db_module.DB = db
+    try:
+        await retention.cleanup_operational_data_once()
+    finally:
+        _db_module.DB = monkeypatch_db
+
     survivors = {
         str(r["status"]) for r in await db.fetch_all("SELECT status FROM approvals")
     }
@@ -514,7 +523,6 @@ async def test_retention_never_purges_an_open_approval(tmp_path) -> None:
     )
     assert sp.STATUS_PENDING in survivors
     assert sp.STATUS_APPROVED not in survivors, "settled rows should still be purged"
-    del retention
 
 
 @pytest.mark.asyncio
@@ -531,10 +539,16 @@ async def test_an_active_cooldown_is_never_purged(tmp_path) -> None:
             (subject, until, utc_now(), utc_now(), utc_now()),
         )
 
-    await db.execute_rowcount(
-        "DELETE FROM substitution_cooldowns WHERE suppress_until<?",
-        (sp.utc_iso(),),
-    )
+    import db as _db_module
+    import retention
+
+    previous = _db_module.DB
+    _db_module.DB = db
+    try:
+        await retention.cleanup_operational_data_once()
+    finally:
+        _db_module.DB = previous
+
     remaining = {
         str(r["subject"]) for r in
         await db.fetch_all("SELECT subject FROM substitution_cooldowns")
@@ -681,3 +695,497 @@ def test_the_promotion_callback_reuses_the_registered_planv2_family() -> None:
 
     assert '"planv2:promote:"' in router, "the promotion prefix is not debounced"
     assert '"planv2"' in guard, "planv2 is not registered with the orphan guard"
+
+
+# ---------------------------------------------------------------------------
+# Detector evidence rules
+#
+# Added after deliberate breakage: five mutations survived because nothing
+# called `collect_evidence` or `find_promotable` at all. The lifecycle was
+# tested thoroughly and the thing that DECIDES whether to start a lifecycle was
+# not tested once -- so `pain` could have become promotable, invalid slot ids
+# could have counted, and one workout could have manufactured a promotion,
+# with every existing test still green.
+# ---------------------------------------------------------------------------
+async def _audit_row(
+    db: Database,
+    *,
+    session_id: int,
+    slot_id: str | None,
+    target: str = "hack_squat",
+    source: str = "leg_press",
+    reason: str = "equipment",
+    plan_id: int | None = 7,
+    signature: str | None = "sig0123456789ab",
+    details_override: str | None = None,
+) -> None:
+    """One `approve_substitution` audit row, written the way production does."""
+    payload = {
+        "source": source,
+        "target": target,
+        "reason": reason,
+    }
+    if slot_id is not None:
+        payload["slot_id"] = slot_id
+    if plan_id is not None:
+        payload["evidence_plan_id"] = plan_id
+    if signature is not None:
+        payload["split_signature"] = signature
+    await db.execute(
+        "INSERT INTO audit(user_id, action, entity, entity_id, details, created_at) "
+        "VALUES(1, 'approve_substitution', 'exercise', ?, ?, ?)",
+        (
+            str(session_id),
+            details_override if details_override is not None
+            else json.dumps(payload, ensure_ascii=False),
+            utc_now(),
+        ),
+    )
+
+
+_VALID_SLOT = "abc1_a:leg_press"
+
+
+@pytest.mark.asyncio
+async def test_two_distinct_sessions_meet_the_threshold(tmp_path) -> None:
+    """D-5: two consecutive occurrences. Sourced from the plan, not invented."""
+    db = await _db(tmp_path, "evidence_ok")
+    await _audit_row(db, session_id=1, slot_id=_VALID_SLOT)
+    await _audit_row(db, session_id=2, slot_id=_VALID_SLOT)
+
+    found = await sp.find_promotable(db, 1)
+
+    assert found is not None
+    assert found["slot_id"] == _VALID_SLOT
+    assert found["target"] == "hack_squat"
+    assert found["occurrences"] == sp.PROMOTION_THRESHOLD
+
+
+@pytest.mark.asyncio
+async def test_one_session_never_promotes(tmp_path) -> None:
+    db = await _db(tmp_path, "evidence_one")
+    await _audit_row(db, session_id=1, slot_id=_VALID_SLOT)
+    assert await sp.find_promotable(db, 1) is None
+
+
+@pytest.mark.asyncio
+async def test_repeated_rows_from_one_session_cannot_promote(tmp_path) -> None:
+    """The replay guard. Counting rows instead of sessions would let a single
+    workout -- or one replayed callback -- manufacture a promotion by itself."""
+    db = await _db(tmp_path, "evidence_replay")
+    for _ in range(5):
+        await _audit_row(db, session_id=1, slot_id=_VALID_SLOT)
+
+    evidence = await sp.collect_evidence(db, 1)
+    assert evidence["rows"] == 5
+    assert evidence["skipped"].get(sp.SKIP_DUPLICATE_SESSION) == 4
+    assert await sp.find_promotable(db, 1) is None, (
+        "one session produced a promotion; the detector is counting rows"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pain_is_never_promotion_evidence(tmp_path) -> None:
+    """A safety adaptation is not a preference.
+
+    Promoting it would turn "this hurt" into "I like this" and bake a
+    pain-driven avoidance into the programme permanently.
+    """
+    db = await _db(tmp_path, "evidence_pain")
+    await _audit_row(db, session_id=1, slot_id=_VALID_SLOT, reason="pain")
+    await _audit_row(db, session_id=2, slot_id=_VALID_SLOT, reason="pain")
+
+    evidence = await sp.collect_evidence(db, 1)
+    assert evidence["skipped"].get(sp.SKIP_REASON) == 2
+    assert await sp.find_promotable(db, 1) is None
+    assert "pain" not in sp.PROMOTABLE_REASONS
+
+
+@pytest.mark.asyncio
+async def test_unspecified_is_not_automatically_eligible(tmp_path) -> None:
+    """It marks a pre-A11b keyboard or an unrecognised value, not a signal."""
+    db = await _db(tmp_path, "evidence_unspec")
+    await _audit_row(db, session_id=1, slot_id=_VALID_SLOT, reason="unspecified")
+    await _audit_row(db, session_id=2, slot_id=_VALID_SLOT, reason="unspecified")
+
+    assert await sp.find_promotable(db, 1) is None
+    assert "unspecified" not in sp.PROMOTABLE_REASONS
+
+
+@pytest.mark.asyncio
+async def test_invalid_slot_ids_are_never_evidence(tmp_path) -> None:
+    """Missing, empty and malformed all fail the same round-trip check.
+
+    A11b stored `slot_id=""` on legacy entries. Treating that as a key would
+    merge every legacy substitution into one phantom pattern.
+    """
+    db = await _db(tmp_path, "evidence_slot")
+    for session_id, slot_id in ((1, None), (2, ""), (3, "not-a-slot"), (4, "abc1_a")):
+        await _audit_row(db, session_id=session_id, slot_id=slot_id)
+
+    evidence = await sp.collect_evidence(db, 1)
+    assert evidence["skipped"].get(sp.SKIP_INVALID_SLOT) == 4
+    assert evidence["groups"] == {}
+    assert await sp.find_promotable(db, 1) is None
+
+
+@pytest.mark.asyncio
+async def test_missing_plan_provenance_is_never_evidence(tmp_path) -> None:
+    """Without knowing which plan it happened under, it cannot be grouped."""
+    db = await _db(tmp_path, "evidence_prov")
+    await _audit_row(db, session_id=1, slot_id=_VALID_SLOT, plan_id=None)
+    await _audit_row(db, session_id=2, slot_id=_VALID_SLOT, signature=None)
+
+    evidence = await sp.collect_evidence(db, 1)
+    assert evidence["skipped"].get(sp.SKIP_NO_PROVENANCE) == 2
+    assert await sp.find_promotable(db, 1) is None
+
+
+@pytest.mark.asyncio
+async def test_malformed_json_is_counted_not_raised(tmp_path) -> None:
+    """A corrupt row must never break detection for every other row."""
+    db = await _db(tmp_path, "evidence_json")
+    await _audit_row(db, session_id=1, slot_id=_VALID_SLOT, details_override="{not json")
+    await _audit_row(db, session_id=2, slot_id=_VALID_SLOT)
+    await _audit_row(db, session_id=3, slot_id=_VALID_SLOT)
+
+    evidence = await sp.collect_evidence(db, 1)
+    assert evidence["skipped"].get(sp.SKIP_MALFORMED) == 1
+    assert await sp.find_promotable(db, 1) is not None, (
+        "one corrupt row suppressed detection for the healthy rows"
+    )
+
+
+@pytest.mark.asyncio
+async def test_evidence_never_crosses_a_split_signature_boundary(tmp_path) -> None:
+    """Two occurrences under DIFFERENT splits are not two occurrences.
+
+    They are one each, under two programmes -- and joining them would promote a
+    pattern the user never expressed in either.
+    """
+    db = await _db(tmp_path, "evidence_split")
+    await _audit_row(db, session_id=1, slot_id=_VALID_SLOT, signature="aaaaaaaaaaaaaaaa")
+    await _audit_row(db, session_id=2, slot_id=_VALID_SLOT, signature="bbbbbbbbbbbbbbbb")
+
+    evidence = await sp.collect_evidence(db, 1)
+    assert len(evidence["groups"]) == 2, "the two splits were merged into one group"
+    assert all(len(g["sessions"]) == 1 for g in evidence["groups"].values())
+    assert await sp.find_promotable(db, 1) is None
+
+
+def test_the_subject_is_scoped_by_split_signature() -> None:
+    """A cooldown earned under one split must not suppress another.
+
+    Dropping the signature from the subject would make a decline in a 3-day
+    programme silence the same question in a 6-day one.
+    """
+    first = sp.subject_of("aaaaaaaaaaaaaaaa", _VALID_SLOT, "hack_squat")
+    second = sp.subject_of("bbbbbbbbbbbbbbbb", _VALID_SLOT, "hack_squat")
+
+    assert first != second, "the subject does not distinguish splits"
+    assert first.startswith("aaaaaaaaaaaaaaaa|")
+
+
+@pytest.mark.asyncio
+async def test_the_lookback_window_is_bounded(tmp_path) -> None:
+    """Evidence older than the window does not count."""
+    db = await _db(tmp_path, "evidence_window")
+    old = sp.utc_iso(
+        dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=sp.LOOKBACK_DAYS + 5)
+    )
+    await _audit_row(db, session_id=1, slot_id=_VALID_SLOT)
+    await db.execute(
+        "INSERT INTO audit(user_id, action, entity, entity_id, details, created_at) "
+        "VALUES(1, 'approve_substitution', 'exercise', '99', ?, ?)",
+        (json.dumps({
+            "source": "leg_press", "target": "hack_squat", "reason": "equipment",
+            "slot_id": _VALID_SLOT, "evidence_plan_id": 7,
+            "split_signature": "sig0123456789ab",
+        }), old),
+    )
+
+    evidence = await sp.collect_evidence(db, 1)
+    assert evidence["rows"] == 1, "a row outside the lookback window was read"
+    assert await sp.find_promotable(db, 1) is None
+
+
+@pytest.mark.asyncio
+async def test_a_shorter_promise_cannot_shorten_a_longer_one_via_the_detector_path(
+    tmp_path,
+) -> None:
+    """The UPSERT rule, asserted on values rather than on SQL text."""
+    db = await _db(tmp_path, "cooldown_order")
+    subject = "sig|slot|target"
+
+    await sp.record_cooldown(
+        db, 1, subject, decided_as=sp.STATUS_APPROVED,
+        approval_id=None, days=sp.APPROVE_COOLDOWN_DAYS,
+    )
+    long_row = await db.fetch_one(
+        "SELECT suppress_until FROM substitution_cooldowns WHERE user_id=1", ()
+    )
+    await sp.record_cooldown(
+        db, 1, subject, decided_as=sp.STATUS_DECLINED,
+        approval_id=None, days=sp.DECLINE_COOLDOWN_DAYS,
+    )
+    after = await db.fetch_one(
+        "SELECT suppress_until, decided_as FROM substitution_cooldowns WHERE user_id=1", ()
+    )
+
+    assert str(after["suppress_until"]) == str(long_row["suppress_until"])
+    assert str(after["decided_as"]) == sp.STATUS_APPROVED
+
+
+@pytest.mark.asyncio
+async def test_finalize_refuses_when_it_does_not_hold_the_claim(
+    tmp_path, monkeypatch
+) -> None:
+    """The rowcount check is the whole concurrency argument.
+
+    `_finalize` must write NOTHING unless its conditional UPDATE matched. A
+    version that ignored the rowcount would let a caller that never held the
+    lease write a cooldown -- and deliberate breakage found that this was
+    untested: mutating the check away broke nothing.
+    """
+    db = await _db(tmp_path, "finalize_claim")
+    _bind(monkeypatch, db)
+    plan_id, signature, slot_id, source = await _active_plan(db)
+    approval_id = await _proposal(db, plan_id, signature, slot_id, source)
+
+    # The row is `pending`, not `processing`, so no caller holds the claim.
+    won = await sp._finalize(
+        db, approval_id, 1, become=sp.STATUS_APPROVED,
+        subject="sig|slot|target", days=sp.APPROVE_COOLDOWN_DAYS,
+    )
+
+    assert won is False, "finalize claimed a row it did not hold"
+    assert await _status(db, approval_id) == sp.STATUS_PENDING
+    assert not await db.fetch_all(
+        "SELECT 1 FROM substitution_cooldowns WHERE user_id=1"
+    ), "a cooldown was written without holding the processing claim"
+
+
+@pytest.mark.asyncio
+async def test_only_one_of_two_finalizers_writes(tmp_path, monkeypatch) -> None:
+    """Two callers, one winner -- the same rule, on the finalize path."""
+    db = await _db(tmp_path, "finalize_race")
+    _bind(monkeypatch, db)
+    plan_id, signature, slot_id, source = await _active_plan(db)
+    approval_id = await _proposal(db, plan_id, signature, slot_id, source)
+    await sp.claim_status(
+        db, approval_id, 1, expect=sp.STATUS_PENDING, become=sp.STATUS_PROCESSING
+    )
+
+    first = await sp._finalize(
+        db, approval_id, 1, become=sp.STATUS_APPROVED,
+        subject="sig|slot|target", days=sp.APPROVE_COOLDOWN_DAYS,
+    )
+    second = await sp._finalize(
+        db, approval_id, 1, become=sp.STATUS_APPROVED,
+        subject="sig|slot|target", days=sp.APPROVE_COOLDOWN_DAYS,
+    )
+
+    assert [first, second] == [True, False]
+    rows = await db.fetch_all("SELECT subject FROM substitution_cooldowns WHERE user_id=1")
+    assert len(rows) == 1
+
+
+# ---------------------------------------------------------------------------
+# Real router round-trip
+#
+# Everything above calls the service layer directly. That leaves the most
+# expensive failure untested: callback data that never reaches the handler at
+# all. A11b found exactly that -- `sub` sat in an allowlist while being
+# invisible to the guard scanner, and the orphan test passed while covering
+# nothing.
+#
+# These drive the PRODUCTION router entry point with data built the way the
+# keyboard builds it, so a prefix that stops dispatching fails here.
+# ---------------------------------------------------------------------------
+class _RouterQuery:
+    """Minimal stand-in for a Telegram CallbackQuery."""
+
+    def __init__(self, data: str, user_id: int = 1) -> None:
+        self.data = data
+        self.from_user = SimpleNamespace(id=user_id, first_name="T", username=None)
+        self.message = SimpleNamespace(
+            message_id=1,
+            chat=SimpleNamespace(id=user_id),
+            reply_markup=None,
+        )
+        self.edits: list[str] = []
+        self.answers: list[str] = []
+
+    async def answer(self, text: str | None = None, show_alert: bool = False) -> None:
+        del show_alert
+        if text:
+            self.answers.append(text)
+
+    async def edit_message_text(
+        self, text: str, reply_markup=None, parse_mode=None
+    ) -> None:
+        del reply_markup, parse_mode
+        self.edits.append(text)
+
+    async def edit_message_reply_markup(self, reply_markup=None) -> None:
+        del reply_markup
+
+
+def _router_update(query: _RouterQuery, user_id: int = 1) -> SimpleNamespace:
+    return SimpleNamespace(
+        effective_user=SimpleNamespace(id=user_id, first_name="T", username=None),
+        effective_chat=SimpleNamespace(id=user_id),
+        effective_message=query.message,
+        callback_query=query,
+    )
+
+
+async def _drive_router(query: _RouterQuery, user_id: int = 1) -> None:
+    import coach_bot
+
+    await coach_bot.handle_callback(
+        _router_update(query, user_id), SimpleNamespace(job_queue=None, bot=None)
+    )
+
+
+@pytest.fixture
+def _allow_user(monkeypatch: pytest.MonkeyPatch):
+    from config import SETTINGS
+
+    monkeypatch.setattr(SETTINGS, "telegram_allowed_user_id", 1, raising=False)
+    yield
+
+
+@pytest.mark.asyncio
+async def test_a_generated_callback_reaches_the_handler_through_the_router(
+    tmp_path, monkeypatch, _allow_user
+) -> None:
+    """The whole path: minted data -> production router -> A12 handler -> plan.
+
+    If `planv2:promote:` ever stopped dispatching, every service-level test
+    above would still pass while the feature was dead in production.
+    """
+    import coach_bot
+    from noam_coach.bot import callback_plans
+
+    db = await _db(tmp_path, "roundtrip")
+    _bind(monkeypatch, db)
+    monkeypatch.setattr(callback_plans, "DB", db, raising=False)
+    monkeypatch.setattr(coach_bot, "DB", db, raising=False)
+
+    plan_id, signature, slot_id, source = await _active_plan(db)
+    approval_id = await _proposal(db, plan_id, signature, slot_id, source)
+
+    query = _RouterQuery(f"planv2:promote:yes:{approval_id}")
+    await _drive_router(query)
+
+    assert await _status(db, approval_id) == sp.STATUS_APPROVED, (
+        "the callback did not reach the A12 handler through the real router"
+    )
+    active = await planning.get_active_plan(db, 1, "workout")
+    entry = next(
+        e for s in active["payload"]["sessions"] for e in s["exercises"]
+        if e.get("slot_id") == slot_id
+    )
+    assert entry["id"] == "promoted_target"
+    assert query.edits, "the user was shown nothing"
+
+
+@pytest.mark.asyncio
+async def test_another_users_approval_cannot_be_promoted(
+    tmp_path, monkeypatch, _allow_user
+) -> None:
+    """Ownership is enforced on the approval row, not assumed from the router."""
+    db = await _db(tmp_path, "ownership")
+    _bind(monkeypatch, db)
+    plan_id, signature, slot_id, source = await _active_plan(db)
+    approval_id = await _proposal(db, plan_id, signature, slot_id, source)
+
+    await db.execute(
+        "INSERT INTO users(id, first_name, updated_at) VALUES(2,'B',?)", (utc_now(),)
+    )
+    before = await _plan_version_count(db)
+
+    # User 2 taps user 1's approval id.
+    assert await sp.approve(db, 2, approval_id) == sp.STATUS_STALE
+    assert await _status(db, approval_id) == sp.STATUS_PENDING, (
+        "another user's tap changed the owner's approval"
+    )
+    assert await _plan_version_count(db) == before
+
+
+@pytest.mark.asyncio
+async def test_a_double_tap_through_the_router_mutates_once(
+    tmp_path, monkeypatch, _allow_user
+) -> None:
+    """Two taps, one side effect -- asserted through the real dispatch path."""
+    import coach_bot
+    from noam_coach.bot import callback_plans
+
+    db = await _db(tmp_path, "router_double")
+    _bind(monkeypatch, db)
+    monkeypatch.setattr(callback_plans, "DB", db, raising=False)
+    monkeypatch.setattr(coach_bot, "DB", db, raising=False)
+
+    plan_id, signature, slot_id, source = await _active_plan(db)
+    approval_id = await _proposal(db, plan_id, signature, slot_id, source)
+    before = await _plan_version_count(db)
+
+    data = f"planv2:promote:yes:{approval_id}"
+    await _drive_router(_RouterQuery(data))
+    await _drive_router(_RouterQuery(data))
+
+    assert await _plan_version_count(db) == before + 1, (
+        "the second tap produced a second plan version"
+    )
+    rows = await db.fetch_all("SELECT subject FROM substitution_cooldowns WHERE user_id=1")
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_stale_approval_id_through_the_router_changes_nothing(
+    tmp_path, monkeypatch, _allow_user
+) -> None:
+    """An id from a keyboard whose approval no longer exists."""
+    import coach_bot
+    from noam_coach.bot import callback_plans
+
+    db = await _db(tmp_path, "router_stale")
+    _bind(monkeypatch, db)
+    monkeypatch.setattr(callback_plans, "DB", db, raising=False)
+    monkeypatch.setattr(coach_bot, "DB", db, raising=False)
+    await _active_plan(db)
+    before = await _plan_version_count(db)
+
+    await _drive_router(_RouterQuery("planv2:promote:yes:never_existed"))
+
+    assert await _plan_version_count(db) == before
+    assert not await db.fetch_all("SELECT 1 FROM substitution_cooldowns WHERE user_id=1")
+
+
+@pytest.mark.asyncio
+async def test_tapping_yes_after_declining_does_not_mutate(
+    tmp_path, monkeypatch, _allow_user
+) -> None:
+    """A stale keyboard still showing both buttons after the answer was given."""
+    import coach_bot
+    from noam_coach.bot import callback_plans
+
+    db = await _db(tmp_path, "declined_then_yes")
+    _bind(monkeypatch, db)
+    monkeypatch.setattr(callback_plans, "DB", db, raising=False)
+    monkeypatch.setattr(coach_bot, "DB", db, raising=False)
+
+    plan_id, signature, slot_id, source = await _active_plan(db)
+    approval_id = await _proposal(db, plan_id, signature, slot_id, source)
+    before = await _plan_version_count(db)
+
+    await _drive_router(_RouterQuery(f"planv2:promote:no:{approval_id}"))
+    assert await _status(db, approval_id) == sp.STATUS_DECLINED
+
+    await _drive_router(_RouterQuery(f"planv2:promote:yes:{approval_id}"))
+
+    assert await _status(db, approval_id) == sp.STATUS_DECLINED, (
+        "a late yes overturned a recorded decline"
+    )
+    assert await _plan_version_count(db) == before
