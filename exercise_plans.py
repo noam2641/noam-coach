@@ -457,5 +457,29 @@ SPLIT_BY_FREQUENCY: dict[int, list[str]] = {
     5: ["A", "B", "C", "F", "F"],
     6: ["A", "B", "C", "A", "B", "C"],  # A/B/C twice
 }
+
+#: A11b: the stable professional identity of each session IN a split.
+#:
+#: A session code is not unique within a split -- `['F','F']`, `['A','B','C',
+#: 'A','B','C']` -- so identity cannot be the code alone. It also cannot be the
+#: code's Nth appearance while traversing: measured, two semantically distinct
+#: sessions sharing a code SWAP identities when the split order changes, so
+#: every slot in both is reattributed to the other session's meaning.
+#:
+#: These keys are DECLARED against the split definition, so they are a property
+#: of the programme rather than of traversal order. Reordering a split moves a
+#: session; it does not rename it.
+#:
+#: A key names what the session IS -- "the first full-body day", "the second
+#: A/B/C rotation" -- and is parallel to `slot_key` one level down. Neither is
+#: derived from weekday, array position, or the exercise implementing it.
+SESSION_KEYS_BY_FREQUENCY: dict[int, list[str]] = {
+    1: ["full_1"],
+    2: ["full_1", "full_2"],
+    3: ["abc1_a", "abc1_b", "abc1_c"],
+    4: ["abc1_a", "abc1_b", "abc1_c", "full_1"],
+    5: ["abc1_a", "abc1_b", "abc1_c", "full_1", "full_2"],
+    6: ["abc1_a", "abc1_b", "abc1_c", "abc2_a", "abc2_b", "abc2_c"],
+}
 MIN_FREQUENCY = 1
 MAX_FREQUENCY = 6

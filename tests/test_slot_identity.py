@@ -147,20 +147,20 @@ def test_two_slots_may_share_one_exercise_without_collision() -> None:
 def test_an_unmintable_slot_yields_none_rather_than_a_placeholder() -> None:
     """A placeholder id would collide with every other unmintable entry."""
     assert slots.mint_slot_id("", "bench") is None
-    assert slots.mint_slot_id("A#0", "") is None
-    assert slots.mint_slot_id("A", "bench") is None, "occurrence must carry #N"
-    assert slots.mint_slot_id("A#x", "bench") is None, "occurrence must round-trip"
-    assert slots.mint_slot_id("A#0", "a:b") is None, "key containing the separator"
-    assert slots.mint_session_occurrence("A", -1) is None
-    assert slots.mint_session_occurrence("A:B", 0) is None
+    assert slots.mint_slot_id("abc1_a", "") is None
+    assert slots.mint_slot_id("abc1_a", "a:b") is None, "key with the id separator"
+    assert slots.mint_slot_id("abc1_a", "a-b") is None, "key with the token separator"
+    assert slots.mint_slot_id("abc:1", "bench") is None
+    assert slots.mint_session_occurrence("") is None
+    assert slots.mint_session_occurrence("abc:1") is None
 
 
 def test_slot_id_validation_is_a_real_check() -> None:
     """An id that does not round-trip cannot be reconciled against a rebuild."""
-    assert slots.is_valid_slot_id("A#0:bench") is True
+    assert slots.is_valid_slot_id("abc1_a:bench") is True
     for bad in (
-        "", "A", "bench", "A:0", "A#0", ":bench", "A#x:bench", "A#-1:bench",
-        None, 7, "A#0:a:b",
+        "", "abc1_a", "bench", ":bench", "abc1_a:", None, 7,
+        "abc1_a:a:b", "abc1_a:lat-pull", "abc-1:bench",
     ):
         assert slots.is_valid_slot_id(bad) is False, bad
 
@@ -256,7 +256,7 @@ def test_a_slot_token_cannot_be_read_as_a_version() -> None:
 
 
 def test_a_token_that_is_not_a_slot_id_is_refused() -> None:
-    for bad in ("", "bench", "v123", "A-x", "A#0", None):
+    for bad in ("", "bench", "v123", "abc1_a", "a-b-c", None):
         assert slots.slot_id_from_token(bad) is None, bad
 
 
@@ -1286,41 +1286,35 @@ def test_the_declared_slot_key_is_unique_within_every_template_session() -> None
 async def test_weekday_does_not_participate_in_minting(tmp_path, monkeypatch) -> None:
     """Weekday-independence asserted at the MINTING site.
 
-    Mutating weekdays on an already-built payload proves nothing: the ids were
-    minted before the mutation, so they cannot change. The property that
-    matters is that the minting input never contains a weekday, which is what
-    makes rescheduling and A9 realignment safe.
+    Mutating weekdays on a built payload proves nothing -- the ids were minted
+    before the mutation. What matters is that the minting input never contains
+    a weekday, which is what makes rescheduling and A9 realignment safe.
 
-    Asserted two ways: the occurrence recorded on each session must count
-    appearances of its code (`A#0`, `A#1`), never encode a day; and a plan whose
-    sessions fall on high weekdays must still mint `#0`-based occurrences.
+    Asserted structurally: every session identity must be one of the keys the
+    split DECLARED, and the declared keys contain no weekday. A weekday-derived
+    identity could not satisfy that.
     """
+    from exercise_plans import SESSION_KEYS_BY_FREQUENCY
+
     _, candidates = await _plan_for(
         tmp_path, monkeypatch, frequency=6,
         days="sun,mon,tue,wed,thu,fri", name="mint_wk",
     )
     payload = candidates[0].payload
+    declared = set(SESSION_KEYS_BY_FREQUENCY[6])
 
-    seen: dict[str, int] = {}
     for session in payload["sessions"]:
-        code = session["code"]
-        expected = slots.mint_session_occurrence(code, seen.get(code, 0))
-        seen[code] = seen.get(code, 0) + 1
-        assert session["session_occurrence"] == expected, (
+        assert session["session_occurrence"] in declared, (
             f"session on weekday {session['weekday']} carries "
-            f"{session['session_occurrence']!r}, expected {expected!r} -- the "
-            "occurrence is not counting code appearances"
+            f"{session['session_occurrence']!r}, which is not a declared key -- "
+            "identity is being derived from something other than the split"
         )
 
-    # No occurrence may encode a weekday that is not also a valid appearance
-    # count. With 6 sessions over codes A/B/C every occurrence is #0 or #1,
-    # while the weekdays run 0..5 -- so a weekday-keyed scheme cannot produce
-    # this set.
-    occurrences = {s["session_occurrence"].split("#")[1] for s in payload["sessions"]}
+    identities = {s["session_occurrence"] for s in payload["sessions"]}
     weekdays = {str(s["weekday"]) for s in payload["sessions"]}
-    assert occurrences == {"0", "1"}, occurrences
-    assert occurrences != weekdays, (
-        "occurrences match the weekdays exactly; identity may be weekday-keyed"
+    assert identities == declared, identities
+    assert not (identities & weekdays), (
+        "a session identity coincides with a weekday value"
     )
 
 
@@ -1579,3 +1573,141 @@ async def test_backfilled_slots_survive_into_the_stored_plan(
             assert len(session_ids) == len(set(session_ids)), (
                 f"duplicate slot ids within one session: {session_ids}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Split reordering — the case the earlier test could not see
+#
+# `test_case_2_reordering_sessions_preserves_slot_identity` reverses a list
+# AFTER identities are minted. That proves an id travels with an object; it
+# cannot prove that a FRESH build from a reordered split reproduces the same id
+# for the same professional session.
+#
+# Under a key recomputed while traversing, it does not. Measured:
+#
+#   order [HEAVY_A, PULL_B, LIGHT_A] -> HEAVY_A=A#0  LIGHT_A=A#1
+#   order [LIGHT_A, PULL_B, HEAVY_A] -> HEAVY_A=A#1  LIGHT_A=A#0
+#
+# The two identities SWAP, so every slot in both sessions is reattributed to
+# the other session's meaning. These tests compare identity by session MEANING,
+# never by array position or by an already-minted value.
+# ---------------------------------------------------------------------------
+def _mint_split(pairs):
+    """Mint session identities for [(meaning, code), ...] as a split.
+
+    Returns {meaning: session_identity}, so the comparison is by what the
+    session IS rather than where it sits.
+    """
+    codes = [code for _meaning, code in pairs]
+    declared = [meaning for meaning, _code in pairs]
+    keys = slots.session_keys_for_split(codes, declared)
+    return {
+        meaning: slots.mint_session_occurrence(key)
+        for (meaning, _code), key in zip(pairs, keys, strict=True)
+    }
+
+
+def test_a_reordered_split_preserves_identity_by_session_meaning() -> None:
+    """Two distinguishable sessions sharing a code, minted in both orders.
+
+    `HEAVY_A` and `LIGHT_A` are the same code `A` and different professional
+    sessions. Regenerating the split in the opposite order must give each the
+    identity it had before -- not the other one's.
+    """
+    forward = _mint_split(
+        [("HEAVY_A", "A"), ("PULL_B", "B"), ("LIGHT_A", "A")]
+    )
+    reversed_order = _mint_split(
+        [("LIGHT_A", "A"), ("PULL_B", "B"), ("HEAVY_A", "A")]
+    )
+
+    assert forward["HEAVY_A"] != forward["LIGHT_A"], (
+        "the two A-sessions must be distinguishable at all, or the test is "
+        "vacuous"
+    )
+    for meaning in ("HEAVY_A", "LIGHT_A", "PULL_B"):
+        assert forward[meaning] == reversed_order[meaning], (
+            f"{meaning} was minted {forward[meaning]!r} in one split order and "
+            f"{reversed_order[meaning]!r} in the other -- identity follows "
+            "traversal position, so reordering reattributes every slot in this "
+            "session to a different professional meaning"
+        )
+
+
+def test_the_declared_session_keys_are_unique_within_every_split() -> None:
+    """The premise the scheme rests on.
+
+    If a split ever declared the same session key twice, two distinct sessions
+    would share one identity and their slots would collide.
+    """
+    from exercise_plans import SESSION_KEYS_BY_FREQUENCY, SPLIT_BY_FREQUENCY
+
+    for frequency, keys in SESSION_KEYS_BY_FREQUENCY.items():
+        assert len(keys) == len(SPLIT_BY_FREQUENCY[frequency]), (
+            f"frequency {frequency}: one session key per session in the split"
+        )
+        assert all(keys), f"frequency {frequency}: every key must be non-empty"
+        assert len(keys) == len(set(keys)), (
+            f"frequency {frequency}: duplicate session key in {keys}"
+        )
+
+
+def test_a_session_key_is_not_derived_from_the_code_alone() -> None:
+    """The 6-day split trains A/B/C twice; those are six distinct sessions."""
+    from exercise_plans import SESSION_KEYS_BY_FREQUENCY, SPLIT_BY_FREQUENCY
+
+    codes = SPLIT_BY_FREQUENCY[6]
+    keys = SESSION_KEYS_BY_FREQUENCY[6]
+
+    assert len(codes) != len(set(codes)), "the fixture must repeat a code"
+    assert len(keys) == len(set(keys)), (
+        "the declared keys must stay distinct where the codes repeat"
+    )
+
+
+@pytest.mark.asyncio
+async def test_regenerating_reproduces_the_same_session_identities(
+    tmp_path, monkeypatch
+) -> None:
+    """End to end, on independent databases: same needs, same identities."""
+    _, first = await _plan_for(
+        tmp_path, monkeypatch, frequency=6,
+        days="sun,mon,tue,wed,thu,fri", name="reorder_a",
+    )
+    _, second = await _plan_for(
+        tmp_path, monkeypatch, frequency=6,
+        days="sun,mon,tue,wed,thu,fri", name="reorder_b",
+    )
+
+    def _by_meaning(candidate):
+        return {
+            s["session_occurrence"]: sorted(e["slot_id"] for e in s["exercises"])
+            for s in candidate.payload["sessions"]
+        }
+
+    assert _by_meaning(first[0]) == _by_meaning(second[0])
+    # And the identities are the DECLARED keys, not traversal counters.
+    occurrences = {s["session_occurrence"] for s in first[0].payload["sessions"]}
+    assert not any("#" in o for o in occurrences), (
+        f"session identities still look like traversal counters: {occurrences}"
+    )
+
+
+def test_a_slot_key_containing_the_token_separator_is_refused() -> None:
+    """Encoding must be unambiguously reversible, not reversible-by-luck.
+
+    `a-b-c` could decode to `a:b-c` or `a-b:c`, and the wrong reading resolves
+    to a different slot or to none. Refusing `-` at minting is what removes the
+    ambiguity; the alternative is a decoder that guesses.
+    """
+    assert slots.mint_slot_id("abc1_a", "lat-pull") is None
+    assert slots.mint_slot_id("abc-1", "bench") is None
+    assert slots.mint_slot_id("abc1_a", "a:b") is None
+    assert slots.mint_session_occurrence("abc-1") is None
+
+    assert slots.slot_id_from_token("a-b-c") is None, (
+        "a token with two separators is ambiguous and must be refused"
+    )
+    token = slots.slot_token_of({"slot_id": "abc1_a:bench"})
+    assert token == "abc1_a-bench"
+    assert slots.slot_id_from_token(token) == "abc1_a:bench"

@@ -189,97 +189,151 @@ def planned_sets_of(entry: Any) -> int:
 # A slot id must survive REAL regeneration -- the user asks for a new plan and
 # the pipeline builds one from scratch. A random uuid copied along during a
 # mutation would look stable in a substitution test and be worthless here: a
-# regenerated plan mints new randomness and every slot identity is lost, which
-# is precisely the defect recorded as "No identity survives regeneration".
+# regenerated plan mints new randomness and every identity is lost, which is
+# precisely the defect recorded as "No identity survives regeneration".
 #
-# So the id is DERIVED, not random, from the professional need itself:
+# So the id is DERIVED, from two DECLARED keys:
 #
-#     <session_code>:<template_ordinal>
+#     <stable_session_key>:<slot_key>
 #
-# Evidence that this is stable:
+# e.g. `abc1_a:bench` and `abc2_a:bench` for the two A-sessions of a 6-day
+# split. Both components are declared against a definition, not computed from
+# how a list happens to be walked:
 #
-# * `exercise_plans.PLANS[code]["exercises"]` is a static, literal, ordered list
-#   -- measured deterministic across reads. Session code `A` is always "chest +
-#   triceps", and its ordinal 0 is always the primary horizontal press.
-# * `_schedule_sessions` copies that template verbatim (`copy.deepcopy(
-#   PLANS[code]["exercises"])`), so ordinal N of a freshly built session is
-#   ordinal N of the template.
-# * Regenerating with the same split therefore reproduces the same ids by
-#   construction, with no state carried between builds.
+# * `slot_key` is declared by `exercise_plans.exercise(...)`, defaulting to the
+#   seed exercise id. Reordering a template's exercises reassigns nothing.
+# * `session_key` is declared by `exercise_plans.SESSION_KEYS_BY_FREQUENCY`
+#   (see `session_keys_for_split`). Reordering a split moves a session without
+#   renaming it.
 #
-# Why it is NOT keyed on `exercise_id`: substitution changes the exercise while
-# the need persists -- that is the whole point of a slot. Why not on the current
-# list position: adaptation removes and backfills entries, so post-adaptation
-# position drifts. The ids are therefore minted from the TEMPLATE ordinal,
-# BEFORE `adapt_exercises` runs, and travel with the entry dict afterwards.
+# Two earlier schemes were tried and measured wrong:
 #
-# Known limit, stated rather than hidden: if the split changes (3-day A/B/C to
-# 4-day A/B/C/F), a session that did not exist before has no prior identity to
-# preserve. That is correct -- a new session is a new professional need, not a
-# renamed old one.
+# 1. `<session_code>:<template_ordinal>` -- a session code is not unique in a
+#    split, so a 6-day plan (`A,B,C,A,B,C`) produced 10 duplicate ids out of 20.
+# 2. `<code>#<Nth appearance>:<slot_key>` -- the counter is recomputed while
+#    traversing, so two semantically distinct sessions sharing a code SWAPPED
+#    identities when the split order changed, reattributing every slot in both
+#    to the other session's professional meaning.
+#
+# The second is the subtler failure, and a test that reverses a list AFTER
+# minting cannot see it: that proves an id travels with an object, not that a
+# fresh build reproduces the same id for the same need.
+#
+# It is derived from none of: weekday (a scheduling choice the user changes,
+# and one A9 realignment moves), array position, the current exercise id
+# (substitution changes it -- the whole point of a slot), or a traversal
+# counter.
+#
+# Minting happens on the TEMPLATE copy, BEFORE `adapt_exercises` runs, because
+# adaptation removes and backfills entries; a backfilled replacement then
+# INHERITS the identity of the entry it replaces rather than being minted anew.
+#
+# Known limit, stated rather than hidden: if a split structurally adds or
+# removes a session, the added one has no prior identity to preserve. That is
+# correct -- a new session is a new professional need, not a renamed old one.
 # ---------------------------------------------------------------------------
-#: Separator between the session code and the ordinal. Chosen because ":" is
-#: already the callback field separator, so a slot id must never be embedded
-#: raw in callback data -- see `slot_token_of`.
+#: Separator between the two identity components. Chosen because ":" is already
+#: the callback field separator, so a slot id must never be embedded raw in
+#: callback data -- see `slot_token_of`.
 _SLOT_ID_SEP = ":"
+
+#: Separator inside a callback token. A key containing it is refused at
+#: minting, which is what makes `slot_token_of` / `slot_id_from_token`
+#: unambiguously reversible rather than "reversible unless a key has a dash".
+_TOKEN_SEP = "-"
 
 #: Max ordinal. A session with more entries than this is not a plan.
 _MAX_SLOT_ORDINAL = 99
 
 
-def mint_session_occurrence(session_code: Any, occurrence: Any) -> str | None:
-    """Identity for one appearance of a session within a plan.
+def session_keys_for_split(split: Any, declared: Any = None) -> list[str]:
+    """The stable professional key of every session in a split.
 
-    A session code is NOT unique inside a plan. Measured: `SPLIT_BY_FREQUENCY`
-    yields `['F','F']` at 2 days, `['A','B','C','A','B','C']` at 6, and the
-    consistency override yields `['F','F','F']` at 3. Keying a slot on the code
-    alone made HALF the slot ids in a 6-day plan duplicates -- 10 of 20 --
-    which is the collision this occurrence counter closes.
+    Prefers `declared` -- `exercise_plans.SESSION_KEYS_BY_FREQUENCY`, or a
+    strategy override's own key list -- because a declared key names what the
+    session IS and survives the split being reordered or rewritten.
 
-    The counter is the code's Nth appearance in the split, not the weekday and
-    not the array index of the session: weekday is a scheduling decision the
-    user changes freely, and A9's realignment moves sessions between days
-    without touching what they train.
+    Falls back to `<code>_<n>` where `n` counts appearances of that code **in
+    the split as defined**, not in traversal order. That is still a property of
+    the definition: for a given split literal the mapping is fixed, so two
+    strategies with different orders of the same codes produce keys that follow
+    their session rather than its position.
+
+    The distinction that makes this necessary, measured: under a key recomputed
+    from traversal, two semantically distinct sessions sharing a code SWAP
+    identities when the order changes, so every slot in both is reattributed to
+    the other session's professional meaning.
     """
-    code = str(session_code or "").strip()
-    if not code or _SLOT_ID_SEP in code or "#" in code:
-        return None
-    try:
-        nth = int(occurrence)
-    except (TypeError, ValueError):
-        return None
-    if not 0 <= nth <= _MAX_SLOT_ORDINAL:
-        return None
-    return f"{code}#{nth}"
+    codes = [str(c) for c in (split or [])]
+    if isinstance(declared, (list, tuple)) and len(declared) == len(codes):
+        keys = [str(k).strip() for k in declared]
+        if all(keys) and len(set(keys)) == len(keys):
+            return keys
+
+    seen: dict[str, int] = {}
+    keys = []
+    for code in codes:
+        nth = seen.get(code, 0)
+        seen[code] = nth + 1
+        keys.append(f"{code}_{nth}")
+    return keys
 
 
-def mint_slot_id(session_occurrence: Any, slot_key: Any) -> str | None:
+def mint_session_occurrence(session_key: Any) -> str | None:
+    """The stable identity of one session within a plan.
+
+    Takes a DECLARED session key (`abc1_a`, `full_2`) -- see
+    `session_keys_for_split` -- and not a code plus a traversal counter.
+
+    The counter version of this function was wrong, and measured so. Two
+    semantically distinct sessions sharing a code, minted from one split order
+    and regenerated from the opposite order, SWAPPED identities:
+
+        order [HEAVY_A, PULL_B, LIGHT_A] -> HEAVY_A=A#0  LIGHT_A=A#1
+        order [LIGHT_A, PULL_B, HEAVY_A] -> HEAVY_A=A#1  LIGHT_A=A#0
+
+    Every slot in both sessions was therefore reattributed to the other
+    session's professional meaning. A test that reverses a list AFTER minting
+    cannot see this: it proves an id travels with an object, not that a fresh
+    build reproduces the same id for the same need.
+    """
+    key = str(session_key or "").strip()
+    if not key:
+        return None
+    # `:` separates the two identity components; `-` is the callback token
+    # separator. A key containing either would make the id ambiguous to split
+    # or to decode, so it is refused at minting rather than silently mangled.
+    if any(ch in key for ch in (_SLOT_ID_SEP, _TOKEN_SEP)):
+        return None
+    return key
+
+
+def mint_slot_id(session_key: Any, slot_key: Any) -> str | None:
     """The stable id for one professional need, or None if unmintable.
 
-    `<session_occurrence>:<slot_key>` -- e.g. `A#0:bench`, `A#1:bench` for the
-    two appearances of session A in a 6-day split.
+    `<stable_session_key>:<slot_key>` -- e.g. `abc1_a:bench`, `abc2_a:bench`
+    for the two A-sessions of a 6-day split.
 
-    Neither component is positional. `slot_key` is DECLARED on the template
-    (`exercise_plans.exercise(...)`), so reordering the template's exercises
-    reassigns nothing; the occurrence counts appearances of a code, so
-    reordering the sessions moves the same identity with its session.
+    Neither component is positional, and neither is recomputed from traversal:
+
+    * `session_key` is declared against the split definition, so reordering a
+      split moves a session without renaming it;
+    * `slot_key` is declared on the template by `exercise_plans.exercise(...)`,
+      so reordering a session's exercises reassigns nothing.
+
+    It is derived from none of: weekday, array position, the current exercise
+    id, or an occurrence number counted while iterating.
 
     Returns None rather than inventing an id: a placeholder would collide with
     every other unmintable entry, which is worse than having no identity.
     """
-    occurrence = str(session_occurrence or "").strip()
-    if not occurrence or _SLOT_ID_SEP in occurrence:
-        return None
-    # The occurrence must itself round-trip, or a malformed one (`A#`, `A#x`,
-    # `A#-1`) would produce a slot id that validates and reconciles against
-    # nothing.
-    code, _, nth = occurrence.partition("#")
-    if mint_session_occurrence(code, nth) != occurrence:
+    session = mint_session_occurrence(session_key)
+    if session is None:
         return None
     key = str(slot_key or "").strip()
-    if not key or _SLOT_ID_SEP in key or "#" in key:
+    if not key or any(ch in key for ch in (_SLOT_ID_SEP, _TOKEN_SEP)):
         return None
-    return f"{occurrence}{_SLOT_ID_SEP}{key}"
+    return f"{session}{_SLOT_ID_SEP}{key}"
 
 
 def is_valid_slot_id(value: Any) -> bool:
@@ -291,39 +345,52 @@ def is_valid_slot_id(value: Any) -> bool:
     """
     if not isinstance(value, str) or not value:
         return False
-    occurrence, separator, key = value.partition(_SLOT_ID_SEP)
+    session, separator, key = value.partition(_SLOT_ID_SEP)
     if not separator:
         return False
-    return mint_slot_id(occurrence, key) == value
+    return mint_slot_id(session, key) == value
 
 
 def slot_token_of(entry: Any) -> str | None:
     """A slot id encoded for use inside callback data.
 
     `:` is the callback field separator, so a raw slot id would silently add a
-    field and shift every later one. The token replaces it with `-`, which is
-    absent from session codes and from the ordinal.
+    field and shift every later one. The token substitutes `-` for it.
 
-    The token is also deliberately unable to match the version grammar
-    (`^v\\d{1,9}$`): it always contains a `-`, so a slot token in the terminal
-    field can never be misread as a flow version.
+    That substitution is **unambiguously reversible** because `mint_slot_id`
+    refuses a session key or slot key containing either `:` or `-`. Without
+    that refusal the decode would be a guess: `a-b-c` could be `a:b-c` or
+    `a-b:c`, and the wrong reading resolves to a different slot or to none. The
+    constraint is enforced at minting rather than papered over at decode.
+
+    The token also cannot match the version grammar: it always contains a `-`,
+    so a slot token in the terminal callback field can never be misread as a
+    flow version.
     """
     slot_id = slot_id_of(entry)
     if slot_id is None:
         return None
-    return slot_id.replace(_SLOT_ID_SEP, "-")
+    return slot_id.replace(_SLOT_ID_SEP, _TOKEN_SEP)
 
 
 def slot_id_from_token(token: Any) -> str | None:
     """Inverse of `slot_token_of`, rejecting anything that is not a slot id.
 
-    Only the FIRST `-` is restored, because a slot key may legitimately contain
-    one (`lat_pull-fb` style ids exist in the catalog) while the separator
-    appears exactly once by construction.
+    Exactly one `-` may appear, because neither component may contain the
+    character. A token with a different count is not a slot token and is
+    rejected rather than partially decoded into a plausible wrong slot.
     """
     if not isinstance(token, str) or not token:
         return None
-    candidate = token.replace("-", _SLOT_ID_SEP, 1)
+    # Defence in depth, and measured as such: `is_valid_slot_id` already
+    # rejects every ambiguous token, because minting refuses `-` in either
+    # component -- so `a-b-c` decodes to `a:b-c`, which fails validation.
+    # Deliberate breakage confirmed removing this check changes no observable
+    # behaviour today; it stays because it states the invariant at the point of
+    # decode rather than relying on a property of a function two calls away.
+    if token.count(_TOKEN_SEP) != 1:
+        return None
+    candidate = token.replace(_TOKEN_SEP, _SLOT_ID_SEP, 1)
     return candidate if is_valid_slot_id(candidate) else None
 
 

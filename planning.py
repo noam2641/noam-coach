@@ -20,6 +20,7 @@ from exercise_plans import (
     MAX_FREQUENCY,
     MIN_FREQUENCY,
     PLANS,
+    SESSION_KEYS_BY_FREQUENCY,
     SPLIT_BY_FREQUENCY,
     weekday_he,
 )
@@ -755,16 +756,19 @@ def _schedule_sessions(
 
     sessions = []
     # A session code repeats within a plan -- `['A','B','C','A','B','C']` at 6
-    # days -- so the code alone cannot identify a session. Counting appearances
-    # gives each one a stable occurrence: `A#0`, `A#1`. Measured before this
-    # existed: 10 of 20 slot ids in a 6-day plan were duplicates.
-    code_occurrences: dict[str, int] = {}
+    # days -- so the code alone cannot identify a session. Nor can the code's
+    # Nth appearance while iterating: measured, two semantically distinct
+    # sessions sharing a code SWAP identities when the split order changes, so
+    # every slot in both is reattributed to the other session's meaning.
+    #
+    # The keys come from the split DEFINITION instead, so reordering a split
+    # moves a session without renaming it.
+    session_keys = workout_slots.session_keys_for_split(
+        split, SESSION_KEYS_BY_FREQUENCY.get(frequency) if split_override is None else None
+    )
     for index, (slot, code) in enumerate(zip(selected, split, strict=True)):
-        occurrence_index = code_occurrences.get(code, 0)
-        code_occurrences[code] = occurrence_index + 1
-        session_occurrence = workout_slots.mint_session_occurrence(
-            code, occurrence_index
-        )
+        session_key = session_keys[index] if index < len(session_keys) else None
+        session_occurrence = workout_slots.mint_session_occurrence(session_key)
         exercises = copy.deepcopy(PLANS[code]["exercises"])
         # A11b: mint slot identity HERE -- on the template copy, before
         # `adapt_exercises` runs, so the key is the one the template DECLARED
@@ -780,10 +784,11 @@ def _schedule_sessions(
                 "time": slot.get("start") or slot.get("time") or default_start,
                 "minutes": int(slot.get("minutes") or default_minutes),
                 "code": code,
-                # A11b: which appearance of `code` this session is. Stored so
-                # the session keeps its identity when A9 realigns weekdays or
-                # the list is reordered -- neither of which changes what the
-                # session trains.
+                # A11b: the session's stable professional key, declared against
+                # the split definition. Stored so the session keeps its identity
+                # when A9 realigns weekdays, when the list is reordered, or when
+                # the split is regenerated in a different order -- none of which
+                # changes what the session trains.
                 "session_occurrence": session_occurrence,
                 "name": PLANS[code]["name"],
                 "exercises": exercises,
