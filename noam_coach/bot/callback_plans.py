@@ -1678,12 +1678,22 @@ async def handle_plan_callback(query: Any, user_id: int, data: str) -> bool:
             return True
 
         if decision == "no":
-            await _sp.decline(DB, user_id, approval_id)
-            await safe_edit(
-                query,
-                "בסדר, נשאיר את התוכנית כמו שהיא. לא אשאל על זה שוב בקרוב.",
-                home_keyboard(),
-            )
+            # The DURABLE status, not the tap's intent. A "no" arriving after a
+            # "yes" already applied the change must not claim the plan was left
+            # untouched -- the user would be told the opposite of what their
+            # plan now says.
+            outcome = await _sp.decline(DB, user_id, approval_id)
+            if outcome == _sp.STATUS_DECLINED:
+                text = "בסדר, נשאיר את התוכנית כמו שהיא. לא אשאל על זה שוב בקרוב."
+            elif outcome == _sp.STATUS_APPROVED:
+                text = "התשובה הקודמת כבר נשמרה — התוכנית עודכנה לתרגיל החדש."
+            elif outcome == _sp.STATUS_PROCESSING:
+                text = "רגע, אני עוד מעדכן את זה. תיכף יופיע."
+            elif outcome == _sp.STATUS_STALE:
+                text = "התוכנית השתנתה מאז, אז לא שיניתי כלום."
+            else:
+                text = "לא הצלחתי לשמור את התשובה. אשאל שוב בהזדמנות."
+            await safe_edit(query, text, home_keyboard())
             return True
 
         outcome = await _sp.approve(DB, user_id, approval_id)

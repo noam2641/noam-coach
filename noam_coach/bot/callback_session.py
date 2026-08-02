@@ -232,11 +232,7 @@ async def _handle_session_core_actions(
             return True
         completed, rest = result
         if completed:
-            await safe_edit(
-                query,
-                await workout_summary(user_id, session_id),
-                home_keyboard(),
-            )
+            await _render_workout_end(query, user_id, session_id)
             return True
         await start_rest_timer(
             context=context,
@@ -448,11 +444,7 @@ async def _handle_session_split_actions(
         await clear_split_state(user_id, session_id)
 
         if completed:
-            await safe_edit(
-                query,
-                await workout_summary(user_id, session_id),
-                home_keyboard(),
-            )
+            await _render_workout_end(query, user_id, session_id)
             return True
         await start_rest_timer(
             context=context,
@@ -567,7 +559,7 @@ def _snapshot_plan_id(snapshot: Any) -> int | None:
         return None
 
 
-async def _snapshot_split_signature(snapshot: Any) -> str | None:
+async def _snapshot_split_signature(snapshot: Any, user_id: int) -> str | None:
     """Split signature of the plan version a session was materialized from.
 
     Read from that stored plan version, never from the current active plan --
@@ -581,8 +573,12 @@ async def _snapshot_split_signature(snapshot: Any) -> str | None:
     from noam_coach.services import substitution_patterns
 
     try:
+        # Scoped by user: a plan id alone is not proof of ownership, and a
+        # signature read from another user's plan version would attach foreign
+        # provenance to this user's audit row.
         row = await DB.fetch_one(
-            "SELECT payload FROM plan_versions WHERE id=?", (plan_id,)
+            "SELECT payload FROM plan_versions WHERE id=? AND user_id=?",
+            (plan_id, user_id),
         )
     except Exception:
         LOGGER.exception("snapshot_split_signature_failed plan_id=%s", plan_id)
@@ -590,6 +586,51 @@ async def _snapshot_split_signature(snapshot: Any) -> str | None:
     if not row:
         return None
     return substitution_patterns.signature_from_plan_payload(row["payload"])
+
+
+async def _render_workout_end(query: Any, user_id: int, session_id: int) -> None:
+    """The end-of-workout render: the summary, then the promotion ask if due.
+
+    D-5 places pattern promotion "at the end of the workout", and this is the
+    one place both completion paths converge on -- the one-tap save and the
+    adjusted-RIR save. Putting the call here rather than in each branch is what
+    stops the two from drifting apart.
+
+    The summary is sent FIRST and separately. If the promotion ask fails for any
+    reason the user still sees that their workout was saved; the enhancement
+    never takes the confirmation down with it.
+    """
+    summary = await workout_summary(user_id, session_id)
+
+    from noam_coach.services import substitution_patterns as _sp
+
+    offer = None
+    try:
+        offer = await _sp.offer_after_workout(DB, user_id)
+    except Exception:
+        LOGGER.exception("promotion_offer_failed user_id=%s", user_id)
+
+    if not offer:
+        await safe_edit(query, summary, home_keyboard())
+        return
+
+    await safe_edit(query, summary, None)
+    source_name = offer.get("source_name") or offer["source"]
+    target_name = offer.get("target_name") or offer["target"]
+    await query.message.reply_text(
+        f"שמתי לב שהחלפת {source_name} ב{target_name} פעמיים ברציפות.\n"
+        "לעדכן את התוכנית כך שזה יהיה התרגיל הקבוע?",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "כן, עדכן",
+                callback_data=_sp.promotion_callback_data("yes", offer["approval_id"]),
+            ),
+            InlineKeyboardButton(
+                "לא, השאר",
+                callback_data=_sp.promotion_callback_data("no", offer["approval_id"]),
+            ),
+        ]]),
+    )
 
 
 @runtime_bound(RUNTIME_NAMES)
@@ -744,11 +785,7 @@ async def _handle_session_adjustment_actions(
             return True
         completed, rest = result
         if completed:
-            await safe_edit(
-                query,
-                await workout_summary(user_id, session_id),
-                home_keyboard(),
-            )
+            await _render_workout_end(query, user_id, session_id)
             return True
         await start_rest_timer(
             context=context,
@@ -863,7 +900,7 @@ async def _handle_session_adjustment_actions(
             # snapshot rather than from the current active plan. A substitution
             # made weeks ago happened under whatever plan was live then.
             evidence_plan_id=_snapshot_plan_id(plan),
-            split_signature=await _snapshot_split_signature(plan),
+            split_signature=await _snapshot_split_signature(plan, user_id),
         )
         # A11b: say which plan this changed. The swap is written to the SESSION
         # snapshot, so it applies to today's workout and the saved plan is

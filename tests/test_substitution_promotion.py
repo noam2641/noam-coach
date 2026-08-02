@@ -21,6 +21,7 @@ import datetime as dt
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -263,16 +264,22 @@ async def test_a_changed_source_exercise_finalizes_stale(tmp_path, monkeypatch) 
         "split_signature": signature,
         "slot_id": slot_id,
         "target": "promoted_target",
-        # The proposal claims a source the slot does not hold.
+        # A fabricated source, as an arbitrary historical evidence row could
+        # carry. It must never reach the payload.
         "source": "an_exercise_this_slot_never_had",
         "occurrences": 2,
     }
     approval_id = await sp.propose(db, 1, candidate, active_plan_id=plan_id)
-    before = await _plan_version_count(db)
 
-    assert await sp.approve(db, 1, approval_id) == sp.STATUS_STALE
-    assert await _plan_version_count(db) == before
-    del source
+    stored = await db.fetch_one(
+        "SELECT payload FROM approvals WHERE id=?", (approval_id,)
+    )
+    payload = json.loads(stored["payload"])
+    assert payload["source"] == source, (
+        "the proposal kept a historical source instead of resolving the "
+        "exercise the active plan actually holds"
+    )
+    assert payload["source"] != "an_exercise_this_slot_never_had"
 
 
 # ---------------------------------------------------------------------------
@@ -707,6 +714,61 @@ def test_the_promotion_callback_reuses_the_registered_planv2_family() -> None:
 # could have counted, and one workout could have manufactured a promotion,
 # with every existing test still green.
 # ---------------------------------------------------------------------------
+_EVIDENCE_SESSION_KEYS = ["abc1_a", "abc1_b"]
+
+
+async def _owned_evidence_plan(db: Database, plan_id: int = 7) -> str:
+    """A real plan version owned by user 1, and its true split signature.
+
+    The detector validates ownership and re-derives the signature FROM this
+    row, so evidence tests must build a real plan rather than assert against a
+    fabricated `split_signature` string. That is the point of the check: an
+    audit row may claim any signature it likes and only the plan decides.
+    """
+    payload = {
+        "sessions": [
+            {"session_occurrence": key, "exercises": []}
+            for key in _EVIDENCE_SESSION_KEYS
+        ]
+    }
+    await db.execute(
+        "INSERT OR REPLACE INTO plan_versions("
+        "id, user_id, plan_type, title, strategy, fit_score, status, payload, created_at) "
+        "VALUES(?, 1, 'workout', 'evidence', 'test', 1.0, 'superseded', ?, ?)",
+        (plan_id, json.dumps(payload), utc_now()),
+    )
+    return sp.signature_from_plan_payload(payload)
+
+
+async def _owned_session(
+    db: Database,
+    session_id: int,
+    *,
+    performed: str,
+    slot_id: str = "",
+    started_at: str | None = None,
+) -> None:
+    """A session owned by user 1, with one logged set recording what was done.
+
+    `performed` is the exercise actually trained in the slot. Consecutiveness
+    is decided on this -- not on the substitution audit -- so a test that only
+    wrote audit rows could never distinguish A, A from A, B, A.
+    """
+    plan = {"exercises": [{"slot_id": slot_id, "id": performed, "name": performed}]}
+    await db.execute(
+        "INSERT OR REPLACE INTO sessions("
+        "id, user_id, code, name, plan, status, exercise_index, set_number, started_at) "
+        "VALUES(?, 1, 'A', 'A', ?, 'completed', 0, 1, ?)",
+        (session_id, json.dumps(plan), started_at or utc_now()),
+    )
+    await db.execute(
+        "INSERT INTO sets(session_id, exercise_id, exercise_name, set_number, "
+        "weight, reps, rir, source, exercise_index, created_at) "
+        "VALUES(?, ?, ?, 1, 60, 10, 2, 'test', 0, ?)",
+        (session_id, performed, performed, started_at or utc_now()),
+    )
+
+
 async def _audit_row(
     db: Database,
     *,
@@ -743,6 +805,14 @@ async def _audit_row(
     )
 
 
+def _days_ago(days: int) -> str:
+    """An in-window timestamp. The detector bounds its read to LOOKBACK_DAYS,
+    so a fixed calendar date silently ages out of the window and the evidence
+    disappears -- which is correct behaviour, and makes absolute dates the
+    wrong choice for a fixture."""
+    return sp.utc_iso(dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days))
+
+
 _VALID_SLOT = "abc1_a:leg_press"
 
 
@@ -750,8 +820,17 @@ _VALID_SLOT = "abc1_a:leg_press"
 async def test_two_distinct_sessions_meet_the_threshold(tmp_path) -> None:
     """D-5: two consecutive occurrences. Sourced from the plan, not invented."""
     db = await _db(tmp_path, "evidence_ok")
-    await _audit_row(db, session_id=1, slot_id=_VALID_SLOT)
-    await _audit_row(db, session_id=2, slot_id=_VALID_SLOT)
+    signature = await _owned_evidence_plan(db)
+    await _owned_session(
+        db, 1, performed="hack_squat", slot_id=_VALID_SLOT,
+        started_at=_days_ago(10),
+    )
+    await _owned_session(
+        db, 2, performed="hack_squat", slot_id=_VALID_SLOT,
+        started_at=_days_ago(5),
+    )
+    await _audit_row(db, session_id=1, slot_id=_VALID_SLOT, signature=signature)
+    await _audit_row(db, session_id=2, slot_id=_VALID_SLOT, signature=signature)
 
     found = await sp.find_promotable(db, 1)
 
@@ -764,7 +843,9 @@ async def test_two_distinct_sessions_meet_the_threshold(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_one_session_never_promotes(tmp_path) -> None:
     db = await _db(tmp_path, "evidence_one")
-    await _audit_row(db, session_id=1, slot_id=_VALID_SLOT)
+    signature = await _owned_evidence_plan(db)
+    await _owned_session(db, 1, performed="hack_squat", slot_id=_VALID_SLOT)
+    await _audit_row(db, session_id=1, slot_id=_VALID_SLOT, signature=signature)
     assert await sp.find_promotable(db, 1) is None
 
 
@@ -773,8 +854,10 @@ async def test_repeated_rows_from_one_session_cannot_promote(tmp_path) -> None:
     """The replay guard. Counting rows instead of sessions would let a single
     workout -- or one replayed callback -- manufacture a promotion by itself."""
     db = await _db(tmp_path, "evidence_replay")
+    signature = await _owned_evidence_plan(db)
+    await _owned_session(db, 1, performed="hack_squat", slot_id=_VALID_SLOT)
     for _ in range(5):
-        await _audit_row(db, session_id=1, slot_id=_VALID_SLOT)
+        await _audit_row(db, session_id=1, slot_id=_VALID_SLOT, signature=signature)
 
     evidence = await sp.collect_evidence(db, 1)
     assert evidence["rows"] == 5
@@ -845,9 +928,15 @@ async def test_missing_plan_provenance_is_never_evidence(tmp_path) -> None:
 async def test_malformed_json_is_counted_not_raised(tmp_path) -> None:
     """A corrupt row must never break detection for every other row."""
     db = await _db(tmp_path, "evidence_json")
+    signature = await _owned_evidence_plan(db)
+    for session_id, day in ((1, 15), (2, 10), (3, 5)):
+        await _owned_session(
+            db, session_id, performed="hack_squat", slot_id=_VALID_SLOT,
+            started_at=_days_ago(day),
+        )
     await _audit_row(db, session_id=1, slot_id=_VALID_SLOT, details_override="{not json")
-    await _audit_row(db, session_id=2, slot_id=_VALID_SLOT)
-    await _audit_row(db, session_id=3, slot_id=_VALID_SLOT)
+    await _audit_row(db, session_id=2, slot_id=_VALID_SLOT, signature=signature)
+    await _audit_row(db, session_id=3, slot_id=_VALID_SLOT, signature=signature)
 
     evidence = await sp.collect_evidence(db, 1)
     assert evidence["skipped"].get(sp.SKIP_MALFORMED) == 1
@@ -864,8 +953,25 @@ async def test_evidence_never_crosses_a_split_signature_boundary(tmp_path) -> No
     pattern the user never expressed in either.
     """
     db = await _db(tmp_path, "evidence_split")
-    await _audit_row(db, session_id=1, slot_id=_VALID_SLOT, signature="aaaaaaaaaaaaaaaa")
-    await _audit_row(db, session_id=2, slot_id=_VALID_SLOT, signature="bbbbbbbbbbbbbbbb")
+    first = await _owned_evidence_plan(db, plan_id=7)
+    second_payload = {
+        "sessions": [
+            {"session_occurrence": key, "exercises": []}
+            for key in ("xyz9_a", "xyz9_b", "xyz9_c")
+        ]
+    }
+    await db.execute(
+        "INSERT OR REPLACE INTO plan_versions("
+        "id, user_id, plan_type, title, strategy, fit_score, status, payload, created_at) "
+        "VALUES(8, 1, 'workout', 'evidence', 'test', 1.0, 'superseded', ?, ?)",
+        (json.dumps(second_payload), utc_now()),
+    )
+    second = sp.signature_from_plan_payload(second_payload)
+    assert first != second
+    await _owned_session(db, 1, performed="hack_squat", slot_id=_VALID_SLOT)
+    await _owned_session(db, 2, performed="hack_squat", slot_id=_VALID_SLOT)
+    await _audit_row(db, session_id=1, slot_id=_VALID_SLOT, signature=first, plan_id=7)
+    await _audit_row(db, session_id=2, slot_id=_VALID_SLOT, signature=second, plan_id=8)
 
     evidence = await sp.collect_evidence(db, 1)
     assert len(evidence["groups"]) == 2, "the two splits were merged into one group"
@@ -1253,3 +1359,748 @@ def test_the_cooldown_upsert_is_defined_exactly_once() -> None:
         "the cooldown UPSERT is defined more than once; a mutation in one copy "
         "will be masked by the other"
     )
+
+
+# ---------------------------------------------------------------------------
+# Production round-trip and the nine review gaps
+#
+# Written after an independent review found that A12 defined a detector, a
+# proposal and a consumer -- and NOTHING in production called any of them. The
+# service-level tests above all passed while the feature was unreachable from
+# the bot, which is precisely the failure mode a service-level fixture cannot
+# see. Every test below therefore drives a REAL production entry point:
+# `handle_session_action_callback` for the workout, `handle_plan_callback` for
+# the answer.
+# ---------------------------------------------------------------------------
+class _RoundTripQuery:
+    """A Telegram query that records edits AND replies.
+
+    `_render_workout_end` edits the summary and then sends the promotion ask as
+    a separate message, so a harness that only captures edits would miss the
+    keyboard entirely -- and report a passing test for a prompt the user never
+    receives.
+    """
+
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+        self.reply_markups: list[Any] = []
+        self.replies: list[str] = []
+        self.reply_keyboards: list[Any] = []
+        outer = self
+
+        class _Message:
+            async def reply_text(self, text: str, reply_markup: Any = None, **kw: Any) -> None:
+                del kw
+                outer.replies.append(text)
+                outer.reply_keyboards.append(reply_markup)
+
+        self.message = _Message()
+
+    async def edit_message_text(
+        self, text: str, reply_markup: Any = None, parse_mode: str | None = None
+    ) -> None:
+        del parse_mode
+        self.messages.append(text)
+        self.reply_markups.append(reply_markup)
+
+    async def answer(self, text: str | None = None, show_alert: bool = False) -> None:
+        del text, show_alert
+
+
+def _callback_data(markup: Any) -> list[str]:
+    if markup is None:
+        return []
+    return [b.callback_data for row in markup.inline_keyboard for b in row]
+
+
+def _button_labels(markup: Any) -> list[str]:
+    if markup is None:
+        return []
+    return [b.text for row in markup.inline_keyboard for b in row]
+
+
+_RT_SLOT = "rt01_a:leg_press"
+
+
+def _one_exercise_plan(performed: str, slot_id: str = _RT_SLOT) -> dict[str, Any]:
+    """A single-exercise session plan, so ONE set completes the workout."""
+    return {
+        "exercises": [
+            {
+                "slot_id": slot_id,
+                "id": performed,
+                "name": performed,
+                "sets": 1,
+                "reps": 10,
+                "rmin": 8,
+                "rmax": 12,
+                "inc": 2.5,
+                "rest": 60,
+                "alts": [{"id": "hack_squat", "name": "hack squat"}],
+            }
+        ]
+    }
+
+
+async def _completed_workout(
+    db: Database,
+    session_id: int,
+    performed: str,
+    *,
+    days_ago: int,
+    slot_id: str = _RT_SLOT,
+    user_id: int = 1,
+    status: str = "completed",
+    source: str = "telegram_one_tap",
+) -> None:
+    """A finished workout with one logged set, as production leaves it."""
+    stamp = _days_ago(days_ago)
+    await db.execute(
+        "INSERT OR REPLACE INTO sessions("
+        "id, user_id, code, name, plan, status, exercise_index, set_number, "
+        "started_at, ended_at) VALUES(?, ?, 'A', 'A', ?, ?, 0, 1, ?, ?)",
+        (
+            session_id, user_id,
+            json.dumps(_one_exercise_plan(performed, slot_id)),
+            status, stamp, stamp,
+        ),
+    )
+    await db.execute(
+        "INSERT INTO sets(session_id, exercise_id, exercise_name, set_number, "
+        "weight, reps, rir, source, exercise_index, created_at) "
+        "VALUES(?, ?, ?, 1, 60, 10, 2, ?, 0, ?)",
+        (session_id, performed, performed, source, stamp),
+    )
+
+
+async def _substitution_audit(
+    db: Database,
+    session_id: int,
+    *,
+    signature: str,
+    plan_id: int,
+    slot_id: str = _RT_SLOT,
+    target: str = "hack_squat",
+    user_id: int = 1,
+) -> None:
+    await db.execute(
+        "INSERT INTO audit(user_id, action, entity, entity_id, details, created_at) "
+        "VALUES(?, 'approve_substitution', 'exercise', ?, ?, ?)",
+        (
+            user_id,
+            str(session_id),
+            json.dumps({
+                "source": "leg_press", "target": target, "reason": "equipment",
+                "slot_id": slot_id, "evidence_plan_id": plan_id,
+                "split_signature": signature,
+            }),
+            utc_now(),
+        ),
+    )
+
+
+async def _active_rt_plan(
+    db: Database, slot_id: str = _RT_SLOT, *, activate: bool = True
+) -> tuple[int, str]:
+    """An ACTIVE plan whose slot holds leg_press. Returns (plan_id, signature)."""
+    payload = {
+        "sessions": [
+            {
+                "session_occurrence": "rt01_a",
+                "code": "A", "name": "אימון A",
+                "weekday": 0, "time": "18:00", "minutes": 45,
+                "exercises": [
+                    {
+                        "slot_id": slot_id, "id": "leg_press", "name": "leg press",
+                        "sets": 3, "reps": 10, "rmin": 8, "rmax": 12,
+                        "inc": 2.5, "rest": 90,
+                        "alts": [{"id": "hack_squat", "name": "hack squat"}],
+                    }
+                ],
+            },
+            {
+                "session_occurrence": "rt01_b",
+                "code": "B", "name": "אימון B",
+                "weekday": 2, "time": "18:00", "minutes": 45,
+                "exercises": [
+                    {
+                        "slot_id": "rt01_b:bench", "id": "bench", "name": "bench",
+                        "sets": 3, "reps": 10, "rmin": 8, "rmax": 12,
+                        "inc": 2.5, "rest": 90, "alts": [],
+                    }
+                ],
+            },
+        ]
+    }
+    # The facts activation validates against. Set through the real API so the
+    # fixture exercises the same gate production does.
+    for key, value in _FACTS.items():
+        await user_model.set_fact(
+            db, 1, key, value,
+            kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
+        )
+    plan_id = await db.execute(
+        "INSERT INTO plan_versions("
+        "user_id, plan_type, title, strategy, fit_score, status, payload, "
+        "created_at, activated_at) "
+        "VALUES(1, 'workout', 'rt', 'test', 1.0, 'active', ?, ?, ?)",
+        (json.dumps(payload), utc_now(), utc_now()),
+    )
+    # Activation lives in `active_plans`, not in a status column: hand-setting
+    # `status='active'` leaves `get_active_plan` returning None, so the
+    # proposal is refused and the round-trip silently produces nothing.
+    if activate:
+        await planning.activate_plan(db, 1, int(plan_id))
+    return int(plan_id), sp.signature_from_plan_payload(payload)
+
+
+async def _drive_workout_to_completion(db: Database, monkeypatch) -> _RoundTripQuery:
+    """Log the final set through the REAL callback, completing the workout."""
+    import coach_bot
+    from noam_coach.bot import callback_session as callback_session_bot
+
+    session_id = await db.execute(
+        "INSERT INTO sessions(user_id, code, name, plan, status, exercise_index, "
+        "set_number, started_at) VALUES(1, 'A', 'A', ?, 'active', 0, 1, ?)",
+        (json.dumps(_one_exercise_plan("hack_squat")), utc_now()),
+    )
+    session = dict(await db.fetch_one("SELECT * FROM sessions WHERE id=?", (session_id,)))
+
+    query = _RoundTripQuery()
+    await callback_session_bot.handle_session_action_callback(
+        query,
+        context=_NoJobContext(),
+        user_id=1,
+        data=coach_bot.session_action_data("setok", session, "60", "10"),
+    )
+    return query
+
+
+class _NoJobContext:
+    job_queue = None
+
+
+@pytest.mark.asyncio
+async def test_completing_a_workout_produces_the_promotion_prompt(tmp_path, monkeypatch):
+    """1. The round-trip the review found missing, end to end.
+
+    Real completion callback -> summary -> detector -> proposal -> a keyboard
+    with two answerable buttons. Every earlier A12 test passed while this
+    produced nothing at all.
+    """
+    db = await _db(tmp_path, "rt_offer")
+    _bind(monkeypatch, db)
+    plan_id, signature = await _active_rt_plan(db)
+
+    # Two consecutive prior workouts where the substitution was performed.
+    for index, session_id in enumerate((101, 102)):
+        await _completed_workout(db, session_id, "hack_squat", days_ago=20 - index * 5)
+        await _substitution_audit(db, session_id, signature=signature, plan_id=plan_id)
+
+    query = await _drive_workout_to_completion(db, monkeypatch)
+
+    assert query.messages, "the workout summary was never rendered"
+    assert "האימון הושלם" in query.messages[-1]
+    assert query.replies, (
+        "the workout completed but no promotion prompt was sent -- the detector "
+        "is not reachable from production"
+    )
+    data = _callback_data(query.reply_keyboards[-1])
+    assert len(data) == 2, f"expected a yes/no keyboard, got {data}"
+    assert any(d.startswith("planv2:promote:yes:") for d in data), data
+    assert any(d.startswith("planv2:promote:no:") for d in data), data
+
+    row = await db.fetch_one(
+        "SELECT status, kind FROM approvals WHERE user_id=1", ()
+    )
+    assert row is not None and row["status"] == sp.STATUS_PENDING
+    assert row["kind"] == sp.APPROVAL_KIND
+
+
+@pytest.mark.asyncio
+async def test_the_prompt_leads_to_a_real_plan_change(tmp_path, monkeypatch):
+    """1b. Tapping "yes" on the produced keyboard rewrites the saved plan."""
+    db = await _db(tmp_path, "rt_apply")
+    _bind(monkeypatch, db)
+    plan_id, signature = await _active_rt_plan(db)
+    for index, session_id in enumerate((101, 102)):
+        await _completed_workout(db, session_id, "hack_squat", days_ago=20 - index * 5)
+        await _substitution_audit(db, session_id, signature=signature, plan_id=plan_id)
+
+    query = await _drive_workout_to_completion(db, monkeypatch)
+    yes = next(
+        d for d in _callback_data(query.reply_keyboards[-1])
+        if d.startswith("planv2:promote:yes:")
+    )
+
+    from noam_coach.bot import callback_plans as callback_plans_bot
+
+    answer = _RoundTripQuery()
+    await callback_plans_bot.handle_plan_callback(
+        answer, user_id=1, data=yes
+    )
+
+    active = await planning.get_active_plan(db, 1, "workout")
+    entry = next(
+        e for s in active["payload"]["sessions"] for e in s["exercises"]
+        if e.get("slot_id") == _RT_SLOT
+    )
+    assert entry["id"] == "hack_squat", "the approved promotion never reached the plan"
+    assert "עודכן" in answer.messages[-1]
+
+
+@pytest.mark.asyncio
+async def test_a_reversible_finish_produces_no_proposal(tmp_path, monkeypatch):
+    """2. The explicit finish keeps a "reopen" button, so nothing is settled.
+
+    Asking there would put a permanent question on a workout the user can still
+    take back -- and a promotion approved against a reopened session would be
+    evidence the user never actually produced.
+    """
+    db = await _db(tmp_path, "rt_partial")
+    _bind(monkeypatch, db)
+    plan_id, signature = await _active_rt_plan(db)
+    for index, session_id in enumerate((101, 102)):
+        await _completed_workout(db, session_id, "hack_squat", days_ago=20 - index * 5)
+        await _substitution_audit(db, session_id, signature=signature, plan_id=plan_id)
+
+    import coach_bot
+    from noam_coach.bot import callback_session as callback_session_bot
+
+    session_id = await db.execute(
+        "INSERT INTO sessions(user_id, code, name, plan, status, exercise_index, "
+        "set_number, started_at) VALUES(1, 'A', 'A', ?, 'active', 0, 1, ?)",
+        (json.dumps(_one_exercise_plan("hack_squat")), utc_now()),
+    )
+    session = dict(await db.fetch_one("SELECT * FROM sessions WHERE id=?", (session_id,)))
+
+    query = _RoundTripQuery()
+    await callback_session_bot.handle_session_action_callback(
+        query, context=_NoJobContext(), user_id=1,
+        data=coach_bot.session_action_data("finish", session),
+    )
+
+    assert not query.replies, "a reversible finish must not raise the promotion ask"
+    assert not await db.fetch_all(
+        "SELECT 1 FROM approvals WHERE user_id=1 AND kind=?", (sp.APPROVAL_KIND,)
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_genuine_completion_after_a_reversible_finish_asks_once(
+    tmp_path, monkeypatch
+):
+    """2b. Deferred, not lost: the next real completion still asks -- once."""
+    db = await _db(tmp_path, "rt_deferred")
+    _bind(monkeypatch, db)
+    plan_id, signature = await _active_rt_plan(db)
+    for index, session_id in enumerate((101, 102)):
+        await _completed_workout(db, session_id, "hack_squat", days_ago=20 - index * 5)
+        await _substitution_audit(db, session_id, signature=signature, plan_id=plan_id)
+
+    first = await _drive_workout_to_completion(db, monkeypatch)
+    assert first.replies, "the first genuine completion did not ask"
+
+    second = await _drive_workout_to_completion(db, monkeypatch)
+    assert not second.replies, (
+        "a second prompt was raised while one was still open -- the user would "
+        "be asked the same question twice"
+    )
+    rows = await db.fetch_all(
+        "SELECT id FROM approvals WHERE user_id=1 AND kind=? AND status=?",
+        (sp.APPROVAL_KIND, sp.STATUS_PENDING),
+    )
+    assert len(rows) == 1
+
+
+# ---------------------------------------------------------------------------
+# Consecutiveness
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_a_then_a_promotes(tmp_path, monkeypatch) -> None:
+    """3. Two consecutive occurrences, which is what D-5 actually says."""
+    db = await _db(tmp_path, "consec_aa")
+    _bind(monkeypatch, db)
+    plan_id, signature = await _active_rt_plan(db, activate=False)
+    for index, session_id in enumerate((101, 102)):
+        await _completed_workout(db, session_id, "hack_squat", days_ago=20 - index * 5)
+        await _substitution_audit(db, session_id, signature=signature, plan_id=plan_id)
+
+    assert await sp.find_promotable(db, 1) is not None
+
+
+@pytest.mark.asyncio
+async def test_a_then_b_then_a_does_not_promote(tmp_path, monkeypatch) -> None:
+    """4. The interrupted run. Two occurrences, but not consecutive.
+
+    Substituting in week 1, training it AS PROGRAMMED in week 2, substituting
+    again in week 3 is an occasional preference. Promoting it would rewrite the
+    plan on evidence the user's own middle workout contradicts.
+    """
+    db = await _db(tmp_path, "consec_aba")
+    _bind(monkeypatch, db)
+    plan_id, signature = await _active_rt_plan(db, activate=False)
+
+    await _completed_workout(db, 101, "hack_squat", days_ago=21)
+    await _substitution_audit(db, 101, signature=signature, plan_id=plan_id)
+    # The interruption: the programmed exercise, actually performed.
+    await _completed_workout(db, 102, "leg_press", days_ago=14)
+    await _completed_workout(db, 103, "hack_squat", days_ago=7)
+    await _substitution_audit(db, 103, signature=signature, plan_id=plan_id)
+
+    evidence = await sp.collect_evidence(db, 1)
+    group = next(iter(evidence["groups"].values()))
+    assert len(group["sessions"]) == 2, "both substitutions are still evidence"
+    assert await sp.find_promotable(db, 1) is None, (
+        "A, B, A promoted; the detector is counting occurrences, not runs"
+    )
+
+
+@pytest.mark.asyncio
+async def test_performing_the_programmed_exercise_breaks_the_streak(
+    tmp_path, monkeypatch
+) -> None:
+    """5. The most recent occurrence decides. A, A, B does not promote."""
+    db = await _db(tmp_path, "consec_aab")
+    _bind(monkeypatch, db)
+    plan_id, signature = await _active_rt_plan(db, activate=False)
+
+    await _completed_workout(db, 101, "hack_squat", days_ago=21)
+    await _substitution_audit(db, 101, signature=signature, plan_id=plan_id)
+    await _completed_workout(db, 102, "hack_squat", days_ago=14)
+    await _substitution_audit(db, 102, signature=signature, plan_id=plan_id)
+    # Then they went back to the programmed exercise.
+    await _completed_workout(db, 103, "leg_press", days_ago=3)
+
+    assert await sp.find_promotable(db, 1) is None, (
+        "the streak was broken by the latest workout and still promoted"
+    )
+
+
+@pytest.mark.asyncio
+async def test_duplicate_and_split_set_rows_do_not_create_occurrences(
+    tmp_path, monkeypatch
+) -> None:
+    """6. One workout is one occurrence, whatever the set rows look like.
+
+    A split set writes a `telegram_split_secondary` row, and a replayed
+    callback can write another. Counting set rows would let a single session
+    manufacture a full streak on its own.
+    """
+    db = await _db(tmp_path, "consec_dupes")
+    _bind(monkeypatch, db)
+    plan_id, signature = await _active_rt_plan(db, activate=False)
+
+    await _completed_workout(db, 101, "hack_squat", days_ago=20)
+    await _substitution_audit(db, 101, signature=signature, plan_id=plan_id)
+    # The same session, logged three more times: a split secondary and two
+    # replays.
+    stamp = _days_ago(20)
+    for source in ("telegram_split_secondary", "telegram_one_tap", "watch"):
+        await db.execute(
+            "INSERT INTO sets(session_id, exercise_id, exercise_name, set_number, "
+            "weight, reps, rir, source, exercise_index, created_at) "
+            "VALUES(101, 'hack_squat', 'hack_squat', 2, 60, 10, 2, ?, 0, ?)",
+            (source, stamp),
+        )
+        await _substitution_audit(db, 101, signature=signature, plan_id=plan_id)
+
+    evidence = await sp.collect_evidence(db, 1)
+    history = evidence["slot_history"].get(_RT_SLOT) or {}
+    assert len(history) == 1, f"one session became {len(history)} occurrences"
+    assert await sp.find_promotable(db, 1) is None
+
+
+@pytest.mark.asyncio
+async def test_an_unfinished_session_is_not_an_occurrence(tmp_path, monkeypatch) -> None:
+    """6b. An abandoned workout is not training that happened."""
+    db = await _db(tmp_path, "consec_unfinished")
+    _bind(monkeypatch, db)
+    plan_id, signature = await _active_rt_plan(db, activate=False)
+
+    await _completed_workout(db, 101, "hack_squat", days_ago=20)
+    await _substitution_audit(db, 101, signature=signature, plan_id=plan_id)
+    await _completed_workout(db, 102, "hack_squat", days_ago=10, status="active")
+    await _substitution_audit(db, 102, signature=signature, plan_id=plan_id)
+
+    evidence = await sp.collect_evidence(db, 1)
+    history = evidence["slot_history"].get(_RT_SLOT) or {}
+    assert "102" not in history, "an unfinished session counted as performed"
+    assert await sp.find_promotable(db, 1) is None
+
+
+# ---------------------------------------------------------------------------
+# Ownership and provenance
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_another_users_session_is_never_evidence(tmp_path, monkeypatch) -> None:
+    """7. Cross-user provenance fails closed."""
+    db = await _db(tmp_path, "own_session")
+    _bind(monkeypatch, db)
+    plan_id, signature = await _active_rt_plan(db, activate=False)
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(2,'B',NULL,?)",
+        (utc_now(),),
+    )
+
+    await _completed_workout(db, 101, "hack_squat", days_ago=20)
+    await _substitution_audit(db, 101, signature=signature, plan_id=plan_id)
+    # A session that belongs to user 2, claimed by user 1's audit row.
+    await _completed_workout(db, 202, "hack_squat", days_ago=10, user_id=2)
+    await _substitution_audit(db, 202, signature=signature, plan_id=plan_id)
+
+    evidence = await sp.collect_evidence(db, 1)
+    assert evidence["skipped"].get(sp.SKIP_FOREIGN_SESSION) == 1
+    assert await sp.find_promotable(db, 1) is None
+
+
+@pytest.mark.asyncio
+async def test_another_users_plan_is_never_provenance(tmp_path, monkeypatch) -> None:
+    """7b. The evidence plan must belong to the audit user."""
+    db = await _db(tmp_path, "own_plan")
+    _bind(monkeypatch, db)
+    plan_id, signature = await _active_rt_plan(db, activate=False)
+    await db.execute(
+        "INSERT INTO users(id, first_name, username, updated_at) VALUES(2,'B',NULL,?)",
+        (utc_now(),),
+    )
+    foreign_plan = await db.execute(
+        "INSERT INTO plan_versions("
+        "user_id, plan_type, title, strategy, fit_score, status, payload, created_at) "
+        "VALUES(2, 'workout', 'other', 'test', 1.0, 'active', ?, ?)",
+        (json.dumps({"sessions": [{"session_occurrence": "rt01_a", "exercises": []}]}),
+         utc_now()),
+    )
+
+    for index, session_id in enumerate((101, 102)):
+        await _completed_workout(db, session_id, "hack_squat", days_ago=20 - index * 5)
+    await _substitution_audit(db, 101, signature=signature, plan_id=plan_id)
+    await _substitution_audit(db, 102, signature=signature, plan_id=int(foreign_plan))
+
+    evidence = await sp.collect_evidence(db, 1)
+    assert evidence["skipped"].get(sp.SKIP_FOREIGN_PLAN) == 1
+    assert await sp.find_promotable(db, 1) is None
+
+
+@pytest.mark.asyncio
+async def test_a_forged_signature_is_rejected(tmp_path, monkeypatch) -> None:
+    """8. The claimed signature must be the one that plan version really has.
+
+    Otherwise an audit row could name any signature it liked and group
+    unrelated substitutions into a promotable pattern.
+    """
+    db = await _db(tmp_path, "forged_sig")
+    _bind(monkeypatch, db)
+    plan_id, signature = await _active_rt_plan(db, activate=False)
+
+    for index, session_id in enumerate((101, 102)):
+        await _completed_workout(db, session_id, "hack_squat", days_ago=20 - index * 5)
+        await _substitution_audit(
+            db, session_id, signature="ffffffffffffffff", plan_id=plan_id
+        )
+
+    evidence = await sp.collect_evidence(db, 1)
+    assert evidence["skipped"].get(sp.SKIP_SIGNATURE_MISMATCH) == 2
+    assert await sp.find_promotable(db, 1) is None
+    del signature
+
+
+def test_a_partial_key_set_has_no_signature() -> None:
+    """8b. Identity fails closed rather than fingerprinting a subset."""
+    assert sp.split_signature(["a", "b"]) is not None
+    assert sp.split_signature(["a", None]) is None, "a malformed key was dropped"
+    assert sp.split_signature(["a", ""]) is None
+    assert sp.split_signature(["a", "a"]) is None, "duplicate keys collapsed"
+    assert sp.split_signature([]) is None
+    assert sp.signature_from_plan_payload(
+        {"sessions": [{"session_occurrence": "a"}, {"no_key": 1}]}
+    ) is None
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle honesty
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_a_finalization_failure_is_never_rendered_as_success(
+    tmp_path, monkeypatch
+) -> None:
+    """9. A failed status+cooldown transaction must not print "done".
+
+    Injected at the real boundary and answered through the real callback, so
+    what is asserted is the sentence the user actually receives.
+    """
+    db = await _db(tmp_path, "final_fail")
+    _bind(monkeypatch, db)
+    plan_id, signature, slot_id, source = await _active_plan(db)
+    approval_id = await _proposal(db, plan_id, signature, slot_id, source)
+
+    async def _refuse(*args: Any, **kwargs: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(sp, "_finalize", _refuse)
+
+    from noam_coach.bot import callback_plans as callback_plans_bot
+
+    query = _RoundTripQuery()
+    await callback_plans_bot.handle_plan_callback(
+        query, user_id=1,
+        data=sp.promotion_callback_data("yes", approval_id),
+    )
+
+    rendered = query.messages[-1]
+    assert "עודכן ✅" not in rendered, (
+        f"finalization failed and the user was told it succeeded: {rendered}"
+    )
+    row = await db.fetch_one(
+        "SELECT status FROM approvals WHERE id=?", (approval_id,)
+    )
+    assert str(row["status"]) != sp.STATUS_APPROVED
+
+
+@pytest.mark.asyncio
+async def test_an_active_lease_is_never_superseded(tmp_path, monkeypatch) -> None:
+    """10. A live mutation must not be marked stale by a new proposal.
+
+    Superseding it would mark the approval stale while A9 is mid-flight, so the
+    change would land on the plan and then be reported as though it never
+    happened.
+    """
+    db = await _db(tmp_path, "live_lease")
+    _bind(monkeypatch, db)
+    plan_id, signature, slot_id, source = await _active_plan(db)
+    approval_id = await _proposal(db, plan_id, signature, slot_id, source)
+
+    # A caller takes the lease and is still working.
+    assert await sp.claim_status(
+        db, approval_id, 1, expect=sp.STATUS_PENDING, become=sp.STATUS_PROCESSING
+    )
+
+    second = await sp.propose(
+        db, 1,
+        {
+            "subject": sp.subject_of(signature, slot_id, "another_target"),
+            "split_signature": signature, "slot_id": slot_id,
+            "target": "another_target", "source": source, "occurrences": 2,
+        },
+        active_plan_id=plan_id,
+    )
+    assert second is None, "a new proposal was created over a live lease"
+    row = await db.fetch_one("SELECT status FROM approvals WHERE id=?", (approval_id,))
+    assert str(row["status"]) == sp.STATUS_PROCESSING, (
+        "the in-flight mutation was marked stale underneath its own caller"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_expired_lease_may_be_superseded(tmp_path, monkeypatch) -> None:
+    """10b. The complement: abandoned work must not block the feature forever."""
+    db = await _db(tmp_path, "dead_lease")
+    _bind(monkeypatch, db)
+    plan_id, signature, slot_id, source = await _active_plan(db)
+    approval_id = await _proposal(db, plan_id, signature, slot_id, source)
+    await sp.claim_status(
+        db, approval_id, 1, expect=sp.STATUS_PENDING, become=sp.STATUS_PROCESSING
+    )
+    await _age_the_lease(db, approval_id, minutes=sp.PROCESSING_LEASE_MINUTES + 5)
+
+    second = await sp.propose(
+        db, 1,
+        {
+            "subject": sp.subject_of(signature, slot_id, "another_target"),
+            "split_signature": signature, "slot_id": slot_id,
+            "target": "another_target", "source": source, "occurrences": 2,
+        },
+        active_plan_id=plan_id,
+    )
+    assert second, "an abandoned lease permanently blocked new proposals"
+
+
+@pytest.mark.asyncio
+async def test_the_decision_audit_is_written_exactly_once(tmp_path, monkeypatch) -> None:
+    """11. Double taps and recovery must not multiply the record.
+
+    The audit rides the same transaction as the conditional status UPDATE, so
+    only the caller that wins rowcount==1 writes it.
+    """
+    db = await _db(tmp_path, "audit_once")
+    _bind(monkeypatch, db)
+    plan_id, signature, slot_id, source = await _active_plan(db)
+    approval_id = await _proposal(db, plan_id, signature, slot_id, source)
+
+    from noam_coach.bot import callback_plans as callback_plans_bot
+
+    for _ in range(3):
+        await callback_plans_bot.handle_plan_callback(
+            _RoundTripQuery(), user_id=1,
+            data=sp.promotion_callback_data("yes", approval_id),
+        )
+
+    rows = await db.fetch_all(
+        "SELECT details FROM audit WHERE user_id=1 AND action=?",
+        (sp._PROMOTION_AUDIT_ACTION,),
+    )
+    assert len(rows) == 1, f"the decision was recorded {len(rows)} times"
+    details = json.loads(rows[0]["details"])
+    assert details["outcome"] == sp.STATUS_APPROVED
+    assert details["approval_id"] == approval_id
+    # Bounded fields only -- no free text, no payload contents.
+    assert set(details) == {
+        "outcome", "subject", "slot_id", "target", "occurrences", "approval_id"
+    }
+
+
+@pytest.mark.asyncio
+async def test_no_after_yes_reports_the_durable_decision(tmp_path, monkeypatch) -> None:
+    """12. A late "no" must not claim the plan was left unchanged.
+
+    By then the plan HAS been rewritten. Telling the user otherwise contradicts
+    what their own plan now shows.
+    """
+    db = await _db(tmp_path, "no_after_yes")
+    _bind(monkeypatch, db)
+    plan_id, signature, slot_id, source = await _active_plan(db)
+    approval_id = await _proposal(db, plan_id, signature, slot_id, source)
+
+    from noam_coach.bot import callback_plans as callback_plans_bot
+
+    yes = _RoundTripQuery()
+    await callback_plans_bot.handle_plan_callback(
+        yes, user_id=1,
+        data=sp.promotion_callback_data("yes", approval_id),
+    )
+    assert "עודכן" in yes.messages[-1]
+
+    no = _RoundTripQuery()
+    await callback_plans_bot.handle_plan_callback(
+        no, user_id=1,
+        data=sp.promotion_callback_data("no", approval_id),
+    )
+    rendered = no.messages[-1]
+    assert "נשאיר את התוכנית כמו שהיא" not in rendered, (
+        f"a late no claimed nothing changed after the plan was rewritten: {rendered}"
+    )
+    assert "עודכנה" in rendered or "כבר" in rendered, rendered
+
+
+@pytest.mark.asyncio
+async def test_a_coincidental_target_under_another_split_is_stale(
+    tmp_path, monkeypatch
+) -> None:
+    """13. Already-applied must be OUR change, not a lookalike.
+
+    The user moved to a different programme that happens to hold the same
+    exercise in the same slot. Finalizing that as approved would write a
+    365-day cooldown for a change this promotion never made.
+    """
+    db = await _db(tmp_path, "coincidence")
+    _bind(monkeypatch, db)
+    plan_id, signature, slot_id, source = await _active_plan(db)
+    approval_id = await _proposal(db, plan_id, signature, slot_id, source)
+
+    assert await sp._already_applied(
+        db, 1, slot_id, source, expected_signature=signature
+    ), "precondition: the slot holds `source` under the proposal's own split"
+    assert not await sp._already_applied(
+        db, 1, slot_id, source, expected_signature="ffffffffffffffff"
+    ), "a different split was accepted as already applied"
+    del approval_id, plan_id
