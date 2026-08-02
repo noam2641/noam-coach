@@ -1404,22 +1404,29 @@ def test_a_version_shaped_exercise_id_cannot_break_the_callback() -> None:
     stale: a substitution that silently stops working for one exercise, with
     nothing in the logs naming the cause.
     """
-    import conversation
     from noam_coach.bot import callback_session as cs_bot
-    from noam_coach.services.callback_grammar import install_callback_grammar
+    from noam_coach.services import callback_grammar
 
-    install_callback_grammar()
+    # The strict extractors are called DIRECTLY rather than through
+    # `install_callback_grammar()`. That installer rebinds
+    # `conversation.extract_version` / `extract_flow_id` process-wide and is
+    # idempotent by a module-level sentinel, so it can never be undone within a
+    # session -- it leaked into `test_extract_flow_id_legacy`, which asserts the
+    # LEGACY extractor still accepts `legacy-42`. Locally the two files never
+    # ran in that order; CI ran them in one process and failed. Calling the
+    # strict functions directly tests exactly the same thing with no global
+    # state touched.
     session = {"id": 5, "exercise_index": 0, "set_number": 1}
 
     for alt_id in ("v123", "v9", "v999999999"):
         minted = cs_bot._substitution_callback(
             session, {"id": "x"}, {"id": alt_id}, cs_bot.SUB_REASON_PAIN
         )
-        assert conversation.extract_version(minted) is None, (
+        assert callback_grammar.strict_extract_version(minted) is None, (
             f"{minted!r} parses as carrying a flow version -- the router would "
             "refuse this tap as stale"
         )
-        assert conversation.extract_flow_id(minted) is None, minted
+        assert callback_grammar.strict_extract_flow_id(minted) is None, minted
         assert minted.split(":")[1].isdigit(), (
             "parts[1] must stay numeric or the callback is rejected before any "
             "handler sees it"

@@ -555,19 +555,22 @@ def test_a_substitution_callback_cannot_be_read_as_a_version() -> None:
     `v12` the router would read it as a flow version and refuse the tap as
     stale — a substitution that silently stops working.
     """
-    import conversation
-    from noam_coach.services.callback_grammar import install_callback_grammar
+    from noam_coach.services import callback_grammar
 
-    install_callback_grammar()
-
+    # Strict extractors called DIRECTLY. `install_callback_grammar()` rebinds
+    # `conversation.extract_version` / `extract_flow_id` process-wide and is
+    # idempotent by a module-level sentinel, so it cannot be undone within a
+    # session -- it leaked into `test_extract_flow_id_legacy`, which asserts the
+    # LEGACY extractor still accepts `legacy-42`. CI ran both files in one
+    # process and failed; locally they never ran in that order.
     for data in (
         "sub:5:0:1:hack_squat:pain",
         "sub:5:0:1:leg_press:equipment",
         "sub:5:0:1:rdl:unspecified",
     ):
-        assert conversation.extract_version(data) is None, (
+        assert callback_grammar.strict_extract_version(data) is None, (
             f"{data!r} parses as carrying a flow version; the router would "
             "refuse this tap as stale"
         )
-        assert conversation.extract_flow_id(data) is None, data
+        assert callback_grammar.strict_extract_flow_id(data) is None, data
         assert len(data.encode("utf-8")) <= 64, f"{data!r} exceeds Telegram's limit"
