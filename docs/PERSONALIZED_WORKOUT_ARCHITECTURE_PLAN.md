@@ -178,7 +178,67 @@ into permanent identity and destroying the information `NULL` currently carries.
 | **A9** | **COMPLETE** | `4345993` | #70 | proven, exit 0 |
 | **A7** | **COMPLETE** | `6de87f9` | #71 | proven, exit 0 |
 | **A10** | **COMPLETE** | `4627e05` | #74 | proven, exit 0 |
-| A8, A11b, A12, A13 | not started | — | — | — |
+| **A11b** | **COMPLETE** | `37c5bc3` | #75 | proven, exit 0 |
+| A8, A12, A13 | not started | — | — | — |
+
+### A11b — the slot identity contract, as shipped
+
+Slot identity is **`<stable_session_key>:<slot_key>`** — e.g. `abc1_a:bench`,
+`abc2_a:bench` for the two A-sessions of a 6-day split. Both components are
+**declared against a definition**; neither is computed from traversal.
+
+| Component | Declared in | Never derived from |
+|---|---|---|
+| `session_key` | `exercise_plans.SESSION_KEYS_BY_FREQUENCY`, `planning._SPLIT_OVERRIDE_SESSION_KEYS` | weekday, array position, appearance counter |
+| `slot_key` | `exercise_plans.exercise(...)`, defaulting to the seed exercise id | the current `id`, list position |
+
+**Two schemes were rejected on measurement**, and both are recorded so they are
+not re-proposed:
+
+1. `<session_code>:<template_ordinal>` — a code is not unique in a split; a
+   6-day plan (`A,B,C,A,B,C`) produced **10 duplicate ids out of 20**.
+2. `<code>#<Nth appearance>:<slot_key>` — the counter is recomputed while
+   traversing, so two distinct sessions sharing a code **swapped identities**
+   when the split order changed, reattributing every slot in both to the other
+   session's professional meaning.
+
+**All ten split producers** (6 default frequencies + 4 strategy overrides)
+declare keys explicitly. There is **no positional fallback**: a producer whose
+codes and keys do not match yields `[]`, and `_schedule_sessions` **fails
+closed** — no invented key, no partial candidate saved, nothing rendered or
+activated, and the defect is observable as
+`split_session_key_mismatch codes=%d declared=%d` with reason code
+`workout_plan_session_keys`.
+
+**Governance rule (binding).** A declared key names what a session *is*.
+Changing a session's professional meaning **requires** changing its key;
+reusing a key for a different meaning silently rewrites the history of every
+pattern already keyed to it.
+
+Also shipped: both `.index(alt)` defects removed (substitutions resolve by
+identity, so a re-ranked list yields a stale callback rather than a wrong
+exercise); `format_weekly_plan` renders the stored payload; unmapped, blocked
+and malformed render distinctly and reserved states are non-performable; a
+bounded substitution `reason` (`pain` / `equipment` / `unspecified`) captured at
+the button and registered in `_AUDIT_ALLOWLIST`; saved-plan changes route
+through A9's `substitute_slot_in_saved_plan`. Verified by 25 deliberate-breakage
+mutations, all caught.
+
+### A12 handoff contract (binding)
+
+1. **Key patterns by the stable `slot_id`** — never by `exercise_id`, list
+   position, weekday, or any traversal counter.
+2. **Never join across a structural split change or a declared-meaning change.**
+   A split that adds or removes a session, and a session whose declared key
+   changed, are both identity boundaries. Joining across either promotes a
+   pattern the user never expressed.
+3. **Exclude pain/safety substitutions from ordinary preference promotion.**
+   `reason=pain` records a safety-driven change; treating it as a preference
+   would promote an adaptation the user made because something hurt.
+4. **Consume only bounded reason codes** from the audit row. No free text, no
+   body region — the region lives on the `medical_constraints` row.
+5. **Preserve the fail-closed split/key contract.** A12 must not add a path that
+   proceeds when session keys are missing or mismatched.
 
 **A10 correction to this document.** The pre-flight and the classification both
 recorded the safety gate as having **four** enforcement points. It has **five**.
