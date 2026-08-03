@@ -666,13 +666,19 @@ def test_every_lifecycle_outcome_has_its_own_user_facing_sentence() -> None:
     source = (root / "noam_coach" / "bot" / "callback_plans.py").read_text(
         encoding="utf-8"
     )
-    start = source.index('if data.startswith("planv2:promote:")')
-    block = source[start : start + 3000]
+    # Scoped to the APPROVE branch, not a fixed character window. A window
+    # silently stopped covering it once the decline branch grew: the decline
+    # sentences alone satisfied a "how many distinct strings" count, so
+    # collapsing every approve outcome into one message passed. Anchor on the
+    # code that renders the answer instead.
+    start = source.index("outcome = await _sp.approve(DB, user_id, approval_id)")
+    end = source.index("await safe_edit(query, text, home_keyboard())", start)
+    block = source[start:end]
 
     for status in (
         "STATUS_APPROVED", "STATUS_PROCESSING", "STATUS_DECLINED", "STATUS_STALE",
     ):
-        assert status in block, f"{status} has no explicit branch"
+        assert status in block, f"{status} has no explicit branch after approve"
     assert "else:" in block, "the failed outcome has no fallback branch"
 
     # And the sentences must differ -- five branches saying the same thing is
@@ -680,7 +686,9 @@ def test_every_lifecycle_outcome_has_its_own_user_facing_sentence() -> None:
     import re as _re
 
     sentences = _re.findall(r'text = \(?\s*"([^"]+)"', block)
-    assert len(set(sentences)) >= 4, f"outcomes share wording: {sentences}"
+    assert len(set(sentences)) >= 5, (
+        f"the approve outcomes share wording: {sentences}"
+    )
 
 
 def test_the_promotion_callback_reuses_the_registered_planv2_family() -> None:
