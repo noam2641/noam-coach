@@ -1,0 +1,1422 @@
+"""Promote a repeated substitution into a preference (A12).
+
+A11b made a substitution *legible*: it records a bounded `reason`, a stable
+`slot_id`, and routes saved-plan changes through A9. What it does not do is
+notice that the user keeps making the same swap. This module notices, proposes,
+and remembers the answer.
+
+D-5 defines the shape and is authoritative here -- the threshold is not invented
+in this module: **two consecutive occurrences**, and a decline suppresses the
+same subject for **eight weeks**.
+
+Three things had to be measured before any of this could be built, and each one
+ruled out an obvious shortcut:
+
+* **`job_state` cannot hold the cooldown.** Its key is
+  `(user_id, day, key)` -- `day` is part of the identity, so a window longer
+  than one calendar day is structurally inexpressible.
+* **A `FactSpec` TTL cannot hold it either.** The TTL lives on the shared spec
+  and is applied at read time. Measured: one stored row flipped from suppressed
+  to expired purely because the spec constant changed. A promise to a user must
+  not be rewritable by editing a config value, so `suppress_until` is absolute
+  and stored on the row.
+* **The current active plan cannot classify history.** A substitution recorded
+  weeks ago happened under whatever plan was live *then*. Grouping by today's
+  plan would silently merge evidence across a programme the user has since left.
+
+So evidence is grouped by a **split signature** derived from the historical plan
+version, and the two identities are kept apart throughout:
+
+* `evidence_plan_id` -- the historical provenance a piece of evidence came
+  from, used only to derive its split signature;
+* `expected_active_plan_id` -- the plan that was active when the proposal was
+  created, guarded when the user approves it.
+
+Using an arbitrary historical evidence plan as the mutation expectation would
+apply a change to a plan the user never saw.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+import json
+import secrets
+from typing import Any
+
+from config import LOGGER
+
+# ---------------------------------------------------------------------------
+# Vocabulary. Bounded codes only -- these reach audit rows and callback data.
+# ---------------------------------------------------------------------------
+APPROVAL_KIND = "promote_substitution"
+
+#: Approval lifecycle. `pending` and `processing` are both OPEN; the partial
+#: unique index added by migration 17 permits only one open row per user.
+STATUS_PENDING = "pending"
+STATUS_PROCESSING = "processing"
+STATUS_APPROVED = "approved"
+STATUS_DECLINED = "declined"
+STATUS_STALE = "stale"
+STATUS_FAILED = "failed"
+OPEN_STATUSES = (STATUS_PENDING, STATUS_PROCESSING)
+
+#: Only reasons a verified production path mints, and only those that describe
+#: a PREFERENCE. `pain` is never promotion evidence -- a safety adaptation is
+#: not something the user chose, and promoting it would turn "this hurt" into
+#: "I like this". `unspecified` marks a pre-A11b keyboard or an unrecognised
+#: value; it is not a signal, so it is not eligible either.
+PROMOTABLE_REASONS = frozenset({"equipment"})
+
+#: D-5: "Pattern promotion asks after **two consecutive** occurrences ... with
+#: an 8-week cooldown on decline." Sourced from the authoritative plan, not
+#: chosen here.
+PROMOTION_THRESHOLD = 2
+DECLINE_COOLDOWN_DAYS = 56
+APPROVE_COOLDOWN_DAYS = 365
+
+#: The detector reads a bounded window and a bounded row count. Both exist so a
+#: pathological history cannot turn one workout into an unbounded scan.
+LOOKBACK_DAYS = 56
+MAX_ROWS = 200
+
+#: How long a `processing` claim is honoured before it is considered abandoned.
+#:
+#: `processing` is a LEASE, not a lock. A process that dies mid-mutation cannot
+#: release it, so without an expiry the approval would be stranded forever and
+#: the user's tap would never produce an answer. Twenty minutes matches the
+#: existing `proactive_claim_ttl_minutes` default, so the codebase has one
+#: notion of "a claim this old belongs to a process that is gone".
+#:
+#: The lease is carried by `approvals.decided_at`, which `claim_status` already
+#: stamps on every transition -- no schema change. Checked in this module rather
+#: than trusted from a read, because the reclaim must be a compare-and-set.
+PROCESSING_LEASE_MINUTES = 20
+
+_AUDIT_ACTION = "approve_substitution"
+#: The A12 decision record. Registered in `core._AUDIT_ALLOWLIST` under
+#: ("promote_substitution", "preference") with six bounded fields and no free
+#: text -- an unregistered pair would fall through to `_scalar_only` and drop
+#: values silently.
+_PROMOTION_AUDIT_ACTION = "promote_substitution"
+_PROMOTION_AUDIT_ENTITY = "preference"
+
+
+def utc_iso(moment: dt.datetime | None = None) -> str:
+    """The one canonical timestamp format used by every column this module writes.
+
+    Absolute, UTC, ISO-8601. `suppress_until` is compared with `MAX()` in SQL,
+    which is only correct because every value shares this format -- a mixed
+    local/naive value would sort wrongly and silently shorten a promise.
+    """
+    current = moment or dt.datetime.now(dt.timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=dt.timezone.utc)
+    return current.astimezone(dt.timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Identity
+# ---------------------------------------------------------------------------
+def split_signature(session_keys: Any) -> str | None:
+    """A canonical fingerprint of the SET of declared session keys in a split.
+
+    Canonical JSON rather than a delimiter join: a joined string is ambiguous
+    the moment a key could contain the delimiter, and two different key sets can
+    collide into one signature. `json.dumps` with explicit separators and sorted
+    input is stable across runs and unambiguous by construction.
+
+    Sorting is what makes reordering a no-op: the same sessions in a different
+    order are the same programme. Adding or removing a session changes the set,
+    so it changes the signature -- which is exactly the boundary A12 must not
+    join across.
+
+    FAILS CLOSED on an incomplete key set. Silently dropping a malformed or
+    blank key would fingerprint a SUBSET of the split and return a
+    valid-looking signature for a programme that does not exist -- and two
+    different splits, each missing a different key, could then collide. A
+    signature is either computed over every declared key or not at all.
+
+    Duplicate keys are rejected for the same reason: a set-based fingerprint
+    cannot represent them, so `[a, a, b]` and `[a, b]` would be one identity.
+    """
+    if not isinstance(session_keys, (list, tuple)):
+        return None
+    raw = list(session_keys)
+    if not raw:
+        return None
+    keys = []
+    for key in raw:
+        if not isinstance(key, str) or not key.strip():
+            return None
+        keys.append(key.strip())
+    if len(set(keys)) != len(keys):
+        return None
+    canonical = json.dumps(sorted(keys), separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def subject_of(signature: str, slot_id: str, target: str) -> str:
+    """The cooldown/proposal subject.
+
+    `<split_signature>|<slot_id>|<target>` -- the signature leads so a cooldown
+    earned under one structural split can never suppress a proposal under
+    another. Two programmes that happen to share a slot id are different
+    questions.
+    """
+    return f"{signature}|{slot_id}|{target}"
+
+
+def signature_from_plan_payload(payload: Any) -> str | None:
+    """Derive a split signature from a HISTORICAL plan-version payload.
+
+    Reads the declared session keys the payload itself carries, never the
+    current active plan and never a recomputed key.
+    """
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(payload, dict):
+        return None
+    sessions = payload.get("sessions")
+    if not isinstance(sessions, list) or not sessions:
+        return None
+    keys = []
+    for session in sessions:
+        if not isinstance(session, dict):
+            # A malformed session is a hole in the identity, not a session to
+            # skip. Filtering it out here would hand `split_signature` a
+            # complete-looking subset and defeat its fail-closed check.
+            return None
+        keys.append(session.get("session_occurrence"))
+    return split_signature(keys)
+
+
+# ---------------------------------------------------------------------------
+# Evidence
+# ---------------------------------------------------------------------------
+#: Why a candidate audit row was not counted. Bounded so the counts can be
+#: logged without the rows themselves.
+SKIP_INVALID_SLOT = "invalid_slot_id"
+SKIP_NO_PROVENANCE = "no_plan_provenance"
+SKIP_MALFORMED = "malformed_json"
+SKIP_REASON = "reason_not_promotable"
+SKIP_DUPLICATE_SESSION = "duplicate_session"
+#: Ownership / provenance rejections. Fabricated or cross-user provenance is a
+#: forged-evidence attempt, not a data-quality problem, so it is counted
+#: separately from the ordinary skips.
+SKIP_FOREIGN_SESSION = "session_not_owned"
+SKIP_FOREIGN_PLAN = "evidence_plan_not_owned"
+SKIP_SIGNATURE_MISMATCH = "signature_not_of_plan"
+#: Counted when a slot's most recent occurrence was NOT the substitution, so the
+#: run was broken (the A, B, A case).
+SKIP_NOT_CONSECUTIVE = "not_consecutive"
+
+
+#: The detector's only query. Column order matches
+#: `idx_audit_user_action_created(user_id, action, created_at, id)`, and the
+#: ORDER BY matches the index too -- proven with EXPLAIN QUERY PLAN: without the
+#: index the plan is `SCAN audit`; ordering by `id DESC` alone still leaves
+#: `USE TEMP B-TREE FOR ORDER BY`, while `created_at DESC, id DESC` removes it.
+_EVIDENCE_SQL = (
+    "SELECT id, entity_id, details, created_at FROM audit "
+    "WHERE user_id=? AND action=? AND created_at>=? "
+    "ORDER BY created_at DESC, id DESC LIMIT ?"
+)
+
+
+async def _owned_session_order(db: Any, user_id: int, session_ids: set[str]) -> dict[str, tuple]:
+    """Order key per session id, for sessions THIS user owns.
+
+    Scoped by `user_id`, so an audit row naming someone else's session id
+    cannot contribute evidence. A missing id is simply absent from the result
+    and its row is rejected by the caller -- fail closed, not fail open.
+    """
+    if not session_ids:
+        return {}
+    numeric = []
+    for raw in session_ids:
+        try:
+            numeric.append(int(raw))
+        except (TypeError, ValueError):
+            continue
+    if not numeric:
+        return {}
+    placeholders = ",".join("?" for _ in numeric)
+    try:
+        rows = await db.fetch_all(
+            "SELECT id, started_at FROM sessions "
+            f"WHERE user_id=? AND id IN ({placeholders})",
+            (user_id, *numeric),
+        )
+    except Exception:
+        LOGGER.exception("session_ownership_read_failed user_id=%s", user_id)
+        return {}
+    # `started_at` orders the workouts as the user lived them; `id` breaks ties
+    # deterministically so two sessions sharing a timestamp still have a total
+    # order.
+    return {
+        str(row["id"]): (str(row["started_at"] or ""), int(row["id"]))
+        for row in rows or []
+    }
+
+
+async def _owned_plan_signatures(db: Any, user_id: int, plan_ids: set) -> dict[int, str | None]:
+    """Split signature per plan version, for plans THIS user owns.
+
+    Scoped by `user_id` and derived FROM THE STORED PAYLOAD rather than trusted
+    from the audit row. A row may claim any `split_signature` it likes; only a
+    signature that matches the plan version it names is evidence.
+    """
+    if not plan_ids:
+        return {}
+    numeric = []
+    for raw in plan_ids:
+        try:
+            numeric.append(int(raw))
+        except (TypeError, ValueError):
+            continue
+    if not numeric:
+        return {}
+    placeholders = ",".join("?" for _ in numeric)
+    try:
+        rows = await db.fetch_all(
+            "SELECT id, payload FROM plan_versions "
+            f"WHERE user_id=? AND id IN ({placeholders})",
+            (user_id, *numeric),
+        )
+    except Exception:
+        LOGGER.exception("plan_ownership_read_failed user_id=%s", user_id)
+        return {}
+    return {
+        int(row["id"]): signature_from_plan_payload(row["payload"])
+        for row in rows or []
+    }
+
+
+async def _slot_occurrences(
+    db: Any, user_id: int, slot_ids: set[str], *, since: str
+) -> dict[str, dict[str, Any]]:
+    """What was ACTUALLY performed in each slot, per session, in order.
+
+    Read from the sessions the user trained, not from the substitution audit.
+    That distinction is the whole point: a history built only from
+    `approve_substitution` rows cannot see the sessions where the user trained
+    the PROGRAMMED exercise, so an A, B, A pattern -- substitute, do it as
+    written, substitute again -- would look like two consecutive substitutions
+    and promote against the user's own behaviour.
+
+    Returns `slot_id -> {session_id: (order_key, performed_exercise_id)}`.
+
+    "Performed" is defined canonically, because every loose edge here becomes a
+    phantom occurrence in the streak:
+
+    * only sessions this user owns (`s.user_id`);
+    * only sessions that genuinely COMPLETED -- an abandoned or cancelled
+      session is not a training occurrence, and counting one would let a
+      workout the user walked away from break or extend a streak;
+    * only real logged sets. `telegram_split_secondary` rows are the second
+      half of one split set, excluded exactly as `workout_summary` excludes
+      them from its own count, so one set never reads as two. Undone sets need
+      no filter: undo DELETEs the row;
+    * exactly ONE occurrence per (slot, session), decided by the FIRST set
+      logged in that slot rather than by whichever row the loop happened to
+      see last;
+    * a total, deterministic order -- `started_at` then `id`, so sessions
+      sharing a timestamp still order stably;
+    * the slot resolved by IDENTITY from the session's own plan entry, never by
+      `exercise_id` -- a plan that programmes the same movement twice has two
+      distinct slots, and matching on the exercise would merge them;
+    * only the split the evidence belongs to, which `_is_consecutive` scopes.
+    """
+    if not slot_ids:
+        return {}
+    try:
+        rows = await db.fetch_all(
+            "SELECT s.id AS session_id, s.started_at AS started_at, s.plan AS plan, "
+            "st.id AS set_id, st.exercise_id AS exercise_id, "
+            "st.exercise_index AS exercise_index "
+            "FROM sessions s JOIN sets st ON st.session_id = s.id "
+            "WHERE s.user_id=? AND s.started_at>=? AND s.status='completed' "
+            "AND st.source != 'telegram_split_secondary' "
+            "ORDER BY s.started_at DESC, s.id DESC, st.id ASC",
+            (user_id, since),
+        )
+    except Exception:
+        LOGGER.exception("slot_occurrence_read_failed user_id=%s", user_id)
+        return {}
+
+    from noam_coach.services import workout_slots
+
+    plans: dict[str, Any] = {}
+    history: dict[str, dict[str, Any]] = {}
+    for row in rows or []:
+        session_id = str(row["session_id"])
+        if session_id not in plans:
+            try:
+                parsed = json.loads(row["plan"] or "{}")
+            except (TypeError, ValueError):
+                parsed = {}
+            plans[session_id] = (
+                parsed.get("exercises") if isinstance(parsed, dict) else None
+            )
+        exercises = plans[session_id]
+        if not isinstance(exercises, list):
+            continue
+        index = row["exercise_index"]
+        if index is None or not (0 <= int(index) < len(exercises)):
+            continue
+        entry = exercises[int(index)]
+        if not isinstance(entry, dict):
+            continue
+        slot_id = workout_slots.slot_id_of(entry)
+        if slot_id not in slot_ids:
+            continue
+        performed = str(row["exercise_id"] or "")
+        if not performed:
+            continue
+        bucket = history.setdefault(slot_id, {})
+        if session_id in bucket:
+            # One occurrence per slot per session. The rows arrive ordered by
+            # `st.id ASC`, so the first one -- the set the user actually
+            # started the slot with -- wins, and a replayed or extra set cannot
+            # rewrite what was performed.
+            continue
+        order_key = (str(row["started_at"] or ""), int(row["session_id"]))
+        bucket[session_id] = (order_key, performed)
+    return history
+
+
+async def collect_evidence(db: Any, user_id: int, *, now: dt.datetime | None = None) -> dict[str, Any]:
+    """Group promotable substitutions by `(split_signature, slot_id, target)`.
+
+    Counts DISTINCT session ids, never raw rows. A single workout can emit
+    several `approve_substitution` rows for one slot -- the user changes their
+    mind, or a replayed callback lands twice -- and counting rows would let one
+    session manufacture a promotion on its own.
+
+    Every rejection is counted by bounded code rather than dropped silently, so
+    "no promotion" can be explained without re-reading the audit table.
+    """
+    current = now or dt.datetime.now(dt.timezone.utc)
+    since = utc_iso(current - dt.timedelta(days=LOOKBACK_DAYS))
+
+    try:
+        rows = await db.fetch_all(
+            _EVIDENCE_SQL, (user_id, _AUDIT_ACTION, since, MAX_ROWS)
+        )
+    except Exception:
+        LOGGER.exception("substitution_evidence_read_failed user_id=%s", user_id)
+        return {"groups": {}, "skipped": {}, "rows": 0}
+
+    from noam_coach.services import workout_slots
+
+    groups: dict[str, dict[str, Any]] = {}
+    skipped: dict[str, int] = {}
+    candidates: list[dict[str, Any]] = []
+
+    def _skip(code: str) -> None:
+        skipped[code] = skipped.get(code, 0) + 1
+
+    for row in rows or []:
+        raw = row["details"] if "details" in row.keys() else None
+        try:
+            details = json.loads(raw or "{}")
+        except (TypeError, ValueError):
+            # A corrupt row must never break detection. Counted, not raised.
+            _skip(SKIP_MALFORMED)
+            continue
+        if not isinstance(details, dict):
+            _skip(SKIP_MALFORMED)
+            continue
+
+        if str(details.get("reason") or "") not in PROMOTABLE_REASONS:
+            _skip(SKIP_REASON)
+            continue
+
+        slot_id = details.get("slot_id")
+        # `is_valid_slot_id` is a round-trip check, so this rejects missing,
+        # empty, malformed and non-round-tripping ids in one test. A11b stored
+        # `slot_id=""` on legacy entries; those rows stay readable and never
+        # count.
+        if not workout_slots.is_valid_slot_id(slot_id):
+            _skip(SKIP_INVALID_SLOT)
+            continue
+
+        signature = details.get("split_signature")
+        plan_id = details.get("evidence_plan_id")
+        if not isinstance(signature, str) or not signature or plan_id is None:
+            _skip(SKIP_NO_PROVENANCE)
+            continue
+
+        target = str(details.get("target") or "")
+        source = str(details.get("source") or "")
+        if not target or not source:
+            _skip(SKIP_NO_PROVENANCE)
+            continue
+
+        session_id = str(row["entity_id"] or "")
+        if not session_id:
+            _skip(SKIP_NO_PROVENANCE)
+            continue
+
+        candidates.append({
+            "session_id": session_id,
+            "plan_id": plan_id,
+            "signature": signature,
+            "slot_id": str(slot_id),
+            "target": target,
+            "source": source,
+        })
+
+    # Ownership and provenance are resolved in two batched reads rather than
+    # per row, so a 200-row window costs two queries instead of 400.
+    order = await _owned_session_order(
+        db, user_id, {c["session_id"] for c in candidates}
+    )
+    plan_signatures = await _owned_plan_signatures(
+        db, user_id, {c["plan_id"] for c in candidates}
+    )
+
+    for candidate in candidates:
+        session_id = candidate["session_id"]
+        if session_id not in order:
+            # The session is not this user's (or does not exist). A row naming a
+            # foreign session is forged provenance, never evidence.
+            _skip(SKIP_FOREIGN_SESSION)
+            continue
+        try:
+            plan_key = int(candidate["plan_id"])
+        except (TypeError, ValueError):
+            _skip(SKIP_FOREIGN_PLAN)
+            continue
+        if plan_key not in plan_signatures:
+            _skip(SKIP_FOREIGN_PLAN)
+            continue
+        # The claimed signature must be the one that plan version actually has.
+        # Trusting the audit row would let a fabricated `split_signature` group
+        # unrelated substitutions into a promotable pattern.
+        if plan_signatures[plan_key] != candidate["signature"]:
+            _skip(SKIP_SIGNATURE_MISMATCH)
+            continue
+
+        subject = subject_of(
+            candidate["signature"], candidate["slot_id"], candidate["target"]
+        )
+        group = groups.setdefault(
+            subject,
+            {
+                "subject": subject,
+                "split_signature": candidate["signature"],
+                "slot_id": candidate["slot_id"],
+                "target": candidate["target"],
+                "source": candidate["source"],
+                "sessions": set(),
+                "evidence_plan_ids": set(),
+            },
+        )
+        if session_id in group["sessions"]:
+            _skip(SKIP_DUPLICATE_SESSION)
+            continue
+        group["sessions"].add(session_id)
+        group["evidence_plan_ids"].add(candidate["plan_id"])
+
+    # Consecutiveness is decided on what the user actually performed in the
+    # slot, which includes the sessions where they trained it as programmed.
+    slot_history = await _slot_occurrences(
+        db, user_id, {g["slot_id"] for g in groups.values()}, since=since
+    )
+
+    return {
+        "groups": groups,
+        "skipped": skipped,
+        "rows": len(rows or []),
+        "slot_history": slot_history,
+    }
+
+
+async def find_promotable(db: Any, user_id: int, *, now: dt.datetime | None = None):
+    """The single subject that has met the D-5 threshold, or None.
+
+    Returns at most one candidate: only one proposal may be open per user, and
+    that is a database rule (the partial unique index), not a convention.
+    """
+    evidence = await collect_evidence(db, user_id, now=now)
+    history = evidence.get("slot_history") or {}
+
+    def _is_consecutive(group: dict[str, Any]) -> bool:
+        """The last PROMOTION_THRESHOLD occurrences of this slot are all this target.
+
+        D-5 says *two consecutive* occurrences, and a set of two distinct
+        sessions is not that. Substituting in January and again in March, with
+        the programmed exercise trained in between, is an occasional preference
+        -- promoting it would rewrite the plan on evidence the user's own
+        behaviour contradicts.
+
+        Judged per SLOT rather than per calendar: the run is broken only by
+        another occurrence OF THAT SLOT. A leg-day slot is not interrupted by
+        the push days between two leg days.
+        """
+        seen = history.get(group["slot_id"]) or {}
+        # Only the sessions belonging to THIS group's evidence count toward its
+        # streak. A slot id can recur under a different plan version, and a
+        # session trained under another split is not part of this programme's
+        # sequence -- joining them would build a streak the user never trained.
+        scoped = {
+            session_id: entry
+            for session_id, entry in seen.items()
+            if session_id in group["sessions"] or entry[1] != group["target"]
+        }
+        if len(scoped) < PROMOTION_THRESHOLD:
+            return False
+        recent = sorted(scoped.values(), key=lambda entry: entry[0], reverse=True)
+        return all(
+            target == group["target"]
+            for _, target in recent[:PROMOTION_THRESHOLD]
+        )
+
+    ready = []
+    for group in evidence["groups"].values():
+        if len(group["sessions"]) < PROMOTION_THRESHOLD:
+            continue
+        if not _is_consecutive(group):
+            evidence["skipped"][SKIP_NOT_CONSECUTIVE] = (
+                evidence["skipped"].get(SKIP_NOT_CONSECUTIVE, 0) + 1
+            )
+            continue
+        ready.append(group)
+    if not ready:
+        if evidence["skipped"]:
+            LOGGER.info(
+                "substitution_evidence_skipped user_id=%s rows=%d %s",
+                user_id,
+                evidence["rows"],
+                " ".join(f"{k}={v}" for k, v in sorted(evidence["skipped"].items())),
+            )
+        return None
+    ready.sort(key=lambda g: (len(g["sessions"]), g["subject"]), reverse=True)
+    winner = ready[0]
+    return {
+        "subject": winner["subject"],
+        "split_signature": winner["split_signature"],
+        "slot_id": winner["slot_id"],
+        "target": winner["target"],
+        "source": winner["source"],
+        "occurrences": len(winner["sessions"]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cooldown
+# ---------------------------------------------------------------------------
+async def is_suppressed(db: Any, user_id: int, subject: str, *, now: dt.datetime | None = None) -> bool:
+    """True while an unexpired promise covers this subject."""
+    try:
+        row = await db.fetch_one(
+            "SELECT suppress_until FROM substitution_cooldowns "
+            "WHERE user_id=? AND subject=?",
+            (user_id, subject),
+        )
+    except Exception:
+        LOGGER.exception("substitution_cooldown_read_failed user_id=%s", user_id)
+        # Fail closed: an unreadable cooldown is not evidence that none exists.
+        return True
+    if not row:
+        return False
+    return utc_iso(now) < str(row["suppress_until"])
+
+
+async def record_cooldown(
+    db: Any,
+    user_id: int,
+    subject: str,
+    *,
+    decided_as: str,
+    approval_id: str | None,
+    days: int,
+    now: dt.datetime | None = None,
+) -> None:
+    """Write the promise, never shortening one already made.
+
+    The UPSERT keeps the LONGEST `suppress_until`, and -- the part that is easy
+    to get wrong -- keeps the provenance of that winning promise with it. A
+    shorter later decision must not overwrite `decided_as`/`approval_id`,
+    because the row would then claim a 365-day approval was the reason for a
+    56-day suppression, or vice versa. Every field moves together or none does.
+    """
+    current = now or dt.datetime.now(dt.timezone.utc)
+    stamp = utc_iso(current)
+    until = utc_iso(current + dt.timedelta(days=days))
+
+    await db.execute(
+        _COOLDOWN_UPSERT,
+        (user_id, subject, until, decided_as, approval_id, stamp, stamp, stamp),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle
+#
+#   pending -> processing -> approved | declined | stale | failed
+#
+# `processing` exists so a crash has a recoverable state to be found in. Without
+# it, a process that died between mutating the plan and finalizing the approval
+# would leave a `pending` row indistinguishable from one nobody had tapped, and
+# a retry would apply the substitution a second time.
+#
+# Only the caller that observes `rowcount == 1` on a state transition may act.
+# That is the whole concurrency argument: SQLite serializes the UPDATE, so of
+# two racing taps exactly one changes the row and exactly one side effect
+# follows. `payload.subject` is a grouping value, NOT a database idempotency
+# key -- nothing enforces uniqueness on it, and calling it one would be false.
+# The database rules are the partial unique index (one open row per user) and
+# these conditional UPDATEs.
+# ---------------------------------------------------------------------------
+async def claim_status(
+    db: Any,
+    approval_id: str,
+    user_id: int,
+    *,
+    expect: str,
+    become: str,
+) -> bool:
+    """Move one approval between states, returning whether THIS caller won.
+
+    Conditional on both the id and the current status, so a replayed callback,
+    a double tap and a concurrent worker all resolve to exactly one winner.
+    """
+    changed = await db.execute_rowcount(
+        "UPDATE approvals SET status=?, decided_at=? "
+        "WHERE id=? AND user_id=? AND status=?",
+        (become, utc_iso(), approval_id, user_id, expect),
+    )
+    return int(changed) == 1
+
+
+#: The one cooldown UPSERT. Stated ONCE because a rule written twice drifts:
+#: deliberate breakage mutated one copy and the tests stayed green, since the
+#: lifecycle path used the other.
+#:
+#: `MAX()` keeps the longest promise, and the CASE arms move `decided_as`,
+#: `approval_id` and `decided_at` together with it. Splitting them would let a
+#: 56-day decline landing after a 365-day approval leave the row claiming a
+#: decline is the reason for a year-long suppression.
+_COOLDOWN_UPSERT = """
+    INSERT INTO substitution_cooldowns(
+        user_id, subject, suppress_until, decided_as, approval_id,
+        decided_at, created_at, updated_at
+    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(user_id, subject) DO UPDATE SET
+        decided_as = CASE
+            WHEN excluded.suppress_until > substitution_cooldowns.suppress_until
+            THEN excluded.decided_as ELSE substitution_cooldowns.decided_as END,
+        approval_id = CASE
+            WHEN excluded.suppress_until > substitution_cooldowns.suppress_until
+            THEN excluded.approval_id ELSE substitution_cooldowns.approval_id END,
+        decided_at = CASE
+            WHEN excluded.suppress_until > substitution_cooldowns.suppress_until
+            THEN excluded.decided_at ELSE substitution_cooldowns.decided_at END,
+        suppress_until = MAX(
+            substitution_cooldowns.suppress_until, excluded.suppress_until
+        ),
+        updated_at = excluded.updated_at
+"""
+
+
+async def _finalize(
+    db: Any,
+    approval_id: str,
+    user_id: int,
+    *,
+    become: str,
+    subject: str,
+    days: int,
+    slot_id: str = "",
+    target: str = "",
+    occurrences: int = 0,
+    now: dt.datetime | None = None,
+) -> bool:
+    """Commit the final status AND its cooldown together, or neither.
+
+    Two statements outside a transaction would leave a window in which the
+    approval reads `approved` while no promise exists -- and the next detector
+    pass would propose the same subject again, immediately, to a user who had
+    just answered it. `db.transaction()` issues BEGIN IMMEDIATE, so the pair is
+    atomic and the conditional UPDATE inside it still decides the single winner.
+
+    Returns whether THIS caller performed the finalization.
+    """
+    stamp = utc_iso(now)
+    until = utc_iso(
+        (now or dt.datetime.now(dt.timezone.utc)) + dt.timedelta(days=days)
+    )
+    try:
+        async with db.transaction() as conn:
+            cursor = await conn.execute(
+                "UPDATE approvals SET status=?, decided_at=? "
+                "WHERE id=? AND user_id=? AND status=?",
+                (become, stamp, approval_id, user_id, STATUS_PROCESSING),
+            )
+            if int(cursor.rowcount) != 1:
+                return False
+            if subject:
+                await conn.execute(
+                    _COOLDOWN_UPSERT,
+                    (user_id, subject, until, become, approval_id, stamp, stamp, stamp),
+                )
+            # The audit row rides the SAME transaction and the same
+            # rowcount==1 winner, so the decision is recorded exactly once:
+            # a duplicate callback loses the conditional UPDATE and never
+            # reaches here, and a crash rolls the record back with the status.
+            await conn.execute(
+                "INSERT INTO audit(user_id, action, entity, entity_id, details, created_at) "
+                "VALUES(?, ?, ?, ?, ?, ?)",
+                (
+                    user_id,
+                    _PROMOTION_AUDIT_ACTION,
+                    _PROMOTION_AUDIT_ENTITY,
+                    str(approval_id),
+                    json.dumps(
+                        {
+                            "outcome": become,
+                            "subject": subject,
+                            "slot_id": slot_id,
+                            "target": target,
+                            "occurrences": occurrences,
+                            "approval_id": str(approval_id),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    stamp,
+                ),
+            )
+    except Exception:
+        LOGGER.exception(
+            "substitution_finalize_failed user_id=%s status=%s", user_id, become
+        )
+        return False
+    return True
+
+
+async def reclaim_abandoned(
+    db: Any,
+    approval_id: str,
+    user_id: int,
+    *,
+    now: dt.datetime | None = None,
+) -> bool:
+    """Atomically take over a `processing` row whose lease has expired.
+
+    This is what makes crash recovery real rather than asserted. After a crash
+    between the mutation and finalization the row is `processing`, and the
+    ordinary `pending -> processing` claim can never match it again -- so
+    without this the approval is stranded and the user's tap has no outcome.
+
+    The reclaim is a single conditional UPDATE, not a read-then-act: the
+    `decided_at < ?` predicate is evaluated by SQLite inside the same statement
+    that flips the row, so of two callers racing to recover the same approval
+    exactly one sees `rowcount == 1`. A read followed by a write would let both
+    read the same stale timestamp and both proceed.
+
+    Re-stamping `decided_at` renews the lease, so a recovery that itself dies is
+    recoverable in turn -- no row can be stranded permanently.
+    """
+    cutoff = utc_iso(
+        (now or dt.datetime.now(dt.timezone.utc))
+        - dt.timedelta(minutes=PROCESSING_LEASE_MINUTES)
+    )
+    changed = await db.execute_rowcount(
+        "UPDATE approvals SET decided_at=? "
+        "WHERE id=? AND user_id=? AND status=? AND decided_at IS NOT NULL "
+        "AND decided_at < ?",
+        (utc_iso(now), approval_id, user_id, STATUS_PROCESSING, cutoff),
+    )
+    return int(changed) == 1
+
+
+async def propose(
+    db: Any,
+    user_id: int,
+    candidate: dict[str, Any],
+    *,
+    active_plan_id: int | None,
+    now: dt.datetime | None = None,
+) -> str | None:
+    """Create the pending proposal, or None when one must not be created.
+
+    Returns None when the subject is under an unexpired promise, when there is
+    no active plan to guard against, or when another open proposal already
+    exists -- the last of which is enforced by the database, not by this check:
+    the partial unique index raises on the INSERT if two callers race past the
+    read.
+
+    The whole create runs inside `db.transaction()`, which issues
+    BEGIN IMMEDIATE, so the supersede-then-insert pair cannot interleave with
+    another writer.
+    """
+    if active_plan_id is None:
+        return None
+    subject = str(candidate.get("subject") or "")
+    if not subject:
+        return None
+
+    # The exercise that will actually be REPLACED is read from the plan that is
+    # active right now, not from the historical evidence row. Those can differ:
+    # evidence may span superseded plan versions, and the slot may since hold a
+    # different exercise. Trusting history here would send A9 an
+    # `expected_source_exercise_id` that no longer matches the plan, so the
+    # guard silently protects nothing.
+    active_source = await _active_slot_exercise(db, user_id, candidate["slot_id"])
+    if not active_source:
+        LOGGER.info(
+            "substitution_proposal_skipped user_id=%s reason=no_active_source", user_id
+        )
+        return None
+    if active_source == str(candidate["target"]):
+        # The slot already holds the target; there is nothing to promote.
+        return None
+
+    payload = {
+        "subject": subject,
+        "split_signature": candidate["split_signature"],
+        "slot_id": candidate["slot_id"],
+        "target": candidate["target"],
+        "source": active_source,
+        "occurrences": int(candidate["occurrences"]),
+        # The plan that was ACTIVE when the proposal was made -- guarded at
+        # approval. Deliberately not an evidence plan id: evidence may span
+        # several superseded versions, and applying a change to one of those
+        # would touch a plan the user never saw this proposal for.
+        "expected_active_plan_id": int(active_plan_id),
+    }
+
+    approval_id = secrets.token_urlsafe(8)
+    lease_cutoff = utc_iso(
+        (now or dt.datetime.now(dt.timezone.utc))
+        - dt.timedelta(minutes=PROCESSING_LEASE_MINUTES)
+    )
+    try:
+        async with db.transaction() as conn:
+            # The suppression read lives INSIDE the transaction. Outside it, a
+            # decline could commit between the check and the insert and the
+            # proposal would re-ask a question the user had just refused.
+            # BEGIN IMMEDIATE makes the read-then-insert pair indivisible.
+            cursor = await conn.execute(
+                "SELECT suppress_until FROM substitution_cooldowns "
+                "WHERE user_id=? AND subject=?",
+                (user_id, subject),
+            )
+            promise = await cursor.fetchone()
+            if promise and str(promise["suppress_until"] or "") > utc_iso(now):
+                return None
+
+            # An UNEXPIRED `processing` row is a live mutation, not a stale
+            # proposal. Superseding it would mark the approval stale while the
+            # A9 boundary is mid-flight, so the user's tap would apply to the
+            # plan and then be reported as if it never happened.
+            cursor = await conn.execute(
+                "SELECT COUNT(*) AS live FROM approvals "
+                "WHERE user_id=? AND kind=? AND status=? "
+                "AND (decided_at IS NULL OR decided_at >= ?)",
+                (user_id, APPROVAL_KIND, STATUS_PROCESSING, lease_cutoff),
+            )
+            live = await cursor.fetchone()
+            if live and int(live["live"] or 0) > 0:
+                LOGGER.info(
+                    "substitution_proposal_skipped user_id=%s reason=active_lease",
+                    user_id,
+                )
+                return None
+
+            # An unanswered `pending` proposal is an OPEN QUESTION, not stale
+            # work. Superseding it and inserting a replacement would ask the
+            # user the same thing after their next workout while quietly
+            # invalidating the keyboard they were already looking at -- so the
+            # older message answers into a `stale` row and reports that nothing
+            # happened. One open question at a time; this one waits.
+            cursor = await conn.execute(
+                "SELECT id FROM approvals "
+                "WHERE user_id=? AND kind=? AND status=? LIMIT 1",
+                (user_id, APPROVAL_KIND, STATUS_PENDING),
+            )
+            open_question = await cursor.fetchone()
+            if open_question:
+                LOGGER.info(
+                    "substitution_proposal_skipped user_id=%s reason=open_proposal",
+                    user_id,
+                )
+                return None
+
+            # Only ABANDONED work is superseded: a `processing` row whose lease
+            # expired. `pending` is handled above (it blocks instead), and a
+            # live lease is never touched -- so this clears exactly the rows a
+            # dead process left behind, which is what frees the partial unique
+            # index for the new proposal.
+            await conn.execute(
+                "UPDATE approvals SET status=? , decided_at=? "
+                "WHERE user_id=? AND kind=? AND status=? "
+                "AND decided_at IS NOT NULL AND decided_at < ?",
+                (STATUS_STALE, utc_iso(now), user_id, APPROVAL_KIND,
+                 STATUS_PROCESSING, lease_cutoff),
+            )
+            await conn.execute(
+                "INSERT INTO approvals(id, user_id, kind, payload, status, created_at) "
+                "VALUES(?, ?, ?, ?, ?, ?)",
+                (approval_id, user_id, APPROVAL_KIND,
+                 json.dumps(payload, ensure_ascii=False), STATUS_PENDING,
+                 utc_iso(now)),
+            )
+    except Exception:
+        LOGGER.exception("substitution_proposal_failed user_id=%s", user_id)
+        return None
+    LOGGER.info(
+        "substitution_proposed user_id=%s occurrences=%d", user_id,
+        payload["occurrences"],
+    )
+    return approval_id
+
+
+#: Callback data for the promotion answer. Inside the router-owned `planv2:`
+#: family so no new registration surface exists to forget.
+PROMOTE_CALLBACK_PREFIX = "planv2:promote:"
+
+
+def promotion_callback_data(decision: str, approval_id: str) -> str:
+    """`planv2:promote:<yes|no>:<approval_id>` -- parsed by callback_plans."""
+    return f"{PROMOTE_CALLBACK_PREFIX}{decision}:{approval_id}"
+
+
+async def offer_after_workout(
+    db: Any, user_id: int, *, now: dt.datetime | None = None
+) -> dict[str, Any] | None:
+    """Detect, propose, and return what to ask -- or None when there is nothing.
+
+    THE production entry point. D-5 places this at the end of the workout, so
+    it is called from the completion render and nowhere else: asking mid-set
+    would interrupt training, and asking from a scheduled job would raise a
+    question with no context around it.
+
+    Never raises into the workout summary. A promotion is an enhancement; if
+    detection fails the user must still see that their workout was saved.
+    """
+    try:
+        candidate = await find_promotable(db, user_id, now=now)
+        if not candidate:
+            return None
+
+        active_plan_id = await _active_plan_id(db, user_id)
+        approval_id = await propose(
+            db, user_id, candidate, active_plan_id=active_plan_id, now=now
+        )
+        if not approval_id:
+            return None
+    except Exception:
+        LOGGER.exception("substitution_offer_failed user_id=%s", user_id)
+        return None
+
+    # Display names come from the plan entries themselves, which is where the
+    # rest of the bot reads them from -- there is no global id -> name map, and
+    # inventing one here would drift from what the user sees in their plan.
+    names = await _slot_display_names(
+        db, user_id, candidate["slot_id"], candidate["target"]
+    )
+    return {
+        "approval_id": approval_id,
+        "target": candidate["target"],
+        "source": candidate["source"],
+        "slot_id": candidate["slot_id"],
+        "occurrences": candidate["occurrences"],
+        "source_name": names.get("source") or candidate["source"],
+        "target_name": names.get("target") or candidate["target"],
+    }
+
+
+async def _slot_display_names(
+    db: Any, user_id: int, slot_id: str, target: str
+) -> dict[str, str]:
+    """Human names for the slot's current exercise and the promotion target."""
+    result: dict[str, str] = {}
+    try:
+        import planning
+        from noam_coach.services import workout_slots
+
+        active = await planning.get_active_plan(db, user_id, "workout")
+    except Exception:
+        LOGGER.exception("display_name_lookup_failed user_id=%s", user_id)
+        return result
+    if not active:
+        return result
+    for session in (active.get("payload") or {}).get("sessions") or []:
+        if not isinstance(session, dict):
+            continue
+        found = workout_slots.find_by_slot_id(session.get("exercises"), slot_id)
+        if found is None:
+            continue
+        entry = found[1]
+        result["source"] = str(entry.get("name") or "")
+        for alt in entry.get("alts") or []:
+            if isinstance(alt, dict) and str(alt.get("id") or "") == target:
+                result["target"] = str(alt.get("name") or "")
+                break
+        break
+    return result
+
+
+async def _active_plan_id(db: Any, user_id: int) -> int | None:
+    """Row id of the currently active workout plan, or None."""
+    try:
+        import planning
+
+        active = await planning.get_active_plan(db, user_id, "workout")
+    except Exception:
+        LOGGER.exception("active_plan_id_failed user_id=%s", user_id)
+        return None
+    if not active:
+        return None
+    raw = active.get("id")
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+async def _durable_status(
+    db: Any, user_id: int, approval_id: str, *, fallback: str
+) -> str:
+    """Re-read what the approval DURABLY says, for honest reporting.
+
+    Used whenever this caller did not perform the transition it attempted. The
+    truth is in the row, not in the branch that was taken -- reporting the
+    intent instead is how a late "no" ends up telling the user nothing changed
+    after their plan was already rewritten.
+    """
+    try:
+        row = await db.fetch_one(
+            "SELECT status FROM approvals WHERE id=? AND user_id=?",
+            (approval_id, user_id),
+        )
+    except Exception:
+        LOGGER.exception("durable_status_read_failed user_id=%s", user_id)
+        return fallback
+    if not row:
+        return STATUS_STALE
+    status = str(row["status"] or "")
+    # `processing` is someone else's in-flight mutation; the outcome is not
+    # known yet, so report it as such rather than guessing.
+    return status or fallback
+
+
+async def decline(db: Any, user_id: int, approval_id: str, *, now: dt.datetime | None = None) -> str:
+    """Record a refusal and suppress the subject for the D-5 window."""
+    row = await db.fetch_one(
+        "SELECT payload, status FROM approvals WHERE id=? AND user_id=?",
+        (approval_id, user_id),
+    )
+    if not row:
+        return STATUS_STALE
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    subject = str(payload.get("subject") or "")
+
+    # A decline goes straight from `pending` to `declined` -- there is no
+    # mutation to protect, so no lease is needed. The status and the promise
+    # still commit together: a decline recorded without its cooldown would
+    # re-ask the question the user just refused.
+    if not await claim_status(
+        db, approval_id, user_id, expect=STATUS_PENDING, become=STATUS_PROCESSING
+    ):
+        # Someone already decided this. Report what durably happened rather
+        # than what this tap asked for: a "no" arriving after a "yes" must not
+        # tell the user their plan was left unchanged when it was rewritten.
+        return await _durable_status(db, user_id, approval_id, fallback=STATUS_DECLINED)
+    if not await _finalize(
+        db, approval_id, user_id, become=STATUS_DECLINED,
+        subject=subject, days=DECLINE_COOLDOWN_DAYS,
+        slot_id=str(payload.get("slot_id") or ""),
+        target=str(payload.get("target") or ""),
+        occurrences=int(payload.get("occurrences") or 0),
+        now=now,
+    ):
+        # The status+cooldown transaction did not commit. Claiming DECLINED
+        # here would promise a suppression that does not exist, and the next
+        # detector pass would re-ask immediately.
+        LOGGER.warning("substitution_decline_not_finalized user_id=%s", user_id)
+        return await _durable_status(db, user_id, approval_id, fallback=STATUS_FAILED)
+    return STATUS_DECLINED
+
+
+async def approve(db: Any, user_id: int, approval_id: str, *, now: dt.datetime | None = None) -> str:
+    """Apply the promoted substitution, once, through the A9 boundary.
+
+    The claim is `pending -> processing`, so a crash mid-mutation leaves a row
+    that says so. Recovery is not a special path: re-entering calls the same
+    boundary, which reports `no_change` when the target is already applied --
+    finalizing without creating a second plan version.
+    """
+    row = await db.fetch_one(
+        "SELECT payload, status FROM approvals WHERE id=? AND user_id=?",
+        (approval_id, user_id),
+    )
+    if not row:
+        return STATUS_STALE
+
+    status = str(row["status"] or "")
+    if status not in (STATUS_PENDING, STATUS_PROCESSING):
+        return status
+
+    if status == STATUS_PENDING:
+        if not await claim_status(
+            db, approval_id, user_id, expect=STATUS_PENDING, become=STATUS_PROCESSING
+        ):
+            # Lost the race. The winner owns the mutation.
+            return STATUS_PROCESSING
+    else:
+        # Already `processing`. Either another caller is mid-mutation right now
+        # -- in which case this tap must not act -- or a process died and left
+        # the lease behind. Only an EXPIRED lease may be reclaimed, and only by
+        # the single caller whose conditional UPDATE matches.
+        if not await reclaim_abandoned(db, approval_id, user_id, now=now):
+            return STATUS_PROCESSING
+        LOGGER.info("substitution_promotion_recovered user_id=%s", user_id)
+
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+
+    slot_id = str(payload.get("slot_id") or "")
+    target = str(payload.get("target") or "")
+    source = str(payload.get("source") or "")
+    expected_plan = payload.get("expected_active_plan_id")
+    expected_signature = str(payload.get("split_signature") or "")
+    subject = str(payload.get("subject") or "")
+
+    # Fail closed on incomplete identity. Every one of these is required to
+    # know WHICH change was promised and under which programme; missing any of
+    # them means the approval cannot be applied safely, and guessing a default
+    # would apply an unintended change to a real plan.
+    if (
+        not slot_id
+        or not target
+        or not source
+        or not expected_signature
+        or expected_plan is None
+    ):
+        LOGGER.warning(
+            "substitution_promotion_incomplete_identity user_id=%s", user_id
+        )
+        await claim_status(
+            db, approval_id, user_id, expect=STATUS_PROCESSING, become=STATUS_FAILED
+        )
+        return STATUS_FAILED
+
+    from noam_coach.services import plan_mutations
+
+    # ALREADY APPLIED takes precedence over every staleness guard, and the
+    # ordering is load-bearing rather than cosmetic.
+    #
+    # Measured: the A9 boundary is copy-on-write, so a SUCCESSFUL mutation
+    # always activates a NEW plan version -- id 1 becomes id 4. On recovery the
+    # `expected_active_plan_id` guard therefore rejects the promotion's own
+    # completed work as stale, and the cooldown is never written. Checking the
+    # applied state first turns that into the finalize-only path it should be.
+    if await _already_applied(
+        db, user_id, slot_id, target, expected_signature=expected_signature
+    ):
+        if not await _finalize(
+            db, approval_id, user_id, become=STATUS_APPROVED,
+            subject=subject, days=APPROVE_COOLDOWN_DAYS,
+            slot_id=slot_id, target=target,
+            occurrences=int(payload.get("occurrences") or 0),
+            now=now,
+        ):
+            LOGGER.warning("substitution_approve_not_finalized user_id=%s", user_id)
+            return await _durable_status(
+                db, user_id, approval_id, fallback=STATUS_FAILED
+            )
+        LOGGER.info("substitution_promotion_finalized user_id=%s applied=already", user_id)
+        return STATUS_APPROVED
+
+    # The split must still be the one the proposal was built against. Checked
+    # here rather than inside A9's boundary because it is A12's contract, not
+    # the mutation boundary's.
+    active = await _active_plan_signature(db, user_id)
+    if active is not None and expected_signature and active != expected_signature:
+        await claim_status(
+            db, approval_id, user_id, expect=STATUS_PROCESSING, become=STATUS_STALE
+        )
+        LOGGER.info("substitution_promotion_stale user_id=%s reason=split", user_id)
+        return STATUS_STALE
+
+    outcome = await plan_mutations.substitute_slot_in_saved_plan(
+        db, user_id, slot_id, target,
+        reason="promoted_preference",
+        expected_active_plan_id=int(expected_plan),
+        expected_source_exercise_id=source or None,
+    )
+
+    if outcome.outcome in (
+        plan_mutations.OUTCOME_REALIGNED,
+        # `no_change` is the crash-recovery case: the mutation already landed
+        # and only finalization was missing. Finalize; do not mutate again.
+        plan_mutations.OUTCOME_NO_CHANGE,
+    ):
+        if not await _finalize(
+            db, approval_id, user_id, become=STATUS_APPROVED,
+            subject=subject, days=APPROVE_COOLDOWN_DAYS,
+            slot_id=slot_id, target=target,
+            occurrences=int(payload.get("occurrences") or 0),
+            now=now,
+        ):
+            # The plan HAS been mutated but the approval did not finalize. The
+            # honest answer is the durable row, not APPROVED: the recovery path
+            # (already-applied) will finalize it on the next pass.
+            LOGGER.warning(
+                "substitution_promoted_not_finalized user_id=%s outcome=%s",
+                user_id, outcome.outcome,
+            )
+            return await _durable_status(
+                db, user_id, approval_id, fallback=STATUS_FAILED
+            )
+        LOGGER.info(
+            "substitution_promoted user_id=%s outcome=%s", user_id, outcome.outcome
+        )
+        return STATUS_APPROVED
+
+    if outcome.outcome == plan_mutations.OUTCOME_BLOCKED:
+        # The plan or the slot moved on. Stale, not failed: nothing broke, the
+        # question simply no longer applies.
+        await claim_status(
+            db, approval_id, user_id, expect=STATUS_PROCESSING, become=STATUS_STALE
+        )
+        LOGGER.info(
+            "substitution_promotion_stale user_id=%s reason=%s", user_id, outcome.reason
+        )
+        return STATUS_STALE
+
+    await claim_status(
+        db, approval_id, user_id, expect=STATUS_PROCESSING, become=STATUS_FAILED
+    )
+    LOGGER.info(
+        "substitution_promotion_failed user_id=%s reason=%s", user_id, outcome.reason
+    )
+    return STATUS_FAILED
+
+
+async def _already_applied(
+    db: Any,
+    user_id: int,
+    slot_id: str,
+    target: str,
+    *,
+    expected_signature: str,
+) -> bool:
+    """True when THIS promotion's change is already in effect.
+
+    The crash-recovery discriminator. It reads the CURRENT active plan on
+    purpose -- unlike evidence classification, "is this change already in
+    effect" is a question about now, not about history.
+
+    Scoped by split identity, because slot+target alone is not this
+    promotion's fingerprint. The user may have moved to a different programme
+    that happens to contain the same slot holding the same exercise, and
+    treating that coincidence as "already applied" would finalize the approval
+    as APPROVED and write a 365-day cooldown for a change this promotion never
+    made. A coincidental match under a different split is STALE.
+
+    Fails closed when the active signature cannot be read: without identity
+    there is no evidence the change is ours.
+    """
+    if not expected_signature:
+        return False
+    try:
+        import planning
+        from noam_coach.services import workout_slots
+
+        active = await planning.get_active_plan(db, user_id, "workout")
+    except Exception:
+        LOGGER.exception("already_applied_check_failed user_id=%s", user_id)
+        return False
+    if not active:
+        return False
+    payload_now = active.get("payload") or {}
+    if signature_from_plan_payload(payload_now) != expected_signature:
+        return False
+    for session in payload_now.get("sessions") or []:
+        if not isinstance(session, dict):
+            continue
+        found = workout_slots.find_by_slot_id(session.get("exercises"), slot_id)
+        if found is not None:
+            return str(found[1].get("id") or "") == str(target)
+    return False
+
+
+async def _active_slot_exercise(db: Any, user_id: int, slot_id: str) -> str | None:
+    """The exercise id currently occupying `slot_id` in the active plan."""
+    try:
+        import planning
+        from noam_coach.services import workout_slots
+
+        active = await planning.get_active_plan(db, user_id, "workout")
+    except Exception:
+        LOGGER.exception("active_slot_read_failed user_id=%s", user_id)
+        return None
+    if not active:
+        return None
+    for session in (active.get("payload") or {}).get("sessions") or []:
+        if not isinstance(session, dict):
+            continue
+        found = workout_slots.find_by_slot_id(session.get("exercises"), slot_id)
+        if found is not None:
+            return str(found[1].get("id") or "") or None
+    return None
+
+
+async def _active_plan_signature(db: Any, user_id: int) -> str | None:
+    """Split signature of the CURRENT active workout plan, or None."""
+    try:
+        import planning
+
+        active = await planning.get_active_plan(db, user_id, "workout")
+    except Exception:
+        LOGGER.exception("active_plan_signature_failed user_id=%s", user_id)
+        return None
+    if not active:
+        return None
+    return signature_from_plan_payload(active.get("payload"))
+
+
+__all__ = [
+    "APPROVAL_KIND",
+    "approve",
+    "claim_status",
+    "decline",
+    "propose",
+    "reclaim_abandoned",
+    "collect_evidence",
+    "find_promotable",
+    "is_suppressed",
+    "record_cooldown",
+    "APPROVE_COOLDOWN_DAYS",
+    "DECLINE_COOLDOWN_DAYS",
+    "LOOKBACK_DAYS",
+    "MAX_ROWS",
+    "OPEN_STATUSES",
+    "PROMOTABLE_REASONS",
+    "PROCESSING_LEASE_MINUTES",
+    "PROMOTION_THRESHOLD",
+    "STATUS_APPROVED",
+    "STATUS_DECLINED",
+    "STATUS_FAILED",
+    "STATUS_PENDING",
+    "STATUS_PROCESSING",
+    "STATUS_STALE",
+    "signature_from_plan_payload",
+    "split_signature",
+    "subject_of",
+    "utc_iso",
+]

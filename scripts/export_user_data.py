@@ -44,6 +44,9 @@ DIRECT_TABLES = (
     "conversation_state",
     "analytics_events",
     "exercise_overrides",
+    # A12: a durable promise made to this user. A DSAR export that omitted it
+    # would understate what the system remembers about them.
+    "substitution_cooldowns",
 )
 
 

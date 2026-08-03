@@ -661,6 +661,7 @@ SCHEMA_MIGRATIONS: tuple[tuple[int, str], ...] = (
     (14, "exercise_override_identity"),
     (15, "dev_notes_table"),
     (16, "set_occurrence_identity"),
+    (17, "substitution_promotion"),
 )
 
 FK_MIGRATION_TABLES: tuple[str, ...] = (
@@ -1453,6 +1454,76 @@ async def _migration_set_occurrence_identity(db: Database) -> None:
         await _record_migration(connection, 16, "set_occurrence_identity")
 
 
+async def _migration_substitution_promotion(db: Database) -> None:
+    """Migration 17: durable cooldown for substitution-promotion proposals.
+
+    A12 promotes a repeated substitution into a preference, and D-5 requires a
+    decline to suppress the same subject for eight weeks. Nothing existing can
+    express that, and both near-misses were measured rather than assumed:
+
+    * `job_state` has `PRIMARY KEY(user_id, day, key)` -- `day` is part of the
+      identity, so a window longer than one calendar day is structurally
+      inexpressible.
+    * A `FactSpec` TTL is a property of the shared spec, applied at READ time to
+      whatever `updated_at` the row carries. Measured: one stored row flipped
+      from suppressed to expired purely because the spec constant changed. A
+      promise made to a user must not be rewritable by a config edit, so
+      `suppress_until` is an ABSOLUTE timestamp stored on the row.
+
+    Both foreign keys are deliberate. `user_id` cascades so a deleted account
+    leaves no orphan promise. `approval_id` sets NULL rather than cascading:
+    approvals are purged at 90 days while an APPROVED cooldown runs 365, so the
+    approval row disappears first -- and the promise must outlive its receipt.
+
+    The partial unique index on `approvals` is what makes "one open proposal per
+    user" a database rule instead of a convention. Without it two racing taps
+    can both find no pending row and both insert one.
+    """
+    async with db.transaction() as connection:
+        await connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS substitution_cooldowns(
+                user_id INTEGER NOT NULL,
+                subject TEXT NOT NULL,
+                suppress_until TEXT NOT NULL,
+                decided_as TEXT NOT NULL,
+                approval_id TEXT,
+                decided_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(user_id, subject),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(approval_id) REFERENCES approvals(id) ON DELETE SET NULL
+            )
+            """
+        )
+        await connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_substitution_cooldowns_expiry "
+            "ON substitution_cooldowns(suppress_until)"
+        )
+        # The detector's only query. Column order matters: the equality columns
+        # first, then the range column, then `id`. Proven with EXPLAIN QUERY
+        # PLAN -- without it the plan is `SCAN audit`; with it, and with
+        # `ORDER BY created_at DESC, id DESC`, there is no temp B-tree either.
+        await connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_user_action_created "
+            "ON audit(user_id, action, created_at, id)"
+        )
+        # One OPEN proposal per user, enforced by the database. `pending` and
+        # `processing` are both open: a proposal mid-mutation must not be
+        # joined by a second one.
+        await connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_approvals_one_open_promotion "
+            "ON approvals(user_id) "
+            "WHERE kind='promote_substitution' AND status IN ('pending','processing')"
+        )
+        await connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_approvals_user_kind_status "
+            "ON approvals(user_id, kind, status)"
+        )
+        await _record_migration(connection, 17, "substitution_promotion")
+
+
 async def run_migrations(
     db: Database,
     *,
@@ -1503,6 +1574,8 @@ async def run_migrations(
             await _migration_dev_notes(db)
         elif version == 16:
             await _migration_set_occurrence_identity(db)
+        elif version == 17:
+            await _migration_substitution_promotion(db)
         else:
             raise RuntimeError(f"Unknown schema migration {version}")
         LOGGER.info("Applied schema migration %s: %s", version, name)

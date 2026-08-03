@@ -148,10 +148,19 @@ async def cleanup_operational_data_once() -> dict[str, int]:
     deleted["approvals"] = await _db.DB.execute_rowcount(
         """
         DELETE FROM approvals
-        WHERE status!='pending'
+        WHERE status NOT IN ('pending', 'processing')
           AND COALESCE(decided_at, created_at)<?
         """,
         (cutoffs["approvals"],),
+    )
+    # A12: only EXPIRED promises are purged. An active `suppress_until` is a
+    # commitment already made to the user -- deleting it would silently re-ask a
+    # question they declined, which is the exact behaviour the cooldown exists
+    # to prevent. The row is therefore keyed off its own deadline, not off a
+    # global retention cutoff.
+    deleted["substitution_cooldowns"] = await _db.DB.execute_rowcount(
+        "DELETE FROM substitution_cooldowns WHERE suppress_until<?",
+        (now.isoformat(),),
     )
     deleted["product_events"] = await _db.DB.execute_rowcount(
         "DELETE FROM product_events WHERE created_at<?",

@@ -232,11 +232,7 @@ async def _handle_session_core_actions(
             return True
         completed, rest = result
         if completed:
-            await safe_edit(
-                query,
-                await workout_summary(user_id, session_id),
-                home_keyboard(),
-            )
+            await _render_workout_end(query, user_id, session_id)
             return True
         await start_rest_timer(
             context=context,
@@ -448,11 +444,7 @@ async def _handle_session_split_actions(
         await clear_split_state(user_id, session_id)
 
         if completed:
-            await safe_edit(
-                query,
-                await workout_summary(user_id, session_id),
-                home_keyboard(),
-            )
+            await _render_workout_end(query, user_id, session_id)
             return True
         await start_rest_timer(
             context=context,
@@ -540,6 +532,104 @@ def _substitution_callback(
         session,
         alt_id,
         reason if reason in SUB_REASONS else SUB_REASON_UNKNOWN,
+    )
+
+
+def _snapshot_plan_id(snapshot: Any) -> int | None:
+    """The plan version a session was materialized from, or None.
+
+    `materialize_snapshot` freezes a `provenance` block into `sessions.plan` at
+    session start, so this is the plan that was live THEN -- immutable, and the
+    only honest answer for a historical event.
+
+    The legacy start path (`get_user_plan`) writes no provenance, so its
+    sessions return None. Those rows stay readable and simply never count as
+    promotion evidence, which is the correct outcome: without knowing which
+    plan a substitution happened under, it cannot be grouped safely.
+    """
+    if not isinstance(snapshot, dict):
+        return None
+    provenance = snapshot.get("provenance")
+    if not isinstance(provenance, dict):
+        return None
+    plan_id = provenance.get("plan_id")
+    try:
+        return int(plan_id) if plan_id is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+async def _snapshot_split_signature(snapshot: Any, user_id: int) -> str | None:
+    """Split signature of the plan version a session was materialized from.
+
+    Read from that stored plan version, never from the current active plan --
+    the two differ precisely when it matters, and using today's plan to
+    classify a historical event is the mistake this whole identity scheme
+    exists to prevent.
+    """
+    plan_id = _snapshot_plan_id(snapshot)
+    if plan_id is None:
+        return None
+    from noam_coach.services import substitution_patterns
+
+    try:
+        # Scoped by user: a plan id alone is not proof of ownership, and a
+        # signature read from another user's plan version would attach foreign
+        # provenance to this user's audit row.
+        row = await DB.fetch_one(
+            "SELECT payload FROM plan_versions WHERE id=? AND user_id=?",
+            (plan_id, user_id),
+        )
+    except Exception:
+        LOGGER.exception("snapshot_split_signature_failed plan_id=%s", plan_id)
+        return None
+    if not row:
+        return None
+    return substitution_patterns.signature_from_plan_payload(row["payload"])
+
+
+async def _render_workout_end(query: Any, user_id: int, session_id: int) -> None:
+    """The end-of-workout render: the summary, then the promotion ask if due.
+
+    D-5 places pattern promotion "at the end of the workout", and this is the
+    one place both completion paths converge on -- the one-tap save and the
+    adjusted-RIR save. Putting the call here rather than in each branch is what
+    stops the two from drifting apart.
+
+    The summary is sent FIRST and separately. If the promotion ask fails for any
+    reason the user still sees that their workout was saved; the enhancement
+    never takes the confirmation down with it.
+    """
+    summary = await workout_summary(user_id, session_id)
+
+    from noam_coach.services import substitution_patterns as _sp
+
+    offer = None
+    try:
+        offer = await _sp.offer_after_workout(DB, user_id)
+    except Exception:
+        LOGGER.exception("promotion_offer_failed user_id=%s", user_id)
+
+    if not offer:
+        await safe_edit(query, summary, home_keyboard())
+        return
+
+    await safe_edit(query, summary, None)
+    source_name = offer.get("source_name") or offer["source"]
+    target_name = offer.get("target_name") or offer["target"]
+    await query.message.reply_text(
+        f"שמתי לב שהחלפת {source_name} ב{target_name} פעמיים ברציפות.\n"
+        "לעדכן את התוכנית כך שזה יהיה התרגיל הקבוע?",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "כן, עדכן",
+                callback_data=_sp.promotion_callback_data("yes", offer["approval_id"]),
+            ),
+            InlineKeyboardButton(
+                "לא, השאר",
+                callback_data=_sp.promotion_callback_data("no", offer["approval_id"]),
+            ),
+        ]]),
     )
 
 
@@ -695,11 +785,7 @@ async def _handle_session_adjustment_actions(
             return True
         completed, rest = result
         if completed:
-            await safe_edit(
-                query,
-                await workout_summary(user_id, session_id),
-                home_keyboard(),
-            )
+            await _render_workout_end(query, user_id, session_id)
             return True
         await start_rest_timer(
             context=context,
@@ -803,7 +889,18 @@ async def _handle_session_adjustment_actions(
             reason=sub_reason,
             # Slot identity, so a pattern can be keyed on the professional need
             # rather than on whichever exercise happened to implement it.
-            slot_id=workout_slots.slot_id_of(current) or "",
+            #
+            # A12 correction: `None`, never `""`. `write_audit` omits None but
+            # STORES an empty string, so the previous `or ""` wrote a row whose
+            # slot_id looked present and joined to nothing. A detector treating
+            # that as a key would merge every legacy substitution into one
+            # phantom pattern.
+            slot_id=workout_slots.slot_id_of(current),
+            # A12: historical provenance, read from the session's own immutable
+            # snapshot rather than from the current active plan. A substitution
+            # made weeks ago happened under whatever plan was live then.
+            evidence_plan_id=_snapshot_plan_id(plan),
+            split_signature=await _snapshot_split_signature(plan, user_id),
         )
         # A11b: say which plan this changed. The swap is written to the SESSION
         # snapshot, so it applies to today's workout and the saved plan is

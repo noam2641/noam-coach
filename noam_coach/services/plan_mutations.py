@@ -381,6 +381,17 @@ async def _audit(
 #: stale callback as a successful no-op.
 REASON_UNKNOWN_SLOT = "slot_not_in_plan"
 
+#: A12: the active plan is no longer the one the proposal was built against.
+#: The user regenerated, realigned or switched strategy between seeing the
+#: proposal and tapping it, so applying it now would change a plan they never
+#: saw the proposal for.
+REASON_PLAN_CHANGED = "active_plan_changed"
+
+#: A12: the slot still exists but no longer implements the exercise the
+#: proposal promised to replace. Applying the swap would silently overwrite a
+#: more recent decision.
+REASON_SOURCE_CHANGED = "slot_source_changed"
+
 
 async def substitute_slot_in_saved_plan(
     db: Any,
@@ -389,6 +400,8 @@ async def substitute_slot_in_saved_plan(
     replacement_exercise_id: str,
     *,
     reason: str,
+    expected_active_plan_id: int | None = None,
+    expected_source_exercise_id: str | None = None,
 ) -> MutationOutcome:
     """Persist a substitution against the SAVED plan, by slot identity.
 
@@ -424,6 +437,25 @@ async def substitute_slot_in_saved_plan(
     if not active:
         return MutationOutcome(OUTCOME_NO_PLAN)
 
+    # A12 staleness guard. Optional, so A11b's existing callers are unchanged,
+    # and checked BEFORE anything is written.
+    #
+    # `expected_active_plan_id` is the plan that was active when the proposal
+    # was CREATED -- deliberately not the historical plan the evidence came
+    # from. Evidence may span several superseded versions; the mutation must
+    # only ever apply to the plan the user was actually looking at.
+    if (
+        expected_active_plan_id is not None
+        and int(active["id"]) != int(expected_active_plan_id)
+    ):
+        LOGGER.info(
+            "slot_substitution_blocked user_id=%s slot=%s reason=%s",
+            user_id, slot_id, REASON_PLAN_CHANGED,
+        )
+        return MutationOutcome(
+            OUTCOME_BLOCKED, reason=REASON_PLAN_CHANGED, plan_id=int(active["id"])
+        )
+
     # Defensive, not load-bearing, and measured as such: `get_active_plan`
     # decodes the payload from JSON on every call, so this dict is already a
     # fresh object and mutating it cannot reach the stored row. The copy stays
@@ -449,7 +481,29 @@ async def substitute_slot_in_saved_plan(
             OUTCOME_BLOCKED, reason=REASON_UNKNOWN_SLOT, plan_id=int(active["id"])
         )
 
-    if str(target.get("id") or "") == str(replacement_exercise_id):
+    current_exercise = str(target.get("id") or "")
+
+    if (
+        expected_source_exercise_id is not None
+        and current_exercise != str(expected_source_exercise_id)
+        and current_exercise != str(replacement_exercise_id)
+    ):
+        # The slot moved on since the proposal was made. Refusing is the point:
+        # applying the swap now would overwrite a decision the user made more
+        # recently than the one they are answering.
+        LOGGER.info(
+            "slot_substitution_blocked user_id=%s slot=%s reason=%s",
+            user_id, slot_id, REASON_SOURCE_CHANGED,
+        )
+        return MutationOutcome(
+            OUTCOME_BLOCKED, reason=REASON_SOURCE_CHANGED, plan_id=int(active["id"])
+        )
+
+    if current_exercise == str(replacement_exercise_id):
+        # Already applied. Reported as no_change rather than realigned, which is
+        # what makes crash recovery safe: a process that died after the mutation
+        # but before finalizing re-enters here and finalizes without creating a
+        # second plan version.
         return MutationOutcome(OUTCOME_NO_CHANGE, plan_id=int(active["id"]))
 
     # The slot keeps its identity; only the implementation changes. That is the
@@ -562,8 +616,10 @@ __all__ = [
     "OUTCOME_NO_PLAN",
     "OUTCOME_REALIGNED",
     "REASON_INTERNAL",
+    "REASON_PLAN_CHANGED",
     "REASON_QUALITY",
     "REASON_READINESS",
+    "REASON_SOURCE_CHANGED",
     "REASON_UNEXPRESSIBLE",
     "REASON_UNKNOWN_SLOT",
     "activate_proposed_plan",
