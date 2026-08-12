@@ -25,6 +25,7 @@ import pytest
 from db import Database
 from helpers import utc_now
 from noam_coach.services import training
+from noam_coach.services.training import _LOAD_AUDIT_CHAINS
 
 
 async def _db(tmp_path: Path, name: str = "a13") -> Database:
@@ -1135,3 +1136,104 @@ async def test_channels_are_not_serialized_against_each_other(
     assert first_occurrence != second_occurrence, (
         "two occurrences of one movement share a chain and serialize needlessly"
     )
+
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_tail_does_not_disconnect_a_running_predecessor(
+    tmp_path, monkeypatch
+) -> None:
+    """The cancellation edge in the per-key chain.
+
+        T1 is running; chain[key] = T1
+        T2 is scheduled behind T1; chain[key] = T2
+        T2 is CANCELLED while T1 is still pending
+        T2 retires and -- unconditionally -- pops the key
+        T3 finds no predecessor and runs CONCURRENTLY with T1
+
+    The ordering invariant is lost silently, which is the same interleaving the
+    chain exists to prevent, reached through cancellation rather than through
+    scheduling. A cancelled tail must hand the key back to the predecessor it
+    was waiting on.
+
+    Deterministic: T1 is held on a real Event and T3's arrival at the recorder
+    is observed, so nothing here depends on how many times the loop yields.
+    """
+    db = await _db(tmp_path, "cancel_edge")
+    _bind(monkeypatch, db)
+
+    key = training._chain_key(
+        1, exercise_id="leg_press", exercise_index=0, session_id=7,
+        set_number=1, channel=training.LOAD_CHANNEL_WATCH,
+    )
+
+    t1_entered = asyncio.Event()
+    release_t1 = asyncio.Event()
+    t3_entered = asyncio.Event()
+    real_record = training.record_load_decision
+
+    async def _instrumented(*args: Any, **kwargs: Any) -> None:
+        recommendation = args[1] if len(args) > 1 else None
+        weight = getattr(recommendation, "weight", None)
+        if weight == 60.0:                     # T1: hold it here.
+            t1_entered.set()
+            await release_t1.wait()
+        elif weight == 62.5:                   # T3: record its arrival.
+            t3_entered.set()
+        await real_record(*args, **kwargs)
+
+    monkeypatch.setattr(training, "record_load_decision", _instrumented)
+
+    # 1. T1 running and held.
+    task1 = training.schedule_load_decision_record(
+        1, _decision(weight=60.0), **_OCCURRENCE
+    )
+    await asyncio.wait_for(t1_entered.wait(), timeout=5)
+    assert not task1.done(), "precondition: T1 must still be pending"
+
+    # 2. T2 chained behind T1.
+    task2 = training.schedule_load_decision_record(
+        1, _decision(weight=57.5), **_OCCURRENCE
+    )
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert _LOAD_AUDIT_CHAINS.get(key) is task2, "T2 should be the chain tail"
+    assert not task2.done(), "T2 should be waiting behind T1"
+
+    # 3. Cancel T2 while T1 is still pending.
+    task2.cancel()
+    with suppress(asyncio.CancelledError):
+        await task2
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    # The key must still point at work that is genuinely in flight. Popping it
+    # here is what lets T3 start beside T1.
+    assert _LOAD_AUDIT_CHAINS.get(key) is task1, (
+        "a cancelled tail disconnected the chain from its running predecessor"
+    )
+
+    # 4. T3 for the same durable key.
+    task3 = training.schedule_load_decision_record(
+        1, _decision(weight=62.5), **_OCCURRENCE
+    )
+
+    # 5. T3 must not reach the recorder while T1 is held.
+    with suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(t3_entered.wait(), timeout=0.5)
+    assert not t3_entered.is_set(), (
+        "T3 ran concurrently with T1: cancelling T2 disconnected the chain"
+    )
+
+    # 6. Release T1.
+    release_t1.set()
+
+    # 7. T3 proceeds.
+    await asyncio.wait_for(t3_entered.wait(), timeout=5)
+    await asyncio.gather(task1, task3)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    # 8. Both registries retire.
+    assert training._LOAD_AUDIT_CHAINS == {}, "the chain registry leaked a key"
+    assert training._LOAD_AUDIT_TASKS == set(), "the task registry leaked a task"

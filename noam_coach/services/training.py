@@ -316,8 +316,15 @@ def schedule_load_decision_record(
             # Wait for the earlier recording for this key, whatever its
             # outcome. `record_load_decision` cannot raise, and a cancelled
             # predecessor must not strand this one either.
+            #
+            # SHIELDED, because awaiting a task propagates cancellation INTO
+            # it: cancelling this tail would otherwise kill the recording it
+            # is queued behind. Measured -- `t2.cancel()` flipped `t1.done()`
+            # to True while T1 was still mid-write, so a cancelled follower
+            # destroyed an in-flight audit write rather than merely dropping
+            # itself.
             with suppress(BaseException):
-                await previous
+                await asyncio.shield(previous)
         await record_load_decision(
             user_id,
             decision,
