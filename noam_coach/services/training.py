@@ -323,8 +323,25 @@ def schedule_load_decision_record(
             # to True while T1 was still mid-write, so a cancelled follower
             # destroyed an in-flight audit write rather than merely dropping
             # itself.
-            with suppress(BaseException):
+            #
+            # The two cancellations must NOT be conflated, and a blanket
+            # `suppress(BaseException)` here conflates them. Measured with one:
+            # `t2.cancel()` left `t2.cancelled()` False and T2 walked straight
+            # into the recorder while T1 was still running -- FIFO broken by
+            # the very handler meant to protect it.
+            #
+            #   * THIS task cancelled -> propagate. It must never record.
+            #   * the PREDECESSOR cancelled or failed -> continue. A dead
+            #     neighbour must not strand this recording.
+            try:
                 await asyncio.shield(previous)
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+                # The predecessor was cancelled, not us; carry on.
+            except Exception:  # noqa: BLE001 — a failed predecessor is not ours.
+                pass
         await record_load_decision(
             user_id,
             decision,
