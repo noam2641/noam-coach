@@ -1102,3 +1102,20 @@ async def test_channels_are_not_serialized_against_each_other(
     )
 
     assert watch_key != telegram_key, "the two channels share one chain"
+
+    # The occurrence is part of the chain key too. Dropping it does not corrupt
+    # any stored row -- both occurrences still record correctly -- so this is a
+    # CONCURRENCY property, not a correctness one: two occurrences of the same
+    # movement would queue behind each other for no reason. Pinned here rather
+    # than dressed up as a correctness test.
+    first_occurrence = training._chain_key(
+        1, exercise_id="leg_press", exercise_index=0, session_id=7,
+        set_number=1, channel=training.LOAD_CHANNEL_WATCH,
+    )
+    second_occurrence = training._chain_key(
+        1, exercise_id="leg_press", exercise_index=1, session_id=7,
+        set_number=1, channel=training.LOAD_CHANNEL_WATCH,
+    )
+    assert first_occurrence != second_occurrence, (
+        "two occurrences of one movement share a chain and serialize needlessly"
+    )
