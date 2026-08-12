@@ -237,9 +237,11 @@ def schedule_load_decision_record(
     decision: LoadRecommendation,
     *,
     exercise_id: str,
+    exercise_index: Any,
     session_id: Any,
     set_number: Any,
     channel: str,
+    slot_id: str = "",
 ) -> Any:
     """Record without holding up the caller's response.
 
@@ -257,9 +259,11 @@ def schedule_load_decision_record(
                 user_id,
                 decision,
                 exercise_id=exercise_id,
+                exercise_index=exercise_index,
                 session_id=session_id,
                 set_number=set_number,
                 channel=channel,
+                slot_id=slot_id,
             )
         )
     )
@@ -269,6 +273,7 @@ async def _already_recorded(
     user_id: int,
     *,
     exercise_id: str,
+    exercise_index: Any,
     session_id: Any,
     set_number: Any,
     channel: str,
@@ -276,7 +281,25 @@ async def _already_recorded(
     """Has this exact presentation already been recorded?
 
     THE DURABLE-RECORD SEMANTIC (A13): one row per
-    `(user, session, set, exercise, channel)`.
+    `(user, session, exercise_index, set, channel)`.
+
+    `exercise_index` -- the OCCURRENCE, not the movement -- is load-bearing.
+    A2 exists because one workout may program the same movement twice, so
+    `exercise_id` cannot identify which performance is meant; that is why
+    `sets` persists `exercise_index` at all. And `set_number` RESETS to 1 when
+    the session advances (`workout.py`, the advance branch), so:
+
+        exercise_index=0, leg_press, set 1
+        exercise_index=1, leg_press, set 1
+
+    are two genuinely different presentations that agree on every other field.
+    Keyed without the occurrence they collide, and A13 would suppress the
+    second -- losing exactly the history it exists to keep.
+
+    `exercise_id` stays as the audit ENTITY: it is what a human reads, and it
+    is what `entity_id` has always meant here. The occurrence rides in the
+    details alongside it. This reuses A2's established identity rather than
+    inventing a second one.
 
     A poll is not a decision. `GET /api/watch/current` is client-driven with no
     server-side interval, so a Watch sitting on one set can call it every few
@@ -308,6 +331,7 @@ async def _already_recorded(
             "SELECT 1 FROM audit "
             "WHERE user_id=? AND action=? AND entity=? AND entity_id=? "
             "AND json_extract(details,'$.session_id')=? "
+            "AND json_extract(details,'$.exercise_index')=? "
             "AND json_extract(details,'$.set_number')=? "
             "AND json_extract(details,'$.channel')=? "
             "LIMIT 1",
@@ -317,6 +341,7 @@ async def _already_recorded(
                 _LOAD_AUDIT_ENTITY,
                 exercise_id,
                 int(session_id) if session_id is not None else None,
+                int(exercise_index) if exercise_index is not None else None,
                 int(set_number) if set_number is not None else None,
                 channel,
             ),
@@ -334,9 +359,11 @@ async def record_load_decision(
     decision: LoadRecommendation,
     *,
     exercise_id: str,
+    exercise_index: Any,
     session_id: Any,
     set_number: Any,
     channel: str,
+    slot_id: str = "",
 ) -> None:
     """Record one load decision the athlete was actually asked to act on (A13).
 
@@ -357,6 +384,7 @@ async def record_load_decision(
         if await _already_recorded(
             user_id,
             exercise_id=exercise_id,
+            exercise_index=exercise_index,
             session_id=session_id,
             set_number=set_number,
             channel=channel,
@@ -371,7 +399,19 @@ async def record_load_decision(
             exercise_id,
             channel=channel,
             session_id=int(session_id) if session_id is not None else None,
+            # A2's occurrence identity. Part of the durable key -- see
+            # `_already_recorded` -- because one workout can program the same
+            # movement twice and `set_number` restarts at each one.
+            exercise_index=(
+                int(exercise_index) if exercise_index is not None else None
+            ),
             set_number=int(set_number) if set_number is not None else None,
+            # A11b's canonical slot identity, as supplemental provenance only.
+            # It answers "which slot in the programme" where `exercise_index`
+            # answers "which performance in this session"; a rebuilt plan can
+            # move a slot to a new index, so it does NOT replace the
+            # occurrence in the key.
+            slot_id=slot_id or None,
             **decision.to_audit_dict(),
         )
     except Exception as exc:  # noqa: BLE001 — never break coaching (emit.py rule 1).

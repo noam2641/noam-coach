@@ -395,7 +395,13 @@ _AUDIT_ALLOWLIST: dict[tuple[str, str], dict[str, Any]] = {
         "data_completeness": _pass("data_completeness"),
         "channel": _pass("channel"),
         "session_id": _pass("session_id"),
+        # A2's occurrence identity: which performance within the session. The
+        # same movement can be programmed twice and `set_number` restarts at
+        # each, so without this two real presentations are indistinguishable.
+        "exercise_index": _pass("exercise_index"),
         "set_number": _pass("set_number"),
+        # A11b's canonical slot identity, supplemental provenance only.
+        "slot_id": _pass("slot_id"),
     },
     ("promote_substitution", "preference"): {
         "outcome": _pass("outcome"),

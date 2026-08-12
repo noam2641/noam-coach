@@ -133,7 +133,7 @@ async def test_every_field_survives_the_allowlist(tmp_path, monkeypatch) -> None
     _bind(monkeypatch, db)
 
     await training.record_load_decision(
-        1, _decision(), exercise_id="leg_press", session_id=7,
+        1, _decision(), exercise_id="leg_press", exercise_index=0, session_id=7,
         set_number=2, channel=training.LOAD_CHANNEL_TELEGRAM,
     )
 
@@ -184,7 +184,7 @@ async def test_two_channels_are_distinguishable(tmp_path, monkeypatch) -> None:
 
     for channel in (training.LOAD_CHANNEL_TELEGRAM, training.LOAD_CHANNEL_WATCH):
         await training.record_load_decision(
-            1, _decision(), exercise_id="leg_press", session_id=7,
+            1, _decision(), exercise_id="leg_press", exercise_index=0, session_id=7,
             set_number=2, channel=channel,
         )
 
@@ -217,7 +217,7 @@ async def test_a_failing_write_neither_raises_nor_changes_the_decision(
 
     # Must not raise.
     await training.record_load_decision(
-        1, decision, exercise_id="leg_press", session_id=7,
+        1, decision, exercise_id="leg_press", exercise_index=0, session_id=7,
         set_number=2, channel=training.LOAD_CHANNEL_TELEGRAM,
     )
 
@@ -355,7 +355,7 @@ async def test_the_watch_task_completes_and_stores_its_row(
 
     task = asyncio.ensure_future(
         training.record_load_decision(
-            1, _decision(), exercise_id="leg_press", session_id=7,
+            1, _decision(), exercise_id="leg_press", exercise_index=0, session_id=7,
             set_number=1, channel=training.LOAD_CHANNEL_WATCH,
         )
     )
@@ -478,7 +478,7 @@ async def test_the_watch_recording_task_is_owned(tmp_path, monkeypatch) -> None:
     assert training._LOAD_AUDIT_TASKS == set(), "the registry starts empty"
 
     task = training.schedule_load_decision_record(
-        1, _decision(), exercise_id="leg_press", session_id=7,
+        1, _decision(), exercise_id="leg_press", exercise_index=0, session_id=7,
         set_number=1, channel=training.LOAD_CHANNEL_WATCH,
     )
 
@@ -507,7 +507,7 @@ async def test_repeated_watch_polling_creates_one_durable_row(
 
     for _ in range(6):
         await training.record_load_decision(
-            1, _decision(), exercise_id="leg_press", session_id=7,
+            1, _decision(), exercise_id="leg_press", exercise_index=0, session_id=7,
             set_number=1, channel=training.LOAD_CHANNEL_WATCH,
         )
 
@@ -529,7 +529,7 @@ async def test_the_durable_key_still_separates_real_presentations(
     _bind(monkeypatch, db)
 
     base = dict(
-        exercise_id="leg_press", session_id=7, set_number=1,
+        exercise_id="leg_press", exercise_index=0, session_id=7, set_number=1,
         channel=training.LOAD_CHANNEL_WATCH,
     )
     await training.record_load_decision(1, _decision(), **base)
@@ -565,7 +565,7 @@ async def test_an_unreadable_audit_table_fails_open(tmp_path, monkeypatch) -> No
 
     monkeypatch.setattr(db, "fetch_one", _explode)
     await training.record_load_decision(
-        1, _decision(), exercise_id="leg_press", session_id=7,
+        1, _decision(), exercise_id="leg_press", exercise_index=0, session_id=7,
         set_number=1, channel=training.LOAD_CHANNEL_WATCH,
     )
 
@@ -598,3 +598,147 @@ async def test_a_stale_edit_with_no_fallback_target_is_not_delivered() -> None:
     assert await safe_edit_delivered(_NoMessageQuery(), "text", None) is False, (
         "a stale edit with no fallback target was reported as delivered"
     )
+
+
+
+# ---------------------------------------------------------------------------
+# Occurrence identity (A2) and the real Watch handler path
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_two_occurrences_of_one_movement_are_two_presentations(
+    tmp_path, monkeypatch
+) -> None:
+    """The collision the durable key must NOT make.
+
+    A2 exists because one workout may program the same movement twice, so
+    `exercise_id` cannot say which performance is meant -- that is why `sets`
+    persists `exercise_index`. And `set_number` RESETS to 1 when the session
+    advances, so these two rows agree on user, session, exercise_id,
+    set_number and channel while being genuinely different presentations:
+
+        exercise_index=0, leg_press, set 1
+        exercise_index=1, leg_press, set 1
+
+    Keyed without the occurrence, A13 suppresses the second and loses exactly
+    the history it exists to keep.
+    """
+    db = await _db(tmp_path, "occurrence")
+    _bind(monkeypatch, db)
+
+    base = dict(
+        exercise_id="leg_press", session_id=7, set_number=1,
+        channel=training.LOAD_CHANNEL_WATCH,
+    )
+    await training.record_load_decision(1, _decision(), exercise_index=0, **base)
+    await training.record_load_decision(1, _decision(), exercise_index=1, **base)
+
+    rows = await _audit_rows(db)
+    assert len(rows) == 2, (
+        f"two occurrences of one movement collapsed into {len(rows)} row(s)"
+    )
+    assert {row["exercise_index"] for row in rows} == {0, 1}
+
+    # ...and repeating the exact same occurrences adds nothing.
+    await training.record_load_decision(1, _decision(), exercise_index=0, **base)
+    await training.record_load_decision(1, _decision(), exercise_index=1, **base)
+
+    rows = await _audit_rows(db)
+    assert len(rows) == 2, f"repeating the same occurrences produced {len(rows)} rows"
+
+
+@pytest.mark.asyncio
+async def test_the_slot_id_rides_along_as_supplemental_provenance(
+    tmp_path, monkeypatch
+) -> None:
+    """A11b's canonical slot identity is recorded, but is NOT the key.
+
+    It answers "which slot in the programme"; `exercise_index` answers "which
+    performance in this session". A rebuilt plan can move a slot to a new
+    index, so the slot cannot replace the occurrence.
+    """
+    db = await _db(tmp_path, "slot_prov")
+    _bind(monkeypatch, db)
+
+    await training.record_load_decision(
+        1, _decision(), exercise_id="leg_press", exercise_index=0,
+        session_id=7, set_number=1, channel=training.LOAD_CHANNEL_WATCH,
+        slot_id="abc1_a:leg_press",
+    )
+
+    rows = await _audit_rows(db)
+    assert len(rows) == 1
+    assert rows[0]["slot_id"] == "abc1_a:leg_press"
+
+
+class _WatchDB:
+    """Routes `active_session` to the test database for the real handler."""
+
+    def __init__(self, db: Any) -> None:
+        self._db = db
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._db, name)
+
+
+@pytest.mark.asyncio
+async def test_watch_current_schedules_the_record_without_awaiting_it(
+    tmp_path, monkeypatch
+) -> None:
+    """The validation gap: the previous test never called `watch_current`.
+
+    Ownership was asserted against the scheduler directly, which cannot show
+    that the REAL handler schedules rather than awaits, nor that the response
+    is returned without waiting for the write. This drives the handler.
+    """
+    from config import SETTINGS
+    from noam_coach.api import watch_routes
+    from noam_coach.services import training as training_mod
+
+    db = await _db(tmp_path, "watch_handler")
+    _bind(monkeypatch, db)
+    monkeypatch.setattr(watch_routes, "DB", db, raising=False)
+    monkeypatch.setattr(training_mod, "DB", db, raising=False)
+    monkeypatch.setattr(SETTINGS, "telegram_allowed_user_id", 1, raising=False)
+
+    plan = {
+        "exercises": [{
+            "slot_id": "s1:leg_press", "id": "leg_press", "name": "leg press",
+            "sets": 3, "reps": 10, "rmin": 8, "rmax": 12, "inc": 2.5,
+            "rest": 90, "weight": 60.0, "cues": [], "alts": [],
+        }]
+    }
+    await db.execute(
+        "INSERT INTO sessions(id, user_id, code, name, plan, status, "
+        "exercise_index, set_number, started_at) "
+        "VALUES(500, 1, 'A', 'A', ?, 'active', 0, 1, ?)",
+        (json.dumps(plan), utc_now()),
+    )
+
+    assert training._LOAD_AUDIT_TASKS == set()
+    payload = await watch_routes.watch_current(1)
+
+    # The handler returned a real prescription...
+    assert payload["active"] is True
+    assert payload["weight"] is not None
+    # ...and did NOT wait for the audit write: the task is still owned.
+    pending = set(training._LOAD_AUDIT_TASKS)
+    assert pending, "the handler awaited the write, or never scheduled it"
+
+    for task in pending:
+        await task
+    await asyncio.sleep(0)
+
+    assert training._LOAD_AUDIT_TASKS == set(), "the registry leaks tasks"
+    rows = await _audit_rows(db)
+    assert len(rows) == 1, "the scheduled write never landed"
+    assert rows[0]["channel"] == "watch"
+    assert rows[0]["exercise_index"] == 0
+
+    # Polling again is the same presentation, not a new one.
+    await watch_routes.watch_current(1)
+    for task in set(training._LOAD_AUDIT_TASKS):
+        await task
+    await asyncio.sleep(0)
+
+    rows = await _audit_rows(db)
+    assert len(rows) == 1, f"a second poll produced {len(rows)} rows"

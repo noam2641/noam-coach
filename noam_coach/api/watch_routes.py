@@ -104,9 +104,11 @@ async def watch_current(user_id: int) -> dict[str, Any]:
             user_id,
             load_decision,
             exercise_id=str(current.get("id") or ""),
+            exercise_index=exercise_index,
             session_id=session["id"],
             set_number=session["set_number"],
             channel=LOAD_CHANNEL_WATCH,
+            slot_id=str(current.get("slot_id") or ""),
         )
 
     return {

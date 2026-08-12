@@ -542,9 +542,11 @@ async def show_session(query: Any, user_id: int, session_id: int) -> None:
             user_id,
             load_decision,
             exercise_id=str(current.get("id") or ""),
+            exercise_index=session["exercise_index"],
             session_id=session["id"],
             set_number=session["set_number"],
             channel=LOAD_CHANNEL_TELEGRAM,
+            slot_id=str(current.get("slot_id") or ""),
         )
 
 
