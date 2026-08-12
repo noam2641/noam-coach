@@ -336,8 +336,18 @@ def schedule_load_decision_record(
         # Only the CURRENT tail retires the key. A later scheduling has already
         # replaced it, and that one owns the entry now -- so the registry holds
         # at most one entry per active key and empties when work stops.
-        if _LOAD_AUDIT_CHAINS.get(key) is done:
-            _LOAD_AUDIT_CHAINS.pop(key, None)
+        if _LOAD_AUDIT_CHAINS.get(key) is not done:
+            return
+        # ...unless this tail was CANCELLED while the task it was waiting for
+        # is still running. Popping the key then would leave that predecessor
+        # in flight with nothing pointing at it, and the next scheduling would
+        # find no chain and run CONCURRENTLY with it -- silently losing the
+        # per-key ordering this whole mechanism exists to provide. Handing the
+        # tail back to the predecessor keeps the chain intact.
+        if previous is not None and not previous.done():
+            _LOAD_AUDIT_CHAINS[key] = previous
+            return
+        _LOAD_AUDIT_CHAINS.pop(key, None)
 
     task.add_done_callback(_retire)
     return task
