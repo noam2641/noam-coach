@@ -572,3 +572,29 @@ async def test_an_unreadable_audit_table_fails_open(tmp_path, monkeypatch) -> No
     monkeypatch.setattr(db, "fetch_one", real_fetch_one)
     rows = await _audit_rows(db)
     assert len(rows) == 1, "a failed dedupe read suppressed the recording"
+
+
+
+@pytest.mark.asyncio
+async def test_a_stale_edit_with_no_fallback_target_is_not_delivered() -> None:
+    """The branch with no fallback at all -- found by deliberate breakage.
+
+    A stale edit is only recoverable when the query carries a `message` that
+    can be replied to. Job-driven and API-driven callers pass query-like
+    objects that do not, so the edit fails, NO fallback is attempted, and
+    nothing reaches the user. Reporting that as delivered would record a
+    presentation that never occurred -- the same lie as blocker 1, through a
+    path the earlier tests never touched.
+    """
+    from noam_coach.bot.ui import safe_edit_delivered
+
+    class _NoMessageQuery:
+        async def edit_message_text(self, *a: Any, **k: Any) -> None:
+            del a, k
+            from telegram.error import BadRequest
+
+            raise BadRequest("Message to edit not found")
+
+    assert await safe_edit_delivered(_NoMessageQuery(), "text", None) is False, (
+        "a stale edit with no fallback target was reported as delivered"
+    )
