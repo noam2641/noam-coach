@@ -893,29 +893,62 @@ async def safe_edit(
     a full conversation flow can be scrolled and inspected. Off by default;
     production behavior (edit-in-place, including the stale-edit recovery
     below) is this function's normal path and is unchanged.
+
+    Returns nothing: ~190 call sites treat rendering as fire-and-continue, and
+    that is the right default for them. A caller that must know whether the
+    screen actually REACHED the user calls `safe_edit_delivered` below.
+    """
+    await safe_edit_delivered(query, text, keyboard)
+
+
+async def safe_edit_delivered(
+    query: Any,
+    text: str,
+    keyboard: InlineKeyboardMarkup | None = None,
+) -> bool:
+    """`safe_edit`, reporting whether the screen was actually delivered.
+
+    Same behaviour, one extra bit of truth. `safe_edit` returns None in three
+    different outcomes -- edited, recovered by a fallback reply, and
+    *fallback itself failed inside `suppress(Exception)`* -- so a caller
+    cannot distinguish "the user is looking at this" from "nothing reached
+    them". A13 records a load decision as PRESENTED, and that claim is only
+    honest if the card arrived.
+
+    False means the user did not receive this screen.
     """
     if SETTINGS.debug_append_only_messages:
         await _send_new_instead_of_edit(query, text, keyboard)
-        return
+        return True
     try:
         await query.edit_message_text(
             text,
             reply_markup=keyboard,
             parse_mode=ParseMode.HTML,
         )
+        return True
     except BadRequest as exc:
         if is_stale_edit_error(exc):
             message = getattr(query, "message", None)
             if message is not None and hasattr(message, "reply_text"):
-                with suppress(Exception):
+                try:
                     await message.reply_text(
                         text,
                         reply_markup=keyboard,
                         parse_mode=ParseMode.HTML,
                     )
-            return
+                except Exception:  # noqa: BLE001 — recovery is best-effort.
+                    # Unchanged behaviour: the exception is still contained and
+                    # the caller still proceeds. The difference is that the
+                    # caller can now learn nothing was delivered.
+                    return False
+                return True
+            return False
         if "not modified" not in str(exc).lower():
             raise
+        # "not modified": the screen the user is looking at already carries
+        # this content, so it IS delivered.
+        return True
 
 
 async def _send_new_instead_of_edit(

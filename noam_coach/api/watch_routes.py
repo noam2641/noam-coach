@@ -14,7 +14,14 @@ from noam_coach.bot.workout import try_save_set
 from noam_coach.runtime_bind import runtime_bound
 from noam_coach.services import workout_slots
 from noam_coach.services.core import ensure_user_record
-from noam_coach.services.training import RIR_UNKNOWN, active_session, recommend_load
+from noam_coach.services.training import (
+    LOAD_CHANNEL_WATCH,
+    RIR_UNKNOWN,
+    active_session,
+    recommend_load,
+    recommend_load_decision,
+    schedule_load_decision_record,
+)
 
 router = APIRouter()
 _RUNTIME = (
@@ -23,6 +30,8 @@ _RUNTIME = (
     "ensure_user_record",
     "active_session",
     "recommend_load",
+    "recommend_load_decision",
+    "schedule_load_decision_record",
     "try_save_set",
     "RIR_UNKNOWN",
     "workout_slots",
@@ -66,11 +75,41 @@ async def watch_current(user_id: int) -> dict[str, Any]:
             "exercise_index": exercise_index,
             "set_number": session["set_number"],
         }
-    weight, reps, _ = await recommend_load(user_id, current)
+    load_decision = await recommend_load_decision(user_id, current)
+    weight, reps, _ = load_decision.to_tuple()
+    recommendation_presented = True
     if session.get("pending_weight") is not None:
         weight = float(session["pending_weight"])
+        recommendation_presented = False
     if session.get("pending_reps") is not None:
         reps = int(session["pending_reps"])
+        recommendation_presented = False
+
+    # A13 — this endpoint PRESENTS a prescription: the payload below is what
+    # the Watch face shows and the athlete lifts to. It is therefore an
+    # actionable recommendation like the Telegram card, in a different channel.
+    #
+    # Unlike the card, there is no "after presentation" inside this function --
+    # the `return` IS the presentation. An awaited write here would sit in
+    # front of every Watch poll, so recording is scheduled and the response is
+    # not held for it.
+    #
+    # `schedule_load_decision_record` OWNS the task: asyncio holds only a weak
+    # reference to a running task, so a bare `ensure_future` whose handle is
+    # dropped can be collected mid-await and the write silently never lands.
+    # It also dedupes -- this endpoint is polled, and a poll re-renders the
+    # same prescription rather than making a new one.
+    if recommendation_presented:
+        schedule_load_decision_record(
+            user_id,
+            load_decision,
+            exercise_id=str(current.get("id") or ""),
+            exercise_index=exercise_index,
+            session_id=session["id"],
+            set_number=session["set_number"],
+            channel=LOAD_CHANNEL_WATCH,
+            slot_id=str(current.get("slot_id") or ""),
+        )
 
     return {
         "active": True,

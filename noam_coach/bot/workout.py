@@ -402,6 +402,17 @@ async def _exercise_pain_warning_line(user_id: int, current: dict[str, Any]) -> 
 
 @runtime_bound(RUNTIME_NAMES)
 async def show_session(query: Any, user_id: int, session_id: int) -> None:
+    # Imported directly rather than resolved through `runtime_bound`: A12
+    # measured that the facade rebind is not reliable for names a handler adds
+    # (`_substitution_callback` raised NameError under it), and an A13 failure
+    # here would surface as a broken workout card.
+    from noam_coach.bot.ui import safe_edit_delivered
+    from noam_coach.services.training import (
+        LOAD_CHANNEL_TELEGRAM,
+        recommend_load_decision,
+        record_load_decision,
+    )
+
     session = await DB.fetch_one(
         """
         SELECT *
@@ -416,12 +427,19 @@ async def show_session(query: Any, user_id: int, session_id: int) -> None:
 
     plan = json.loads(session["plan"])
     current = plan["exercises"][session["exercise_index"]]
-    weight, reps, explanation = await recommend_load(user_id, current)
+    load_decision = await recommend_load_decision(user_id, current)
+    weight, reps, explanation = load_decision.to_tuple()
 
+    # A typed value OVERRIDES the recommendation on the card. When it does, the
+    # user is acting on their own number, not on ours, so there is no
+    # recommendation-acted-on to record (A13).
+    recommendation_presented = True
     if session["pending_weight"] is not None:
         weight = float(session["pending_weight"])
+        recommendation_presented = False
     if session["pending_reps"] is not None:
         reps = int(session["pending_reps"])
+        recommendation_presented = False
 
     cues = "\n".join(f"• {cue}" for cue in current["cues"])
     muscle = current.get("muscle")
@@ -506,7 +524,30 @@ async def show_session(query: Any, user_id: int, session_id: int) -> None:
             [button("סיים", session_action_data("finish", session))],
         ]
     )
-    await safe_edit(query, text, keyboard)
+    delivered = await safe_edit_delivered(query, text, keyboard)
+
+    # A13 — AFTER the card is on screen, never before. This await touches the
+    # database; in front of the render it would put recording latency between
+    # the user's tap and the card they are waiting for. Recording is
+    # best-effort and cannot raise (see `record_load_decision`), so the card
+    # stands whatever happens here.
+    #
+    # `delivered` is load-bearing, not defensive. `safe_edit` swallows a failed
+    # stale-message fallback, so without this the edit could fail, the fallback
+    # could fail, the user could see NOTHING, and A13 would still record that a
+    # recommendation was presented -- the audit row would assert something that
+    # never happened, which is precisely the evidence a weight dispute relies on.
+    if recommendation_presented and delivered:
+        await record_load_decision(
+            user_id,
+            load_decision,
+            exercise_id=str(current.get("id") or ""),
+            exercise_index=session["exercise_index"],
+            session_id=session["id"],
+            set_number=session["set_number"],
+            channel=LOAD_CHANNEL_TELEGRAM,
+            slot_id=str(current.get("slot_id") or ""),
+        )
 
 
 # ---------------------------------------------------------------------------

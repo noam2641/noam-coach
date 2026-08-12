@@ -307,7 +307,17 @@ async def _operational_snapshot(user_id: int) -> dict[str, Any]:
             plan = json.loads(active["plan"])
             current = plan["exercises"][active["exercise_index"]]
             decision = await coach_bot.recommend_load_decision(user_id, current)
-            current_load = decision.to_audit_dict()
+            # A13 narrowed `to_audit_dict` to the persistence-safe shape: no
+            # prose, and `signals`/`missing_context` joined into scalars so the
+            # audit allowlist keeps them. This is a DEBUG surface, not a stored
+            # row, so it composes the human-readable parts back on top rather
+            # than widening the persisted shape for everyone.
+            current_load = {
+                **decision.to_audit_dict(),
+                "explanation": decision.explanation,
+                "signals": list(decision.signals),
+                "missing_context": list(decision.missing_context),
+            }
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             current_load = {"error": "active_session_plan_unreadable"}
     return {

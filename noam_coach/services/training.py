@@ -125,6 +125,41 @@ async def active_session(user_id: int) -> dict[str, Any] | None:
 
 RIR_UNKNOWN = -1
 
+#: A13: the audit surface for the load decision.
+#:
+#: `audit` rather than the event stream, deliberately. A13 exists to answer
+#: "what did we recommend for this set" when a user disputes a weight, which is
+#: a durable record question. `emit_event` is the better-instrumented boundary
+#: -- correlation, mode policy, its own contained failure handling -- but it
+#: writes the event STREAM, which is retention-bounded and mode-gated: with
+#: observability OFF it performs no write at all, and the record a dispute
+#: needs would legitimately not exist.
+_LOAD_AUDIT_ACTION = "recommend_load"
+_LOAD_AUDIT_ENTITY = "exercise"
+
+#: Caps for the joined token scalars below. Bounded so an audit row can never
+#: carry an unbounded payload, and well under `_AUDIT_MAX_SCALAR_STR`.
+_MAX_AUDIT_TOKENS = 8
+_MAX_AUDIT_TOKEN_LEN = 24
+
+
+def _bounded_tokens(values: Any) -> str:
+    """Join bounded codes into ONE scalar the audit allowlist will keep.
+
+    `_scalar_only` returns False for a list, so a list-valued detail is dropped
+    silently -- no error, no log, and a test that asserts "the write happened"
+    still passes while the field is gone. Encoding at the source removes the
+    trap instead of documenting it.
+    """
+    if not values:
+        return ""
+    tokens = []
+    for value in list(values)[:_MAX_AUDIT_TOKENS]:
+        token = str(value).strip()[:_MAX_AUDIT_TOKEN_LEN]
+        if token:
+            tokens.append(token)
+    return ",".join(tokens)
+
 
 @dataclass(frozen=True)
 class LoadRecommendation:
@@ -141,16 +176,432 @@ class LoadRecommendation:
         return self.weight, self.reps, self.explanation
 
     def to_audit_dict(self) -> dict[str, Any]:
+        """The persistence-safe shape of this decision (A13).
+
+        Two rules make this shape different from the dataclass:
+
+        * **No prose.** `explanation` is free Hebrew text written for a human
+          reading a workout card. LOG-012 exists because exactly that kind of
+          text reached `audit` and then the DSAR export, so it is absent here
+          by construction rather than by an allowlist that a future caller
+          might extend. A display surface that wants it reads `.explanation`
+          from the recommendation directly -- see `mini_api`.
+        * **No lists.** `_allowlist_audit_details` drops list-valued details
+          via `_scalar_only`, silently and without error, so `signals` as a
+          list would vanish from the stored row while its test still passed.
+          They are joined into bounded scalars here, at the single place that
+          defines the persisted shape, so no call site can get it wrong.
+        """
         return {
             "decision": self.decision,
             "recommended_weight": self.weight,
             "recommended_reps": self.reps,
-            "explanation": self.explanation,
-            "signals": list(self.signals),
-            "missing_context": list(self.missing_context),
+            "signals": _bounded_tokens(self.signals),
+            "missing_context": _bounded_tokens(self.missing_context),
             "confidence": self.confidence,
             "data_completeness": self.data_completeness,
         }
+
+
+#: Channels that PRESENT a load prescription to the athlete. Recorded so two
+#: genuine presentations of the same set -- the Telegram card and the Watch
+#: face -- are distinguishable instead of reading as a duplicate.
+LOAD_CHANNEL_TELEGRAM = "telegram"
+LOAD_CHANNEL_WATCH = "watch"
+
+#: In-process counters, mirroring `emit.py`'s `_health`. A silent failure with
+#: no signal is the second thing that boundary forbids.
+_LOAD_AUDIT_HEALTH: dict[str, Any] = {"write_failures": 0, "last_error": None}
+
+#: Strong references to in-flight background recordings.
+#:
+#: `asyncio` keeps only a WEAK reference to a running task, so a bare
+#: `ensure_future(...)` whose handle is discarded can be garbage-collected
+#: mid-await and the write silently never lands -- and on some paths the loop
+#: reports "Task was destroyed but it is pending!" instead. Anything scheduled
+#: here holds a reference until it finishes and then removes itself, which is
+#: the minimal owned lifecycle: no scheduler, no queue, and nothing to shut
+#: down, because each task is short and self-retiring.
+_LOAD_AUDIT_TASKS: set[Any] = set()
+
+
+def _own(task: Any) -> Any:
+    """Hold a strong reference to *task* until it completes."""
+    _LOAD_AUDIT_TASKS.add(task)
+    task.add_done_callback(_LOAD_AUDIT_TASKS.discard)
+    return task
+
+
+#: The tail of the in-flight chain per durable key. Ownership alone is not
+#: enough: it keeps tasks ALIVE but says nothing about their ORDER.
+#:
+#: `record_load_decision` reads the latest row and writes in two separately
+#: awaited steps, so two concurrent recordings for one occurrence can
+#: interleave:
+#:
+#:     latest = A
+#:     B reads latest=A, then suspends before writing
+#:     A is presented again; A reads latest=A and suppresses itself as a repeat
+#:     B resumes and writes B
+#:     stored: A, B   -- while the athlete saw A, B, A
+#:
+#: That is the same false-chronology defect the transition semantic exists to
+#: prevent, reached by a different route: the last stored row again disagrees
+#: with what was last shown. Serializing per key removes the interleaving
+#: rather than trying to detect it, and needs no lock, table or migration.
+#:
+#: Keyed INCLUDING channel, so the Telegram card never waits behind a Watch
+#: poll -- they are different presentations and already different identities.
+_LOAD_AUDIT_CHAINS: dict[tuple, Any] = {}
+
+
+def _chain_key(
+    user_id: int,
+    *,
+    exercise_id: str,
+    exercise_index: Any,
+    session_id: Any,
+    set_number: Any,
+    channel: str,
+) -> tuple:
+    """The durable identity, as a hashable key."""
+    return (
+        int(user_id),
+        str(session_id) if session_id is not None else None,
+        str(exercise_index) if exercise_index is not None else None,
+        str(set_number) if set_number is not None else None,
+        str(exercise_id),
+        str(channel),
+    )
+
+
+def schedule_load_decision_record(
+    user_id: int,
+    decision: LoadRecommendation,
+    *,
+    exercise_id: str,
+    exercise_index: Any,
+    session_id: Any,
+    set_number: Any,
+    channel: str,
+    slot_id: str = "",
+) -> Any:
+    """Record without holding up the caller's response.
+
+    For surfaces whose RESPONSE is the presentation -- the Watch endpoint
+    returns a payload, so there is no "after" inside the handler in which to
+    await a write. Awaiting there would put database latency in front of every
+    poll.
+
+    Recordings for ONE durable key run in scheduling order, chained behind
+    whatever is already in flight for that key. Without that, the read-then-
+    write inside `record_load_decision` can interleave and store a history
+    whose last row is not what was last presented -- see `_LOAD_AUDIT_CHAINS`.
+
+    Returns the owned task so a caller (or a test) can await completion; the
+    production call site deliberately does not.
+    """
+    key = _chain_key(
+        user_id,
+        exercise_id=exercise_id,
+        exercise_index=exercise_index,
+        session_id=session_id,
+        set_number=set_number,
+        channel=channel,
+    )
+    previous = _LOAD_AUDIT_CHAINS.get(key)
+
+    async def _run() -> None:
+        if previous is not None:
+            # Wait for the earlier recording for this key, whatever its
+            # outcome. `record_load_decision` cannot raise, and a cancelled
+            # predecessor must not strand this one either.
+            #
+            # SHIELDED, because awaiting a task propagates cancellation INTO
+            # it: cancelling this tail would otherwise kill the recording it
+            # is queued behind. Measured -- `t2.cancel()` flipped `t1.done()`
+            # to True while T1 was still mid-write, so a cancelled follower
+            # destroyed an in-flight audit write rather than merely dropping
+            # itself.
+            #
+            # The two cancellations must NOT be conflated, and a blanket
+            # `suppress(BaseException)` here conflates them. Measured with one:
+            # `t2.cancel()` left `t2.cancelled()` False and T2 walked straight
+            # into the recorder while T1 was still running -- FIFO broken by
+            # the very handler meant to protect it.
+            #
+            #   * THIS task cancelled -> propagate. It must never record.
+            #   * the PREDECESSOR cancelled or failed -> continue. A dead
+            #     neighbour must not strand this recording.
+            try:
+                await asyncio.shield(previous)
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+                # The predecessor was cancelled, not us; carry on.
+            except Exception:  # noqa: BLE001 — a failed predecessor is not ours.
+                pass
+        await record_load_decision(
+            user_id,
+            decision,
+            exercise_id=exercise_id,
+            exercise_index=exercise_index,
+            session_id=session_id,
+            set_number=set_number,
+            channel=channel,
+            slot_id=slot_id,
+        )
+
+    task = _own(asyncio.ensure_future(_run()))
+    _LOAD_AUDIT_CHAINS[key] = task
+
+    def _retire(done: Any) -> None:
+        # Only the CURRENT tail retires the key. A later scheduling has already
+        # replaced it, and that one owns the entry now -- so the registry holds
+        # at most one entry per active key and empties when work stops.
+        if _LOAD_AUDIT_CHAINS.get(key) is not done:
+            return
+        # ...unless this tail was CANCELLED while the task it was waiting for
+        # is still running. Popping the key then would leave that predecessor
+        # in flight with nothing pointing at it, and the next scheduling would
+        # find no chain and run CONCURRENTLY with it -- silently losing the
+        # per-key ordering this whole mechanism exists to provide. Handing the
+        # tail back to the predecessor keeps the chain intact.
+        if previous is not None and not previous.done():
+            _LOAD_AUDIT_CHAINS[key] = previous
+            return
+        _LOAD_AUDIT_CHAINS.pop(key, None)
+
+    task.add_done_callback(_retire)
+    return task
+
+
+async def _already_recorded(
+    user_id: int,
+    *,
+    exercise_id: str,
+    exercise_index: Any,
+    session_id: Any,
+    set_number: Any,
+    channel: str,
+    decision_fields: dict[str, Any],
+) -> bool:
+    """Has this exact presentation already been recorded?
+
+    THE DURABLE-RECORD SEMANTIC (A13): one row per RECOMMENDATION TRANSITION
+    per `(user, session, exercise_index, set, channel)`.
+
+    Compared against the LATEST recorded recommendation only, never against
+    the whole history. Comparing against every past row suppresses a return to
+    an earlier value, and `audit` carries `created_at` -- it is a sequence in
+    time, not a set of values that once occurred. Measured on 60 -> 57.5 -> 60:
+    matching any historical row stored only 60 and 57.5, so the LAST row said
+    57.5 while the athlete's final recommendation was 60. An investigator
+    reading the latest row would draw the opposite conclusion to the truth.
+    That is worse than an extra row: the audit itself tells a false story.
+
+        60   -> row
+        60   -> no row
+        57.5 -> row
+        57.5 -> no row
+        60   -> row      (a transition back, and it must be recorded)
+
+    The occurrence alone is not the identity. `recommend_load_decision` reads
+    MUTABLE state on every call -- `get_daily_flags` for `sleep_quality` and
+    `energy`, and active pain regions -- so the recommendation for one live
+    occurrence can legitimately change before the set is performed: a user who
+    reports bad sleep mid-session is held back to 57.5 kg where the first
+    render said 60 kg. Keyed on the occurrence alone, that second, real
+    recommendation is suppressed and the audit preserves only that *some*
+    recommendation once existed. A13 exists to record WHAT was recommended,
+    so that is a defect, not an optimisation.
+
+    The comparison reuses `to_audit_dict()` -- the one place that defines the
+    persisted shape -- rather than naming fields here. A field added there is
+    automatically material; a second list would drift from it silently.
+
+    `exercise_index` -- the OCCURRENCE, not the movement -- is load-bearing.
+    A2 exists because one workout may program the same movement twice, so
+    `exercise_id` cannot identify which performance is meant; that is why
+    `sets` persists `exercise_index` at all. And `set_number` RESETS to 1 when
+    the session advances (`workout.py`, the advance branch), so:
+
+        exercise_index=0, leg_press, set 1
+        exercise_index=1, leg_press, set 1
+
+    are two genuinely different presentations that agree on every other field.
+    Keyed without the occurrence they collide, and A13 would suppress the
+    second -- losing exactly the history it exists to keep.
+
+    `exercise_id` stays as the audit ENTITY: it is what a human reads, and it
+    is what `entity_id` has always meant here. The occurrence rides in the
+    details alongside it. This reuses A2's established identity rather than
+    inventing a second one.
+
+    A poll is not a decision. `GET /api/watch/current` is client-driven with no
+    server-side interval, so a Watch sitting on one set can call it every few
+    seconds; each call re-renders the SAME prescription for the SAME set. Every
+    poll is a refresh of one presentation, not a new one, and recording each
+    would grow the audit table without bound and make "what did we recommend
+    for this set" -- the question A13 exists to answer -- unanswerable in the
+    noise.
+
+    The Telegram card is the same statement in a different channel: re-opening
+    the card shows the same prescription again. `channel` is part of the key,
+    so the card and the Watch are counted separately -- two genuine
+    presentations -- while repetition WITHIN a channel is one.
+
+    Read-then-write is not atomic. This is deliberately not a lock: a race can
+    at worst leave two rows for one presentation, which costs an extra row and
+    loses nothing. The alternative -- a unique index -- needs a migration, and
+    A13 is explicitly a no-migration item.
+    """
+    # Read through the SAME module `write_audit` writes through. Reading via
+    # this module's own `DB` global looked equivalent -- in production it is
+    # the same object -- but they can diverge, and a dedupe that queries a
+    # different database than it writes to silently never matches: every poll
+    # would look like the first one.
+    from noam_coach.services import core as _core
+
+    try:
+        # Fetch the recommendations already recorded for this occurrence and
+        # compare their persisted decision fields. Comparing in SQL would mean
+        # restating every field of `to_audit_dict()` in a predicate, which
+        # drifts the moment that shape changes -- exactly the silent-drift
+        # class this item keeps hitting.
+        row = await _core.DB.fetch_one(
+            "SELECT details FROM audit "
+            "WHERE user_id=? AND action=? AND entity=? AND entity_id=? "
+            "AND json_extract(details,'$.session_id')=? "
+            "AND json_extract(details,'$.exercise_index')=? "
+            "AND json_extract(details,'$.set_number')=? "
+            "AND json_extract(details,'$.channel')=? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (
+                user_id,
+                _LOAD_AUDIT_ACTION,
+                _LOAD_AUDIT_ENTITY,
+                exercise_id,
+                int(session_id) if session_id is not None else None,
+                int(exercise_index) if exercise_index is not None else None,
+                int(set_number) if set_number is not None else None,
+                channel,
+            ),
+        )
+    except Exception:
+        # Fail OPEN: an unreadable audit table must not silence recording.
+        # A duplicate row is recoverable; a missing decision record is not.
+        LOGGER.exception("load decision dedupe read failed user=%s", user_id)
+        return False
+
+    if not row:
+        return False
+    try:
+        stored = json.loads(row["details"] or "{}")
+    except (TypeError, ValueError):
+        # An unreadable row cannot prove anything about the current state.
+        return False
+
+    wanted = {key: decision_fields.get(key) for key in _DECISION_IDENTITY_FIELDS}
+    return all(_same_value(stored.get(k), v) for k, v in wanted.items())
+
+
+#: The persisted fields that make one recommendation materially different from
+#: another. Derived from `to_audit_dict()` so the two cannot drift: everything
+#: that shape persists about the DECISION is compared.
+_DECISION_IDENTITY_FIELDS = (
+    "decision",
+    "recommended_weight",
+    "recommended_reps",
+    "signals",
+    "missing_context",
+    "confidence",
+    "data_completeness",
+)
+
+
+def _same_value(stored: Any, wanted: Any) -> bool:
+    """Compare one persisted field, tolerating JSON's number round-trip.
+
+    `recommended_weight` is a float that survives a JSON round-trip as a float,
+    but 60 and 60.0 must compare equal or every render would look like a change
+    and the dedupe would never match.
+    """
+    if isinstance(stored, (int, float)) and isinstance(wanted, (int, float)):
+        return abs(float(stored) - float(wanted)) < 1e-9
+    return stored == wanted
+
+
+async def record_load_decision(
+    user_id: int,
+    decision: LoadRecommendation,
+    *,
+    exercise_id: str,
+    exercise_index: Any,
+    session_id: Any,
+    set_number: Any,
+    channel: str,
+    slot_id: str = "",
+) -> None:
+    """Record one load decision the athlete was actually asked to act on (A13).
+
+    Recording is best-effort; the set is not. This borrows the contract stated
+    in `observability/emit.py` -- contain the failure, count it, log it
+    structurally, never raise -- rather than adding a second governed boundary
+    beside it. A13 needs no transaction (unlike A12, whose audit row must
+    commit with its status UPDATE, which is why A12 writes a raw INSERT and
+    this does not).
+
+    CALL THIS AFTER THE RECOMMENDATION HAS BEEN PRESENTED. It is awaited, so a
+    caller that awaits it before rendering would put database latency in front
+    of the user's card -- which A13 must not do.
+    """
+    from noam_coach.services.core import write_audit
+
+    try:
+        audit_fields = decision.to_audit_dict()
+        if await _already_recorded(
+            user_id,
+            exercise_id=exercise_id,
+            exercise_index=exercise_index,
+            session_id=session_id,
+            set_number=set_number,
+            channel=channel,
+            decision_fields=audit_fields,
+        ):
+            # Same presentation, seen again. One durable row per
+            # (user, session, set, exercise, channel) -- see `_already_recorded`.
+            return
+        await write_audit(
+            user_id,
+            _LOAD_AUDIT_ACTION,
+            _LOAD_AUDIT_ENTITY,
+            exercise_id,
+            channel=channel,
+            session_id=int(session_id) if session_id is not None else None,
+            # A2's occurrence identity. Part of the durable key -- see
+            # `_already_recorded` -- because one workout can program the same
+            # movement twice and `set_number` restarts at each one.
+            exercise_index=(
+                int(exercise_index) if exercise_index is not None else None
+            ),
+            set_number=int(set_number) if set_number is not None else None,
+            # A11b's canonical slot identity, as supplemental provenance only.
+            # It answers "which slot in the programme" where `exercise_index`
+            # answers "which performance in this session"; a rebuilt plan can
+            # move a slot to a new index, so it does NOT replace the
+            # occurrence in the key.
+            slot_id=slot_id or None,
+            **audit_fields,
+        )
+    except Exception as exc:  # noqa: BLE001 — never break coaching (emit.py rule 1).
+        _LOAD_AUDIT_HEALTH["write_failures"] += 1
+        _LOAD_AUDIT_HEALTH["last_error"] = f"{type(exc).__name__}: {exc}"
+        LOGGER.error(
+            "load decision audit failed user=%s exercise=%s channel=%s: %s",
+            user_id, exercise_id, channel, exc,
+        )
 
 
 # ---------------------------------------------------------------------------

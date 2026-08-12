@@ -372,6 +372,37 @@ _AUDIT_ALLOWLIST: dict[tuple[str, str], dict[str, Any]] = {
     },
     # A12: the promotion decision itself. Bounded codes and internal ids only;
     # `subject` is a joined identity triple, never prose.
+    # A13: the load decision actually presented to the athlete. Registered so
+    # the fields are a stated contract rather than whatever `_scalar_only`
+    # happens to preserve.
+    #
+    # `signals` and `missing_context` arrive as JOINED SCALARS, not lists --
+    # `LoadRecommendation.to_audit_dict` encodes them, because a list here is
+    # dropped by `_scalar_only` with no error and the field would simply be
+    # missing from the row while every test still passed.
+    #
+    # No `explanation`: it is free Hebrew prose, and LOG-012 exists because
+    # exactly that reached `audit` and the DSAR export. `channel` distinguishes
+    # the Telegram card from the Watch face, so two real presentations of one
+    # set are not mistaken for a duplicate write.
+    ("recommend_load", "exercise"): {
+        "decision": _pass("decision"),
+        "recommended_weight": _pass("recommended_weight"),
+        "recommended_reps": _pass("recommended_reps"),
+        "signals": _pass("signals"),
+        "missing_context": _pass("missing_context"),
+        "confidence": _pass("confidence"),
+        "data_completeness": _pass("data_completeness"),
+        "channel": _pass("channel"),
+        "session_id": _pass("session_id"),
+        # A2's occurrence identity: which performance within the session. The
+        # same movement can be programmed twice and `set_number` restarts at
+        # each, so without this two real presentations are indistinguishable.
+        "exercise_index": _pass("exercise_index"),
+        "set_number": _pass("set_number"),
+        # A11b's canonical slot identity, supplemental provenance only.
+        "slot_id": _pass("slot_id"),
+    },
     ("promote_substitution", "preference"): {
         "outcome": _pass("outcome"),
         "subject": _pass("subject"),
