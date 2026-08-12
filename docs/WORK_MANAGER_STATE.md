@@ -665,6 +665,29 @@ stored on the profile is a diagnosis we are not entitled to make, and it decays
 badly — one bad evening would become a durable property of the person. Derived
 and transient achieves the same behaviour with none of that risk.
 
+### Track separation (binding)
+
+- **Track C must not block A13**, and A13 must not absorb Track C work.
+- **Do not fold C-INV into A13** beyond text A13 already renders. A13 is
+  recording-only; there is no planned observability overlap that would justify
+  pulling conversation work into it.
+- **Do not absorb W1-17 into A13.** They share the word "observability" and
+  nothing else: W1-17 is a case-drift defect across three event stores, A13 is
+  a load-decision recording task. Merging them requires a separate written
+  justification and its own acceptance criteria.
+
+### Required deliverables before Track C leaves DESIGN
+
+No implementation is authorized until this returns:
+
+1. the proposed conversation-state model;
+2. which principles require **architecture** versus which are **conventions**
+   (current read: C-1 and C-2 are architectural; the five C-INV items are
+   conventions applied at rendering time);
+3. concrete interaction examples, including the register-shift case;
+4. risks and safety boundaries, stated against the A10/A11b/A12 guarantees;
+5. a phased implementation proposal.
+
 ### Rejected from the source artifact (recorded so they are not re-proposed)
 
 - **Already ours, better:** stimulant-appetite awareness (`morning_flag`),
