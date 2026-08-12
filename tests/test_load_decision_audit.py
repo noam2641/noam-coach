@@ -1171,10 +1171,15 @@ async def test_cancelling_a_tail_does_not_disconnect_a_running_predecessor(
     release_t1 = asyncio.Event()
     t3_entered = asyncio.Event()
     real_record = training.record_load_decision
+    #: Every arrival at the recorder, in order. A cancelled follower must never
+    #: appear here -- asserting only on stored rows would miss it entering and
+    #: being deduped.
+    arrivals: list[Any] = []
 
     async def _instrumented(*args: Any, **kwargs: Any) -> None:
         recommendation = args[1] if len(args) > 1 else None
         weight = getattr(recommendation, "weight", None)
+        arrivals.append(weight)
         if weight == 60.0:                     # T1: hold it here.
             t1_entered.set()
             await release_t1.wait()
@@ -1207,6 +1212,20 @@ async def test_cancelling_a_tail_does_not_disconnect_a_running_predecessor(
     for _ in range(5):
         await asyncio.sleep(0)
 
+    # T2 must ACTUALLY be cancelled. Shielding the predecessor while swallowing
+    # this task's own CancelledError protects T1 and then ignores what cancel()
+    # asked for: measured with a blanket `suppress(BaseException)`, T2 stayed
+    # alive and entered the recorder beside a still-running T1.
+    assert task2.cancelled(), (
+        "the follower's cancellation was swallowed; it did not stay cancelled"
+    )
+    assert 57.5 not in arrivals, (
+        "a cancelled follower entered record_load_decision"
+    )
+
+    # T1 must have survived the follower's cancellation.
+    assert not task1.done(), "cancelling the follower killed its predecessor"
+
     # The key must still point at work that is genuinely in flight. Popping it
     # here is what lets T3 start beside T1.
     assert _LOAD_AUDIT_CHAINS.get(key) is task1, (
@@ -1234,6 +1253,12 @@ async def test_cancelling_a_tail_does_not_disconnect_a_running_predecessor(
     for _ in range(5):
         await asyncio.sleep(0)
 
-    # 8. Both registries retire.
+    # 8. The cancelled follower never recorded, and both registries retire.
+    assert 57.5 not in arrivals, (
+        "the cancelled follower recorded after its predecessor was released"
+    )
+    assert arrivals == [60.0, 62.5], f"unexpected recorder arrivals: {arrivals}"
+    stored = [row["recommended_weight"] for row in await _audit_rows(db)]
+    assert 57.5 not in stored, "the cancelled follower reached the audit table"
     assert training._LOAD_AUDIT_CHAINS == {}, "the chain registry leaked a key"
     assert training._LOAD_AUDIT_TASKS == set(), "the task registry leaked a task"
