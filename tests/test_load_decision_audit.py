@@ -558,20 +558,27 @@ async def test_an_unreadable_audit_table_fails_open(tmp_path, monkeypatch) -> No
     db = await _db(tmp_path, "dedupe_open")
     _bind(monkeypatch, db)
 
-    real_fetch_one = db.fetch_one
+    # Record one first. On an EMPTY table "the read failed" and "nothing found"
+    # both yield False, so failing closed is invisible -- the mutation survived
+    # exactly that gap. With a row already present, failing closed would report
+    # "already recorded" and silently drop this second, real recommendation.
+    await training.record_load_decision(1, _decision(weight=60.0), **_OCCURRENCE)
+    assert len(await _audit_rows(db)) == 1
+
+    real_fetch_all = db.fetch_all
 
     async def _explode(*a: Any, **k: Any) -> None:
         raise RuntimeError("audit unreadable")
 
-    monkeypatch.setattr(db, "fetch_one", _explode)
-    await training.record_load_decision(
-        1, _decision(), exercise_id="leg_press", exercise_index=0, session_id=7,
-        set_number=1, channel=training.LOAD_CHANNEL_WATCH,
-    )
+    monkeypatch.setattr(db, "fetch_all", _explode)
+    await training.record_load_decision(1, _decision(weight=57.5), **_OCCURRENCE)
 
-    monkeypatch.setattr(db, "fetch_one", real_fetch_one)
+    monkeypatch.setattr(db, "fetch_all", real_fetch_all)
     rows = await _audit_rows(db)
-    assert len(rows) == 1, "a failed dedupe read suppressed the recording"
+    assert len(rows) == 2, (
+        "a failed dedupe read suppressed a real recommendation; recording must "
+        "fail OPEN"
+    )
 
 
 
@@ -850,11 +857,22 @@ async def test_a_float_round_trip_is_not_a_change(tmp_path, monkeypatch) -> None
     db = await _db(tmp_path, "reco_float")
     _bind(monkeypatch, db)
 
-    await training.record_load_decision(1, _decision(weight=60), **_OCCURRENCE)
-    await training.record_load_decision(1, _decision(weight=60.0), **_OCCURRENCE)
+    # 60 vs 60.0 proves nothing -- Python already compares those equal. The
+    # discriminating case is accumulated binary error, which is what a plan
+    # built from repeated 2.5 kg increments actually produces: 0.1 + 0.2 != 0.3
+    # under `==`, and only the tolerance resolves it.
+    drifted = 57.2 + 0.1 + 0.2      # 57.50000000000001
+    exact = 57.5
+    assert drifted != exact, "precondition: these must differ under `==`"
+
+    await training.record_load_decision(1, _decision(weight=exact), **_OCCURRENCE)
+    await training.record_load_decision(1, _decision(weight=drifted), **_OCCURRENCE)
 
     rows = await _audit_rows(db)
-    assert len(rows) == 1, "a float round-trip was treated as a changed weight"
+    assert len(rows) == 1, (
+        "float drift was treated as a changed weight; every render would look "
+        "like a change and duplication returns by the back door"
+    )
 
 
 def test_the_compared_fields_are_exactly_the_persisted_decision_shape() -> None:
