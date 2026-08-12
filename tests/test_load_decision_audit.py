@@ -565,15 +565,22 @@ async def test_an_unreadable_audit_table_fails_open(tmp_path, monkeypatch) -> No
     await training.record_load_decision(1, _decision(weight=60.0), **_OCCURRENCE)
     assert len(await _audit_rows(db)) == 1
 
+    # Break BOTH read methods. Patching only the one the dedupe happens to use
+    # today made this test silently stop exercising the failure path when the
+    # implementation moved from fetch_all to fetch_one -- it kept passing while
+    # proving nothing, and the mutation survived.
     real_fetch_all = db.fetch_all
+    real_fetch_one = db.fetch_one
 
     async def _explode(*a: Any, **k: Any) -> None:
         raise RuntimeError("audit unreadable")
 
     monkeypatch.setattr(db, "fetch_all", _explode)
+    monkeypatch.setattr(db, "fetch_one", _explode)
     await training.record_load_decision(1, _decision(weight=57.5), **_OCCURRENCE)
 
     monkeypatch.setattr(db, "fetch_all", real_fetch_all)
+    monkeypatch.setattr(db, "fetch_one", real_fetch_one)
     rows = await _audit_rows(db)
     assert len(rows) == 2, (
         "a failed dedupe read suppressed a real recommendation; recording must "
