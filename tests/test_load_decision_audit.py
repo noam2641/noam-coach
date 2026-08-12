@@ -829,7 +829,11 @@ async def test_a_changed_decision_or_reps_is_a_new_durable_row(
 async def test_repeating_the_changed_recommendation_adds_nothing(
     tmp_path, monkeypatch
 ) -> None:
-    """4. Re-polling after the change stays deduped against BOTH rows."""
+    """4. Re-polling the CURRENT recommendation adds nothing.
+
+    Deduped against the LATEST row, not the whole history: consecutive
+    repetition is one presentation, so only a change writes.
+    """
     db = await _db(tmp_path, "reco_repeat")
     _bind(monkeypatch, db)
 
@@ -837,12 +841,68 @@ async def test_repeating_the_changed_recommendation_adds_nothing(
     await training.record_load_decision(1, _decision(weight=57.5), **_OCCURRENCE)
     for _ in range(4):
         await training.record_load_decision(1, _decision(weight=57.5), **_OCCURRENCE)
-        await training.record_load_decision(1, _decision(weight=60.0), **_OCCURRENCE)
 
     rows = await _audit_rows(db)
     assert len(rows) == 2, (
-        f"repeated polling after a change produced {len(rows)} rows"
+        f"repeated polling of the current recommendation produced {len(rows)} rows"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_return_to_an_earlier_recommendation_is_recorded_again(
+    tmp_path, monkeypatch
+) -> None:
+    """The A-B-A case: `audit` is a SEQUENCE, not a set of values seen.
+
+    Measured before the fix: 60 -> 57.5 -> 60 stored only 60 and 57.5, because
+    the third recommendation matched a HISTORICAL row. The last row then said
+    57.5 while the athlete's final recommendation was 60, so an investigator
+    reading the latest row would conclude the opposite of the truth. That is
+    worse than a duplicate: the audit tells a false story about what was
+    recommended.
+    """
+    db = await _db(tmp_path, "reco_aba")
+    _bind(monkeypatch, db)
+
+    for weight in (60.0, 57.5, 60.0):
+        await training.record_load_decision(
+            1, _decision(weight=weight), **_OCCURRENCE
+        )
+
+    rows = await _audit_rows(db)
+    assert len(rows) == 3, (
+        f"a return to an earlier recommendation was suppressed; {len(rows)} rows"
+    )
+    # And the ORDER is the story: the last row must be what was last shown.
+    ordered = await db.fetch_all(
+        "SELECT details FROM audit WHERE action='recommend_load' "
+        "ORDER BY created_at ASC, id ASC",
+        (),
+    )
+    weights = [json.loads(row["details"])["recommended_weight"] for row in ordered]
+    assert weights == [60.0, 57.5, 60.0], f"the sequence was not preserved: {weights}"
+
+
+@pytest.mark.asyncio
+async def test_only_the_latest_recommendation_suppresses_a_repeat(
+    tmp_path, monkeypatch
+) -> None:
+    """Dedupe compares the LATEST row, never the whole history.
+
+    A -> B -> B: the second B is consecutive with the first, so it is
+    suppressed. That is the half of the contract the A-B-A case must not
+    break -- transitions are recorded, repetition is not.
+    """
+    db = await _db(tmp_path, "reco_latest")
+    _bind(monkeypatch, db)
+
+    for weight in (60.0, 57.5, 57.5, 57.5):
+        await training.record_load_decision(
+            1, _decision(weight=weight), **_OCCURRENCE
+        )
+
+    rows = await _audit_rows(db)
+    assert len(rows) == 2, f"consecutive repetition was recorded; {len(rows)} rows"
 
 
 @pytest.mark.asyncio
