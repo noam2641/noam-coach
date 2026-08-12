@@ -16,6 +16,8 @@ so the two screens cannot disagree about which exercises are affected.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 import coach_bot
@@ -23,13 +25,26 @@ import training_intelligence
 
 
 def _pain_row(location: str, severity: int | None = None) -> dict:
+    """An ACTIVE pain constraint -- one that is still inside its TTL.
+
+    The date is relative on purpose. It was written as a fixed
+    `2026-07-27T06:58:17+00:00`, which was recent when the test was authored
+    and silently aged past `PAIN_CONSTRAINT_TTL_DAYS` (14) as the calendar
+    moved. `active_pain_regions` then correctly returned no regions, every
+    warning assertion failed, and the failure read as a safety regression in
+    the product rather than as an expired fixture.
+
+    A test for "an active constraint is warned about" must express *active*,
+    not a date that used to be.
+    """
+    created_at = datetime.now(timezone.utc) - timedelta(days=1)
     return {
         "kind": "pain",
         "status": "active",
         "location": location,
         "note": "",
         "severity": severity,
-        "created_at": "2026-07-27T06:58:17+00:00",
+        "created_at": created_at.isoformat(),
     }
 
 
