@@ -1262,3 +1262,107 @@ async def test_cancelling_a_tail_does_not_disconnect_a_running_predecessor(
     assert 57.5 not in stored, "the cancelled follower reached the audit table"
     assert training._LOAD_AUDIT_CHAINS == {}, "the chain registry leaked a key"
     assert training._LOAD_AUDIT_TASKS == set(), "the task registry leaked a task"
+
+
+
+@pytest.mark.asyncio
+async def test_a_failed_predecessor_does_not_strand_its_successor(
+    tmp_path, monkeypatch
+) -> None:
+    """The other half of the cancellation contract.
+
+    A follower must stop when IT is cancelled, but must NOT be stranded by a
+    neighbour that died. Those two are easy to collapse into one blanket
+    handler -- and collapsing them is what let a cancelled follower record
+    beside a running predecessor.
+
+    Left untested, the containment could be removed and every recording behind
+    a single failed one would be silently dropped: the queue would stall
+    permanently for that occurrence with nothing in the audit trail to show it.
+    """
+    db = await _db(tmp_path, "predecessor_failed")
+    _bind(monkeypatch, db)
+
+    arrivals: list[Any] = []
+    real_record = training.record_load_decision
+
+    async def _instrumented(*args: Any, **kwargs: Any) -> None:
+        recommendation = args[1] if len(args) > 1 else None
+        weight = getattr(recommendation, "weight", None)
+        arrivals.append(weight)
+        if weight == 60.0:
+            raise RuntimeError("the predecessor's recording exploded")
+        await real_record(*args, **kwargs)
+
+    monkeypatch.setattr(training, "record_load_decision", _instrumented)
+
+    task1 = training.schedule_load_decision_record(
+        1, _decision(weight=60.0), **_OCCURRENCE
+    )
+    task2 = training.schedule_load_decision_record(
+        1, _decision(weight=57.5), **_OCCURRENCE
+    )
+    await asyncio.gather(task1, task2, return_exceptions=True)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert 57.5 in arrivals, (
+        "a failed predecessor stranded its successor; the queue for this "
+        "occurrence would stall permanently"
+    )
+    stored = [row["recommended_weight"] for row in await _audit_rows(db)]
+    assert stored == [57.5], f"the successor's recording did not land: {stored}"
+    assert training._LOAD_AUDIT_CHAINS == {}, "the chain registry leaked a key"
+    assert training._LOAD_AUDIT_TASKS == set(), "the task registry leaked a task"
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_predecessor_does_not_strand_its_successor(
+    tmp_path, monkeypatch
+) -> None:
+    """Same contract, cancellation flavour.
+
+    `cancelling()` distinguishes "I was cancelled" from "the task I am waiting
+    on was cancelled". Only the first stops this recording.
+    """
+    db = await _db(tmp_path, "predecessor_cancelled")
+    _bind(monkeypatch, db)
+
+    t1_entered = asyncio.Event()
+    release_t1 = asyncio.Event()
+    arrivals: list[Any] = []
+    real_record = training.record_load_decision
+
+    async def _instrumented(*args: Any, **kwargs: Any) -> None:
+        recommendation = args[1] if len(args) > 1 else None
+        weight = getattr(recommendation, "weight", None)
+        arrivals.append(weight)
+        if weight == 60.0:
+            t1_entered.set()
+            await release_t1.wait()
+        await real_record(*args, **kwargs)
+
+    monkeypatch.setattr(training, "record_load_decision", _instrumented)
+
+    task1 = training.schedule_load_decision_record(
+        1, _decision(weight=60.0), **_OCCURRENCE
+    )
+    await asyncio.wait_for(t1_entered.wait(), timeout=5)
+    task2 = training.schedule_load_decision_record(
+        1, _decision(weight=57.5), **_OCCURRENCE
+    )
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    # Cancel the PREDECESSOR this time, not the follower.
+    task1.cancel()
+    release_t1.set()
+    await asyncio.gather(task1, task2, return_exceptions=True)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert task1.cancelled(), "precondition: the predecessor must be cancelled"
+    assert 57.5 in arrivals, (
+        "a cancelled predecessor stranded its successor"
+    )
+    assert training._LOAD_AUDIT_CHAINS == {}, "the chain registry leaked a key"
