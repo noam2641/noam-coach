@@ -1,7 +1,6 @@
 """Apple Watch workout companion routes."""
 from __future__ import annotations
 
-import asyncio
 import json
 from typing import Any
 
@@ -21,7 +20,7 @@ from noam_coach.services.training import (
     active_session,
     recommend_load,
     recommend_load_decision,
-    record_load_decision,
+    schedule_load_decision_record,
 )
 
 router = APIRouter()
@@ -32,7 +31,7 @@ _RUNTIME = (
     "active_session",
     "recommend_load",
     "recommend_load_decision",
-    "record_load_decision",
+    "schedule_load_decision_record",
     "try_save_set",
     "RIR_UNKNOWN",
     "workout_slots",
@@ -92,19 +91,22 @@ async def watch_current(user_id: int) -> dict[str, Any]:
     #
     # Unlike the card, there is no "after presentation" inside this function --
     # the `return` IS the presentation. An awaited write here would sit in
-    # front of every Watch poll, so recording is scheduled as an independent
-    # task and the response is not held for it. `record_load_decision` cannot
-    # raise, so the task cannot surface as an unretrieved exception.
+    # front of every Watch poll, so recording is scheduled and the response is
+    # not held for it.
+    #
+    # `schedule_load_decision_record` OWNS the task: asyncio holds only a weak
+    # reference to a running task, so a bare `ensure_future` whose handle is
+    # dropped can be collected mid-await and the write silently never lands.
+    # It also dedupes -- this endpoint is polled, and a poll re-renders the
+    # same prescription rather than making a new one.
     if recommendation_presented:
-        asyncio.ensure_future(
-            record_load_decision(
-                user_id,
-                load_decision,
-                exercise_id=str(current.get("id") or ""),
-                session_id=session["id"],
-                set_number=session["set_number"],
-                channel=LOAD_CHANNEL_WATCH,
-            )
+        schedule_load_decision_record(
+            user_id,
+            load_decision,
+            exercise_id=str(current.get("id") or ""),
+            session_id=session["id"],
+            set_number=session["set_number"],
+            channel=LOAD_CHANNEL_WATCH,
         )
 
     return {

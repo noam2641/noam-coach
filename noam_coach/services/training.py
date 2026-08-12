@@ -213,6 +213,121 @@ LOAD_CHANNEL_WATCH = "watch"
 #: no signal is the second thing that boundary forbids.
 _LOAD_AUDIT_HEALTH: dict[str, Any] = {"write_failures": 0, "last_error": None}
 
+#: Strong references to in-flight background recordings.
+#:
+#: `asyncio` keeps only a WEAK reference to a running task, so a bare
+#: `ensure_future(...)` whose handle is discarded can be garbage-collected
+#: mid-await and the write silently never lands -- and on some paths the loop
+#: reports "Task was destroyed but it is pending!" instead. Anything scheduled
+#: here holds a reference until it finishes and then removes itself, which is
+#: the minimal owned lifecycle: no scheduler, no queue, and nothing to shut
+#: down, because each task is short and self-retiring.
+_LOAD_AUDIT_TASKS: set[Any] = set()
+
+
+def _own(task: Any) -> Any:
+    """Hold a strong reference to *task* until it completes."""
+    _LOAD_AUDIT_TASKS.add(task)
+    task.add_done_callback(_LOAD_AUDIT_TASKS.discard)
+    return task
+
+
+def schedule_load_decision_record(
+    user_id: int,
+    decision: LoadRecommendation,
+    *,
+    exercise_id: str,
+    session_id: Any,
+    set_number: Any,
+    channel: str,
+) -> Any:
+    """Record without holding up the caller's response.
+
+    For surfaces whose RESPONSE is the presentation -- the Watch endpoint
+    returns a payload, so there is no "after" inside the handler in which to
+    await a write. Awaiting there would put database latency in front of every
+    poll.
+
+    Returns the owned task so a caller (or a test) can await completion; the
+    production call site deliberately does not.
+    """
+    return _own(
+        asyncio.ensure_future(
+            record_load_decision(
+                user_id,
+                decision,
+                exercise_id=exercise_id,
+                session_id=session_id,
+                set_number=set_number,
+                channel=channel,
+            )
+        )
+    )
+
+
+async def _already_recorded(
+    user_id: int,
+    *,
+    exercise_id: str,
+    session_id: Any,
+    set_number: Any,
+    channel: str,
+) -> bool:
+    """Has this exact presentation already been recorded?
+
+    THE DURABLE-RECORD SEMANTIC (A13): one row per
+    `(user, session, set, exercise, channel)`.
+
+    A poll is not a decision. `GET /api/watch/current` is client-driven with no
+    server-side interval, so a Watch sitting on one set can call it every few
+    seconds; each call re-renders the SAME prescription for the SAME set. Every
+    poll is a refresh of one presentation, not a new one, and recording each
+    would grow the audit table without bound and make "what did we recommend
+    for this set" -- the question A13 exists to answer -- unanswerable in the
+    noise.
+
+    The Telegram card is the same statement in a different channel: re-opening
+    the card shows the same prescription again. `channel` is part of the key,
+    so the card and the Watch are counted separately -- two genuine
+    presentations -- while repetition WITHIN a channel is one.
+
+    Read-then-write is not atomic. This is deliberately not a lock: a race can
+    at worst leave two rows for one presentation, which costs an extra row and
+    loses nothing. The alternative -- a unique index -- needs a migration, and
+    A13 is explicitly a no-migration item.
+    """
+    # Read through the SAME module `write_audit` writes through. Reading via
+    # this module's own `DB` global looked equivalent -- in production it is
+    # the same object -- but they can diverge, and a dedupe that queries a
+    # different database than it writes to silently never matches: every poll
+    # would look like the first one.
+    from noam_coach.services import core as _core
+
+    try:
+        row = await _core.DB.fetch_one(
+            "SELECT 1 FROM audit "
+            "WHERE user_id=? AND action=? AND entity=? AND entity_id=? "
+            "AND json_extract(details,'$.session_id')=? "
+            "AND json_extract(details,'$.set_number')=? "
+            "AND json_extract(details,'$.channel')=? "
+            "LIMIT 1",
+            (
+                user_id,
+                _LOAD_AUDIT_ACTION,
+                _LOAD_AUDIT_ENTITY,
+                exercise_id,
+                int(session_id) if session_id is not None else None,
+                int(set_number) if set_number is not None else None,
+                channel,
+            ),
+        )
+    except Exception:
+        # Fail OPEN: an unreadable audit table must not silence recording.
+        # A duplicate row is recoverable; a missing decision record is not.
+        LOGGER.exception("load decision dedupe read failed user=%s", user_id)
+        return False
+    return row is not None
+
 
 async def record_load_decision(
     user_id: int,
@@ -239,6 +354,16 @@ async def record_load_decision(
     from noam_coach.services.core import write_audit
 
     try:
+        if await _already_recorded(
+            user_id,
+            exercise_id=exercise_id,
+            session_id=session_id,
+            set_number=set_number,
+            channel=channel,
+        ):
+            # Same presentation, seen again. One durable row per
+            # (user, session, set, exercise, channel) -- see `_already_recorded`.
+            return
         await write_audit(
             user_id,
             _LOAD_AUDIT_ACTION,

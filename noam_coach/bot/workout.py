@@ -406,6 +406,7 @@ async def show_session(query: Any, user_id: int, session_id: int) -> None:
     # measured that the facade rebind is not reliable for names a handler adds
     # (`_substitution_callback` raised NameError under it), and an A13 failure
     # here would surface as a broken workout card.
+    from noam_coach.bot.ui import safe_edit_delivered
     from noam_coach.services.training import (
         LOAD_CHANNEL_TELEGRAM,
         recommend_load_decision,
@@ -523,14 +524,20 @@ async def show_session(query: Any, user_id: int, session_id: int) -> None:
             [button("סיים", session_action_data("finish", session))],
         ]
     )
-    await safe_edit(query, text, keyboard)
+    delivered = await safe_edit_delivered(query, text, keyboard)
 
     # A13 — AFTER the card is on screen, never before. This await touches the
-    # database; in front of `safe_edit` it would put recording latency between
+    # database; in front of the render it would put recording latency between
     # the user's tap and the card they are waiting for. Recording is
     # best-effort and cannot raise (see `record_load_decision`), so the card
     # stands whatever happens here.
-    if recommendation_presented:
+    #
+    # `delivered` is load-bearing, not defensive. `safe_edit` swallows a failed
+    # stale-message fallback, so without this the edit could fail, the fallback
+    # could fail, the user could see NOTHING, and A13 would still record that a
+    # recommendation was presented -- the audit row would assert something that
+    # never happened, which is precisely the evidence a weight dispute relies on.
+    if recommendation_presented and delivered:
         await record_load_decision(
             user_id,
             load_decision,

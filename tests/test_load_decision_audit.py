@@ -244,13 +244,15 @@ async def test_recording_is_not_awaited_before_the_watch_response(
     from noam_coach.api import watch_routes
 
     source = inspect.getsource(watch_routes.watch_current)
-    record_at = source.index("record_load_decision(")
-    return_at = source.index("return {\n        \"active\": True,\n        \"session_id\"")
+    record_at = source.index("schedule_load_decision_record(")
+    return_at = source.index('return {\n        "active": True,\n        "session_id"')
 
     assert record_at < return_at, "recording must be scheduled before the return"
-    scheduled = source[record_at - 200:record_at]
-    assert "ensure_future" in scheduled or "create_task" in scheduled, (
+    assert "await schedule_load_decision_record" not in source, (
         "the Watch recording is awaited inline; it will delay every poll"
+    )
+    assert "await record_load_decision" not in source, (
+        "the Watch handler awaits the audit write in front of its response"
     )
 
 
@@ -265,7 +267,7 @@ def test_the_telegram_card_records_after_it_is_presented() -> None:
     from noam_coach.bot import workout
 
     source = inspect.getsource(workout.show_session)
-    present_at = source.rindex("await safe_edit(query, text, keyboard)")
+    present_at = source.rindex("await safe_edit_delivered(query, text, keyboard)")
     record_at = source.index("await record_load_decision(")
 
     assert present_at < record_at, (
@@ -323,7 +325,7 @@ async def test_a_typed_weight_is_not_a_recommendation_the_user_acted_on(
 
     source = inspect.getsource(workout.show_session)
     assert "recommendation_presented = False" in source
-    assert "if recommendation_presented:" in source
+    assert "if recommendation_presented and delivered:" in source
     del tmp_path, monkeypatch
 
 
@@ -362,3 +364,211 @@ async def test_the_watch_task_completes_and_stores_its_row(
     rows = await _audit_rows(db)
     assert len(rows) == 1
     assert rows[0]["channel"] == "watch"
+
+
+
+# ---------------------------------------------------------------------------
+# Review blockers on head 7048fc8
+#
+# All three were "correct on the happy path, wrong at the edge", which is why
+# each test below drives the REAL delivery path rather than the recording
+# helper: asserting on `record_load_decision` directly cannot see any of them.
+# ---------------------------------------------------------------------------
+class _StaleQuery:
+    """A query whose edit fails as stale, with a controllable fallback."""
+
+    def __init__(self, *, fallback_works: bool) -> None:
+        self.fallback_works = fallback_works
+        self.fallback_attempted = False
+        outer = self
+
+        class _Message:
+            async def reply_text(self, *a: Any, **k: Any) -> None:
+                del a, k
+                outer.fallback_attempted = True
+                if not outer.fallback_works:
+                    raise RuntimeError("telegram is unreachable")
+
+        self.message = _Message()
+
+    async def edit_message_text(self, *a: Any, **k: Any) -> None:
+        del a, k
+        from telegram.error import BadRequest
+
+        raise BadRequest("Message to edit not found")
+
+    async def answer(self, *a: Any, **k: Any) -> None:
+        del a, k
+
+
+@pytest.mark.asyncio
+async def test_a_screen_that_never_reached_the_user_is_delivered_false() -> None:
+    """Blocker 1, at the delivery boundary.
+
+    `safe_edit` returns None whether the edit worked, the fallback rescued it,
+    or the fallback ALSO failed inside `suppress(Exception)`. A caller could
+    not tell "the user is looking at this" from "nothing arrived".
+    """
+    from noam_coach.bot.ui import safe_edit_delivered
+
+    rescued = _StaleQuery(fallback_works=True)
+    assert await safe_edit_delivered(rescued, "text", None) is True
+    assert rescued.fallback_attempted
+
+    lost = _StaleQuery(fallback_works=False)
+    assert await safe_edit_delivered(lost, "text", None) is False, (
+        "a screen the user never received was reported as delivered"
+    )
+    assert lost.fallback_attempted
+
+
+@pytest.mark.asyncio
+async def test_no_audit_row_when_the_card_never_reached_the_user(
+    tmp_path, monkeypatch
+) -> None:
+    """Blocker 1, through the real `show_session` path.
+
+    The edit fails as stale AND the fallback reply fails, so the athlete sees
+    nothing. Recording "presented" here would put a claim in the audit trail
+    that never happened -- and that trail is the evidence a weight dispute
+    rests on.
+    """
+    db = await _db(tmp_path, "undelivered")
+    _bind(monkeypatch, db)
+    from noam_coach.bot import workout as workout_bot
+
+    monkeypatch.setattr(workout_bot, "DB", db, raising=False)
+    plan = {
+        "exercises": [{
+            "slot_id": "s1:leg_press", "id": "leg_press",
+            "name": "leg press", "sets": 3, "reps": 10, "rmin": 8,
+            "rmax": 12, "inc": 2.5, "rest": 90, "weight": 60.0,
+            "cues": [], "alts": [],
+        }]
+    }
+    session_id = await db.execute(
+        "INSERT INTO sessions(user_id, code, name, plan, status, exercise_index, "
+        "set_number, started_at) VALUES(1, 'A', 'A', ?, 'active', 0, 1, ?)",
+        (json.dumps(plan), utc_now()),
+    )
+
+    await workout_bot.show_session(
+        _StaleQuery(fallback_works=False), 1, int(session_id)
+    )
+
+    rows = await _audit_rows(db)
+    assert rows == [], (
+        "a load decision was recorded as presented although the card never "
+        "reached the user"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_watch_recording_task_is_owned(tmp_path, monkeypatch) -> None:
+    """Blocker 2: asyncio holds only a WEAK reference to a running task.
+
+    A bare `ensure_future` whose handle is discarded can be collected
+    mid-await, so the write silently never lands. The scheduler keeps a strong
+    reference until the task retires, and removes it afterwards so the set
+    cannot grow without bound.
+    """
+    db = await _db(tmp_path, "owned_task")
+    _bind(monkeypatch, db)
+
+    assert training._LOAD_AUDIT_TASKS == set(), "the registry starts empty"
+
+    task = training.schedule_load_decision_record(
+        1, _decision(), exercise_id="leg_press", session_id=7,
+        set_number=1, channel=training.LOAD_CHANNEL_WATCH,
+    )
+
+    assert task in training._LOAD_AUDIT_TASKS, "the task is not owned"
+    await task
+    await asyncio.sleep(0)  # let the done-callback run
+    assert task not in training._LOAD_AUDIT_TASKS, "the registry leaks tasks"
+
+    rows = await _audit_rows(db)
+    assert len(rows) == 1, "the scheduled write did not land"
+
+
+@pytest.mark.asyncio
+async def test_repeated_watch_polling_creates_one_durable_row(
+    tmp_path, monkeypatch
+) -> None:
+    """Blocker 3: a poll is a refresh of one presentation, not a new decision.
+
+    `GET /api/watch/current` is client-driven with no server interval, so a
+    Watch resting on one set can call it every few seconds. Without a durable
+    key the audit table grows without bound and the question A13 exists to
+    answer -- "what did we recommend for this set" -- drowns in its own noise.
+    """
+    db = await _db(tmp_path, "watch_idem")
+    _bind(monkeypatch, db)
+
+    for _ in range(6):
+        await training.record_load_decision(
+            1, _decision(), exercise_id="leg_press", session_id=7,
+            set_number=1, channel=training.LOAD_CHANNEL_WATCH,
+        )
+
+    rows = await _audit_rows(db)
+    assert len(rows) == 1, f"six polls produced {len(rows)} rows"
+
+
+@pytest.mark.asyncio
+async def test_the_durable_key_still_separates_real_presentations(
+    tmp_path, monkeypatch
+) -> None:
+    """Idempotency must not collapse genuinely different presentations.
+
+    A different SET, a different EXERCISE, or a different CHANNEL is a new
+    prescription. Deduping those away would lose exactly the history A13 is
+    for -- the failure mode opposite to unbounded duplication.
+    """
+    db = await _db(tmp_path, "durable_key")
+    _bind(monkeypatch, db)
+
+    base = dict(
+        exercise_id="leg_press", session_id=7, set_number=1,
+        channel=training.LOAD_CHANNEL_WATCH,
+    )
+    await training.record_load_decision(1, _decision(), **base)
+    await training.record_load_decision(1, _decision(), **{**base, "set_number": 2})
+    await training.record_load_decision(
+        1, _decision(), **{**base, "exercise_id": "squat"}
+    )
+    await training.record_load_decision(
+        1, _decision(), **{**base, "channel": training.LOAD_CHANNEL_TELEGRAM}
+    )
+    await training.record_load_decision(1, _decision(), **{**base, "session_id": 8})
+    # ...and one exact repeat, which must NOT add a row.
+    await training.record_load_decision(1, _decision(), **base)
+
+    rows = await _audit_rows(db)
+    assert len(rows) == 5, f"expected 5 distinct presentations, got {len(rows)}"
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_audit_table_fails_open(tmp_path, monkeypatch) -> None:
+    """The dedupe read must never become a reason NOT to record.
+
+    A duplicate row is recoverable; a missing decision record is not. If the
+    lookup cannot be answered, recording proceeds.
+    """
+    db = await _db(tmp_path, "dedupe_open")
+    _bind(monkeypatch, db)
+
+    real_fetch_one = db.fetch_one
+
+    async def _explode(*a: Any, **k: Any) -> None:
+        raise RuntimeError("audit unreadable")
+
+    monkeypatch.setattr(db, "fetch_one", _explode)
+    await training.record_load_decision(
+        1, _decision(), exercise_id="leg_press", session_id=7,
+        set_number=1, channel=training.LOAD_CHANNEL_WATCH,
+    )
+
+    monkeypatch.setattr(db, "fetch_one", real_fetch_one)
+    rows = await _audit_rows(db)
+    assert len(rows) == 1, "a failed dedupe read suppressed the recording"
