@@ -742,3 +742,132 @@ async def test_watch_current_schedules_the_record_without_awaiting_it(
 
     rows = await _audit_rows(db)
     assert len(rows) == 1, f"a second poll produced {len(rows)} rows"
+
+
+
+# ---------------------------------------------------------------------------
+# Recommendation identity: a CHANGED recommendation for a live occurrence
+#
+# `recommend_load_decision` reads mutable state on every call -- daily flags
+# (`sleep_quality`, `energy`) and active pain -- so the recommendation for one
+# occurrence can legitimately change before the set is performed. Keyed on the
+# occurrence alone, the second real recommendation was suppressed and the audit
+# preserved only that SOME recommendation once existed.
+# ---------------------------------------------------------------------------
+_OCCURRENCE = dict(
+    exercise_id="leg_press", exercise_index=0, session_id=7, set_number=1,
+    channel=training.LOAD_CHANNEL_WATCH,
+)
+
+
+@pytest.mark.asyncio
+async def test_an_identical_recommendation_repeated_is_one_row(
+    tmp_path, monkeypatch
+) -> None:
+    """1. Same occurrence, same channel, identical recommendation => 1 row."""
+    db = await _db(tmp_path, "reco_same")
+    _bind(monkeypatch, db)
+
+    for _ in range(5):
+        await training.record_load_decision(1, _decision(), **_OCCURRENCE)
+
+    rows = await _audit_rows(db)
+    assert len(rows) == 1, f"five identical renders produced {len(rows)} rows"
+
+
+@pytest.mark.asyncio
+async def test_a_changed_weight_is_a_new_durable_row(tmp_path, monkeypatch) -> None:
+    """2. Same occurrence, changed `recommended_weight` => 2 rows.
+
+    The real case: the athlete reports bad sleep mid-session, `hold_for_recovery`
+    trips, and the same set is now prescribed at a lower load. Suppressing that
+    would leave the audit asserting 60 kg for a set actually advised at 57.5.
+    """
+    db = await _db(tmp_path, "reco_weight")
+    _bind(monkeypatch, db)
+
+    await training.record_load_decision(1, _decision(weight=60.0), **_OCCURRENCE)
+    await training.record_load_decision(1, _decision(weight=57.5), **_OCCURRENCE)
+
+    rows = await _audit_rows(db)
+    assert len(rows) == 2, (
+        f"a changed recommendation was suppressed; {len(rows)} row(s) stored"
+    )
+    assert {row["recommended_weight"] for row in rows} == {60.0, 57.5}
+
+
+@pytest.mark.asyncio
+async def test_a_changed_decision_or_reps_is_a_new_durable_row(
+    tmp_path, monkeypatch
+) -> None:
+    """3. A different decision code or rep target is a different prescription."""
+    db = await _db(tmp_path, "reco_decision")
+    _bind(monkeypatch, db)
+
+    await training.record_load_decision(1, _decision(), **_OCCURRENCE)
+    await training.record_load_decision(
+        1, _decision(decision="hold_for_recovery"), **_OCCURRENCE
+    )
+    await training.record_load_decision(1, _decision(reps=8), **_OCCURRENCE)
+    # A changed SIGNAL set is also material: it is why the load was chosen.
+    await training.record_load_decision(
+        1, _decision(signals=("sleep_quality:bad",)), **_OCCURRENCE
+    )
+
+    rows = await _audit_rows(db)
+    assert len(rows) == 4, f"expected 4 distinct recommendations, got {len(rows)}"
+
+
+@pytest.mark.asyncio
+async def test_repeating_the_changed_recommendation_adds_nothing(
+    tmp_path, monkeypatch
+) -> None:
+    """4. Re-polling after the change stays deduped against BOTH rows."""
+    db = await _db(tmp_path, "reco_repeat")
+    _bind(monkeypatch, db)
+
+    await training.record_load_decision(1, _decision(weight=60.0), **_OCCURRENCE)
+    await training.record_load_decision(1, _decision(weight=57.5), **_OCCURRENCE)
+    for _ in range(4):
+        await training.record_load_decision(1, _decision(weight=57.5), **_OCCURRENCE)
+        await training.record_load_decision(1, _decision(weight=60.0), **_OCCURRENCE)
+
+    rows = await _audit_rows(db)
+    assert len(rows) == 2, (
+        f"repeated polling after a change produced {len(rows)} rows"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_float_round_trip_is_not_a_change(tmp_path, monkeypatch) -> None:
+    """60 and 60.0 must compare equal, or every render looks like a change.
+
+    JSON round-trips numbers, so a naive `==` on the stored value would make
+    the dedupe never match and reintroduce unbounded duplication by the back
+    door -- passing the "a change is recorded" tests while failing the
+    "repetition is not" ones.
+    """
+    db = await _db(tmp_path, "reco_float")
+    _bind(monkeypatch, db)
+
+    await training.record_load_decision(1, _decision(weight=60), **_OCCURRENCE)
+    await training.record_load_decision(1, _decision(weight=60.0), **_OCCURRENCE)
+
+    rows = await _audit_rows(db)
+    assert len(rows) == 1, "a float round-trip was treated as a changed weight"
+
+
+def test_the_compared_fields_are_exactly_the_persisted_decision_shape() -> None:
+    """The comparison must not drift from `to_audit_dict()`.
+
+    If that shape gains a field and this tuple does not, a materially changed
+    recommendation silently dedupes as identical -- the same class of silent
+    drift as the list-valued detail trap.
+    """
+    persisted = set(_decision().to_audit_dict())
+    compared = set(training._DECISION_IDENTITY_FIELDS)
+
+    assert compared == persisted, (
+        "the dedupe comparison and the persisted decision shape have drifted: "
+        f"only persisted={persisted - compared}, only compared={compared - persisted}"
+    )

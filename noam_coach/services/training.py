@@ -277,11 +277,26 @@ async def _already_recorded(
     session_id: Any,
     set_number: Any,
     channel: str,
+    decision_fields: dict[str, Any],
 ) -> bool:
     """Has this exact presentation already been recorded?
 
-    THE DURABLE-RECORD SEMANTIC (A13): one row per
-    `(user, session, exercise_index, set, channel)`.
+    THE DURABLE-RECORD SEMANTIC (A13): one row per MATERIALLY DISTINCT
+    RECOMMENDATION per `(user, session, exercise_index, set, channel)`.
+
+    The occurrence alone is not the identity. `recommend_load_decision` reads
+    MUTABLE state on every call -- `get_daily_flags` for `sleep_quality` and
+    `energy`, and active pain regions -- so the recommendation for one live
+    occurrence can legitimately change before the set is performed: a user who
+    reports bad sleep mid-session is held back to 57.5 kg where the first
+    render said 60 kg. Keyed on the occurrence alone, that second, real
+    recommendation is suppressed and the audit preserves only that *some*
+    recommendation once existed. A13 exists to record WHAT was recommended,
+    so that is a defect, not an optimisation.
+
+    The comparison reuses `to_audit_dict()` -- the one place that defines the
+    persisted shape -- rather than naming fields here. A field added there is
+    automatically material; a second list would drift from it silently.
 
     `exercise_index` -- the OCCURRENCE, not the movement -- is load-bearing.
     A2 exists because one workout may program the same movement twice, so
@@ -327,14 +342,18 @@ async def _already_recorded(
     from noam_coach.services import core as _core
 
     try:
-        row = await _core.DB.fetch_one(
-            "SELECT 1 FROM audit "
+        # Fetch the recommendations already recorded for this occurrence and
+        # compare their persisted decision fields. Comparing in SQL would mean
+        # restating every field of `to_audit_dict()` in a predicate, which
+        # drifts the moment that shape changes -- exactly the silent-drift
+        # class this item keeps hitting.
+        rows = await _core.DB.fetch_all(
+            "SELECT details FROM audit "
             "WHERE user_id=? AND action=? AND entity=? AND entity_id=? "
             "AND json_extract(details,'$.session_id')=? "
             "AND json_extract(details,'$.exercise_index')=? "
             "AND json_extract(details,'$.set_number')=? "
-            "AND json_extract(details,'$.channel')=? "
-            "LIMIT 1",
+            "AND json_extract(details,'$.channel')=? ",
             (
                 user_id,
                 _LOAD_AUDIT_ACTION,
@@ -351,7 +370,43 @@ async def _already_recorded(
         # A duplicate row is recoverable; a missing decision record is not.
         LOGGER.exception("load decision dedupe read failed user=%s", user_id)
         return False
-    return row is not None
+
+    wanted = {key: decision_fields.get(key) for key in _DECISION_IDENTITY_FIELDS}
+    for existing in rows or []:
+        try:
+            stored = json.loads(existing["details"] or "{}")
+        except (TypeError, ValueError):
+            # An unreadable row cannot prove this recommendation was recorded.
+            continue
+        if all(_same_value(stored.get(k), v) for k, v in wanted.items()):
+            return True
+    return False
+
+
+#: The persisted fields that make one recommendation materially different from
+#: another. Derived from `to_audit_dict()` so the two cannot drift: everything
+#: that shape persists about the DECISION is compared.
+_DECISION_IDENTITY_FIELDS = (
+    "decision",
+    "recommended_weight",
+    "recommended_reps",
+    "signals",
+    "missing_context",
+    "confidence",
+    "data_completeness",
+)
+
+
+def _same_value(stored: Any, wanted: Any) -> bool:
+    """Compare one persisted field, tolerating JSON's number round-trip.
+
+    `recommended_weight` is a float that survives a JSON round-trip as a float,
+    but 60 and 60.0 must compare equal or every render would look like a change
+    and the dedupe would never match.
+    """
+    if isinstance(stored, (int, float)) and isinstance(wanted, (int, float)):
+        return abs(float(stored) - float(wanted)) < 1e-9
+    return stored == wanted
 
 
 async def record_load_decision(
@@ -381,6 +436,7 @@ async def record_load_decision(
     from noam_coach.services.core import write_audit
 
     try:
+        audit_fields = decision.to_audit_dict()
         if await _already_recorded(
             user_id,
             exercise_id=exercise_id,
@@ -388,6 +444,7 @@ async def record_load_decision(
             session_id=session_id,
             set_number=set_number,
             channel=channel,
+            decision_fields=audit_fields,
         ):
             # Same presentation, seen again. One durable row per
             # (user, session, set, exercise, channel) -- see `_already_recorded`.
@@ -412,7 +469,7 @@ async def record_load_decision(
             # move a slot to a new index, so it does NOT replace the
             # occurrence in the key.
             slot_id=slot_id or None,
-            **decision.to_audit_dict(),
+            **audit_fields,
         )
     except Exception as exc:  # noqa: BLE001 — never break coaching (emit.py rule 1).
         _LOAD_AUDIT_HEALTH["write_failures"] += 1
