@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -1005,14 +1006,23 @@ async def test_concurrent_recordings_for_one_key_keep_presentation_order(
     gate = asyncio.Event()
     released = asyncio.Event()
     real_already = training._already_recorded
-    calls = {"n": 0}
+
+    a_read = asyncio.Event()
 
     async def _gated(*args: Any, **kwargs: Any) -> bool:
-        calls["n"] += 1
+        # Gate by WHAT is being recorded, not by call ordinal: counting calls
+        # depended on how many reads happened earlier, so the gate could land
+        # on the wrong one and the test silently stopped discriminating.
+        fields = kwargs.get("decision_fields") or {}
+        weight = fields.get("recommended_weight")
         result = await real_already(*args, **kwargs)
-        if calls["n"] == 1:          # B's read only
+        if weight == 57.5 and not released.is_set():
             released.set()
             await gate.wait()
+        elif weight == 60.0 and released.is_set():
+            # A's read, taken while B is gated. Signalling it is what makes
+            # the interleaving deterministic instead of relying on a yield.
+            a_read.set()
         return result
 
     monkeypatch.setattr(training, "_already_recorded", _gated)
@@ -1035,7 +1045,13 @@ async def test_concurrent_recordings_for_one_key_keep_presentation_order(
     task_a = training.schedule_load_decision_record(
         1, _decision(weight=60.0), **_OCCURRENCE
     )
-    await asyncio.sleep(0)
+    # Wait for A to REACH its read rather than yielding a fixed number of
+    # times. `asyncio.sleep(0)` yields once, which was sometimes enough and
+    # sometimes not -- so the test passed or failed on scheduler ordering, the
+    # very thing it claims not to depend on. With per-key chaining A never
+    # reads while B is gated, so a timeout here is the EXPECTED path.
+    with suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(a_read.wait(), timeout=1)
 
     # 5. Release B and let both finish.
     gate.set()
