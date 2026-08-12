@@ -1021,7 +1021,15 @@ async def test_concurrent_recordings_for_one_key_keep_presentation_order(
     task_b = training.schedule_load_decision_record(
         1, _decision(weight=57.5), **_OCCURRENCE
     )
-    await released.wait()
+    # Bounded: if the dedupe read is never reached, this test must FAIL rather
+    # than hang. An unbounded wait here turned a broken build into a 15-minute
+    # CI stall during deliberate breakage.
+    try:
+        await asyncio.wait_for(released.wait(), timeout=5)
+    except asyncio.TimeoutError:  # pragma: no cover - only on a broken build
+        gate.set()
+        await asyncio.gather(task_b, return_exceptions=True)
+        pytest.fail("the dedupe read was never reached; the gate never opened")
 
     # 4. Schedule A again WHILE B is blocked.
     task_a = training.schedule_load_decision_record(
