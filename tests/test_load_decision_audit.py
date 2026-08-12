@@ -956,3 +956,132 @@ def test_the_compared_fields_are_exactly_the_persisted_decision_shape() -> None:
         "the dedupe comparison and the persisted decision shape have drifted: "
         f"only persisted={persisted - compared}, only compared={compared - persisted}"
     )
+
+
+
+# ---------------------------------------------------------------------------
+# Concurrency: scheduled recordings must land in PRESENTATION order
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_concurrent_recordings_for_one_key_keep_presentation_order(
+    tmp_path, monkeypatch
+) -> None:
+    """The interleaving that reintroduces false chronology.
+
+    `record_load_decision` reads the latest row and writes in two separately
+    awaited steps, so ownership alone -- which keeps tasks ALIVE but says
+    nothing about their ORDER -- is not enough:
+
+        latest = A
+        B reads latest=A, then suspends before writing
+        A is presented again; A reads latest=A and suppresses itself as a repeat
+        B resumes and writes B
+        stored: A, B   -- while the athlete saw A, B, A
+
+    The last stored row would again disagree with what was last shown, which is
+    exactly the defect the transition semantic exists to prevent, reached by a
+    different route.
+
+    The block is deterministic: B is held at its read via a real gate, not a
+    sleep, so this cannot pass or fail on timing.
+    """
+    db = await _db(tmp_path, "concurrent_order")
+    _bind(monkeypatch, db)
+
+    # 1. Seed A.
+    await training.record_load_decision(1, _decision(weight=60.0), **_OCCURRENCE)
+    assert len(await _audit_rows(db)) == 1
+
+    # 2. Gate the NEXT dedupe read so B suspends between read and write.
+    gate = asyncio.Event()
+    released = asyncio.Event()
+    real_already = training._already_recorded
+    calls = {"n": 0}
+
+    async def _gated(*args: Any, **kwargs: Any) -> bool:
+        calls["n"] += 1
+        result = await real_already(*args, **kwargs)
+        if calls["n"] == 1:          # B's read only
+            released.set()
+            await gate.wait()
+        return result
+
+    monkeypatch.setattr(training, "_already_recorded", _gated)
+
+    # 3. Schedule B, and wait until it is provably blocked after its read.
+    task_b = training.schedule_load_decision_record(
+        1, _decision(weight=57.5), **_OCCURRENCE
+    )
+    await released.wait()
+
+    # 4. Schedule A again WHILE B is blocked.
+    task_a = training.schedule_load_decision_record(
+        1, _decision(weight=60.0), **_OCCURRENCE
+    )
+    await asyncio.sleep(0)
+
+    # 5. Release B and let both finish.
+    gate.set()
+    await asyncio.gather(task_b, task_a)
+    await asyncio.sleep(0)
+
+    ordered = await db.fetch_all(
+        "SELECT details FROM audit WHERE action='recommend_load' "
+        "ORDER BY created_at ASC, id ASC",
+        (),
+    )
+    weights = [json.loads(row["details"])["recommended_weight"] for row in ordered]
+
+    assert weights == [60.0, 57.5, 60.0], (
+        f"scheduled recordings landed out of presentation order: {weights}"
+    )
+    assert weights[-1] == 60.0, (
+        "the last stored recommendation is not the one last presented"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_chain_registry_retires_and_does_not_grow(
+    tmp_path, monkeypatch
+) -> None:
+    """A per-key chain must self-retire, or the registry leaks one entry per key."""
+    db = await _db(tmp_path, "chain_retire")
+    _bind(monkeypatch, db)
+
+    assert training._LOAD_AUDIT_CHAINS == {}
+
+    tasks = [
+        training.schedule_load_decision_record(
+            1, _decision(weight=60.0 + index), **_OCCURRENCE
+        )
+        for index in range(3)
+    ]
+    await asyncio.gather(*tasks)
+    await asyncio.sleep(0)
+
+    assert training._LOAD_AUDIT_CHAINS == {}, "the chain registry leaked keys"
+    assert training._LOAD_AUDIT_TASKS == set(), "the task registry leaked tasks"
+
+
+@pytest.mark.asyncio
+async def test_channels_are_not_serialized_against_each_other(
+    tmp_path, monkeypatch
+) -> None:
+    """Telegram must never queue behind a Watch poll.
+
+    They are different presentations and already different durable identities,
+    so chaining them together would add latency for no correctness gain.
+    """
+    db = await _db(tmp_path, "chain_channels")
+    _bind(monkeypatch, db)
+
+    watch_key = training._chain_key(
+        1, exercise_id="leg_press", exercise_index=0, session_id=7,
+        set_number=1, channel=training.LOAD_CHANNEL_WATCH,
+    )
+    telegram_key = training._chain_key(
+        1, exercise_id="leg_press", exercise_index=0, session_id=7,
+        set_number=1, channel=training.LOAD_CHANNEL_TELEGRAM,
+    )
+
+    assert watch_key != telegram_key, "the two channels share one chain"

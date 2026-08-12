@@ -232,6 +232,49 @@ def _own(task: Any) -> Any:
     return task
 
 
+#: The tail of the in-flight chain per durable key. Ownership alone is not
+#: enough: it keeps tasks ALIVE but says nothing about their ORDER.
+#:
+#: `record_load_decision` reads the latest row and writes in two separately
+#: awaited steps, so two concurrent recordings for one occurrence can
+#: interleave:
+#:
+#:     latest = A
+#:     B reads latest=A, then suspends before writing
+#:     A is presented again; A reads latest=A and suppresses itself as a repeat
+#:     B resumes and writes B
+#:     stored: A, B   -- while the athlete saw A, B, A
+#:
+#: That is the same false-chronology defect the transition semantic exists to
+#: prevent, reached by a different route: the last stored row again disagrees
+#: with what was last shown. Serializing per key removes the interleaving
+#: rather than trying to detect it, and needs no lock, table or migration.
+#:
+#: Keyed INCLUDING channel, so the Telegram card never waits behind a Watch
+#: poll -- they are different presentations and already different identities.
+_LOAD_AUDIT_CHAINS: dict[tuple, Any] = {}
+
+
+def _chain_key(
+    user_id: int,
+    *,
+    exercise_id: str,
+    exercise_index: Any,
+    session_id: Any,
+    set_number: Any,
+    channel: str,
+) -> tuple:
+    """The durable identity, as a hashable key."""
+    return (
+        int(user_id),
+        str(session_id) if session_id is not None else None,
+        str(exercise_index) if exercise_index is not None else None,
+        str(set_number) if set_number is not None else None,
+        str(exercise_id),
+        str(channel),
+    )
+
+
 def schedule_load_decision_record(
     user_id: int,
     decision: LoadRecommendation,
@@ -250,23 +293,54 @@ def schedule_load_decision_record(
     await a write. Awaiting there would put database latency in front of every
     poll.
 
+    Recordings for ONE durable key run in scheduling order, chained behind
+    whatever is already in flight for that key. Without that, the read-then-
+    write inside `record_load_decision` can interleave and store a history
+    whose last row is not what was last presented -- see `_LOAD_AUDIT_CHAINS`.
+
     Returns the owned task so a caller (or a test) can await completion; the
     production call site deliberately does not.
     """
-    return _own(
-        asyncio.ensure_future(
-            record_load_decision(
-                user_id,
-                decision,
-                exercise_id=exercise_id,
-                exercise_index=exercise_index,
-                session_id=session_id,
-                set_number=set_number,
-                channel=channel,
-                slot_id=slot_id,
-            )
-        )
+    key = _chain_key(
+        user_id,
+        exercise_id=exercise_id,
+        exercise_index=exercise_index,
+        session_id=session_id,
+        set_number=set_number,
+        channel=channel,
     )
+    previous = _LOAD_AUDIT_CHAINS.get(key)
+
+    async def _run() -> None:
+        if previous is not None:
+            # Wait for the earlier recording for this key, whatever its
+            # outcome. `record_load_decision` cannot raise, and a cancelled
+            # predecessor must not strand this one either.
+            with suppress(BaseException):
+                await previous
+        await record_load_decision(
+            user_id,
+            decision,
+            exercise_id=exercise_id,
+            exercise_index=exercise_index,
+            session_id=session_id,
+            set_number=set_number,
+            channel=channel,
+            slot_id=slot_id,
+        )
+
+    task = _own(asyncio.ensure_future(_run()))
+    _LOAD_AUDIT_CHAINS[key] = task
+
+    def _retire(done: Any) -> None:
+        # Only the CURRENT tail retires the key. A later scheduling has already
+        # replaced it, and that one owns the entry now -- so the registry holds
+        # at most one entry per active key and empties when work stops.
+        if _LOAD_AUDIT_CHAINS.get(key) is done:
+            _LOAD_AUDIT_CHAINS.pop(key, None)
+
+    task.add_done_callback(_retire)
+    return task
 
 
 async def _already_recorded(
