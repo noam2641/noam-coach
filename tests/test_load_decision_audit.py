@@ -43,6 +43,15 @@ def _bind(monkeypatch: pytest.MonkeyPatch, db: Database) -> None:
     monkeypatch.setattr(coach_bot, "DB", db, raising=False)
     monkeypatch.setattr(core_services, "DB", db, raising=False)
 
+    # `_LOAD_AUDIT_CHAINS` and `_LOAD_AUDIT_TASKS` are module globals that
+    # outlive a test. Left populated, a COMPLETED task from an earlier test
+    # sits at the head of the chain for the same key, so the next schedule
+    # awaits something already finished and accidentally serializes -- which
+    # masked the concurrency failure this file exists to catch. Each test gets
+    # a clean scheduler.
+    training._LOAD_AUDIT_CHAINS.clear()
+    training._LOAD_AUDIT_TASKS.clear()
+
 
 def _decision(**overrides: Any) -> training.LoadRecommendation:
     fields: dict[str, Any] = {
