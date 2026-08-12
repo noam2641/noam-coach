@@ -281,8 +281,23 @@ async def _already_recorded(
 ) -> bool:
     """Has this exact presentation already been recorded?
 
-    THE DURABLE-RECORD SEMANTIC (A13): one row per MATERIALLY DISTINCT
-    RECOMMENDATION per `(user, session, exercise_index, set, channel)`.
+    THE DURABLE-RECORD SEMANTIC (A13): one row per RECOMMENDATION TRANSITION
+    per `(user, session, exercise_index, set, channel)`.
+
+    Compared against the LATEST recorded recommendation only, never against
+    the whole history. Comparing against every past row suppresses a return to
+    an earlier value, and `audit` carries `created_at` -- it is a sequence in
+    time, not a set of values that once occurred. Measured on 60 -> 57.5 -> 60:
+    matching any historical row stored only 60 and 57.5, so the LAST row said
+    57.5 while the athlete's final recommendation was 60. An investigator
+    reading the latest row would draw the opposite conclusion to the truth.
+    That is worse than an extra row: the audit itself tells a false story.
+
+        60   -> row
+        60   -> no row
+        57.5 -> row
+        57.5 -> no row
+        60   -> row      (a transition back, and it must be recorded)
 
     The occurrence alone is not the identity. `recommend_load_decision` reads
     MUTABLE state on every call -- `get_daily_flags` for `sleep_quality` and
@@ -347,13 +362,14 @@ async def _already_recorded(
         # restating every field of `to_audit_dict()` in a predicate, which
         # drifts the moment that shape changes -- exactly the silent-drift
         # class this item keeps hitting.
-        rows = await _core.DB.fetch_all(
+        row = await _core.DB.fetch_one(
             "SELECT details FROM audit "
             "WHERE user_id=? AND action=? AND entity=? AND entity_id=? "
             "AND json_extract(details,'$.session_id')=? "
             "AND json_extract(details,'$.exercise_index')=? "
             "AND json_extract(details,'$.set_number')=? "
-            "AND json_extract(details,'$.channel')=? ",
+            "AND json_extract(details,'$.channel')=? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
             (
                 user_id,
                 _LOAD_AUDIT_ACTION,
@@ -371,16 +387,16 @@ async def _already_recorded(
         LOGGER.exception("load decision dedupe read failed user=%s", user_id)
         return False
 
+    if not row:
+        return False
+    try:
+        stored = json.loads(row["details"] or "{}")
+    except (TypeError, ValueError):
+        # An unreadable row cannot prove anything about the current state.
+        return False
+
     wanted = {key: decision_fields.get(key) for key in _DECISION_IDENTITY_FIELDS}
-    for existing in rows or []:
-        try:
-            stored = json.loads(existing["details"] or "{}")
-        except (TypeError, ValueError):
-            # An unreadable row cannot prove this recommendation was recorded.
-            continue
-        if all(_same_value(stored.get(k), v) for k, v in wanted.items()):
-            return True
-    return False
+    return all(_same_value(stored.get(k), v) for k, v in wanted.items())
 
 
 #: The persisted fields that make one recommendation materially different from
