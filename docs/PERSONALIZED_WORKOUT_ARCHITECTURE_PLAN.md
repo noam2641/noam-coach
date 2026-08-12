@@ -179,7 +179,9 @@ into permanent identity and destroying the information `NULL` currently carries.
 | **A7** | **COMPLETE** | `6de87f9` | #71 | proven, exit 0 |
 | **A10** | **COMPLETE** | `4627e05` | #74 | proven, exit 0 |
 | **A11b** | **COMPLETE** | `37c5bc3` | #75 | proven, exit 0 |
-| A8, A12, A13 | not started | — | — | — |
+| **A12** | **COMPLETE** | `ddd73f4` | #76 | proven, exit 0 |
+| **A13** | **COMPLETE** | `a53d94e` | #80 | proven, exit 0 |
+| **A8** | **COMPLETE / RETIRED** | — | — | absorbed by A2 + A11b; not reopened |
 
 ### A11b — the slot identity contract, as shipped
 
