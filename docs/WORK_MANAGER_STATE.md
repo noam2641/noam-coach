@@ -13,9 +13,10 @@ phase changes and before every pause.
 | **Governance rule (binding)** | **REUSE BEFORE BUILD.** Before adding any new code path, helper, service, table, migration, state model, callback, audit event, guard, API, job or UI component, the assigned agent runs a repository-wide reuse check and records a **Reuse assessment** in the task plan and PR. Prefer extend/repair/generalise; an incomplete mechanism is a candidate for upgrade, not permission to duplicate. NEW requires recorded evidence that the existing architecture cannot support the requirement. Superseded paths are retired, not left beside the new one. The Work Manager verifies the assessment independently before implementation and before merge; a proposal without evidence **returns to planning**. Full text: §2a of `docs/PERSONALIZED_WORKOUT_ARCHITECTURE_PLAN.md`. |
 | Approved work outstanding | **Track A**: **A13 only.** Done and merged with reachability proven: A1–A7, A9, A10, A11a, A11b, A12. **A8 is COMPLETE / RETIRED through A2 + A11b** — not reopened, not expanded. **W1-44 is closed by A9**; **W1-10 is split into A2 + A8**, with the progression-history residual carried separately as **W1-10R** (below). **Track B** (WAVE-1 survivors): W1-11, W1-13, W1-14, W1-15, W1-16, W1-18, W1-20, W1-21, W1-22, W1-23, and **W1-17 (reopened — see below)**. |
 | W1-10R (registered 2026-08-03) | **Preserve progression history across a slot implementation change.** The residual left after W1-10 was split into A2 + A8: when the exercise occupying a slot changes (substitution, promotion, plan rebuild), the load/progression history keyed to the previous implementation is not carried forward, so progression restarts. A2 gave `sets` a stable `exercise_index` and A11b gave slots a stable `slot_id`, which together make the carry-forward *expressible* — neither performs it. Owner: unassigned. **Not scheduled**; recorded so it cannot vanish into "A8 is done". |
-| A13 (the only remaining Track A item) | **Persist the load decision to audit.** Surfaced by A5: `LoadRecommendation.to_audit_dict()` is complete but its only consumer is a Mini App debug endpoint, so no past recommendation can be reconstructed. Owner: Observability. Scope is recording-only — no load-behaviour change. Structured fields only, never the Hebrew explanation or raw set rows. Must handle duplicate suppression: `ui.py` calls `recommend_load` per exercise in a render loop. **Must rebase on `ed4c9b9` and re-run the REUSE BEFORE BUILD audit before implementation**, because A12 landed after this row was written and now owns audit-write surface (`_finalize` writes `promote_substitution`/`preference` inside the finalizing transaction) and the `("promote_substitution","preference")` allowlist entry in `services/core.py`. The overlap is real and must be assessed, not assumed away. |
+| A13 (the only remaining Track A item) | **Persist the load decision to audit.** Surfaced by A5: `LoadRecommendation.to_audit_dict()` is complete but its only consumer is a Mini App debug endpoint, so no past recommendation can be reconstructed. Owner: Observability. Scope is recording-only — no load-behaviour change. Structured fields only, never the Hebrew explanation or raw set rows. Must handle duplicate suppression: `ui.py` calls `recommend_load` per exercise in a render loop. **Must rebase on `ed4c9b9` and re-run the REUSE BEFORE BUILD audit before implementation**, because A12 landed after this row was written and now owns audit-write surface (`_finalize` writes `promote_substitution`/`preference` inside the finalizing transaction) and the `("promote_substitution","preference")` allowlist entry in `services/core.py`. The overlap is real and must be assessed, not assumed away. **Track C's C-INV invariants bind A13 wherever it renders user-facing text** — A13 is recording-only, so in practice this touches little, but the binding is stated so it is not re-litigated per task. |
 | W1-18 / W1-19 (partial) | Both remain **PARTIALLY COMPLETE** with their known residuals; neither is closed. W1-18 was partially fixed incidentally by W1-7 rather than by direct work, so the remainder was never scoped. W1-19 (#40) covered part of its item only. Not scheduled; not to be recorded as done without evidence. |
 | W1-24 – W1-43 | **UNVERIFIED.** No repository evidence has been gathered for these items either way. They are neither claimed complete nor confirmed open. Any status change requires the same evidence standard applied to W1-17 above — a code or git observation, not a document claim. |
+| **Track C — Conversation Architecture (registered 2026-08-03)** | **DESIGN / RESEARCH ONLY. No implementation authorized.** Derived from a read-only analysis of an exported Meta AI coaching conversation (71 messages, Hebrew), studied for interaction principles rather than features. Five of its behaviours were rejected as already implemented here (stimulant-appetite awareness, `session_minutes` fitting, running daily totals, live set logging, plateau/deload assessment). **Binding constraint on the whole track: nothing in it may weaken or bypass any guarantee established by A10, A11b or A12.** The source conversation's fluency is partly a product of having no binding obligations — it delivered instantly because nothing it said was authoritative, and it accepted every deviation because it was tracking none. Two of its most attractive properties (instant delivery, unconditional acceptance) are precisely the ones that would erode safety gating and adherence integrity if adopted without a boundary. See §Track C below. |
 | Batch 1 evidence | A1 `0691da3` — pain mirror isolated from the committed safety write. A2 `09e06d9` — migration 16 adds nullable `sets.exercise_index`; undo rewinds to the performed occurrence. A3 `295bb9f`+`2bd99da` — effort CTA on the rest screen, offered only when RIR is unknown. Each verified to fail without its fix. |
 | Corrected 2026-07-29 | This row previously named W1-7 as the active task and listed W1-7/W1-8 as outstanding. **Both are merged and live in code** — verified on `develop`. W1-10 is split into A2+A8; W1-44 is absorbed into A9. *(The "W1-17 (#42) … done" clause in this row is **withdrawn** — see the W1-17 row below. W1-19 (#40) is partially complete, see below.)* |
 | **W1-17 — REOPENED (corrected 2026-08-03)** | **OPEN. Owner: Observability.** The previous "**DONE — #42**" claim is **incorrect and is removed.** PR #42 is *"Anchor learning windows to the data, not to today (W1-3)"*, merge `0ac6a0d`, and its diff touches exactly two files — `routine.py` and `tests/test_learning_window_anchoring.py`. It never touched observability and never addressed the case-drift defect; the completion claim was a misattribution to the wrong item. **The defect is still live at `ed4c9b9`:** `noam_coach/bot/callback_router.py:289` writes the event as lowercase `"user_callback"`, while `data_quality.py:249` queries `WHERE event IN ('USER_MESSAGE','USER_CALLBACK')` — uppercase. SQLite `IN` is case-sensitive for text, so **that query cannot match a single callback row that the router writes**: it returns 0 while the rows exist. Three stores with no shared key and drifting case names is the underlying W1-17 finding, and it is unfixed. |
@@ -578,6 +579,119 @@ the single source for this wave; do not maintain a copy outside the repository.
    and `assistant.py` contain zero logging calls). This is *why* a dead button
    survived: `routing.decided` is written before dispatch and nothing records
    the outcome.
+
+## Track C — Conversation Architecture (DESIGN / RESEARCH — no implementation authorized)
+
+Registered 2026-08-03 from a read-only study of an exported Meta AI coaching
+conversation. The artifact was analysed as **interaction design**, not as a
+feature list: what governs each turn, not what each turn delivers.
+
+**Why this track exists.** Our system can be technically correct and still feel
+mechanical or judgmental. Every item below addresses that gap and nothing else.
+None of them changes what we compute — only what the user experiences of it.
+
+### C-INV — Binding conversation invariants (adopted; apply to all new work)
+
+These are **standards, not projects**. They bind any task that renders text to
+a user, in this track or any other. They add no state and no new component.
+
+1. **Visible state reflection.** When the user supplies information, show
+   immediately what changed because of it. Extraction that lands silently in
+   `user_facts` earns nothing: the user cannot tell the system heard him, so
+   the next disclosure has no reason to feel worthwhile.
+2. **No debt framing.** A deviation is never presented as a debt, a failure or
+   a shortfall to be repaid. Several components already compute shortfalls
+   (adherence, calorie watch, weekly summary); this invariant governs how — and
+   whether — those numbers are ever surfaced as an accusation.
+3. **Explain enforced boundaries.** When we refuse, gate or substitute, say
+   why. We already fail closed correctly (A10 safety gating, A12 staleness);
+   we do it silently, so correct behaviour reads to the user as malfunction.
+4. **Bounded choice with a recommendation.** When a decision is needed: a small
+   number of concrete options, each pre-costed, and **one of them named as the
+   recommendation**. Options without a default transfer the computation back to
+   the user, which is the effort we exist to remove.
+5. **Felt continuity.** When stored knowledge materially changes an answer, make
+   that link visible — "because of the tennis elbow you told me about, I'd
+   rather do X than Y today," not merely a silently safe exercise.
+
+   *This is the one that resolves the structural-vs-felt tension.* The source
+   conversation claimed memory ("אני זוכר אותך") and then, forty minutes after
+   accommodating an elbow injury, prescribed hammer curls and dips — correcting
+   only when challenged. Its continuity is a conversational artifact. Ours is
+   structural: stored, enforced at every plan-build path, fail-closed,
+   deliberate-breakage tested. We hold the knowledge and never say so. This
+   invariant buys the felt property at rendering time, with no change to the
+   guarantee underneath.
+
+### C-1 — Progressive refinement (DESIGN ONLY — problem accepted, solution not)
+
+**The asymmetry is real.** We are precondition-gated: `check_plan_readiness`
+requires eight facts before a plan exists, so we ask eight questions and then
+deliver. The source conversation delivers a generic plan immediately and earns
+those same facts as *corrections* to it — the user never fills a form, yet a
+complete profile assembles itself, because reacting is cheaper than specifying.
+
+**What is approved: the principle only.** Early value may be offered on partial
+information, but **no partial output may become authoritative or bypass a
+safety gate.** A first-pass direction is explicitly framed as provisional —
+"this is an initial direction; once you answer X and Y I'll sharpen it" — and
+is **not persisted as an active plan**.
+
+**What is NOT approved:** a new persisted `provisional` plan kind, or any new
+state. The earlier analysis jumped from a real problem to an architectural
+solution; that jump is withdrawn. Any structural change here requires a
+separate design pass and explicit authorization.
+
+### C-2 — Interaction registers (DESIGN ONLY)
+
+The source conversation runs three distinct stances and switches between them
+mid-thread: **planning** (long, structured), **live companion** (two lines, one
+question), and **repair** (no plan at all — a smaller option offered instead).
+The sharpest moment in the artifact is a register shift: at "אין לי כוח
+להתאמן" it abandons the pending question (next set weight) rather than
+answering it, and offers ten minutes or a walk. It reads state, not intent.
+
+We have **flows** — a state machine over a task (`FlowName.workout_session`,
+`active_flow`). A register is orthogonal: a stance toward the user that cuts
+across tasks. `training.py:656` already computes something adjacent (fatigue /
+plateau) and spends it on a deload heads-up rather than on how we speak.
+
+**Approved shape: a transient, derived `interaction_mode`** — e.g. `normal`,
+`low_energy`, `repair`, `live_action`, `planning` — resolved per turn from the
+current conversation and context.
+
+**Explicitly rejected: a persisted psychological label.** "User is depleted"
+stored on the profile is a diagnosis we are not entitled to make, and it decays
+badly — one bad evening would become a durable property of the person. Derived
+and transient achieves the same behaviour with none of that risk.
+
+### Rejected from the source artifact (recorded so they are not re-proposed)
+
+- **Already ours, better:** stimulant-appetite awareness (`morning_flag`),
+  `session_minutes` fitting, running daily calorie/protein totals, live per-set
+  logging with progression, plateau/deload assessment, injury-aware
+  substitution. The artifact *described* several of these as future
+  capabilities; we have them built and tested.
+- **Meal-photo calorie extraction** — ours is verified; the artifact's invents
+  numbers from an image with no verification.
+- **"Send three emojis every evening"** — duplicates check-ins and adds a
+  parallel input path. Technical debt.
+- **Persona styling** — tone is not architecture.
+
+### Defects observed in the source (useful as anti-patterns)
+
+1. **Forgot the injury it had accommodated** 40 minutes earlier, and corrected
+   only when challenged.
+2. **Fabricated precision** — "2 schnitzels ≈ 550-600 kcal" with no portion or
+   cooking method, silently revised when sauce was mentioned.
+3. **Stated a limit and then abandoned it** — called a 16.8 kg / 3-month target
+   aggressive, then complied with a ~1000 kcal/day deficit anyway. Stating a
+   boundary without holding it converts honesty into theatre.
+4. **Crisis misfire** — a benign body-composition question ("I don't want to
+   lose weight, I want to look better") returned a crisis-hotline referral and
+   never answered the question. We have **no** crisis-routing path in either
+   direction; that is a separate gap, unscheduled, and a naive classifier would
+   reproduce exactly this failure.
 
 ## Links
 - **WAVE-1 work plan (current): `docs/WAVE1_WORK_PLAN.md`**
