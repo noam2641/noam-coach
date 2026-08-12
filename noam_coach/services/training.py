@@ -125,6 +125,41 @@ async def active_session(user_id: int) -> dict[str, Any] | None:
 
 RIR_UNKNOWN = -1
 
+#: A13: the audit surface for the load decision.
+#:
+#: `audit` rather than the event stream, deliberately. A13 exists to answer
+#: "what did we recommend for this set" when a user disputes a weight, which is
+#: a durable record question. `emit_event` is the better-instrumented boundary
+#: -- correlation, mode policy, its own contained failure handling -- but it
+#: writes the event STREAM, which is retention-bounded and mode-gated: with
+#: observability OFF it performs no write at all, and the record a dispute
+#: needs would legitimately not exist.
+_LOAD_AUDIT_ACTION = "recommend_load"
+_LOAD_AUDIT_ENTITY = "exercise"
+
+#: Caps for the joined token scalars below. Bounded so an audit row can never
+#: carry an unbounded payload, and well under `_AUDIT_MAX_SCALAR_STR`.
+_MAX_AUDIT_TOKENS = 8
+_MAX_AUDIT_TOKEN_LEN = 24
+
+
+def _bounded_tokens(values: Any) -> str:
+    """Join bounded codes into ONE scalar the audit allowlist will keep.
+
+    `_scalar_only` returns False for a list, so a list-valued detail is dropped
+    silently -- no error, no log, and a test that asserts "the write happened"
+    still passes while the field is gone. Encoding at the source removes the
+    trap instead of documenting it.
+    """
+    if not values:
+        return ""
+    tokens = []
+    for value in list(values)[:_MAX_AUDIT_TOKENS]:
+        token = str(value).strip()[:_MAX_AUDIT_TOKEN_LEN]
+        if token:
+            tokens.append(token)
+    return ",".join(tokens)
+
 
 @dataclass(frozen=True)
 class LoadRecommendation:
@@ -141,16 +176,86 @@ class LoadRecommendation:
         return self.weight, self.reps, self.explanation
 
     def to_audit_dict(self) -> dict[str, Any]:
+        """The persistence-safe shape of this decision (A13).
+
+        Two rules make this shape different from the dataclass:
+
+        * **No prose.** `explanation` is free Hebrew text written for a human
+          reading a workout card. LOG-012 exists because exactly that kind of
+          text reached `audit` and then the DSAR export, so it is absent here
+          by construction rather than by an allowlist that a future caller
+          might extend. A display surface that wants it reads `.explanation`
+          from the recommendation directly -- see `mini_api`.
+        * **No lists.** `_allowlist_audit_details` drops list-valued details
+          via `_scalar_only`, silently and without error, so `signals` as a
+          list would vanish from the stored row while its test still passed.
+          They are joined into bounded scalars here, at the single place that
+          defines the persisted shape, so no call site can get it wrong.
+        """
         return {
             "decision": self.decision,
             "recommended_weight": self.weight,
             "recommended_reps": self.reps,
-            "explanation": self.explanation,
-            "signals": list(self.signals),
-            "missing_context": list(self.missing_context),
+            "signals": _bounded_tokens(self.signals),
+            "missing_context": _bounded_tokens(self.missing_context),
             "confidence": self.confidence,
             "data_completeness": self.data_completeness,
         }
+
+
+#: Channels that PRESENT a load prescription to the athlete. Recorded so two
+#: genuine presentations of the same set -- the Telegram card and the Watch
+#: face -- are distinguishable instead of reading as a duplicate.
+LOAD_CHANNEL_TELEGRAM = "telegram"
+LOAD_CHANNEL_WATCH = "watch"
+
+#: In-process counters, mirroring `emit.py`'s `_health`. A silent failure with
+#: no signal is the second thing that boundary forbids.
+_LOAD_AUDIT_HEALTH: dict[str, Any] = {"write_failures": 0, "last_error": None}
+
+
+async def record_load_decision(
+    user_id: int,
+    decision: LoadRecommendation,
+    *,
+    exercise_id: str,
+    session_id: Any,
+    set_number: Any,
+    channel: str,
+) -> None:
+    """Record one load decision the athlete was actually asked to act on (A13).
+
+    Recording is best-effort; the set is not. This borrows the contract stated
+    in `observability/emit.py` -- contain the failure, count it, log it
+    structurally, never raise -- rather than adding a second governed boundary
+    beside it. A13 needs no transaction (unlike A12, whose audit row must
+    commit with its status UPDATE, which is why A12 writes a raw INSERT and
+    this does not).
+
+    CALL THIS AFTER THE RECOMMENDATION HAS BEEN PRESENTED. It is awaited, so a
+    caller that awaits it before rendering would put database latency in front
+    of the user's card -- which A13 must not do.
+    """
+    from noam_coach.services.core import write_audit
+
+    try:
+        await write_audit(
+            user_id,
+            _LOAD_AUDIT_ACTION,
+            _LOAD_AUDIT_ENTITY,
+            exercise_id,
+            channel=channel,
+            session_id=int(session_id) if session_id is not None else None,
+            set_number=int(set_number) if set_number is not None else None,
+            **decision.to_audit_dict(),
+        )
+    except Exception as exc:  # noqa: BLE001 — never break coaching (emit.py rule 1).
+        _LOAD_AUDIT_HEALTH["write_failures"] += 1
+        _LOAD_AUDIT_HEALTH["last_error"] = f"{type(exc).__name__}: {exc}"
+        LOGGER.error(
+            "load decision audit failed user=%s exercise=%s channel=%s: %s",
+            user_id, exercise_id, channel, exc,
+        )
 
 
 # ---------------------------------------------------------------------------

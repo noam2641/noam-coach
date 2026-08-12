@@ -1,6 +1,7 @@
 """Apple Watch workout companion routes."""
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -14,7 +15,14 @@ from noam_coach.bot.workout import try_save_set
 from noam_coach.runtime_bind import runtime_bound
 from noam_coach.services import workout_slots
 from noam_coach.services.core import ensure_user_record
-from noam_coach.services.training import RIR_UNKNOWN, active_session, recommend_load
+from noam_coach.services.training import (
+    LOAD_CHANNEL_WATCH,
+    RIR_UNKNOWN,
+    active_session,
+    recommend_load,
+    recommend_load_decision,
+    record_load_decision,
+)
 
 router = APIRouter()
 _RUNTIME = (
@@ -23,6 +31,8 @@ _RUNTIME = (
     "ensure_user_record",
     "active_session",
     "recommend_load",
+    "recommend_load_decision",
+    "record_load_decision",
     "try_save_set",
     "RIR_UNKNOWN",
     "workout_slots",
@@ -66,11 +76,36 @@ async def watch_current(user_id: int) -> dict[str, Any]:
             "exercise_index": exercise_index,
             "set_number": session["set_number"],
         }
-    weight, reps, _ = await recommend_load(user_id, current)
+    load_decision = await recommend_load_decision(user_id, current)
+    weight, reps, _ = load_decision.to_tuple()
+    recommendation_presented = True
     if session.get("pending_weight") is not None:
         weight = float(session["pending_weight"])
+        recommendation_presented = False
     if session.get("pending_reps") is not None:
         reps = int(session["pending_reps"])
+        recommendation_presented = False
+
+    # A13 — this endpoint PRESENTS a prescription: the payload below is what
+    # the Watch face shows and the athlete lifts to. It is therefore an
+    # actionable recommendation like the Telegram card, in a different channel.
+    #
+    # Unlike the card, there is no "after presentation" inside this function --
+    # the `return` IS the presentation. An awaited write here would sit in
+    # front of every Watch poll, so recording is scheduled as an independent
+    # task and the response is not held for it. `record_load_decision` cannot
+    # raise, so the task cannot surface as an unretrieved exception.
+    if recommendation_presented:
+        asyncio.ensure_future(
+            record_load_decision(
+                user_id,
+                load_decision,
+                exercise_id=str(current.get("id") or ""),
+                session_id=session["id"],
+                set_number=session["set_number"],
+                channel=LOAD_CHANNEL_WATCH,
+            )
+        )
 
     return {
         "active": True,
