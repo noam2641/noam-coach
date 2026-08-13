@@ -647,11 +647,21 @@ screens — it renders workout titles only today **[V]**. Document program impor
 
 | Lane | Open items | Note |
 |---|---|---|
-| **C — Observability** | W1-11, W1-13, W1-14, W1-15, W1-16 | W1-17 done (#42). **W1-14** and **W1-16** directly serve A9's audit requirement — sequence adjacent |
-| **A — Nutrition** | W1-18, W1-20, W1-21, W1-22, W1-23 | W1-19 done (#40). Independent of Track A |
-| **D — Workout** | *(none)* | W1-10 dissolved into A2 + A8 |
+| **C — Observability** | W1-11, W1-13 *(residual)*, W1-14, W1-15, W1-16 | **W1-17 is CLOSED as OBSOLETE / SUPERSEDED BY ARCHITECTURE** — *not* "done (#42)", which was a misattribution, and *not* open either; its reopening mechanism was disproven by measurement (see `docs/WORK_MANAGER_STATE.md`). Its only surviving sub-concern transferred to **W1-14**. **W1-14** and **W1-16** directly serve A9's audit requirement — sequence adjacent |
+| **A — Nutrition** | W1-18 *(residual)*, W1-19 *(read side)*, W1-20, W1-21, W1-22 *(wiring)*, W1-23 *(half 1)* | **W1-19's "done (#40)" is withdrawn** — unsupported; only its `proposal_only` read side survives. Independent of Track A |
+| **D — Workout** | *(none in Lane D)* | W1-10 dissolved into A2 + A8; the progression-history residual is carried as **W1-10R** (open, unassigned) |
+| **UX / hygiene** | W1-24–W1-36 *(open, serial)* · W1-37–W1-43 *(blocked)* | No central strings module, so the UX band is not parallelizable with any logic lane. W1-37–W1-43 are live-DB row corrections with no code component and are **blocked by governance, not obsolete** |
 
-Completed and removed from the active backlog: W1-7, W1-8, W1-17, W1-19.
+Completed and removed from the active backlog: W1-7, W1-8.
+**W1-17 is removed from the active backlog as OBSOLETE / SUPERSEDED, not as completed** —
+the distinction matters: no work was done, and none is required.
+**W1-19 remains partially open** and must not be recorded as completed.
+
+Reconciled against `origin/develop` @ `2895559` on 2026-08-13 (B0). Per-item
+evidence with `file:line` lives in `docs/WORK_MANAGER_STATE.md`; that row is the
+current source of truth for Track B status, and several path citations in
+`docs/WAVE1_WORK_PLAN.md` are stale because this repository keeps a root-level
+legacy layer parallel to the `noam_coach/` package.
 
 ---
 
