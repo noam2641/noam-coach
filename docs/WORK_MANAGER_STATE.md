@@ -26,7 +26,7 @@ phase changes and before every pause.
 | W1-37 – W1-43 (data hygiene) | **BLOCKED BY GOVERNANCE — not obsolete, not unverified.** These are live-DB row corrections with **no code component**. Acting on them requires the live database, which the standing constraints forbid (the Bot/API is running and must not be touched or restarted). They stay registered and unschedulable until an explicit, separately-authorized maintenance window exists. Do **not** reclassify them as complete or obsolete on the basis of this row. |
 | Evidence standard (unchanged) | Any status change for a Track B item requires a code or git observation, not a document claim — the same standard applied to W1-17 above, which is precisely how the W1-17 reopening mechanism was disproven. |
 | Batch 1 evidence | A1 `0691da3` — pain mirror isolated from the committed safety write. A2 `09e06d9` — migration 16 adds nullable `sets.exercise_index`; undo rewinds to the performed occurrence. A3 `295bb9f`+`2bd99da` — effort CTA on the rest screen, offered only when RIR is unknown. Each verified to fail without its fix. |
-| Corrected 2026-07-29 | This row previously named W1-7 as the active task and listed W1-7/W1-8 as outstanding. **Both are merged and live in code** — verified on `develop`. W1-10 is split into A2+A8; W1-44 is absorbed into A9. *(The "W1-17 (#42) … done" clause in this row is **withdrawn** — see the W1-17 row below. W1-19 (#40) is partially complete, see below.)* |
+| Corrected 2026-07-29 | This row previously named W1-7 as the active task and listed W1-7/W1-8 as outstanding. **Both are merged and live in code** — verified on `develop`. W1-10 is split into A2+A8; W1-44 is absorbed into A9. *(The "W1-17 (#42) … done" clause in this row is **withdrawn** — see the W1-17 row below, which as of 2026-08-13 closes W1-17 as OBSOLETE / SUPERSEDED rather than open. W1-19 (#40) is partially complete — read side only, see the W1-18/W1-19 row.)* |
 | **W1-17 — CLOSED: OBSOLETE / SUPERSEDED BY ARCHITECTURE (corrected 2026-08-13, B0)** | **No production implementation remains.** *(History preserved: this row previously read "DONE — #42", which was withdrawn on 2026-08-03 as a misattribution — PR #42 is "Anchor learning windows to the data, not to today (W1-3)", merge `0ac6a0d`, touching only `routine.py` and `tests/test_learning_window_anchoring.py`. That withdrawal was correct. The row was then REOPENED on a technical mechanism which is now itself **disproven** — see below.)* **The reopening mechanism was wrong.** It claimed `noam_coach/bot/callback_router.py:289` writes lowercase `"user_callback"` while `data_quality.py:249` queries uppercase, so SQLite's case-sensitive `IN` "cannot match a single callback row". That analysis read only the FIRST half of `track_event` (`noam_coach/services/core.py:118`), which performs a **deliberate dual write**: `:121-127` inserts into `analytics_events` verbatim, then `:128-139` calls `event_log.append_event(..., event.upper(), ...)` → `product_events` (root `event_log.py:105`). The name is **uppercased on the way into the table the query reads**, so the table+case pairing is internally consistent. **Measured on a temp DB** (migrated 1→17, real `track_event` + real `can_send_proactive`, live DB never opened): `track_event(user,'user_callback')` → `analytics_events=['user_callback']`, `product_events=['USER_CALLBACK']`, and `can_send_proactive` → `(False,'user_recently_active')`; the `USER_MESSAGE` path suppresses identically. **Formally withdrawn: "proactive messages are never suppressed for a recently-active user" and "the query reads the wrong table / wrong case".** The suppression path is CORRECT and must not be "fixed": `data_quality.py:249` is the one uppercase-dependent reader, and `tests/test_analytics_dsar_redaction.py:144/160-161/167` deliberately pin BOTH spellings in `analytics_events` to prove redaction is case-agnostic — normalizing either spelling breaks them. **The three-store premise is the intended architecture, not a defect:** `noam_coach/observability/__init__.py:17-19` declares `audit` (domain/business audit trail) and `analytics_events` (compatibility/product metrics) **"intentionally remain separate stores with separate purposes"**, layered under `product_events` as the canonical interaction trace (`event_log.py:8-16`, `config.py:94`). **No migration 18** — see the row below. The only surviving sub-concern (safety evidence reachable only via `audit`) is **transferred to W1-14**, whose own fix (emit a product event at the `safety_alert` and `approve_substitution` sites) closes it with no schema change. |
 | **No migration 18 (decided 2026-08-13, B0)** | A migration adding `trace_id` to `analytics_events` / `audit` was considered for W1-17 and is **NOT JUSTIFIED**, on four independent grounds. **(1) Zero blocked consumers.** Every reader was enumerated: `audit` has four — `noam_coach/bot/checkins.py:221` (`user_id`+`action`), `noam_coach/services/substitution_patterns.py:224` (`user_id`+`action`+time, joining `sessions`/`sets`), `noam_coach/services/training.py:474` (A13's own reader: `user_id`+`action`+`entity`+`entity_id`+JSON details), `retention.py:141` (time); `analytics_events` has two (the DSAR per-table dump `scripts/export_user_data.py:45`, and `retention.py:137`). **None keys on trace; none joins across stores.** **(2) The capability already exists and is reusable.** `product_events` carries the full envelope (migration 13, `db.py:1355-1372`) with ambient auto-inheritance (`event_log.py:93-102`), and `write_audit` (`noam_coach/services/core.py:494-522`) already carries `entity`/`entity_id` — a sufficient join key, so W1-14's product event closes the gap without touching `audit`. A second mechanism for a join `entity_id` already expresses is exactly what REUSE BEFORE BUILD forbids. **(3) It would be unevenly NULL and unread.** `write_audit`'s call sites split: handler-originated rows could inherit a trace, but `health_jobs.py` ×3, `health_service.py`, `plan_readiness.py` ×2, `plan_mutations.py` and `training.py` run in job context and could not — a partially-NULL column in a governance store means a `trace_id IS NOT NULL` filter silently under-reports safety evidence. **(4) Retention makes it incoherent.** `config.py:90-100`: `analytics_events` = 180 days, `product_events` = 365 — a trace pointer on an analytics row expires while its target survives. **Reopen only on** a named, approved consumer that must reconstruct an interaction spanning `product_events` AND an `audit`/`analytics_events` row **whose `entity`/`entity_id` cannot express the link.** No such consumer exists at `2895559`. |
 | Active worktree | `C:\coach_bot\noam-coach` (integration) — the single remaining worktree; every `C:\coach_bot\wt-*` task worktree is removed. A new one is created per parallel writer and removed after its merge. |
@@ -34,9 +34,15 @@ phase changes and before every pause.
 | Protected/PII data | `noam_coach_complete_release\noam_coach.db` (sha `5bd8ac1b…`); `C:\coach_bot\noam-coach-private-audit\` (session trace + meal images) |
 
 ## Current objective
-**WAVE-1 — defects found in the 2026-07-27 live session.** The plan is
-`docs/WAVE1_WORK_PLAN.md` (43 items, five bands). WAVE-0 is closed and its
-fixes are confirmed working in production; see §WAVE-1 below for the evidence.
+**Track B — the surviving WAVE-1 backlog**, reconciled against `origin/develop`
+@ `2895559` on 2026-08-13 (B0). The plan is `docs/WAVE1_WORK_PLAN.md` (43 items,
+five bands); **its per-item status markers and several of its file paths are
+stale**, so the "Track B residuals" row in this document is authoritative where
+the two disagree. Track A is complete. WAVE-0 is closed and its fixes are
+confirmed working in production; see §WAVE-1 below for the evidence.
+
+**No Track B implementation is authorized yet.** The reconciled first batch under
+consideration is W1-16, W1-20 and W1-23.
 
 Naming note: an earlier, unrelated batch was also called "WAVE-1" (B1 / R1 /
 LOG-004 / UX-01, merged as PR #17). The current WAVE-1 is the 2026-07-27 audit
@@ -55,15 +61,25 @@ wave. Where the distinction matters, this document says "WAVE-1 (2026-07-27)".
 - **WAVE-0** — **COMPLETE.** All seven PRs merged: #25–#29 (the five lanes),
   #30 (docs), #31 (the migration-15 startup fix found post-merge). See below.
 
-## Active task
-WAVE-1 (2026-07-27). **14 PRs merged (#33–#46)**: four P0s, two docs, and eight
-WAVE-1 items (W1-1, W1-2, W1-3, W1-4, W1-5, W1-6, W1-9, W1-12). `develop` @
-`3d5dd18`, zero open PRs, single worktree.
+## WAVE-1 wave record (historical — superseded as a status source)
 
-Next: W1-7 (`build_plan` mutates with no confirmation) and W1-8 (a schedule
-correction was discarded while the bot said it agreed) — Lane E, which shares
-reach with Lane A and must therefore be serialized rather than run in parallel
-with nutrition work.
+> **This section is a historical snapshot of the WAVE-1 wave, not current state.**
+> Corrected 2026-08-13 (B0): it previously carried the heading "Active task" and
+> named **W1-7 and W1-8 as "Next"**, while both were already merged and live in
+> code, at a `develop` SHA (`3d5dd18`) many merges old, and asserted "zero open
+> PRs" which is no longer true. For current state read the table at the top of this
+> document; the "Track B residuals" row is authoritative for Track B.
+
+WAVE-1 (2026-07-27). **14 PRs merged (#33–#46)**: four P0s, two docs, and eight
+WAVE-1 items (W1-1, W1-2, W1-3, W1-4, W1-5, W1-6, W1-9, W1-12), as observed at
+`develop` @ `3d5dd18`.
+
+W1-7 (`build_plan` mutates with no confirmation) and W1-8 (a schedule correction
+was discarded while the bot said it agreed) were the Lane E follow-ups at that
+time; **both are now merged and live in code**, verified on `develop`. Lane E
+shares reach with Lane A, which is why it was serialized rather than run in
+parallel with nutrition work — that sequencing lesson still applies to any future
+Lane A/E pairing.
 
 ### Parallel-writer protocol (learned this wave, now standard)
 Disjoint file ownership is **necessary and not sufficient**. The first parallel
@@ -165,19 +181,23 @@ three typed-weight tests failed and the untyped one-tap path stayed green,
 confirming the tests fail for the right reason.
 
 ## Next exact action
-Awaiting a fresh owner-driven session against the reset database. WAVE-0
-changed five things the owner will feel immediately (intent classification,
-typed weight, `##` notes, proactive messages, the Mini App button), and the
-profile is now empty, so a full onboarding pass is the highest-value way to
-exercise them. The resulting `product_events` are a better basis for the next
-wave than continuing from the plan alone.
 
-Ready-to-run when authorised, from `NOAM_COACH_WORK_PLAN_EXECUTABLE.md`:
-**Lane B** (infrastructure — `/help`, voice/video/sticker handlers, medical
-disclaimer) and **Lane C** (technical debt — DSAR redaction, Mini App
-calendar-vs-coaching-day) are file-disjoint and can run in parallel. The
-workout / nutrition / UX lanes share `meal_text.py` and `workout.py` and must
-be serialised.
+**Current (2026-08-13, B0).** Track B is reconciled and W1-17 is closed. The next
+action is the owner's decision on the reconciled first batch — **W1-16, W1-20,
+W1-23** — which is proposed but **not authorized**. No Track B implementation may
+start before that approval. Standing constraints that shape it: the observability
+items collide in `noam_coach/bot/callback_session.py` (serialize W1-16 → W1-14 →
+W1-15); the nutrition items collide in `nutrition_context.py` + `next_meal.py`
+(serialize W1-20 → W1-18 → W1-19); PR #78 and Track C stay gated; W1-37–W1-43 stay
+blocked on live-DB governance; the live Bot/API is not restarted.
+
+> **Superseded WAVE-0-era text, corrected 2026-08-13.** This section previously
+> read "Awaiting a fresh owner-driven session against the reset database" and
+> offered a ready-to-run Lane B / Lane C pairing sourced from
+> `NOAM_COACH_WORK_PLAN_EXECUTABLE.md` — **a file that does not exist in this
+> repository.** Both the next action and the lane pairing predate WAVE-1, Track A
+> and this reconciliation. The one durable point in it still holds and is recorded
+> above: lanes sharing `meal_text.py` / `workout.py` must be serialised.
 
 ## Prohibited scopes (this session)
 AI Gateway · stored weekly-plan regeneration (`planning._meal_slots` Phase 2) ·
@@ -594,5 +614,5 @@ the single source for this wave; do not maintain a copy outside the repository.
 - Canonical implementation ledger: `docs/CANONICAL_IMPLEMENTATION_LEDGER.md`
 - Cleanup ledger: `docs/REPOSITORY_CLEANUP_LEDGER.md`
 - Agent roster & contracts (durable): `docs/WORK_MANAGER_AGENTS.md`
-- PR history: #4/#5/#6/#7/#8 (earlier tracks), #9–#14 (LOG batch), #15–#21 (WAVE-1 + CI hardening), #22–#23 (WAVE-2) — all merged. No open PRs; no task branches outstanding. Superseded line:
+- PR history: #4/#5/#6/#7/#8 (earlier tracks), #9–#14 (LOG batch), #15–#21 (WAVE-1 + CI hardening), #22–#23 (WAVE-2), #59–#77 and #79–#81 (Track A) — all merged. **Open PRs as of 2026-08-13: #78** (Track C design registration — GATED, must not be merged; its body still claims A13 is the highest-priority unfinished item, and both its CI runs are FAILURE) and **#82** (this B0 reconciliation). Superseded line:
   `fix/log-012/014/015/016-*`, `chore/work-manager-autonomy-config`.
