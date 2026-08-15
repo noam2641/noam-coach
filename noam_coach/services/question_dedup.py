@@ -49,6 +49,57 @@ from typing import Any
 
 CLASSIFY_PENDING_PREFIX = "__diet_classify__:"
 
+# W1-23: the payload after the prefix is an ORDERED QUEUE of the items the
+# user named in one answer, not a single item. ``queue[0]`` is the item
+# currently on the classification keyboard; ``queue[1:]`` are still to come.
+# The same pending row (``active_flow.step``) carries it, so the queue is
+# restart-safe for free -- no new mechanism, table or state model.
+#
+# Delimiter: U+001F INFORMATION SEPARATOR ONE (ASCII Unit Separator), the
+# character whose *only* defined purpose is exactly this. It cannot collide
+# with an item produced by ``_parse_dietary_answer``: that parser splits on
+# ``[,\n]+`` / the Hebrew vav connector and then strips whitespace and
+# ``.,;:!?"'`` -- it never emits a C0 control character on its own, and
+# ``encode_classify_pending`` additionally strips every C0 control character
+# from each item before joining, so a hostile paste containing a raw \x1f
+# cannot forge a queue boundary either.
+CLASSIFY_QUEUE_DELIM = "\x1f"
+
+_C0_CONTROL = {chr(code) for code in range(0x00, 0x20)} | {"\x7f"}
+
+
+def _strip_control_chars(value: str) -> str:
+    return "".join(ch for ch in value if ch not in _C0_CONTROL).strip()
+
+
+def encode_classify_pending(items: Any) -> str | None:
+    """Build the pending step for an ordered classification queue.
+
+    Returns ``None`` when nothing is left to classify, which callers treat
+    as "clear the pending question and continue the normal flow".
+    """
+    cleaned: list[str] = []
+    for raw in items or ():
+        item = _strip_control_chars(str(raw))
+        if item and item not in cleaned:
+            cleaned.append(item)
+    if not cleaned:
+        return None
+    return CLASSIFY_PENDING_PREFIX + CLASSIFY_QUEUE_DELIM.join(cleaned)
+
+
+def decode_classify_pending(pending: Any) -> list[str]:
+    """Ordered items still awaiting classification for this pending step.
+
+    Accepts the historical single-item payload unchanged (a payload with no
+    delimiter decodes to a one-element queue), so rows written by an older
+    build resume correctly.
+    """
+    if not isinstance(pending, str) or not pending.startswith(CLASSIFY_PENDING_PREFIX):
+        return []
+    payload = pending[len(CLASSIFY_PENDING_PREFIX):]
+    return [part.strip() for part in payload.split(CLASSIFY_QUEUE_DELIM) if part.strip()]
+
 _NONE_ANSWERS = (
     "אין", "אין לי", "אין אלרגיות", "אין לי אלרגיות", "אין רגישויות",
     "אין לי רגישויות", "אין הגבלות", "שום דבר", "כלום", "אין כלום",
@@ -144,9 +195,14 @@ def install_plan_question_dedup() -> None:
         if pending and pending.startswith(CLASSIFY_PENDING_PREFIX) and text:
             from noam_coach.bot import onboarding as onboarding_bot
 
-            item = pending[len(CLASSIFY_PENDING_PREFIX):]
+            queue = decode_classify_pending(pending)
+            item = queue[0]
             if text in onboarding_bot._CANCEL_WORDS:
-                return await original_text(update, user_id)  # universal cancel
+                # W1-23: a universal cancel word abandons the whole answer,
+                # exactly as before. Cancelling ONE item is the
+                # "לא התכוונתי להימנע" button / "טעות" text, which resolves
+                # through qa:diet_type:cancel and keeps the queue moving.
+                return await original_text(update, user_id)
             resolved = classify_type_from_text(text)
             if resolved is None:
                 await message.reply_text(
@@ -156,11 +212,16 @@ def install_plan_question_dedup() -> None:
                     parse_mode="HTML",
                 )
                 return True
-            await facade.clear_pending(user_id)
             await _emit(
                 db, user_id, "classification_text_resolved",
                 item=item, restriction_type=resolved, text=text[:80],
+                queue_remaining=len(queue) - 1,
             )
+            # W1-23: the pending queue is left in place on purpose — the
+            # canonical qa:diet_type handler is the single place that pops
+            # the head and either re-arms the remainder (rendering the next
+            # keyboard) or clears the pending and continues the wizard. The
+            # button path goes through exactly the same code.
             await facade.handle_onboarding_callback(
                 _CallbackShim(message), user_id, f"qa:diet_type:{resolved}:{item}"
             )
@@ -173,7 +234,8 @@ def install_plan_question_dedup() -> None:
 
             question = questions_module.question_by_id(pending)
         fact_key = getattr(question, "fact_key", None)
-        will_classify_item: str | None = None
+        # W1-23: ALL named items, in order — not only the first.
+        will_classify_items: list[str] = []
         if question is not None and fact_key in _DIETARY_FACT_KEYS and text:
             if is_none_answer(text):
                 import user_model
@@ -208,15 +270,14 @@ def install_plan_question_dedup() -> None:
             except Exception:  # noqa: BLE001
                 parsed = []
             if parsed:
-                will_classify_item = str(parsed[0])
+                will_classify_items = [str(entry) for entry in parsed if str(entry).strip()]
 
         consumed = await original_text(update, user_id)
 
         # --- Invariant repair: answer persisted BEFORE classification. -----
-        if consumed and will_classify_item and fact_key:
+        if consumed and will_classify_items and fact_key:
             import user_model
 
-            item = will_classify_item
             parts_fact = await user_model.get_fact(db, user_id, "diet_restrictions")
             parts_value = (
                 str(parts_fact.get("value"))
@@ -225,8 +286,12 @@ def install_plan_question_dedup() -> None:
                 else ""
             )
             parts = [p.strip() for p in parts_value.split(",") if p.strip()]
-            if item not in parts:
-                parts.append(item)
+            appended = False
+            for item in will_classify_items:
+                if item not in parts:
+                    parts.append(item)
+                    appended = True
+            if appended:
                 await user_model.set_fact(
                     db, user_id, "diet_restrictions", ", ".join(parts),
                     kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
@@ -243,11 +308,24 @@ def install_plan_question_dedup() -> None:
                         kind=user_model.KIND_FACT, source=user_model.SOURCE_USER,
                         confirmed=True,
                     )
-            # The classification is now a real, resumable pending question.
-            await facade.set_pending(user_id, f"{CLASSIFY_PENDING_PREFIX}{item}")
+            # The classification is now a real, resumable pending question —
+            # W1-23: an ORDERED QUEUE of every item the user named, on the
+            # same pending row. ``original_text`` (the protected onboarding
+            # handler) already armed the identical queue; re-arming only when
+            # it did not keeps one writer per state and never rewinds a queue
+            # that has already advanced.
+            flow_now = await conversation.get_active_flow(db, user_id)
+            already = decode_classify_pending(
+                flow_now.step if flow_now.is_question else None
+            )
+            if not already:
+                encoded = encode_classify_pending(will_classify_items)
+                if encoded:
+                    await facade.set_pending(user_id, encoded)
             await _emit(
                 db, user_id, "classification_pending",
-                fact_key=fact_key, item=item,
+                fact_key=fact_key, item=will_classify_items[0],
+                items=list(will_classify_items),
             )
         return consumed
 
@@ -260,12 +338,24 @@ def install_plan_question_dedup() -> None:
         import coach_bot as facade
         import conversation
 
+        db = facade.DB
+        before: list[str] = []
+        if isinstance(data, str) and data.startswith("qa:diet_type:"):
+            flow_before = await conversation.get_active_flow(db, user_id)
+            before = decode_classify_pending(
+                flow_before.step if flow_before.is_question else None
+            )
         result = await original_callback(query, user_id, data)
         if isinstance(data, str) and data.startswith("qa:diet_type:"):
-            # A button tap resolved the classification: release the pending
-            # sub-question so nothing re-renders it.
-            db = facade.DB
+            # A tap/typed answer resolved ONE item. The protected handler has
+            # already popped the head and re-armed the remainder (W1-23), so
+            # only release the pending sub-question when the queue did NOT
+            # advance — i.e. nothing is left to classify. Clearing an advanced
+            # queue here would drop items 2..n all over again.
             flow = await conversation.get_active_flow(db, user_id)
+            after = decode_classify_pending(flow.step if flow.is_question else None)
+            if after and after != before:
+                return result  # queue advanced — keep the new pending head
             if flow.is_question and str(flow.step or "").startswith(CLASSIFY_PENDING_PREFIX):
                 await facade.clear_pending(user_id)
         return result

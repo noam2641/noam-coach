@@ -1074,6 +1074,13 @@ async def handle_onboarding_callback(query: Any, user_id: int, data: str) -> Non
             source="onboarding",
             properties={"restriction_type": restriction_type, "food_item": food_item},
         )
+        # W1-23: one item resolved — if the user named more in the same answer,
+        # ask about the NEXT one instead of continuing the wizard. This runs for
+        # the button tap and (via the shim that re-dispatches here) for the typed
+        # answer, so both paths advance the same queue. A per-item "cancel" is a
+        # resolution like any other and must not abandon the remainder.
+        if await _advance_diet_classification_queue(query, user_id, food_item):
+            return
         if await continue_after_plan_completion_answer(query, user_id):
             return
         if not await ask_next_question(query, user_id):
@@ -3026,6 +3033,75 @@ def format_weekly_plan(
 _CANCEL_WORDS = {"ביטול", "בטל", "עזוב", "תעזוב", "לא משנה", "skip", "cancel", "דלג"}
 
 
+async def _arm_diet_classification_queue(user_id: int, items: Any) -> bool:
+    """Put an ORDERED classification queue on the existing pending row (W1-23).
+
+    A free-text answer can name several foods ("חציל, טורטייה ואגוזים"). Only
+    the first was ever put through the "how should I treat X?" keyboard; items
+    2..n were silently dropped from classification — safety-adjacent, because
+    an unclassified remainder can contain a real allergen.
+
+    This reuses the ``__diet_classify__:`` pending question that already
+    existed for the single-item case (``question_dedup``): the payload after
+    the prefix is now the remaining items joined by a delimiter that item text
+    cannot contain. No new mechanism, table, column or state model.
+
+    Returns True when a queue was armed, False when there was nothing to
+    classify (in which case the pending question is cleared, exactly as the
+    single-item code did).
+    """
+    from noam_coach.services.question_dedup import encode_classify_pending
+
+    encoded = encode_classify_pending(items)
+    if encoded is None:
+        await clear_pending(user_id)
+        return False
+    await set_pending(user_id, encoded)
+    return True
+
+
+async def _advance_diet_classification_queue(target: Any, user_id: int, resolved_item: str) -> bool:
+    """Pop ``resolved_item`` and render the next classification card (W1-23).
+
+    Called from the single canonical ``qa:diet_type:`` handler, so the button
+    path and the typed path (which re-dispatches through that same handler)
+    advance identically. Returns True when another item was rendered — the
+    caller must then NOT continue the wizard yet.
+    """
+    from noam_coach.services.question_dedup import decode_classify_pending
+
+    flow = await conversation.get_active_flow(DB, user_id)
+    queue = decode_classify_pending(flow.step if flow.is_question else None)
+    if not queue:
+        return False
+
+    # The callback payload is truncated to Telegram's 64-byte budget by
+    # ``_safe_cb``, so match the head by prefix rather than equality; fall
+    # back to popping the head so a queue can never wedge on a mismatch.
+    resolved = (resolved_item or "").strip()
+    remaining = [
+        entry
+        for entry in queue
+        if not (entry == resolved or (resolved and entry.startswith(resolved)))
+    ]
+    if len(remaining) == len(queue):
+        remaining = queue[1:]
+
+    if not await _arm_diet_classification_queue(user_id, remaining):
+        return False
+
+    next_item = remaining[0]
+    text = f"איך להתייחס ל{esc(next_item)}?"
+    keyboard = _diet_type_keyboard(next_item)
+    if hasattr(target, "message") and target.message is not None:
+        await target.message.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+    elif hasattr(target, "reply_text"):
+        await target.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+    else:  # pragma: no cover - no surface to render on
+        return False
+    return True
+
+
 def _diet_type_keyboard(food_item: str) -> InlineKeyboardMarkup:
     safe_item = _safe_cb(food_item)
     return InlineKeyboardMarkup([
@@ -3452,8 +3528,11 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
                     properties={"raw_text": text[:200]},
                 )
             if parsed_items:
+                # W1-23: EVERY named item is queued for classification, in
+                # order — not only the first. The queue rides on the existing
+                # __diet_classify__ pending row (restart-safe).
+                await _arm_diet_classification_queue(user_id, parsed_items)
                 first_item = parsed_items[0]
-                await clear_pending(user_id)
                 await message.reply_text(
                     f"איך להתייחס ל{esc(first_item)}?",
                     reply_markup=_diet_type_keyboard(first_item),
@@ -3546,9 +3625,12 @@ async def handle_onboarding_text(update: Update, user_id: int) -> bool:
                     source=user_model.SOURCE_USER,
                     confirmed=True,
                 )
-                # Ask for restriction type classification
+                # Ask for restriction type classification.
+                # W1-23: all parsed items are queued, in order — the storage
+                # loop above already persisted every one of them and is
+                # deliberately left untouched.
+                await _arm_diet_classification_queue(user_id, parsed_items)
                 first_item = parsed_items[0]
-                await clear_pending(user_id)
                 await message.reply_text(
                     f"איך להתייחס ל{esc(first_item)}?",
                     reply_markup=_diet_type_keyboard(first_item),
