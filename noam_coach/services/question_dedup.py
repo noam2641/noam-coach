@@ -31,7 +31,9 @@ Mechanics:
   state the classification callback expects and adjusts), and the
   classification becomes a canonical pending question
   (``__diet_classify__:<item>``) on the active flow — restart-safe,
-  text-answerable.
+  text-answerable. W1-23: when the answer names SEVERAL foods the payload
+  is an ordered QUEUE of them on that same pending row, so every item is
+  classified in turn instead of only the first.
 - a typed classification answer ("אלרגיה" / "רגישות" / "העדפה" / …) is
   mapped to the SAME ``qa:diet_type:*`` callback the buttons dispatch, so
   there is exactly one classification handler; unrecognized text re-prompts
@@ -99,6 +101,7 @@ def decode_classify_pending(pending: Any) -> list[str]:
         return []
     payload = pending[len(CLASSIFY_PENDING_PREFIX):]
     return [part.strip() for part in payload.split(CLASSIFY_QUEUE_DELIM) if part.strip()]
+
 
 _NONE_ANSWERS = (
     "אין", "אין לי", "אין אלרגיות", "אין לי אלרגיות", "אין רגישויות",
