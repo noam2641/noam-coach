@@ -227,11 +227,19 @@ async def _routine_profile(db: Any, user_id: int) -> dict[str, Any]:
     Cross-module callers of this private helper (``next_meal.py:636``,
     ``day_plan.py:478``) are reaching in deliberately for the non-recomputing
     read; they are recorded here because a rename would break them silently.
-    Neither reads ``first_meal_time``/``last_meal_time``: ``day_plan`` takes
-    the sleep block, and ``next_meal`` takes ``typical_meal_hours``, which is
-    a list of independently recurring observed hours (each needs to appear on
-    >= 2 days, see ``routine.learn_eating_windows``) rather than the window
-    interpretation W1-20 gates. So no window guard is owed on those paths.
+    Neither reads ``first_meal_time``/``last_meal_time`` — ``day_plan`` takes
+    the sleep block and ``next_meal`` takes ``typical_meal_hours`` — so the
+    W1-20 window gate is not owed on those paths, which is why it is not
+    applied here.
+
+    That is a statement about SCOPE, not a claim that ``typical_meal_hours``
+    is itself evidence-gated. It is NOT. ``routine.learn_eating_windows``
+    buckets meals by rounded hour and keeps buckets with ``count >= 2``, where
+    the count is of MEALS, not of distinct days (the comment above that code
+    says "recur on multiple days", but the code counts rows in a flat list).
+    Two meals at 08:00 and 08:10 on a SINGLE day yield
+    ``typical_meal_hours == ["08:00"]``. Anyone hardening ``typical_meal_hours``
+    must start from that fact rather than from the misleading comment.
     """
     row = await db.fetch_one("SELECT profile FROM routine_profile WHERE user_id=?", (user_id,))
     if not row:
