@@ -342,23 +342,22 @@ def install_plan_question_dedup() -> None:
         import conversation
 
         db = facade.DB
-        before: list[str] = []
-        if isinstance(data, str) and data.startswith("qa:diet_type:"):
-            flow_before = await conversation.get_active_flow(db, user_id)
-            before = decode_classify_pending(
-                flow_before.step if flow_before.is_question else None
-            )
         result = await original_callback(query, user_id, data)
         if isinstance(data, str) and data.startswith("qa:diet_type:"):
             # A tap/typed answer resolved ONE item. The protected handler has
-            # already popped the head and re-armed the remainder (W1-23), so
-            # only release the pending sub-question when the queue did NOT
-            # advance — i.e. nothing is left to classify. Clearing an advanced
-            # queue here would drop items 2..n all over again.
+            # already popped the resolved entry and re-armed the remainder
+            # (W1-23), so only release the pending sub-question when nothing
+            # is left to classify. Clearing an advanced queue here would drop
+            # items 2..n all over again.
+            #
+            # A queue that is UNCHANGED means the handler rejected the payload
+            # as stale and deliberately kept the head pending (fail-closed).
+            # Clearing it here would defeat that guard and silently drop the
+            # unclassified head — so only clear when the queue actually shrank.
             flow = await conversation.get_active_flow(db, user_id)
             after = decode_classify_pending(flow.step if flow.is_question else None)
-            if after and after != before:
-                return result  # queue advanced — keep the new pending head
+            if after:
+                return result  # still items to classify — keep the pending head
             if flow.is_question and str(flow.step or "").startswith(CLASSIFY_PENDING_PREFIX):
                 await facade.clear_pending(user_id)
         return result

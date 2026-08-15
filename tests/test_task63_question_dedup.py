@@ -663,3 +663,188 @@ async def test_single_item_answer_asks_exactly_once_and_then_continues(
     assert _asked(second.effective_message) == []   # never re-asked
     assert await _pending_queue(db) == []
     assert "אגוזים" in str(await user_model.get_value(db, USER_ID, "allergies"))
+
+
+# ---------------------------------------------------------------------------
+# W1-23 follow-up — a STALE classification callback must fail closed.
+#
+# Telegram cards are not single-use: the user can tap an old card for an
+# item that is already classified, and duplicate deliveries happen. The
+# advance used to fall back to "pop whatever is current" on an unmatchable
+# payload, which (a) persisted a classification the user never gave for the
+# CURRENT item and (b) consumed a queue slot, silently dropping an
+# unclassified restriction. Both are safety-relevant.
+#
+# Invariant: stale callback -> head remains pending, nothing skipped,
+# nothing wrongly written.
+# ---------------------------------------------------------------------------
+
+
+async def _levels(db: Database) -> dict[str, Any]:
+    fact = await user_model.get_fact(db, USER_ID, "diet_restriction_levels")
+    value = (fact or {}).get("value")
+    return dict(value) if isinstance(value, dict) else {}
+
+
+@pytest.mark.asyncio
+async def test_stale_callback_for_a_resolved_item_leaves_the_head_pending(
+    db: Database,
+) -> None:
+    """The required regression: queue [A, B]; resolve A; a STALE callback for
+    A must leave B current AND unclassified."""
+    await _open_question("q_allergies")
+    install_plan_question_dedup()
+    await coach_bot.handle_onboarding_text(_update("גלוטן, חלב"), USER_ID)
+    assert await _pending_queue(db) == ["גלוטן", "חלב"]
+
+    # Resolve A.
+    await coach_bot.handle_onboarding_callback(
+        FakeQuery(), USER_ID, "qa:diet_type:sensitivity:גלוטן"
+    )
+    assert await _pending_queue(db) == ["חלב"]          # B is now current
+    assert await _levels(db) == {"גלוטן": "sensitivity"}
+
+    # STALE: the user taps the OLD card for A again, with a DIFFERENT type.
+    stale = FakeQuery()
+    await coach_bot.handle_onboarding_callback(
+        stale, USER_ID, "qa:diet_type:allergy:גלוטן"
+    )
+
+    # B remains pending and unclassified — nothing was skipped.
+    assert await _pending_queue(db) == ["חלב"]
+    assert "חלב" not in await _levels(db)
+    # A's real classification was NOT overwritten by the stale tap...
+    assert await _levels(db) == {"גלוטן": "sensitivity"}
+    # ...and the stale "allergy" was not persisted anywhere.
+    assert "גלוטן" not in str(await user_model.get_value(db, USER_ID, "allergies"))
+    assert "גלוטן" in str(await user_model.get_value(db, USER_ID, "diet_restrictions"))
+    # The user is re-shown the card that is actually outstanding.
+    assert _asked(stale.message) == ["חלב"]
+
+
+@pytest.mark.asyncio
+async def test_stale_callback_for_an_item_never_in_the_queue_is_ignored(
+    db: Database,
+) -> None:
+    """A button for a food that is not in this queue at all must not reach a
+    write path, and must not consume a queue slot."""
+    await _open_question("q_allergies")
+    install_plan_question_dedup()
+    await coach_bot.handle_onboarding_text(_update("גלוטן, חלב"), USER_ID)
+
+    stale = FakeQuery()
+    await coach_bot.handle_onboarding_callback(
+        stale, USER_ID, "qa:diet_type:allergy:בוטנים"
+    )
+
+    # Nothing consumed, nothing written.
+    assert await _pending_queue(db) == ["גלוטן", "חלב"]
+    assert await _levels(db) == {}
+    assert "בוטנים" not in str(await user_model.get_value(db, USER_ID, "allergies"))
+    assert _asked(stale.message) == ["גלוטן"]           # head re-rendered
+
+
+@pytest.mark.asyncio
+async def test_duplicate_callback_delivery_does_not_double_write(
+    db: Database,
+) -> None:
+    """A replayed delivery of the SAME callback must be a no-op the second
+    time, not a second write that also eats the next queue slot."""
+    await _open_question("q_allergies")
+    install_plan_question_dedup()
+    await coach_bot.handle_onboarding_text(_update("גלוטן, חלב"), USER_ID)
+
+    await coach_bot.handle_onboarding_callback(
+        FakeQuery(), USER_ID, "qa:diet_type:allergy:גלוטן"
+    )
+    allergies_after_first = str(await user_model.get_value(db, USER_ID, "allergies"))
+    assert await _pending_queue(db) == ["חלב"]
+
+    replay = FakeQuery()
+    await coach_bot.handle_onboarding_callback(
+        replay, USER_ID, "qa:diet_type:allergy:גלוטן"
+    )
+
+    assert str(await user_model.get_value(db, USER_ID, "allergies")) == allergies_after_first
+    assert await _pending_queue(db) == ["חלב"]          # חלב not eaten
+    assert "חלב" not in await _levels(db)
+
+
+@pytest.mark.asyncio
+async def test_truncated_payload_persists_the_full_queued_item_name(
+    db: Database,
+) -> None:
+    """``_safe_cb`` truncates callback_data to 15 chars. The classification
+    must be keyed by the FULL queued name, so it matches what is stored in
+    diet_restrictions (and so _unclassified_restriction_count can see it)."""
+    from noam_coach.bot import onboarding as onboarding_bot
+
+    long_item = "אגוזי מלך קלויים בתנור"
+    assert len(long_item) > 15
+    truncated = onboarding_bot._safe_cb(long_item)
+    assert truncated != long_item
+
+    await _open_question("q_allergies")
+    install_plan_question_dedup()
+    await coach_bot.handle_onboarding_text(_update(f"{long_item}, חלב"), USER_ID)
+
+    await coach_bot.handle_onboarding_callback(
+        FakeQuery(), USER_ID, f"qa:diet_type:sensitivity:{truncated}"
+    )
+
+    levels = await _levels(db)
+    assert long_item in levels, levels          # full name, not the 15-char stub
+    assert truncated not in levels
+    assert await _pending_queue(db) == ["חלב"]
+
+
+@pytest.mark.asyncio
+async def test_a_stale_callback_never_leaves_an_item_unasked(
+    db: Database,
+) -> None:
+    """End-to-end: a stale tap in the middle of a 3-item queue must not cost
+    the user a classification prompt. All three still get asked."""
+    await _open_question("q_allergies")
+    install_plan_question_dedup()
+    await coach_bot.handle_onboarding_text(_update("גלוטן, חלב, ביצים"), USER_ID)
+
+    first = FakeQuery()
+    await coach_bot.handle_onboarding_callback(
+        first, USER_ID, "qa:diet_type:sensitivity:גלוטן"
+    )
+    # A stale replay lands between the real answers.
+    await coach_bot.handle_onboarding_callback(
+        FakeQuery(), USER_ID, "qa:diet_type:allergy:גלוטן"
+    )
+    second = FakeQuery()
+    await coach_bot.handle_onboarding_callback(
+        second, USER_ID, "qa:diet_type:sensitivity:חלב"
+    )
+    third = FakeQuery()
+    await coach_bot.handle_onboarding_callback(
+        third, USER_ID, "qa:diet_type:preference:ביצים"
+    )
+
+    assert await _pending_queue(db) == []
+    assert set(await _levels(db)) == set(THREE_ITEMS)   # nothing was skipped
+
+
+@pytest.mark.asyncio
+async def test_classification_without_a_queue_is_still_honoured(
+    db: Database,
+) -> None:
+    """No queue at all (the historical single-card flow, or a card that
+    outlived its pending row) — the payload is the only source of truth and
+    must still be applied. The stale guard must not break that."""
+    from noam_coach.services import core as core_services
+
+    await core_services.set_flow_state(
+        USER_ID, "plan_completion", "q_allergies",
+        {"return_to": "menu:smartplan", "plan_type": "nutrition"},
+    )
+    install_plan_question_dedup()
+
+    await coach_bot.handle_onboarding_callback(
+        FakeQuery(), USER_ID, "qa:diet_type:allergy:אגוזים"
+    )
+    assert "אגוזים" in str(await user_model.get_value(db, USER_ID, "allergies"))

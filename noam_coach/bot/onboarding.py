@@ -995,6 +995,38 @@ async def handle_onboarding_callback(query: Any, user_id: int, data: str) -> Non
     if data.startswith("qa:diet_type:") and len(parts) >= 4:
         restriction_type = parts[2]
         food_item = parts[3] if len(parts) > 3 else ""
+        # W1-23: validate the payload against the pending queue BEFORE any
+        # write. A stale card (an item already classified, a duplicate
+        # delivery, a button for a food not in this queue) must not persist a
+        # classification the user never gave for the item that is current now,
+        # and must not consume a queue slot — that silently drops an
+        # unclassified restriction, which is exactly the safety defect this
+        # queue exists to prevent. Fail closed: leave the head pending and
+        # re-render it. When there is no queue at all the payload is the only
+        # source of truth (the historical single-card flow), so it is honoured
+        # unchanged.
+        queued_items, queued_index = await _queued_classification_match(user_id, food_item)
+        if queued_items and queued_index is None:
+            await event_log.append_event(
+                DB, user_id, "dietary_classification_stale_callback_ignored",
+                entity="fact", entity_id=food_item,
+                source="onboarding",
+                properties={
+                    "restriction_type": restriction_type,
+                    "food_item": food_item,
+                    "pending_head": queued_items[0],
+                    "pending_count": len(queued_items),
+                },
+            )
+            with suppress(Exception):
+                await query.answer()
+            await _render_diet_classification_card(query, queued_items[0])
+            return
+        if queued_index is not None:
+            # Use the FULL queued name, not the 15-char truncated payload, so
+            # the persisted classification is keyed by the same string that is
+            # stored in diet_restrictions.
+            food_item = queued_items[queued_index]
         if restriction_type == "cancel":
             # User didn't mean to avoid this food — remove it
             current = await _existing_list_value(user_id, "diet_restrictions")
@@ -1079,7 +1111,9 @@ async def handle_onboarding_callback(query: Any, user_id: int, data: str) -> Non
         # the button tap and (via the shim that re-dispatches here) for the typed
         # answer, so both paths advance the same queue. A per-item "cancel" is a
         # resolution like any other and must not abandon the remainder.
-        if await _advance_diet_classification_queue(query, user_id, food_item):
+        if queued_index is not None and await _advance_diet_classification_queue(
+            query, user_id, queued_items, queued_index
+        ):
             return
         if await continue_after_plan_completion_answer(query, user_id):
             return
@@ -3060,50 +3094,69 @@ async def _arm_diet_classification_queue(user_id: int, items: Any) -> bool:
     return True
 
 
-async def _advance_diet_classification_queue(target: Any, user_id: int, resolved_item: str) -> bool:
-    """Pop ``resolved_item`` and render the next classification card (W1-23).
+async def _queued_classification_match(
+    user_id: int, food_item: str
+) -> tuple[list[str], int | None]:
+    """Resolve a ``qa:diet_type:`` payload against the pending queue (W1-23).
 
-    Called from the single canonical ``qa:diet_type:`` handler, so the button
-    path and the typed path (which re-dispatches through that same handler)
-    advance identically. Returns True when another item was rendered — the
-    caller must then NOT continue the wizard yet.
+    Returns ``(queue, index)``. ``index`` is the position of the queue entry
+    the payload refers to, or ``None`` when the payload matches nothing —
+    i.e. a STALE card (an item already classified, a duplicate delivery, or a
+    button for a food that is not in this queue at all).
+
+    ``_safe_cb`` truncates callback_data to 15 characters for Telegram's
+    64-byte budget, so an exact match is tried first and a prefix match
+    second; the first prefix match wins so "חלב" can never take "חלב עיזים"
+    with it. Deliberately NO head fallback: guessing "whatever is current"
+    on an unmatchable payload is what silently skipped an unclassified
+    restriction and overwrote a classification the user never gave.
     """
     from noam_coach.services.question_dedup import decode_classify_pending
 
     flow = await conversation.get_active_flow(DB, user_id)
     queue = decode_classify_pending(flow.step if flow.is_question else None)
     if not queue:
-        return False
-
-    # The callback payload is truncated to 15 chars by ``_safe_cb`` (Telegram's
-    # 64-byte callback_data budget), so the resolved item may be a PREFIX of the
-    # queued one. Remove exactly ONE entry: an exact match if there is one,
-    # otherwise the first prefix match — never every entry that shares a prefix,
-    # or "חלב" would silently take "חלב עיזים" with it. Falling back to the head
-    # keeps the queue from wedging on an unmatchable payload.
-    resolved = (resolved_item or "").strip()
+        return [], None
+    resolved = (food_item or "").strip()
+    if not resolved:
+        return queue, None
     index = next((i for i, entry in enumerate(queue) if entry == resolved), None)
-    if index is None and resolved:
+    if index is None:
         index = next(
             (i for i, entry in enumerate(queue) if entry.startswith(resolved)), None
         )
-    if index is None:
-        index = 0
-    remaining = queue[:index] + queue[index + 1:]
+    return queue, index
 
-    if not await _arm_diet_classification_queue(user_id, remaining):
-        return False
 
-    next_item = remaining[0]
-    text = f"איך להתייחס ל{esc(next_item)}?"
-    keyboard = _diet_type_keyboard(next_item)
+async def _render_diet_classification_card(target: Any, item: str) -> bool:
+    """Render the "how should I treat X?" card on whatever surface we have."""
+    text = f"איך להתייחס ל{esc(item)}?"
+    keyboard = _diet_type_keyboard(item)
     if hasattr(target, "message") and target.message is not None:
         await target.message.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
-    elif hasattr(target, "reply_text"):
+        return True
+    if hasattr(target, "reply_text"):
         await target.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
-    else:  # pragma: no cover - no surface to render on
+        return True
+    return False  # pragma: no cover - no surface to render on
+
+
+async def _advance_diet_classification_queue(
+    target: Any, user_id: int, queue: list[str], index: int
+) -> bool:
+    """Pop queue[index] and render the next classification card (W1-23).
+
+    Called from the single canonical ``qa:diet_type:`` handler, so the button
+    path and the typed path (which re-dispatches through that same handler)
+    advance identically. ``index`` has already been validated against the
+    queue by ``_queued_classification_match``, so exactly one — known — entry
+    is removed. Returns True when another item was rendered; the caller must
+    then NOT continue the wizard yet.
+    """
+    remaining = queue[:index] + queue[index + 1:]
+    if not await _arm_diet_classification_queue(user_id, remaining):
         return False
-    return True
+    return await _render_diet_classification_card(target, remaining[0])
 
 
 def _diet_type_keyboard(food_item: str) -> InlineKeyboardMarkup:
