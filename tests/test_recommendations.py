@@ -170,7 +170,7 @@ class _CapturingClient:
         self.responses = _CapturingResponses()
 
 
-async def _prompt_for(eating: dict[str, object]) -> str:
+async def _prompt_for(eating: object) -> str:
     """Run the real morning_menu AI path and return the learned-routine prompt."""
     client = _CapturingClient()
     await recommendations.morning_menu(
@@ -291,6 +291,50 @@ async def test_no_window_never_emits_a_none_valued_meal_time() -> None:
     ]
     assert eating_line, "eating line missing"
     assert "None" not in eating_line[0]
+
+
+# --- F1: a corrupted/legacy profile blob must not crash the menu path --------
+
+
+@pytest.mark.parametrize("bad", [None, "08:00-21:00", 5, ["08:00"], 3.5, True])
+def test_eating_line_treats_a_non_dict_as_no_evidence(bad: object) -> None:
+    """A truthy non-dict ``eating`` (corrupted or legacy routine_profile JSON)
+    used to reach ``.get`` and raise AttributeError on the morning_menu hot
+    path — a worse regression than the window defect this function fixes.
+    Both call sites coerce with ``or {}``, which covers None/""/0 but NOT a
+    truthy non-dict, so the coercion belongs here."""
+    line = recommendations._eating_line(bad)
+    assert line.startswith("- אכילה")
+    assert "אין עדיין נתוני שגרת אכילה" in line
+
+
+@pytest.mark.parametrize("bad", [None, "08:00-21:00", 5, ["08:00"]])
+def test_profile_block_survives_a_non_dict_eating_block(bad: object) -> None:
+    """The real production prompt builder, not just the helper."""
+    block = recommendations._profile_block({"eating": bad})
+    assert "שגרה שנלמדה" in block
+    assert "אין עדיין נתוני שגרת אכילה" in block
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [None, "08:00-21:00", 5, ["08:00"]])
+async def test_morning_menu_ai_path_survives_a_non_dict_eating_block(
+    bad: object,
+) -> None:
+    """End-to-end on the real AI path: a corrupted blob must yield a menu, not
+    an exception."""
+    prompt = await _prompt_for(bad)
+    assert "אין עדיין נתוני שגרת אכילה" in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [None, "08:00-21:00", 5, ["08:00"]])
+async def test_fallback_menu_survives_a_non_dict_eating_block(bad: object) -> None:
+    menu = await recommendations.morning_menu(
+        None, "gpt-4", {"eating": bad}, {"calories": 2000, "protein": 150}, False
+    )
+    assert len(menu.meals) == 3
+    assert "בבוקר" in [m.time_hint for m in menu.meals]
 
 
 @pytest.mark.asyncio

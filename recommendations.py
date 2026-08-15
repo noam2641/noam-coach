@@ -153,7 +153,7 @@ async def motivation_message(
         return seed
 
 
-def _eating_line(eating: dict[str, Any]) -> str:
+def _eating_line(eating: Any) -> str:
     """The learned-eating line of the AI prompt block (W1-20).
 
     A learned eating window only reaches the menu-generating AI as authoritative
@@ -167,7 +167,19 @@ def _eating_line(eating: dict[str, Any]) -> str:
     present, because the calorie average does not depend on the window's width,
     and the line says plainly that the window itself is not yet known. Absent
     and weak stay distinguishable: they produce different text.
+
+    A non-dict ``eating`` is treated as no evidence rather than raising. Both
+    call sites coerce with ``or {}``, which covers None/""/0 but NOT a *truthy*
+    non-dict — a corrupted or legacy ``routine_profile.profile`` blob whose
+    ``eating`` is a string or list would reach ``.get`` and raise. This runs on
+    the morning_menu hot path, where an AttributeError would be a worse
+    regression than the window defect this function exists to fix, so the
+    coercion happens here (mirroring the isinstance handling the gate itself
+    does in ``routine.eating_window_is_trustworthy``) instead of relying on
+    every caller to have gotten its own coercion right.
     """
+    if not isinstance(eating, dict):
+        eating = {}
     calories = eating.get("avg_daily_calories")
     calorie_part = (
         f" ממוצע קלוריות יומי ~{calories}." if calories is not None else ""
@@ -195,7 +207,9 @@ def _eating_line(eating: dict[str, Any]) -> str:
 def _profile_block(profile: dict[str, Any]) -> str:
     sleep = profile.get("sleep", {})
     workout = profile.get("workout", {})
-    eating = profile.get("eating", {}) or {}
+    # No `or {}` needed: _eating_line coerces any non-dict itself (W1-20 F1),
+    # so the safety lives in one place rather than at each call site.
+    eating = profile.get("eating")
     from noam_coach.services import coaching_day
 
     return (
@@ -261,7 +275,12 @@ async def morning_menu(
         # window it came from is trustworthy; otherwise the pre-existing
         # generic "בבוקר" default stands, exactly as it does for a user with no
         # learned routine at all.
-        _eating = profile.get("eating", {}) or {}
+        # A non-dict `eating` (corrupted/legacy profile blob) fails the gate's
+        # own isinstance check, so `.get` is never reached on one — but coerce
+        # anyway so this stays true if the gate is ever reordered (W1-20 F1).
+        _eating = profile.get("eating")
+        if not isinstance(_eating, dict):
+            _eating = {}
         first_time = (
             _eating.get("first_meal_time")
             if routine.eating_window_is_trustworthy(_eating)
