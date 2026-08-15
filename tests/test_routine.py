@@ -363,3 +363,66 @@ def test_gate_tolerates_malformed_sample_counts() -> None:
         {"first_meal_time": "08:00", "last_meal_time": None, "meals_sampled": 50}
     ) is False
     assert routine.eating_window_is_trustworthy("not a window") is False
+
+
+# ---------------------------------------------------------------------------
+# W1-20 RESIDUAL (F3) — meals_sampled counts MEALS, not DAYS.
+#
+# Pinned deliberately as CURRENT behaviour, not as desired behaviour, so the
+# residual is visible in the suite rather than living on as folklore. The
+# headline defect (zero-width single-day window) IS closed; a 3-meals-in-one-day
+# window is NOT, because closing it needs a days_sampled signal that does not
+# exist, and adding one would be a producer change (out of scope for W1-20).
+#
+# If a future task adds day-level evidence, these two tests are the ones that
+# must flip — that is the point of pinning them.
+# ---------------------------------------------------------------------------
+
+
+async def _window_for(rows: list[dict[str, Any]]) -> routine.EatingWindows:
+    return await routine.learn_eating_windows(MockDB(rows), 1, TZ)
+
+
+@pytest.mark.asyncio
+async def test_residual_three_meals_in_one_day_still_passes_the_gate() -> None:
+    """KNOWN GAP: a 07:50-08:20 window from a SINGLE day reaches the AI as
+    authoritative, because meals_sampled == 3 clears the threshold."""
+    windows = await _window_for(
+        [
+            _meal_row("2026-06-10T07:50:00+03:00", 300),
+            _meal_row("2026-06-10T08:05:00+03:00", 300),
+            _meal_row("2026-06-10T08:20:00+03:00", 300),
+        ]
+    )
+    assert windows.meals_sampled == 3
+    assert windows.first_meal_time == "07:50"
+    assert windows.last_meal_time == "08:20"
+    # Pinning the LEAK, not endorsing it.
+    assert routine.eating_window_is_trustworthy(windows) is True
+
+
+@pytest.mark.asyncio
+async def test_residual_two_meals_in_one_day_is_still_caught() -> None:
+    """The threshold does catch the thinnest single-day cases."""
+    windows = await _window_for(
+        [
+            _meal_row("2026-06-10T07:50:00+03:00", 300),
+            _meal_row("2026-06-10T08:20:00+03:00", 300),
+        ]
+    )
+    assert windows.meals_sampled == 2
+    assert routine.eating_window_is_trustworthy(windows) is False
+
+
+@pytest.mark.asyncio
+async def test_typical_meal_hours_is_not_day_gated_either() -> None:
+    """F2: routine.py's comment says "recur on multiple days" but the code
+    counts MEALS in a flat list. Two meals 10 minutes apart on ONE day produce
+    a "typical" hour. Pinned so the docstring correction stays honest."""
+    windows = await _window_for(
+        [
+            _meal_row("2026-06-10T08:00:00+03:00", 300),
+            _meal_row("2026-06-10T08:10:00+03:00", 300),
+        ]
+    )
+    assert windows.typical_meal_hours == ["08:00"]
