@@ -246,6 +246,73 @@ class EatingWindows:
     meals_sampled: int = 0
 
 
+# W1-20: READ-PATH validity gate for a learned eating window.
+#
+# ``learn_eating_windows`` is correct as written and is NOT changed: its
+# docstring states that ``meals_sampled`` and the times "still describe a real,
+# contiguous stretch of logging; the caller decides how much to trust an old
+# one". This is that caller-side decision, kept next to the dataclass so every
+# consumer asks the same question instead of re-deriving its own rule.
+#
+# The defect being corrected: a window built from a single logged day comes out
+# with ``first_meal_time == last_meal_time`` (both circular means over one
+# value) and was interpolated verbatim into the menu-generating AI prompt as
+# authoritative "learned routine". A zero-width window is an artifact of thin
+# evidence, not an observed eating pattern.
+#
+# The gate reuses ``meals_sampled`` — the evidence signal the producer already
+# populates (``:meals_sampled=len(rows)``) and that ``user_model``'s W1-5
+# evidence weighting already keys off. NO new confidence field, no new stored
+# state, and the underlying evidence is never erased: an untrustworthy window
+# is withheld from authoritative presentation, and callers stay free to read
+# the raw fields.
+#
+# Threshold convention mirrors ``build_frequency_trend_proposal`` below: a
+# keyword-only ``min_meals_sampled`` with the same default of 3.
+MIN_MEALS_SAMPLED = 3
+
+
+def eating_window_is_trustworthy(
+    eating: EatingWindows | dict[str, Any] | None,
+    *,
+    min_meals_sampled: int = MIN_MEALS_SAMPLED,
+) -> bool:
+    """Is this learned eating window strong enough to present as authoritative?
+
+    False for the two untrustworthy shapes, which stay distinguishable from
+    each other because this function never mutates or clears anything:
+
+    * **no evidence** — absent window / missing times / ``meals_sampled == 0``
+    * **weak or degenerate** — ``first_meal_time == last_meal_time`` (a
+      zero-width window, the single-day artifact), or fewer than
+      ``min_meals_sampled`` meals behind it
+
+    True for a normal window, and — deliberately — for a *legitimately narrow*
+    window: a genuinely short eating window (real intermittent fasting, e.g.
+    12:00-17:00) passes as long as it is non-degenerate and has enough samples.
+    Narrowness alone is not distrust; only zero width or thin evidence is.
+    """
+    if eating is None:
+        return False
+    if isinstance(eating, EatingWindows):
+        first, last = eating.first_meal_time, eating.last_meal_time
+        sampled = eating.meals_sampled
+    elif isinstance(eating, dict):
+        first, last = eating.get("first_meal_time"), eating.get("last_meal_time")
+        sampled = eating.get("meals_sampled") or 0
+    else:
+        return False
+
+    if not first or not last:
+        return False
+    try:
+        if int(sampled) < min_meals_sampled:
+            return False
+    except (TypeError, ValueError):
+        return False
+    return str(first).strip() != str(last).strip()
+
+
 @dataclass
 class RoutineProfile:
     sleep: SleepSchedule = field(default_factory=SleepSchedule)

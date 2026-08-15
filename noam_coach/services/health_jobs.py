@@ -561,8 +561,14 @@ def _format_pending_fact_value(key: str, value: Any) -> str:
         hours = value.get("typical_meal_hours") or []
         if hours:
             return f"ארוחות בדרך כלל סביב {', '.join(hours)}"
+        # W1-20: truthiness alone used to be the gate here, so a degenerate
+        # window (first == last, typically one logged day) rendered as
+        # "אכילה בין 08:00 ל-08:00" — a zero-width window shown to the user as
+        # a learned routine to approve. Use the shared read-path validity gate
+        # instead; a window that fails it falls back to the generic label
+        # rather than asserting a range that was never observed.
         first, last = value.get("first_meal_time"), value.get("last_meal_time")
-        if first and last:
+        if first and last and routine.eating_window_is_trustworthy(value):
             return f"אכילה בין {first} ל-{last}"
         return "חלונות אכילה"
     display = user_model.display_value(key, value)

@@ -198,6 +198,49 @@ async def _daily_flags(db: Any, user_id: int, local_day: str) -> dict[str, Any]:
 
 
 async def _routine_profile(db: Any, user_id: int) -> dict[str, Any]:
+    """Read the stored routine profile, or ``{}`` when there is none.
+
+    DELIBERATE DIVERGENCE from ``health_service.load_routine_profile`` (W1-20,
+    recorded rather than silently tolerated). That accessor RECOMPUTES the
+    profile on a miss (``save_routine_profile``); this one does not. The
+    difference is intentional here and must not be "fixed" by swapping in the
+    other accessor without re-reading this note:
+
+    * ``load_routine_profile`` runs in request/job paths that can afford a
+      full learning pass and whose whole purpose is to have a profile.
+    * this helper runs inside per-message nutrition-context assembly, on the
+      hot path, and is called with an explicit ``db`` handle rather than
+      ``health_service``'s module-global — recomputing here would put an
+      unbounded learning pass behind every context build.
+
+    Consumers must therefore treat ``{}`` as "not learned yet", never as
+    "learned to be empty". For the eating window specifically that is exactly
+    W1-20 state 1 (no evidence), and
+    ``routine.eating_window_is_trustworthy({})`` returns False, so the missing
+    profile and a degenerate one are both withheld from authoritative
+    presentation while staying distinguishable in the text they produce.
+
+    Full unification of the two accessors is out of scope (it changes the
+    hot-path cost profile of ~13 additional call sites); this note exists so
+    the next reader does not have to rediscover why there are two.
+
+    Cross-module callers of this private helper (``next_meal.py:636``,
+    ``day_plan.py:478``) are reaching in deliberately for the non-recomputing
+    read; they are recorded here because a rename would break them silently.
+    Neither reads ``first_meal_time``/``last_meal_time`` — ``day_plan`` takes
+    the sleep block and ``next_meal`` takes ``typical_meal_hours`` — so the
+    W1-20 window gate is not owed on those paths, which is why it is not
+    applied here.
+
+    That is a statement about SCOPE, not a claim that ``typical_meal_hours``
+    is itself evidence-gated. It is NOT. ``routine.learn_eating_windows``
+    buckets meals by rounded hour and keeps buckets with ``count >= 2``, where
+    the count is of MEALS, not of distinct days (the comment above that code
+    says "recur on multiple days", but the code counts rows in a flat list).
+    Two meals at 08:00 and 08:10 on a SINGLE day yield
+    ``typical_meal_hours == ["08:00"]``. Anyone hardening ``typical_meal_hours``
+    must start from that fact rather than from the misleading comment.
+    """
     row = await db.fetch_one("SELECT profile FROM routine_profile WHERE user_id=?", (user_id,))
     if not row:
         return {}

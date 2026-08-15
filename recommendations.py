@@ -24,6 +24,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+import routine
+
 LOGGER = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -151,10 +153,63 @@ async def motivation_message(
         return seed
 
 
+def _eating_line(eating: Any) -> str:
+    """The learned-eating line of the AI prompt block (W1-20).
+
+    A learned eating window only reaches the menu-generating AI as authoritative
+    routine when ``routine.eating_window_is_trustworthy`` says so. A degenerate
+    window (``first_meal_time == last_meal_time``, the single-logged-day
+    artifact) or one backed by too few meals used to be interpolated raw here,
+    so the AI planned a whole day of meals around a zero-width eating window it
+    had no reason to doubt.
+
+    The evidence is not erased — ``avg_daily_calories`` is still reported when
+    present, because the calorie average does not depend on the window's width,
+    and the line says plainly that the window itself is not yet known. Absent
+    and weak stay distinguishable: they produce different text.
+
+    A non-dict ``eating`` is treated as no evidence rather than raising. Both
+    call sites coerce with ``or {}``, which covers None/""/0 but NOT a *truthy*
+    non-dict — a corrupted or legacy ``routine_profile.profile`` blob whose
+    ``eating`` is a string or list would reach ``.get`` and raise. This runs on
+    the morning_menu hot path, where an AttributeError would be a worse
+    regression than the window defect this function exists to fix, so the
+    coercion happens here (mirroring the isinstance handling the gate itself
+    does in ``routine.eating_window_is_trustworthy``) instead of relying on
+    every caller to have gotten its own coercion right.
+    """
+    if not isinstance(eating, dict):
+        eating = {}
+    calories = eating.get("avg_daily_calories")
+    calorie_part = (
+        f" ממוצע קלוריות יומי ~{calories}." if calories is not None else ""
+    )
+    if routine.eating_window_is_trustworthy(eating):
+        return (
+            f"- אכילה: ארוחה ראשונה ~{eating.get('first_meal_time')}, "
+            f"אחרונה ~{eating.get('last_meal_time')}, "
+            f"שעות אכילה נפוצות {eating.get('typical_meal_hours')},"
+            f"{calorie_part or ' ממוצע קלוריות יומי לא ידוע.'}"
+        )
+    if not eating or not eating.get("meals_sampled"):
+        return (
+            "- אכילה: אין עדיין נתוני שגרת אכילה נלמדת — אל תניח שעות ארוחה, "
+            "קבע אותן לפי ההיגיון התזונתי." + calorie_part
+        )
+    return (
+        "- אכילה: שגרת האכילה עדיין לא נלמדה במידה מספקת "
+        f"(מבוסס על {eating.get('meals_sampled')} ארוחות בלבד) — "
+        "אל תתייחס לשעות שנצפו כשגרה קבועה, קבע שעות לפי ההיגיון התזונתי."
+        + calorie_part
+    )
+
+
 def _profile_block(profile: dict[str, Any]) -> str:
     sleep = profile.get("sleep", {})
     workout = profile.get("workout", {})
-    eating = profile.get("eating", {})
+    # No `or {}` needed: _eating_line coerces any non-dict itself (W1-20 F1),
+    # so the safety lives in one place rather than at each call site.
+    eating = profile.get("eating")
     from noam_coach.services import coaching_day
 
     return (
@@ -165,10 +220,7 @@ def _profile_block(profile: dict[str, Any]) -> str:
         f"- אימונים: ~{workout.get('weekly_frequency')} בשבוע, "
         f"בדרך כלל בשעה ~{workout.get('typical_hour')}, "
         f"~{workout.get('avg_duration_minutes')} דק'.\n"
-        f"- אכילה: ארוחה ראשונה ~{eating.get('first_meal_time')}, "
-        f"אחרונה ~{eating.get('last_meal_time')}, "
-        f"שעות אכילה נפוצות {eating.get('typical_meal_hours')}, "
-        f"ממוצע קלוריות יומי ~{eating.get('avg_daily_calories')}."
+        f"{_eating_line(eating)}"
     )
 
 
@@ -218,7 +270,22 @@ async def morning_menu(
     if not _client_ready(client):
         cal = goal.get("calories", 2000)
         prot = goal.get("protein", 150)
-        first_time = profile.get("eating", {}).get("first_meal_time", "בבוקר") or "בבוקר"
+        # W1-20: the same read-path gate as the AI prompt block. A learned
+        # first-meal time is only used as this menu's breakfast hint when the
+        # window it came from is trustworthy; otherwise the pre-existing
+        # generic "בבוקר" default stands, exactly as it does for a user with no
+        # learned routine at all.
+        # A non-dict `eating` (corrupted/legacy profile blob) fails the gate's
+        # own isinstance check, so `.get` is never reached on one — but coerce
+        # anyway so this stays true if the gate is ever reordered (W1-20 F1).
+        _eating = profile.get("eating")
+        if not isinstance(_eating, dict):
+            _eating = {}
+        first_time = (
+            _eating.get("first_meal_time")
+            if routine.eating_window_is_trustworthy(_eating)
+            else None
+        ) or "בבוקר"
         has_ritalin = flags.get("ritalin")
         is_fasting = flags.get("fasting", False)
         learned_names = _learned_food_names(nutrition_context)

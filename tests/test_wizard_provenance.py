@@ -21,6 +21,7 @@ from typing import Any
 import pytest
 
 import coach_bot
+import routine
 import user_model
 from db import Database
 from helpers import utc_now
@@ -319,3 +320,72 @@ async def test_provenance_absent_for_typed_answer(
     )
     assert ok
     assert await health_jobs.read_wizard_provenance(1, "session_minutes") is None
+
+
+# ---------------------------------------------------------------------------
+# W1-20 — the pending-fact display must not render a zero-width eating window
+# as "אכילה בין X ל-X". Drives the real production formatter used by the
+# wizard/confirm prompts (_format_pending_fact_value).
+# ---------------------------------------------------------------------------
+
+
+def _eating_display(value: dict[str, Any]) -> str:
+    return health_jobs._format_pending_fact_value("eating_windows", value)
+
+
+def test_degenerate_eating_window_is_not_rendered_as_a_range() -> None:
+    """The live defect: one logged day rendered as "אכילה בין 08:00 ל-08:00"."""
+    display = _eating_display(
+        {"first_meal_time": "08:00", "last_meal_time": "08:00", "meals_sampled": 1}
+    )
+    assert "08:00 ל-08:00" not in display
+    assert "בין" not in display
+
+
+def test_thinly_sampled_eating_window_is_not_rendered_as_a_range() -> None:
+    display = _eating_display(
+        {"first_meal_time": "08:00", "last_meal_time": "21:00", "meals_sampled": 2}
+    )
+    assert "בין" not in display
+
+
+def test_well_evidenced_eating_window_is_still_rendered_as_a_range() -> None:
+    display = _eating_display(
+        {"first_meal_time": "08:00", "last_meal_time": "21:00", "meals_sampled": 120}
+    )
+    assert display == "אכילה בין 08:00 ל-21:00"
+
+
+def test_legitimately_narrow_eating_window_is_still_rendered_as_a_range() -> None:
+    """ANTI-OVER-CORRECTION: a real 12:00-17:00 fasting routine is a range."""
+    display = _eating_display(
+        {"first_meal_time": "12:00", "last_meal_time": "17:00", "meals_sampled": 90}
+    )
+    assert display == "אכילה בין 12:00 ל-17:00"
+
+
+def test_typical_meal_hours_still_take_precedence() -> None:
+    """Unchanged pre-existing behaviour: observed meal hours are a list of real
+    observations, not a window interpretation, so they still render first."""
+    display = _eating_display(
+        {
+            "typical_meal_hours": ["08:00", "13:00"],
+            "first_meal_time": "08:00",
+            "last_meal_time": "08:00",
+            "meals_sampled": 1,
+        }
+    )
+    assert display == "ארוחות בדרך כלל סביב 08:00, 13:00"
+
+
+def test_absent_and_degenerate_eating_windows_are_both_withheld() -> None:
+    """States 1 and 2 give the same *display* verdict but keep distinct data."""
+    absent = _eating_display({})
+    degenerate = _eating_display(
+        {"first_meal_time": "08:00", "last_meal_time": "08:00", "meals_sampled": 1}
+    )
+    assert absent == degenerate == "חלונות אכילה"
+    # The evidence itself is untouched — nothing was cleared to produce this.
+    assert routine.eating_window_is_trustworthy(
+        {"first_meal_time": "08:00", "last_meal_time": "08:00", "meals_sampled": 1}
+    ) is False
