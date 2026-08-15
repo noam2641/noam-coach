@@ -549,6 +549,24 @@ async def test_button_path_advances_the_queue(db: Database) -> None:
 
 
 @pytest.mark.asyncio
+async def test_resolving_one_item_does_not_take_its_prefix_neighbour(
+    db: Database,
+) -> None:
+    """``_safe_cb`` truncates callback_data to 15 chars, so the resolved item
+    can be a PREFIX of another queued item. Exactly one entry may be popped —
+    resolving "חלב" must not silently swallow "חלב עיזים" too."""
+    await _open_question("q_allergies")
+    install_plan_question_dedup()
+    await coach_bot.handle_onboarding_text(_update("חלב, חלב עיזים, ביצים"), USER_ID)
+    assert await _pending_queue(db) == ["חלב", "חלב עיזים", "ביצים"]
+
+    query = FakeQuery()
+    await coach_bot.handle_onboarding_callback(query, USER_ID, "qa:diet_type:sensitivity:חלב")
+    assert _asked(query.message) == ["חלב עיזים"]
+    assert await _pending_queue(db) == ["חלב עיזים", "ביצים"]
+
+
+@pytest.mark.asyncio
 async def test_mixed_button_and_text_paths_advance_the_same_queue(
     db: Database,
 ) -> None:

@@ -3075,17 +3075,21 @@ async def _advance_diet_classification_queue(target: Any, user_id: int, resolved
     if not queue:
         return False
 
-    # The callback payload is truncated to Telegram's 64-byte budget by
-    # ``_safe_cb``, so match the head by prefix rather than equality; fall
-    # back to popping the head so a queue can never wedge on a mismatch.
+    # The callback payload is truncated to 15 chars by ``_safe_cb`` (Telegram's
+    # 64-byte callback_data budget), so the resolved item may be a PREFIX of the
+    # queued one. Remove exactly ONE entry: an exact match if there is one,
+    # otherwise the first prefix match — never every entry that shares a prefix,
+    # or "חלב" would silently take "חלב עיזים" with it. Falling back to the head
+    # keeps the queue from wedging on an unmatchable payload.
     resolved = (resolved_item or "").strip()
-    remaining = [
-        entry
-        for entry in queue
-        if not (entry == resolved or (resolved and entry.startswith(resolved)))
-    ]
-    if len(remaining) == len(queue):
-        remaining = queue[1:]
+    index = next((i for i, entry in enumerate(queue) if entry == resolved), None)
+    if index is None and resolved:
+        index = next(
+            (i for i, entry in enumerate(queue) if entry.startswith(resolved)), None
+        )
+    if index is None:
+        index = 0
+    remaining = queue[:index] + queue[index + 1:]
 
     if not await _arm_diet_classification_queue(user_id, remaining):
         return False
