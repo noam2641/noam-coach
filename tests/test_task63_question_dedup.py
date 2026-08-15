@@ -521,6 +521,25 @@ async def test_restart_mid_queue_resumes_at_the_next_unclassified_item(
     assert _asked(resumed.effective_message) == ["ביצים"]
 
 
+@pytest.mark.asyncio
+async def test_restart_mid_queue_resumes_on_the_diet_restrictions_branch_too(
+    db: Database,
+) -> None:
+    """Acceptance 2 for the second affected site, not just the allergies one."""
+    await _open_question("q_diet_restrictions")
+    install_plan_question_dedup()
+    await coach_bot.handle_onboarding_text(_update("גלוטן, חלב, ביצים"), USER_ID)
+    await coach_bot.handle_onboarding_text(_update("רגישות"), USER_ID)
+
+    coach_bot.PENDING_QUESTION.clear()
+    await coach_bot.load_pending_state()
+    assert await _pending_queue(db) == ["חלב", "ביצים"]
+
+    resumed = _update("רגישות")
+    await coach_bot.handle_onboarding_text(resumed, USER_ID)
+    assert _asked(resumed.effective_message) == ["ביצים"]
+
+
 # --- Acceptance 4: the BUTTON path advances the queue too -----------------
 
 
