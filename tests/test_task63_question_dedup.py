@@ -28,7 +28,11 @@ from noam_coach.observability import ObservabilityMode, set_mode
 from noam_coach.observability.emit import reset_observability_health
 from noam_coach.observability.modes import reset_mode
 from noam_coach.services.question_dedup import (
+    CLASSIFY_PENDING_PREFIX,
+    CLASSIFY_QUEUE_DELIM,
     classify_type_from_text,
+    decode_classify_pending,
+    encode_classify_pending,
     install_plan_question_dedup,
     is_none_answer,
     uninstall_plan_question_dedup,
@@ -281,3 +285,322 @@ async def test_non_dietary_questions_are_untouched(db: Database) -> None:
     assert consumed is True
     value = await user_model.get_value(db, USER_ID, "session_minutes")
     assert value is not None
+
+
+# ---------------------------------------------------------------------------
+# W1-23 — a multi-item answer must classify EVERY item, in order.
+#
+# The defect: an answer naming several restrictions ("גלוטן, חלב, ביצים")
+# put only the FIRST through the "how should I treat X?" keyboard. Items
+# 2..n landed in diet_restrictions unclassified -- never ruled out as
+# allergies. All the tests below drive the REAL handlers
+# (coach_bot.handle_onboarding_text / handle_onboarding_callback) through
+# the installed dedup wrap; the pure-unit delimiter tests are a supplement.
+# ---------------------------------------------------------------------------
+
+THREE_ITEMS = ("גלוטן", "חלב", "ביצים")
+
+
+class FakeQuery:
+    """Button tap. ``message`` is a real FakeMessage so the next
+    classification card in the queue has somewhere to render."""
+
+    def __init__(self) -> None:
+        self.message = FakeMessage()
+        self.edits: list[str] = []
+
+    async def edit_message_text(self, text: str, reply_markup: Any = None, parse_mode: Any = None) -> None:
+        self.edits.append(text)
+
+    async def edit_message_reply_markup(self, reply_markup: Any = None) -> None:
+        return None
+
+    async def answer(self, *a: Any, **k: Any) -> None:
+        return None
+
+
+async def _open_question(question_id: str) -> None:
+    from noam_coach.services import core as core_services
+
+    await core_services.set_flow_state(
+        USER_ID, "plan_completion", question_id,
+        {"return_to": "menu:smartplan", "plan_type": "nutrition"},
+    )
+    await coach_bot.set_pending(USER_ID, question_id)
+
+
+async def _pending_queue(db: Database) -> list[str]:
+    flow = await conversation.get_active_flow(db, USER_ID)
+    return decode_classify_pending(flow.step if flow.is_question else None)
+
+
+def _asked(*messages: Any) -> list[str]:
+    """Every 'איך להתייחס ל<item>?' card rendered on these messages, in order."""
+    out: list[str] = []
+    for message in messages:
+        for reply in getattr(message, "replies", []):
+            if "איך להתייחס ל" in reply:
+                out.append(reply.split("איך להתייחס ל", 1)[1].rstrip("?").strip())
+    return out
+
+
+# --- delimiter non-collision (pure unit, supplement) -----------------------
+
+
+def test_queue_delimiter_cannot_appear_in_a_parsed_item() -> None:
+    """The delimiter must be unreachable from _parse_dietary_answer output."""
+    from noam_coach.bot import onboarding as onboarding_bot
+
+    answers = [
+        "גלוטן, חלב, ביצים",
+        "חציל, טורטייה ואגוזים",
+        "אני נמנע מקשיו",
+        "cashew, peanuts",
+        "אגוזים\nחלב",
+        'קשיו; חלב: ביצים!',
+        "a|b, c-d, e_f, גלוטן:חלב",
+        # a hostile paste that literally contains the delimiter
+        f"גלוטן{CLASSIFY_QUEUE_DELIM}חלב, ביצים",
+    ]
+    for answer in answers:
+        items = onboarding_bot._parse_dietary_answer(answer)
+        encoded = encode_classify_pending(items)
+        assert encoded is not None
+        # round-trip is lossless in item COUNT and ORDER for everything the
+        # parser can legitimately produce
+        decoded = decode_classify_pending(encoded)
+        assert all(CLASSIFY_QUEUE_DELIM not in item for item in decoded)
+        assert decoded == [
+            "".join(ch for ch in item if not (ord(ch) < 0x20 or ord(ch) == 0x7F)).strip()
+            for item in dict.fromkeys(items)
+        ]
+
+
+def test_legacy_single_item_payload_still_decodes() -> None:
+    """Rows written before the queue existed must resume, not crash."""
+    assert decode_classify_pending(f"{CLASSIFY_PENDING_PREFIX}אגוזים") == ["אגוזים"]
+    assert decode_classify_pending("q_allergies") == []
+    assert decode_classify_pending(None) == []
+    assert encode_classify_pending([]) is None
+    assert encode_classify_pending(["", "  "]) is None
+
+
+# --- site 1: the allergies branch (q_allergies, free_text_fallback) --------
+
+
+@pytest.mark.asyncio
+async def test_allergies_branch_asks_about_every_named_item_in_order(
+    db: Database,
+) -> None:
+    """Acceptance 1 (site onboarding.py allergies branch): 3 items -> 3 cards."""
+    await _open_question("q_allergies")
+    install_plan_question_dedup()
+
+    first = _update("גלוטן, חלב, ביצים")
+    await coach_bot.handle_onboarding_text(first, USER_ID)
+    assert _asked(first.effective_message) == ["גלוטן"]
+    assert await _pending_queue(db) == list(THREE_ITEMS)
+
+    second = _update("רגישות")
+    await coach_bot.handle_onboarding_text(second, USER_ID)
+    assert _asked(second.effective_message) == ["חלב"]
+    assert await _pending_queue(db) == ["חלב", "ביצים"]
+
+    third = _update("רגישות")
+    await coach_bot.handle_onboarding_text(third, USER_ID)
+    assert _asked(third.effective_message) == ["ביצים"]
+    assert await _pending_queue(db) == ["ביצים"]
+
+    fourth = _update("העדפה")
+    await coach_bot.handle_onboarding_text(fourth, USER_ID)
+    # Queue drained -> pending released, wizard continues.
+    assert await _pending_queue(db) == []
+    levels = await user_model.get_fact(db, USER_ID, "diet_restriction_levels")
+    assert set((levels or {}).get("value", {})) == set(THREE_ITEMS)
+
+
+@pytest.mark.asyncio
+async def test_two_item_answer_classifies_both(db: Database) -> None:
+    await _open_question("q_allergies")
+    install_plan_question_dedup()
+
+    first = _update("קשיו, בוטנים")
+    await coach_bot.handle_onboarding_text(first, USER_ID)
+    assert _asked(first.effective_message) == ["קשיו"]
+
+    second = _update("אלרגיה")
+    await coach_bot.handle_onboarding_text(second, USER_ID)
+    assert _asked(second.effective_message) == ["בוטנים"]
+
+    third = _update("אלרגיה")
+    await coach_bot.handle_onboarding_text(third, USER_ID)
+    assert await _pending_queue(db) == []
+    allergies = str(await user_model.get_value(db, USER_ID, "allergies"))
+    assert "קשיו" in allergies and "בוטנים" in allergies
+
+
+# --- site 2: the diet_restrictions branch (q_diet_restrictions) -----------
+
+
+@pytest.mark.asyncio
+async def test_diet_restrictions_branch_asks_about_every_named_item(
+    db: Database,
+) -> None:
+    """Acceptance 1 + 6 (site onboarding.py diet_restrictions branch).
+
+    The storage loop persists ALL items (unchanged behaviour) AND every one
+    of them is now put through the classification keyboard.
+    """
+    await _open_question("q_diet_restrictions")
+    install_plan_question_dedup()
+
+    first = _update("גלוטן, חלב, ביצים")
+    await coach_bot.handle_onboarding_text(first, USER_ID)
+
+    # Acceptance 6: storage behaviour unchanged -- all three stored up front.
+    stored = str(await user_model.get_value(db, USER_ID, "diet_restrictions"))
+    for item in THREE_ITEMS:
+        assert item in stored, stored
+
+    assert _asked(first.effective_message) == ["גלוטן"]
+    assert await _pending_queue(db) == list(THREE_ITEMS)
+
+    second = _update("רגישות")
+    await coach_bot.handle_onboarding_text(second, USER_ID)
+    assert _asked(second.effective_message) == ["חלב"]
+
+    third = _update("רגישות")
+    await coach_bot.handle_onboarding_text(third, USER_ID)
+    assert _asked(third.effective_message) == ["ביצים"]
+    assert await _pending_queue(db) == ["ביצים"]
+
+
+# --- Acceptance 2: restart mid-queue resumes at the NEXT item --------------
+
+
+@pytest.mark.asyncio
+async def test_restart_mid_queue_resumes_at_the_next_unclassified_item(
+    db: Database,
+) -> None:
+    await _open_question("q_allergies")
+    install_plan_question_dedup()
+    await coach_bot.handle_onboarding_text(_update("גלוטן, חלב, ביצים"), USER_ID)
+    await coach_bot.handle_onboarding_text(_update("רגישות"), USER_ID)  # גלוטן done
+
+    # Simulated process restart: in-memory caches lost, real reload runs.
+    coach_bot.PENDING_QUESTION.clear()
+    await coach_bot.load_pending_state()
+
+    # Not the first item, and not none: the queue survived with its head at חלב.
+    assert await _pending_queue(db) == ["חלב", "ביצים"]
+
+    resumed = _update("רגישות")
+    await coach_bot.handle_onboarding_text(resumed, USER_ID)
+    assert _asked(resumed.effective_message) == ["ביצים"]
+
+
+# --- Acceptance 4: the BUTTON path advances the queue too -----------------
+
+
+@pytest.mark.asyncio
+async def test_button_path_advances_the_queue(db: Database) -> None:
+    await _open_question("q_allergies")
+    install_plan_question_dedup()
+    await coach_bot.handle_onboarding_text(_update("גלוטן, חלב, ביצים"), USER_ID)
+
+    query = FakeQuery()
+    await coach_bot.handle_onboarding_callback(query, USER_ID, "qa:diet_type:allergy:גלוטן")
+    assert _asked(query.message) == ["חלב"]
+    assert await _pending_queue(db) == ["חלב", "ביצים"]
+
+    query2 = FakeQuery()
+    await coach_bot.handle_onboarding_callback(query2, USER_ID, "qa:diet_type:sensitivity:חלב")
+    assert _asked(query2.message) == ["ביצים"]
+    assert await _pending_queue(db) == ["ביצים"]
+
+    query3 = FakeQuery()
+    await coach_bot.handle_onboarding_callback(query3, USER_ID, "qa:diet_type:preference:ביצים")
+    assert _asked(query3.message) == []          # nothing left to ask
+    assert await _pending_queue(db) == []        # pending released
+    allergies = str(await user_model.get_value(db, USER_ID, "allergies"))
+    assert "גלוטן" in allergies
+
+
+@pytest.mark.asyncio
+async def test_mixed_button_and_text_paths_advance_the_same_queue(
+    db: Database,
+) -> None:
+    """Acceptance 4: the two paths share one queue and one handler."""
+    await _open_question("q_allergies")
+    install_plan_question_dedup()
+    await coach_bot.handle_onboarding_text(_update("גלוטן, חלב, ביצים"), USER_ID)
+
+    query = FakeQuery()
+    await coach_bot.handle_onboarding_callback(query, USER_ID, "qa:diet_type:allergy:גלוטן")
+    assert _asked(query.message) == ["חלב"]
+
+    typed = _update("רגישות")
+    await coach_bot.handle_onboarding_text(typed, USER_ID)
+    assert _asked(typed.effective_message) == ["ביצים"]
+    assert await _pending_queue(db) == ["ביצים"]
+
+
+# --- Acceptance 5: a per-item cancel keeps the rest of the queue ----------
+
+
+@pytest.mark.asyncio
+async def test_cancel_on_one_item_does_not_abandon_the_rest(db: Database) -> None:
+    await _open_question("q_allergies")
+    install_plan_question_dedup()
+    await coach_bot.handle_onboarding_text(_update("גלוטן, חלב, ביצים"), USER_ID)
+
+    query = FakeQuery()
+    await coach_bot.handle_onboarding_callback(query, USER_ID, "qa:diet_type:cancel:גלוטן")
+
+    # גלוטן removed, but חלב and ביצים are still asked about.
+    assert _asked(query.message) == ["חלב"]
+    assert await _pending_queue(db) == ["חלב", "ביצים"]
+
+    typed = _update("טעות")  # a typed per-item cancel
+    await coach_bot.handle_onboarding_text(typed, USER_ID)
+    assert _asked(typed.effective_message) == ["ביצים"]
+    assert await _pending_queue(db) == ["ביצים"]
+
+
+@pytest.mark.asyncio
+async def test_universal_cancel_word_still_aborts_the_whole_flow(
+    db: Database,
+) -> None:
+    """A universal cancel word ('ביטול') is not a per-item cancel — it must
+    keep abandoning the whole pending flow, exactly as before W1-23."""
+    await _open_question("q_allergies")
+    install_plan_question_dedup()
+    await coach_bot.handle_onboarding_text(_update("גלוטן, חלב, ביצים"), USER_ID)
+
+    update = _update("ביטול")
+    await coach_bot.handle_onboarding_text(update, USER_ID)
+    assert await _pending_queue(db) == []
+    assert _asked(update.effective_message) == []
+
+
+# --- Acceptance 3: single-item behaviour is unchanged ---------------------
+
+
+@pytest.mark.asyncio
+async def test_single_item_answer_asks_exactly_once_and_then_continues(
+    db: Database,
+) -> None:
+    """No regression: one item -> one card -> pending released."""
+    await _open_question("q_allergies")
+    install_plan_question_dedup()
+
+    first = _update("אגוזים")
+    await coach_bot.handle_onboarding_text(first, USER_ID)
+    assert _asked(first.effective_message) == ["אגוזים"]
+    assert await _pending_queue(db) == ["אגוזים"]
+
+    second = _update("אלרגיה")
+    await coach_bot.handle_onboarding_text(second, USER_ID)
+    assert _asked(second.effective_message) == []   # never re-asked
+    assert await _pending_queue(db) == []
+    assert "אגוזים" in str(await user_model.get_value(db, USER_ID, "allergies"))
