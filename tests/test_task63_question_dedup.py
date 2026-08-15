@@ -420,6 +420,28 @@ async def test_allergies_branch_asks_about_every_named_item_in_order(
 
 
 @pytest.mark.asyncio
+async def test_allergies_branch_persists_every_item_before_classification(
+    db: Database,
+) -> None:
+    """Fail-closed storage for the allergies branch covers ALL items.
+
+    The allergies branch of the protected handler stores nothing before it
+    asks for classification -- the dedup wrap is the only writer, and it
+    used to append parsed[0] alone. Items 2..n were therefore not held
+    anywhere while their classification was still outstanding, so an
+    abandoned flow lost them entirely.
+    """
+    await _open_question("q_allergies")
+    install_plan_question_dedup()
+
+    await coach_bot.handle_onboarding_text(_update("גלוטן, חלב, ביצים"), USER_ID)
+
+    stored = str(await user_model.get_value(db, USER_ID, "diet_restrictions"))
+    for item in THREE_ITEMS:
+        assert item in stored, f"{item!r} not held fail-closed in {stored!r}"
+
+
+@pytest.mark.asyncio
 async def test_two_item_answer_classifies_both(db: Database) -> None:
     await _open_question("q_allergies")
     install_plan_question_dedup()
