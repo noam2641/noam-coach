@@ -95,6 +95,19 @@ survive checking, and acting on them would have meant fixing correct code.
 **Current state: 19 REPRODUCED, 4 CODE-CONFIRMED, 0 AGENT-ONLY.** Nothing in
 this plan rests on an unverified agent claim.
 
+> **B0 reconciliation, 2026-08-13.** The verdicts above record what was true when
+> each item was raised; they are **not** evidence that the mechanism still holds.
+> This plan was reconciled against `origin/develop` @ `2895559`: W1-17 is closed as
+> obsolete, W1-12/W1-19's completion marks were corrected, and W1-13/W1-18/W1-22/W1-23
+> were re-scoped. **Two path conventions matter when reading this document:** several
+> citations name package paths for files that live at the **repository root** —
+> `data_quality.py`, `db.py`, `event_log.py`, `recommendations.py`,
+> `meal_intelligence.py`, `assistant.py`, `routine.py`, `config.py`,
+> `conversation.py`, `retention.py`. A grep at the wrong path returns "no such file"
+> and **reads as evidence the defect was fixed**; that mistake was made and caught
+> during this reconciliation. Current per-item status with `file:line` evidence lives
+> in `docs/WORK_MANAGER_STATE.md`, which is authoritative where the two disagree.
+
 Verification evidence for the three items that started as AGENT-ONLY:
 
 ```
@@ -107,6 +120,12 @@ W1-20  eating_windows consumed by 6 modules; grep for a first==last guard
 W1-22  _PORTION_UNIT_GRAMS = 7 entries, _DISCRETE_UNIT_GRAMS = 5
        -> 'יחידות' present: False;  'יחידה' present: False
 ```
+
+**Superseded in part on 2026-08-13** — the three readings above were accurate when
+taken and are retained as the historical record, but two are no longer the current
+state: `_meals_remaining` is now only a fallback argument (see W1-18), and the
+`_PORTION_UNITS` canonical map at root `meal_intelligence.py:115` *does* contain
+`יחידות → יחידה`; it is simply not wired into the materialization path (see W1-22).
 
 ### Claims rejected at verification (do NOT implement)
 
@@ -127,7 +146,7 @@ WAVE-0's five-lane merge produce zero conflicts.
 |---|---|---|---|
 | **A — Nutrition safety** | W1-1, W1-9, W1-18..W1-23 | `dietary_restrictions.py`, `meals.py`, `next_meal.py`, `day_plan.py`, `meal_*` | B, C, D |
 | **B — Facts & learning** | W1-2..W1-6 | `routine.py`, `health_service.py`, `health_jobs.py`, `user_model.py`, `goals.py` | A, C, D |
-| **C — Observability** | W1-11..W1-17 | `noam_coach/observability/*`, `taxonomy.py` | A, B, D |
+| **C — Observability** | W1-11, W1-13..W1-16 *(W1-12 done; **W1-17 closed obsolete**)* | `noam_coach/observability/*`, `taxonomy.py`, **root `data_quality.py` / `event_log.py`** | A, B, D — **but NOT internally parallel**: `noam_coach/bot/callback_session.py` is shared by W1-13/W1-14/W1-15/W1-16, three of them in the same regions (`_emit_session_event` ~`:170-202`, substitution handler ~`:878-916`). Serialize W1-16 → W1-14 → W1-15 |
 | **D — Workout** | W1-10 | `workout.py`, `callback_session.py` | A, B, C |
 | **E — Intent & routing** | W1-7, W1-8 | `assistant.py`, `bot/assistant.py` | **conflicts with A** (shares `meal_text.py` reach) — serialize after A |
 | **F — UX & copy** | W1-24..W1-36 | inline Hebrew literals across all handlers | **NOT parallel with anything** — no central strings module |
@@ -407,7 +426,16 @@ interactions are formally unterminated — no latency, no verdict, no way to tel
 *before* dispatch and nothing records the outcome.
 
 ## W1-13 · The application logs almost nothing
-**[REPRODUCED]** · Lane C
+**[PARTIALLY COMPLETE — count target MET and retired; residual re-scoped 2026-08-13]** · Lane C
+
+> **Re-measured on `2895559`: product-wide logging rose 57 → 108 calls (+89%),
+> so the original count target is met and is retired.** The new calls landed in the
+> service layer A12/A13 were already writing (e.g. `substitution_patterns.py` 29,
+> `plan_mutations.py` 14), **not** in the files this item named. The surviving
+> residual is exactly: **`noam_coach/bot/workout.py` = 0** (unchanged) and
+> **`noam_coach/bot/assistant.py` = 1**; `callback_session.py` now has 3. Re-scope
+> W1-13 to instrumenting those two files, not to a product-wide count.
+
 Across 2h15m, 63 taps and 20 messages, the app wrote **2 log lines**.
 
 | module | lines | LOGGER calls |
@@ -432,31 +460,111 @@ would report neither happened.
 `state.mutated`. Within one flow: `rir:` and `ready:` emit, `reps:` does not.
 
 ## W1-16 · `state.mutated` cannot reconstruct its own mutation
-**[REPRODUCED]** · Lane C
+**[REPRODUCED — scope must come from the full writer census, 2026-08-13]** · Lane C
 42 of 48 have no `before_state`; 16 have neither. Eight mutually disjoint
 payload shapes share the name, and `event_version` is `1` on every row.
+*(Those counts were measured on one live session's rows, not from a static census.)*
+
+> **Scope note, recorded before this reconciliation merged.** Within
+> `noam_coach/observability/state_trace.py`, `before_state` is currently populated
+> at **2 of its 16** `emit_event` sites (`:130`, `:187`). **That is a subset count,
+> not the complete W1-16 writer census** — a later repo-wide preflight found
+> additional direct `state.mutated` writers outside that installer (~20 writers
+> across 9 files, in several distinct payload shapes, some lacking the `domain`
+> key that `session_trace.py:417` renders). Implementation scope must be set from
+> the **full writer census**, not from the `state_trace.py` count alone.
+>
+> **The before/after plumbing already exists end to end** (`emit.py:116→170`,
+> `event_log`, and the `before_state` column), so this is call-site work, not
+> plumbing work — and **no second mutation-event mechanism may be created.**
+> `EVENT_VERSIONS` is an empty dict (`taxonomy.py:121`), so `event_version()`
+> returns 1 by construction.
 
 ## W1-17 · Three stores, no shared key, case-drift names
-**[DONE — #42]** · Lane C
-`analytics_events` and `audit` have no `trace_id`. The same fact is written as
+**[CLOSED — OBSOLETE / SUPERSEDED BY ARCHITECTURE, 2026-08-13]** · Lane C
+
+> **Status history, preserved.** This entry read `[DONE — #42]`, which was
+> **withdrawn on 2026-08-03** as a misattribution (PR #42 is W1-3, window
+> anchoring). The item was then **reopened** on the claim below. That reopening
+> mechanism has now itself been **disproven by measurement**, and the item is
+> closed as obsolete — **no work was done, and none is required.**
+
+**The original text of this item is retained for the historical record:**
+*"`analytics_events` and `audit` have no `trace_id`. The same fact is written as
 `user_callback` and `USER_CALLBACK` (and 5 more pairs), so a cross-store join on
-`event` returns nothing for 6 of 7 types.
+`event` returns nothing for 6 of 7 types."*
+
+**Why it is obsolete:**
+
+1. **The case-drift half is refuted.** `track_event`
+   (`noam_coach/services/core.py:118`) is a **deliberate dual write**: `:121-127`
+   inserts into `analytics_events` verbatim, then `:128-139` calls
+   `event_log.append_event(..., event.upper(), ...)` → `product_events` (root
+   `event_log.py:105`). So the router's lowercase `"user_callback"` lands as
+   `USER_CALLBACK` in the table `data_quality.py:249` actually reads. Measured on
+   a temp DB (real code path, live DB never opened): `can_send_proactive` returns
+   `(False,'user_recently_active')` for both the callback and the message path.
+   **The claim that the suppression query is dead is formally withdrawn.**
+   Normalizing either spelling would **break** `data_quality.py:249` and the
+   tests at `tests/test_analytics_dsar_redaction.py:144/160-161/167`, which pin
+   both spellings deliberately.
+2. **The three-store premise is the intended architecture.**
+   `noam_coach/observability/__init__.py:17-19` declares `audit` and
+   `analytics_events` **"intentionally remain separate stores with separate
+   purposes"**, layered under `product_events` as the canonical interaction trace
+   (`event_log.py:8-16`, `config.py:94`). The cross-store `event` join described
+   above is one **no code performs and none needs**.
+3. **No `trace_id` migration is justified.** Every reader of `audit` and
+   `analytics_events` was enumerated; none keys on trace. Full reasoning and the
+   reopen condition are recorded in `docs/WORK_MANAGER_STATE.md`.
+4. **The one surviving sub-concern is transferred to W1-14** — safety evidence
+   reachable only via `audit`. W1-14's own fix (emit a product event) closes it
+   with no schema change, because `write_audit` already carries
+   `entity`/`entity_id` as a join key.
 
 ---
 
 # 🟠 WAVE-1C — Nutrition engine
 
 ## W1-18 · Meals-per-day has exactly one entrance, and it was never opened
-**[REPRODUCED]** · Lane A
-`persist_preferred_meal_count` (`profile.py:682-697`) is reachable **only** from
-`q_daily_routine` (`onboarding.py:3164, 3186`). Everything downstream — parsing,
-banding, propagation — is built and tested. Only the trigger is missing.
+**[PARTIALLY COMPLETE — headline CLOSED, residual re-scoped 2026-08-13]** · Lane A
 
-`_meals_remaining` (`next_meal.py:571-589`) **hard-caps at 3** and reads no
-preference at all, which is why you saw exactly 3 slots after asking for 6.
+> **The headline defect is closed, by direct work.** A second entrance now exists
+> at `noam_coach/bot/assistant.py:710-712` (`set_meal_frequency` →
+> `_handle_meal_frequency` → `persist_preferred_meal_count` at `:752`), so a user
+> who says "6 ארוחות ביום" outside onboarding is honoured. The earlier note that
+> this was "partially fixed incidentally by W1-7" is **withdrawn as wrong.**
+> `resolve_remaining_meals_estimate` reads the preference
+> (`noam_coach/services/day_plan.py:326`) and clamps at **10**, not 3
+> (`day_plan.py:43-44`).
+>
+> **The surviving residual is narrower and lives elsewhere:**
+> (a) `MEAL_SPACING_HOURS = 2.5` truncates any stated band ≥5 from mid-afternoon
+> (`day_plan.py:263-267`), while its docstring claims it bites only late in the day;
+> (b) **`noam_coach/services/nutrition_context.py:402`** is an independent third
+> estimator hard-defaulting to 3 and ignoring the preference — the real surviving
+> "cap of 3"; (c) the bridge at `noam_coach/services/next_meal.py:648-649` is
+> wrapped in a bare `except Exception` that silently degrades to the legacy cap.
+
+**Original text, retained:** `persist_preferred_meal_count` (`profile.py:682-697`)
+is reachable **only** from `q_daily_routine` (`onboarding.py:3164, 3186`).
+Everything downstream — parsing, banding, propagation — is built and tested. Only
+the trigger is missing. `_meals_remaining` (`next_meal.py:571-589`) **hard-caps at
+3** and reads no preference at all, which is why you saw exactly 3 slots after
+asking for 6. *(That function survives at `next_meal.py:589` but is now only the
+`legacy_estimate` fallback argument, not the primary path.)*
 
 ## W1-19 · Calorie target has two resolvers over different stores
-**[DONE — #40]** · Lane A
+**[PARTIALLY COMPLETE — the `DONE — #40` mark is WITHDRAWN, 2026-08-13]** · Lane A
+
+> **Withdrawn:** this entry claimed `DONE — #40`, which is **unsupported by
+> repository evidence**. The two-resolver framing is stale, but the **read side is
+> still open**: `proposal_only` is written once
+> (`noam_coach/services/goals.py:409`) and has **zero production readers**, so an
+> unapproved 0.55-confidence proposal remains consumable as if approved. The 2100
+> fallback also survives (`noam_coach/services/nutrition_context.py:441` →
+> `:318-325`, `config.py:83`), with `noam_coach/services/next_meal.py:418`
+> contributing a fourth number (2000). Scope W1-19 to the read side.
 `nutrition_context.py:318-325` reads `goal_versions` → falls back to
 `SETTINGS.default_calories` (**2100**). `goals.py:337-405` computes **2290** and
 writes a `proposal_only` fact. Two screens can legitimately show different
@@ -469,8 +577,35 @@ unapproved 0.55-confidence proposal is consumable as if approved.
 **[REPRODUCED]** · Lane A
 `first == last == "08:00"`, `typical_meal_hours []`, from **one** meal.
 Ten consumers read it; **none guards `first == last`** or checks `meals_sampled`.
-The worst is `recommendations.py:168-171`, which tells the menu-generating AI
-the user eats in an instantaneous window.
+The worst is `recommendations.py:168-171` (**repo root**, not
+`noam_coach/services/`), which tells the menu-generating AI the user eats in an
+instantaneous window.
+
+> **Re-verified 2026-08-13 — still open.** Zero-width / low-sample eating windows
+> are a real defect: no `first == last` guard exists anywhere; the only site
+> touching both fields is a display helper
+> (`noam_coach/services/health_jobs.py:564-566`, truthiness only); and
+> `recommendations.py:168-171` (**repo root**) still feeds the raw window to the
+> menu-generating AI.
+>
+> **Read-path correction, recorded before this reconciliation merged.** An earlier
+> draft asserted that W1-5's attenuation "provably cannot reach these consumers"
+> because they read the `routine_profile` blob directly via
+> `nutrition_context._routine_profile`. **That is withdrawn as the load-bearing
+> description.** A consumer census found an existing **shared accessor** —
+> `health_service.load_routine_profile()` (**repo root** `health_service.py:283-287`,
+> ~21 call sites, recompute-on-miss) — and the most damaging path reaches the
+> profile through it: `proactive.build_daily_context()` → `load_routine_profile()`
+> → `DailyContext.profile` → `recommendations.morning_menu` / `_profile_block`.
+> A separate raw accessor does exist at
+> `noam_coach/services/nutrition_context.py:200-208`, but its existence is **not**
+> evidence that all, or the main, W1-20 consumers bypass the shared accessor.
+>
+> **That existing shared accessor is the primary REUSE BEFORE BUILD candidate** —
+> a candidate, not an approved solution. The final correction semantics (read-time
+> vs write-time, and how *absent* / *degenerate* / *legitimately narrow* windows
+> remain distinguishable) belong to the W1-20 implementation brief and are not
+> authorized here.
 
 ## W1-21 · No macro-consistency validation
 **[REPRODUCED]** · Lane A
@@ -480,20 +615,74 @@ An Atwater band belongs in `meal_plausibility.check_item` as a **warn** (alcohol
 fibre and sugar alcohols legitimately break Atwater).
 
 ## W1-22 · Unit labels are not singularized
-**[REPRODUCED]** · Lane A
+**[OPEN — but RE-SCOPED to a wiring gap, 2026-08-13]** · Lane A
 `"יחידות"` (plural) misses the singular-keyed portion tables (12 entries total),
 so `materialize_count_quantity` declines and the AI's raw gram estimate is
 rendered with a volume label picked by name keyword (`meals.py:699-704`).
 
+> **REUSE BEFORE BUILD — the singularizer already exists; do not build a second
+> one.** The tables live in **root `meal_intelligence.py:1406-1425`**, not in
+> `noam_coach/bot/meals.py` as stated above. `meal_intelligence.py:115` already maps
+> `יחידות → יחידה` in `_PORTION_UNITS` — but that map is consulted **only** at
+> `:264-265`, on a different parsing path. The materialization path compares `unit`
+> **raw** at `:1479`, `:1487` and `:1491`, so a plural label never reaches
+> `_DISCRETE_UNIT_GRAMS`. The requirement is to **wire the existing canonical map
+> into the materialization path**, not to add a parallel normalizer.
+
 ## W1-23 · Multi-item restriction classification handles only the first
-**[REPRODUCED]** · Lane A
+**[PARTIALLY COMPLETE — half 1 open at TWO sites; half 2 already done, 2026-08-13]** · Lane A
 `parsed_items[0]` (`onboarding.py:3166`) — items 2 and 3 are silently dropped.
 Your note said exactly this. The comma splitter also does not split the Hebrew
 conjunction "ו", so "טורטייה ואגוזים" stays one item.
 
+> **Half 1 — STILL OPEN, at THREE sites, not one (and not two).** A repo-wide
+> search found: `noam_coach/bot/onboarding.py:3550` (the diet-restrictions path),
+> `noam_coach/bot/onboarding.py:3455` (an independent copy on the allergies-gap
+> path, which does not even persist the remaining items), **and
+> `noam_coach/services/question_dedup.py:211` (`parsed[0]`)**, in the
+> invariant-repair path that persists the answer before classification. The third
+> site was missed by this plan and by the first pass of the B0 reconciliation.
+> The `qa:diet_type:` callback that consumes the keyboard (`onboarding.py:995`,
+> built at `:3029-3036`) is single-item by construction, and
+> `question_dedup.py` re-dispatches the same callback (`:155`, `:165`, `:264`) —
+> so any sequencing must be honoured there too.
+>
+> **Reuse finding (binding on the W1-23 brief).** `question_dedup.py` **already
+> contains a restart-safe classification mechanism**: `CLASSIFY_PENDING_PREFIX`
+> (`:50`) → `facade.set_pending(...)` (`:247`) → persisted in `active_flow.step` →
+> read back (`:147`) → re-dispatch via `facade.handle_onboarding_callback(...)`
+> (`:163-165`). W1-23 must **extend or reuse that mechanism**, not introduce a new
+> pending queue or persisted state model, unless implementation evidence proves it
+> insufficient. Because of the `:163-165` re-dispatch, sequencing hooked at the
+> callback boundary is inherited by the free-text classification path.
+>
+> **Half 2 — ALREADY DONE.** `onboarding.py:3643` splits on
+> `[,\n]+|\s+ו\s+`, so the "ו" connector is handled. **Caveat:** the pattern
+> requires whitespace on *both* sides, so the example above
+> (`"טורטייה ואגוזים"`, prefixed vav — the normal Hebrew orthography) **still
+> stays one item.** Mechanism present; the cited case still fails.
+>
+> **The requirement is: every parsed restriction is classified, none silently
+> dropped.** The state mechanism is **not** predetermined by this document, but the
+> reuse candidates are named above and are binding as *candidates*: first
+> `question_dedup.py`'s existing `CLASSIFY_PENDING_PREFIX` mechanism, and
+> secondarily the `active_flow` payload machinery
+> (`conversation.set_active_flow` accepts a persisted `payload` dict;
+> `onboarding.py:2113` already stores a list in one). A new queue or new persisted
+> state model requires recorded evidence that **neither** existing mechanism can
+> represent the sequence.
+
 ---
 
 # 🟡 WAVE-1D — UX, copy, navigation
+
+> **Re-verified 2026-08-13: still OPEN and still not parallelizable with any logic
+> lane** — there is **no central strings module**, so Hebrew literals remain inline in
+> the handlers that own the logic. Two items now carry code evidence: **W1-33** —
+> `noam_coach/bot/callback_menu.py` ships the home button as both `⬅️ תפריט`
+> (`:173`, `:185`, `:307`) and `🏠 תפריט` (`:477`, `:504`, `:521`) from one file;
+> **W1-29** — 12 ASCII `ק"ג` vs 31 gershayim `ק״ג` occurrences across `noam_coach/`.
+> The rest of the band remains UNVERIFIED in either direction.
 
 | ID | Item | Evidence |
 |---|---|---|
@@ -515,6 +704,13 @@ conjunction "ו", so "טורטייה ואגוזים" stays one item.
 
 # 🟡 WAVE-1E — Data hygiene (live DB)
 
+> **BLOCKED BY GOVERNANCE, not obsolete (recorded 2026-08-13).** Every item in this
+> band is a live-database row correction with **no code component**. The standing
+> constraints forbid using the live DB, and the Bot/API is running and must not be
+> touched or restarted. These items stay registered and **unschedulable** until an
+> explicitly authorized maintenance window exists. Do not reclassify them as
+> complete or obsolete.
+
 | ID | Row | Action |
 |---|---|---|
 | W1-37 | `food_environment_context.raw_text` holds a dev note, `confirmed=1` | Delete the fact; it has zero real signal |
@@ -535,7 +731,8 @@ W1-2  calorie target 130 low       ← affects you every day
 W1-3  window anchoring             ← root cause of W1-2
 W1-4  weekday widening             ← why Saturday persists
       ↓
-W1-11..W1-17  observability        ← without this the next audit is blind
+W1-11..W1-16  observability        ← without this the next audit is blind
+              (W1-12 done; W1-17 closed obsolete; W1-16 -> W1-14 -> W1-15 serial)
       ↓
 W1-5..W1-10   correctness batch
       ↓
