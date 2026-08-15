@@ -247,3 +247,119 @@ async def test_routine_profile_to_dict() -> None:
     assert "sleep" in d
     assert "workout" in d
     assert "eating" in d
+
+
+# ---------------------------------------------------------------------------
+# W1-20 — read-path validity gate for a learned eating window
+#
+# Four states must stay distinguishable; the gate never mutates or erases the
+# underlying evidence, it only answers "may this be presented as authoritative".
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_single_day_of_meals_produces_a_degenerate_window() -> None:
+    """The producer is unchanged and still emits the degenerate shape.
+
+    One logged meal means per-day first == per-day last, so both circular means
+    land on the same hour. This is the exact defect input; the fix lives on the
+    read path, so this producer behaviour must NOT change.
+    """
+    db = MockDB([_meal_row("2026-06-10T08:00:00+03:00", 400)])
+    result = await routine.learn_eating_windows(db, 1, TZ)
+
+    assert result.meals_sampled == 1
+    assert result.first_meal_time == result.last_meal_time == "08:00"
+    # Evidence preserved, not erased — the caller decides how to read it.
+    assert result.avg_daily_calories == 400
+
+
+def test_gate_state_1_no_evidence() -> None:
+    assert routine.eating_window_is_trustworthy(routine.EatingWindows()) is False
+    assert routine.eating_window_is_trustworthy(None) is False
+    assert routine.eating_window_is_trustworthy({}) is False
+    assert (
+        routine.eating_window_is_trustworthy({"meals_sampled": 0}) is False
+    )
+
+
+def test_gate_state_2_weak_or_degenerate() -> None:
+    # Zero-width window from a single logged day — the live defect shape.
+    degenerate = {
+        "first_meal_time": "08:00",
+        "last_meal_time": "08:00",
+        "meals_sampled": 1,
+    }
+    assert routine.eating_window_is_trustworthy(degenerate) is False
+    # Zero-width even with plenty of samples is still not a window.
+    assert routine.eating_window_is_trustworthy(
+        {"first_meal_time": "08:00", "last_meal_time": "08:00", "meals_sampled": 200}
+    ) is False
+    # Wide window but too thin an evidence base.
+    assert routine.eating_window_is_trustworthy(
+        {"first_meal_time": "08:00", "last_meal_time": "21:00", "meals_sampled": 2}
+    ) is False
+
+
+def test_gate_state_3_valid_evidence() -> None:
+    assert routine.eating_window_is_trustworthy(
+        {"first_meal_time": "08:00", "last_meal_time": "21:00", "meals_sampled": 42}
+    ) is True
+    assert routine.eating_window_is_trustworthy(
+        routine.EatingWindows(
+            first_meal_time="08:00", last_meal_time="19:30", meals_sampled=42
+        )
+    ) is True
+
+
+def test_gate_state_4_legitimately_narrow_window_still_passes() -> None:
+    """ANTI-OVER-CORRECTION: real intermittent fasting must stay authoritative.
+
+    A genuinely short eating window is not the same defect as a zero-width one.
+    Narrowness alone must never be treated as distrust, or the fix would erase
+    the routine of exactly the users whose routine is most distinctive.
+    """
+    narrow_but_real = {
+        "first_meal_time": "12:00",
+        "last_meal_time": "17:00",
+        "typical_meal_hours": ["12:00", "15:00", "17:00"],
+        "meals_sampled": 90,
+    }
+    assert routine.eating_window_is_trustworthy(narrow_but_real) is True
+    # Even a one-hour window passes when the evidence backs it.
+    assert routine.eating_window_is_trustworthy(
+        {"first_meal_time": "13:00", "last_meal_time": "14:00", "meals_sampled": 30}
+    ) is True
+
+
+def test_gate_states_1_and_2_stay_distinguishable() -> None:
+    """Collapsing 'degenerate' into 'absent' is not acceptable: the degenerate
+    window keeps its evidence, so callers can still tell the two apart."""
+    absent = routine.EatingWindows()
+    degenerate = routine.EatingWindows(
+        first_meal_time="08:00", last_meal_time="08:00", meals_sampled=1
+    )
+    assert routine.eating_window_is_trustworthy(absent) is False
+    assert routine.eating_window_is_trustworthy(degenerate) is False
+    # Same verdict, different underlying facts — nothing was overwritten.
+    assert absent.meals_sampled == 0 and degenerate.meals_sampled == 1
+    assert absent.first_meal_time is None
+    assert degenerate.first_meal_time == "08:00"
+
+
+def test_gate_threshold_is_a_keyword_only_parameter() -> None:
+    """Mirrors build_frequency_trend_proposal's min_sessions_sampled convention."""
+    thin = {"first_meal_time": "08:00", "last_meal_time": "21:00", "meals_sampled": 2}
+    assert routine.eating_window_is_trustworthy(thin) is False
+    assert routine.eating_window_is_trustworthy(thin, min_meals_sampled=2) is True
+    assert routine.MIN_MEALS_SAMPLED == 3
+
+
+def test_gate_tolerates_malformed_sample_counts() -> None:
+    assert routine.eating_window_is_trustworthy(
+        {"first_meal_time": "08:00", "last_meal_time": "21:00", "meals_sampled": "many"}
+    ) is False
+    assert routine.eating_window_is_trustworthy(
+        {"first_meal_time": "08:00", "last_meal_time": None, "meals_sampled": 50}
+    ) is False
+    assert routine.eating_window_is_trustworthy("not a window") is False

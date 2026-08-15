@@ -24,6 +24,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+import routine
+
 LOGGER = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -151,10 +153,49 @@ async def motivation_message(
         return seed
 
 
+def _eating_line(eating: dict[str, Any]) -> str:
+    """The learned-eating line of the AI prompt block (W1-20).
+
+    A learned eating window only reaches the menu-generating AI as authoritative
+    routine when ``routine.eating_window_is_trustworthy`` says so. A degenerate
+    window (``first_meal_time == last_meal_time``, the single-logged-day
+    artifact) or one backed by too few meals used to be interpolated raw here,
+    so the AI planned a whole day of meals around a zero-width eating window it
+    had no reason to doubt.
+
+    The evidence is not erased — ``avg_daily_calories`` is still reported when
+    present, because the calorie average does not depend on the window's width,
+    and the line says plainly that the window itself is not yet known. Absent
+    and weak stay distinguishable: they produce different text.
+    """
+    calories = eating.get("avg_daily_calories")
+    calorie_part = (
+        f" ממוצע קלוריות יומי ~{calories}." if calories is not None else ""
+    )
+    if routine.eating_window_is_trustworthy(eating):
+        return (
+            f"- אכילה: ארוחה ראשונה ~{eating.get('first_meal_time')}, "
+            f"אחרונה ~{eating.get('last_meal_time')}, "
+            f"שעות אכילה נפוצות {eating.get('typical_meal_hours')},"
+            f"{calorie_part or ' ממוצע קלוריות יומי לא ידוע.'}"
+        )
+    if not eating or not eating.get("meals_sampled"):
+        return (
+            "- אכילה: אין עדיין נתוני שגרת אכילה נלמדת — אל תניח שעות ארוחה, "
+            "קבע אותן לפי ההיגיון התזונתי." + calorie_part
+        )
+    return (
+        "- אכילה: שגרת האכילה עדיין לא נלמדה במידה מספקת "
+        f"(מבוסס על {eating.get('meals_sampled')} ארוחות בלבד) — "
+        "אל תתייחס לשעות שנצפו כשגרה קבועה, קבע שעות לפי ההיגיון התזונתי."
+        + calorie_part
+    )
+
+
 def _profile_block(profile: dict[str, Any]) -> str:
     sleep = profile.get("sleep", {})
     workout = profile.get("workout", {})
-    eating = profile.get("eating", {})
+    eating = profile.get("eating", {}) or {}
     from noam_coach.services import coaching_day
 
     return (
@@ -165,10 +206,7 @@ def _profile_block(profile: dict[str, Any]) -> str:
         f"- אימונים: ~{workout.get('weekly_frequency')} בשבוע, "
         f"בדרך כלל בשעה ~{workout.get('typical_hour')}, "
         f"~{workout.get('avg_duration_minutes')} דק'.\n"
-        f"- אכילה: ארוחה ראשונה ~{eating.get('first_meal_time')}, "
-        f"אחרונה ~{eating.get('last_meal_time')}, "
-        f"שעות אכילה נפוצות {eating.get('typical_meal_hours')}, "
-        f"ממוצע קלוריות יומי ~{eating.get('avg_daily_calories')}."
+        f"{_eating_line(eating)}"
     )
 
 
@@ -218,7 +256,17 @@ async def morning_menu(
     if not _client_ready(client):
         cal = goal.get("calories", 2000)
         prot = goal.get("protein", 150)
-        first_time = profile.get("eating", {}).get("first_meal_time", "בבוקר") or "בבוקר"
+        # W1-20: the same read-path gate as the AI prompt block. A learned
+        # first-meal time is only used as this menu's breakfast hint when the
+        # window it came from is trustworthy; otherwise the pre-existing
+        # generic "בבוקר" default stands, exactly as it does for a user with no
+        # learned routine at all.
+        _eating = profile.get("eating", {}) or {}
+        first_time = (
+            _eating.get("first_meal_time")
+            if routine.eating_window_is_trustworthy(_eating)
+            else None
+        ) or "בבוקר"
         has_ritalin = flags.get("ritalin")
         is_fasting = flags.get("fasting", False)
         learned_names = _learned_food_names(nutrition_context)
