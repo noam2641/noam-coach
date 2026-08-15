@@ -229,9 +229,27 @@ async def test_degenerate_window_keeps_its_calorie_evidence_in_the_prompt() -> N
     """Withhold the bad interpretation, not the underlying evidence: the daily
     calorie average does not depend on the window's width."""
     prompt = await _prompt_for(_DEGENERATE)
-    assert "140.0" in prompt
+    assert "ממוצע קלוריות יומי ~140.0" in prompt
     # The sample count is surfaced so the AI knows how thin the basis is.
-    assert "1" in prompt
+    assert "1 ארוחות בלבד" in prompt
+
+
+@pytest.mark.asyncio
+async def test_thinly_sampled_window_is_not_sent_to_the_ai_as_learned_routine() -> None:
+    """A wide window can still be untrustworthy: 08:00-21:00 off two meals is
+    not a routine. ``first != last`` alone must not be the gate."""
+    prompt = await _prompt_for(
+        {
+            "first_meal_time": "08:00",
+            "last_meal_time": "21:00",
+            "typical_meal_hours": ["08:00", "21:00"],
+            "avg_daily_calories": 900.0,
+            "meals_sampled": 2,
+        }
+    )
+    assert "ארוחה ראשונה ~08:00" not in prompt
+    assert "לא נלמדה" in prompt
+    assert "2 ארוחות בלבד" in prompt
 
 
 @pytest.mark.asyncio
@@ -281,6 +299,21 @@ async def test_fallback_menu_ignores_a_degenerate_first_meal_time() -> None:
     time as its breakfast hint with only a truthiness check."""
     menu = await recommendations.morning_menu(
         None, "gpt-4", {"eating": _DEGENERATE}, {"calories": 2000, "protein": 150}, False
+    )
+    hints = [m.time_hint for m in menu.meals]
+    assert "08:00" not in hints
+    assert "בבוקר" in hints
+
+
+@pytest.mark.asyncio
+async def test_fallback_menu_ignores_a_thinly_sampled_first_meal_time() -> None:
+    menu = await recommendations.morning_menu(
+        None,
+        "gpt-4",
+        {"eating": {"first_meal_time": "08:00", "last_meal_time": "21:00",
+                    "meals_sampled": 2}},
+        {"calories": 2000, "protein": 150},
+        False,
     )
     hints = [m.time_hint for m in menu.meals]
     assert "08:00" not in hints
