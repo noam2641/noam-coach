@@ -460,9 +460,25 @@ would report neither happened.
 `state.mutated`. Within one flow: `rir:` and `ready:` emit, `reps:` does not.
 
 ## W1-16 · `state.mutated` cannot reconstruct its own mutation
-**[REPRODUCED]** · Lane C
+**[REPRODUCED — scope must come from the full writer census, 2026-08-13]** · Lane C
 42 of 48 have no `before_state`; 16 have neither. Eight mutually disjoint
 payload shapes share the name, and `event_version` is `1` on every row.
+*(Those counts were measured on one live session's rows, not from a static census.)*
+
+> **Scope note, recorded before this reconciliation merged.** Within
+> `noam_coach/observability/state_trace.py`, `before_state` is currently populated
+> at **2 of its 16** `emit_event` sites (`:130`, `:187`). **That is a subset count,
+> not the complete W1-16 writer census** — a later repo-wide preflight found
+> additional direct `state.mutated` writers outside that installer (~20 writers
+> across 9 files, in several distinct payload shapes, some lacking the `domain`
+> key that `session_trace.py:417` renders). Implementation scope must be set from
+> the **full writer census**, not from the `state_trace.py` count alone.
+>
+> **The before/after plumbing already exists end to end** (`emit.py:116→170`,
+> `event_log`, and the `before_state` column), so this is call-site work, not
+> plumbing work — and **no second mutation-event mechanism may be created.**
+> `EVENT_VERSIONS` is an empty dict (`taxonomy.py:121`), so `event_version()`
+> returns 1 by construction.
 
 ## W1-17 · Three stores, no shared key, case-drift names
 **[CLOSED — OBSOLETE / SUPERSEDED BY ARCHITECTURE, 2026-08-13]** · Lane C
@@ -565,16 +581,31 @@ The worst is `recommendations.py:168-171` (**repo root**, not
 `noam_coach/services/`), which tells the menu-generating AI the user eats in an
 instantaneous window.
 
-> **Re-verified 2026-08-13 — still open, and the root cause is deeper than
-> recorded.** No `first == last` guard exists anywhere; the only site touching both
-> fields is a display helper (`noam_coach/services/health_jobs.py:564-566`,
-> truthiness only). Critically, **W1-5's confidence attenuation provably cannot
-> reach these consumers**: they read the `routine_profile` blob directly
-> (`noam_coach/services/nutrition_context.py:200-208`, a raw
-> `SELECT profile FROM routine_profile`) rather than through `user_model`, so the
-> attenuated confidence is computed and then structurally unreachable. A fix
-> applied only in `user_model` is therefore insufficient — the correction belongs at
-> a shared read/quality boundary, not in each consumer separately.
+> **Re-verified 2026-08-13 — still open.** Zero-width / low-sample eating windows
+> are a real defect: no `first == last` guard exists anywhere; the only site
+> touching both fields is a display helper
+> (`noam_coach/services/health_jobs.py:564-566`, truthiness only); and
+> `recommendations.py:168-171` (**repo root**) still feeds the raw window to the
+> menu-generating AI.
+>
+> **Read-path correction, recorded before this reconciliation merged.** An earlier
+> draft asserted that W1-5's attenuation "provably cannot reach these consumers"
+> because they read the `routine_profile` blob directly via
+> `nutrition_context._routine_profile`. **That is withdrawn as the load-bearing
+> description.** A consumer census found an existing **shared accessor** —
+> `health_service.load_routine_profile()` (**repo root** `health_service.py:283-287`,
+> ~21 call sites, recompute-on-miss) — and the most damaging path reaches the
+> profile through it: `proactive.build_daily_context()` → `load_routine_profile()`
+> → `DailyContext.profile` → `recommendations.morning_menu` / `_profile_block`.
+> A separate raw accessor does exist at
+> `noam_coach/services/nutrition_context.py:200-208`, but its existence is **not**
+> evidence that all, or the main, W1-20 consumers bypass the shared accessor.
+>
+> **That existing shared accessor is the primary REUSE BEFORE BUILD candidate** —
+> a candidate, not an approved solution. The final correction semantics (read-time
+> vs write-time, and how *absent* / *degenerate* / *legitimately narrow* windows
+> remain distinguishable) belong to the W1-20 implementation brief and are not
+> authorized here.
 
 ## W1-21 · No macro-consistency validation
 **[REPRODUCED]** · Lane A
@@ -604,13 +635,26 @@ rendered with a volume label picked by name keyword (`meals.py:699-704`).
 Your note said exactly this. The comma splitter also does not split the Hebrew
 conjunction "ו", so "טורטייה ואגוזים" stays one item.
 
-> **Half 1 — STILL OPEN, and at two sites, not one.** The real lines are
-> `noam_coach/bot/onboarding.py:3550` (the diet-restrictions path) **and** `:3455`
-> (an independent copy on the allergies-gap path, which does not even persist the
-> remaining items). The `qa:diet_type:` callback that consumes the keyboard
-> (`onboarding.py:995`, built at `:3029-3036`) is single-item by construction, and
-> `noam_coach/services/question_dedup.py` re-dispatches the same callback
-> (`:155`, `:165`, `:264`) — so any sequencing must be honoured there too.
+> **Half 1 — STILL OPEN, at THREE sites, not one (and not two).** A repo-wide
+> search found: `noam_coach/bot/onboarding.py:3550` (the diet-restrictions path),
+> `noam_coach/bot/onboarding.py:3455` (an independent copy on the allergies-gap
+> path, which does not even persist the remaining items), **and
+> `noam_coach/services/question_dedup.py:211` (`parsed[0]`)**, in the
+> invariant-repair path that persists the answer before classification. The third
+> site was missed by this plan and by the first pass of the B0 reconciliation.
+> The `qa:diet_type:` callback that consumes the keyboard (`onboarding.py:995`,
+> built at `:3029-3036`) is single-item by construction, and
+> `question_dedup.py` re-dispatches the same callback (`:155`, `:165`, `:264`) —
+> so any sequencing must be honoured there too.
+>
+> **Reuse finding (binding on the W1-23 brief).** `question_dedup.py` **already
+> contains a restart-safe classification mechanism**: `CLASSIFY_PENDING_PREFIX`
+> (`:50`) → `facade.set_pending(...)` (`:247`) → persisted in `active_flow.step` →
+> read back (`:147`) → re-dispatch via `facade.handle_onboarding_callback(...)`
+> (`:163-165`). W1-23 must **extend or reuse that mechanism**, not introduce a new
+> pending queue or persisted state model, unless implementation evidence proves it
+> insufficient. Because of the `:163-165` re-dispatch, sequencing hooked at the
+> callback boundary is inherited by the free-text classification path.
 >
 > **Half 2 — ALREADY DONE.** `onboarding.py:3643` splits on
 > `[,\n]+|\s+ו\s+`, so the "ו" connector is handled. **Caveat:** the pattern
@@ -619,11 +663,14 @@ conjunction "ו", so "טורטייה ואגוזים" stays one item.
 > stays one item.** Mechanism present; the cited case still fails.
 >
 > **The requirement is: every parsed restriction is classified, none silently
-> dropped.** The state mechanism is **not** predetermined — prefer the existing
-> `active_flow` payload / conversation state machinery (`conversation.set_active_flow`
-> accepts a persisted `payload` dict; `onboarding.py:2113` already stores a list in
-> it). A new queue or new persisted state requires recorded evidence that the
-> existing flow payload cannot represent the sequence.
+> dropped.** The state mechanism is **not** predetermined by this document, but the
+> reuse candidates are named above and are binding as *candidates*: first
+> `question_dedup.py`'s existing `CLASSIFY_PENDING_PREFIX` mechanism, and
+> secondarily the `active_flow` payload machinery
+> (`conversation.set_active_flow` accepts a persisted `payload` dict;
+> `onboarding.py:2113` already stores a list in one). A new queue or new persisted
+> state model requires recorded evidence that **neither** existing mechanism can
+> represent the sequence.
 
 ---
 
